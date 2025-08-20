@@ -371,6 +371,15 @@ void ProcessManualSaveLoadRequests() {
             uint32_t* p2_char_to_load_ptr = (uint32_t*)0x470024;
             uint32_t* p1_color_selection_ptr = (uint32_t*)0x00470024;
             
+            // INPUT BUFFER - CRITICAL FOR FRAMESTEP: Motion inputs require input history
+            uint16_t* p1_input_history_ptr = (uint16_t*)0x4280E0;  // P1 input history (1024 frames)
+            uint16_t* p2_input_history_ptr = (uint16_t*)0x4290E0;  // P2 input history (1024 frames)
+            uint32_t* input_buffer_index_ptr = (uint32_t*)0x447EE0;  // Frame counter as buffer index
+            const size_t input_history_size = 1024 * sizeof(uint16_t);  // 2048 bytes each
+            
+            // CSS INPUT STATE - CRITICAL FOR CSS: Input change detection for just-pressed buttons
+            uint32_t* player_input_changes_ptr = (uint32_t*)0x447f60;  // g_player_input_changes[8] array
+            
             // Object pool (391KB)
             uint8_t* object_pool_ptr = (uint8_t*)0x4701E0;
             const size_t object_pool_size = 0x5F800;
@@ -384,6 +393,10 @@ void ProcessManualSaveLoadRequests() {
                                   !IsBadReadPtr(p2_y_ptr, sizeof(uint16_t)) &&
                                   !IsBadReadPtr(rng_seed_ptr, sizeof(uint32_t)) &&
                                   !IsBadReadPtr(timer_ptr, sizeof(uint32_t)) &&
+                                  !IsBadReadPtr(p1_input_history_ptr, input_history_size) &&
+                                  !IsBadReadPtr(p2_input_history_ptr, input_history_size) &&
+                                  !IsBadReadPtr(input_buffer_index_ptr, sizeof(uint32_t)) &&
+                                  !IsBadReadPtr(player_input_changes_ptr, 8 * sizeof(uint32_t)) &&
                                   !IsBadReadPtr(object_pool_ptr, object_pool_size) &&
                                   !IsBadReadPtr(p1_char_vars_ptr, sizeof(int16_t) * 16) &&
                                   !IsBadReadPtr(p2_char_vars_ptr, sizeof(int16_t) * 16) &&
@@ -448,6 +461,23 @@ void ProcessManualSaveLoadRequests() {
                 
                 // Save move history
                 memcpy(save_slot->player_move_history, move_history_ptr, 16);
+                
+                // CRITICAL: Save input buffer - required for frame stepping with motion inputs
+                memcpy(save_slot->p1_input_history, p1_input_history_ptr, input_history_size);
+                memcpy(save_slot->p2_input_history, p2_input_history_ptr, input_history_size);
+                save_slot->input_buffer_index = *input_buffer_index_ptr;
+                
+                // CSS INPUT STATE: Save input change detection for just-pressed buttons
+                memcpy(save_slot->player_input_changes, player_input_changes_ptr, 8 * sizeof(uint32_t));
+                
+                // INPUT REPEAT LOGIC STATE: Save repeat logic state for consistency
+                memcpy(save_slot->prev_input_state, g_prev_input_state, 8 * sizeof(uint32_t));
+                memcpy(save_slot->input_repeat_state, g_input_repeat_state, 8 * sizeof(uint32_t));
+                memcpy(save_slot->input_repeat_timer, g_input_repeat_timer, 8 * sizeof(uint32_t));
+                
+                // IMMEDIATE INPUT APPLY STATE: Save ApplyNetworkedInputsImmediately state
+                save_slot->apply_prev_p1_input = g_apply_prev_p1_input;
+                save_slot->apply_prev_p2_input = g_apply_prev_p2_input;
                 
                 // Save additional state
                 save_slot->object_count = *object_count_ptr;
@@ -635,6 +665,15 @@ void ProcessManualSaveLoadRequests() {
             uint32_t* p2_char_to_load_ptr = (uint32_t*)0x470024;
             uint32_t* p1_color_selection_ptr = (uint32_t*)0x00470024;
             
+            // INPUT BUFFER - CRITICAL FOR FRAMESTEP: Motion inputs require input history
+            uint16_t* p1_input_history_ptr = (uint16_t*)0x4280E0;  // P1 input history (1024 frames)
+            uint16_t* p2_input_history_ptr = (uint16_t*)0x4290E0;  // P2 input history (1024 frames)
+            uint32_t* input_buffer_index_ptr = (uint32_t*)0x447EE0;  // Frame counter as buffer index
+            const size_t input_history_size = 1024 * sizeof(uint16_t);  // 2048 bytes each
+            
+            // CSS INPUT STATE - CRITICAL FOR CSS: Input change detection for just-pressed buttons
+            uint32_t* player_input_changes_ptr = (uint32_t*)0x447f60;  // g_player_input_changes[8] array
+            
             // Object pool (391KB)
             uint8_t* object_pool_ptr = (uint8_t*)0x4701E0;
             const size_t object_pool_size = 0x5F800;
@@ -647,6 +686,10 @@ void ProcessManualSaveLoadRequests() {
                                      !IsBadWritePtr(p2_y_ptr, sizeof(uint16_t)) &&
                                      !IsBadWritePtr(rng_seed_ptr, sizeof(uint32_t)) &&
                                      !IsBadWritePtr(timer_ptr, sizeof(uint32_t)) &&
+                                     !IsBadWritePtr(p1_input_history_ptr, input_history_size) &&
+                                     !IsBadWritePtr(p2_input_history_ptr, input_history_size) &&
+                                     !IsBadWritePtr(input_buffer_index_ptr, sizeof(uint32_t)) &&
+                                     !IsBadWritePtr(player_input_changes_ptr, 8 * sizeof(uint32_t)) &&
                                      !IsBadWritePtr(object_pool_ptr, object_pool_size) &&
                                      !IsBadWritePtr(p1_char_vars_ptr, sizeof(int16_t) * 16) &&
                                      !IsBadWritePtr(p2_char_vars_ptr, sizeof(int16_t) * 16) &&
@@ -707,6 +750,23 @@ void ProcessManualSaveLoadRequests() {
                 
                 // Restore move history
                 memcpy(move_history_ptr, save_slot->player_move_history, 16);
+                
+                // CRITICAL: Restore input buffer - required for frame stepping with motion inputs
+                memcpy(p1_input_history_ptr, save_slot->p1_input_history, input_history_size);
+                memcpy(p2_input_history_ptr, save_slot->p2_input_history, input_history_size);
+                *input_buffer_index_ptr = save_slot->input_buffer_index;
+                
+                // CSS INPUT STATE: Restore input change detection for just-pressed buttons
+                memcpy(player_input_changes_ptr, save_slot->player_input_changes, 8 * sizeof(uint32_t));
+                
+                // INPUT REPEAT LOGIC STATE: Restore repeat logic state for consistency
+                memcpy(g_prev_input_state, save_slot->prev_input_state, 8 * sizeof(uint32_t));
+                memcpy(g_input_repeat_state, save_slot->input_repeat_state, 8 * sizeof(uint32_t));
+                memcpy(g_input_repeat_timer, save_slot->input_repeat_timer, 8 * sizeof(uint32_t));
+                
+                // IMMEDIATE INPUT APPLY STATE: Restore ApplyNetworkedInputsImmediately state
+                g_apply_prev_p1_input = save_slot->apply_prev_p1_input;
+                g_apply_prev_p2_input = save_slot->apply_prev_p2_input;
                 
                 // Restore additional state
                 *object_count_ptr = save_slot->object_count;
