@@ -8,24 +8,25 @@
 #include <windows.h>
 #include <SDL3/SDL.h>
 
-// CCCaster-style direct input capture
+// CCCaster-style direct input capture (using P1 FM2K defaults)
 uint16_t CaptureDirectInput() {
     uint16_t input = 0;
     
-    // Direction inputs (correct FM2K bit mapping from documentation)
-    if (GetAsyncKeyState(VK_LEFT) & 0x8000)  input |= 0x001; // Left
-    if (GetAsyncKeyState(VK_RIGHT) & 0x8000) input |= 0x002; // Right  
-    if (GetAsyncKeyState(VK_UP) & 0x8000)    input |= 0x004; // Up
-    if (GetAsyncKeyState(VK_DOWN) & 0x8000)  input |= 0x008; // Down
+    // Direction inputs - FM2K default P1 controls (TFBH)
+    if (GetAsyncKeyState('F') & 0x8000)      input |= 0x001; // Left
+    if (GetAsyncKeyState('H') & 0x8000)      input |= 0x002; // Right  
+    if (GetAsyncKeyState('T') & 0x8000)      input |= 0x004; // Up
+    if (GetAsyncKeyState('B') & 0x8000)      input |= 0x008; // Down
     
-    // Button inputs (using common keyboard mapping)
-    if (GetAsyncKeyState('Z') & 0x8000)      input |= 0x010; // Button 1
-    if (GetAsyncKeyState('X') & 0x8000)      input |= 0x020; // Button 2  
-    if (GetAsyncKeyState('C') & 0x8000)      input |= 0x040; // Button 3
-    if (GetAsyncKeyState('A') & 0x8000)      input |= 0x080; // Button 4
-    if (GetAsyncKeyState('S') & 0x8000)      input |= 0x100; // Button 5
-    if (GetAsyncKeyState('D') & 0x8000)      input |= 0x200; // Button 6
-    if (GetAsyncKeyState('Q') & 0x8000)      input |= 0x400; // Button 7
+    // Button inputs - FM2K default P1 controls (ASDQWE)
+    if (GetAsyncKeyState('A') & 0x8000)      input |= 0x010; // Button 1
+    if (GetAsyncKeyState('S') & 0x8000)      input |= 0x020; // Button 2  
+    if (GetAsyncKeyState('D') & 0x8000)      input |= 0x040; // Button 3
+    if (GetAsyncKeyState('Q') & 0x8000)      input |= 0x080; // Button 4
+    if (GetAsyncKeyState('W') & 0x8000)      input |= 0x100; // Button 5
+    if (GetAsyncKeyState('E') & 0x8000)      input |= 0x200; // Button 6
+    // Button 7 = 0x400 (pause/ESC)
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) input |= 0x400; // Button 7/Pause (ESC)
     
     return input;
 }
@@ -149,29 +150,31 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
         // OFFLINE MODE: Local keyboard input for both players
         if (IsWindowFocused()) {
             if (player_id == 0) {
-                // P1: Arrow keys + ZXCASD
-                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  raw_input |= 0x001;
-                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) raw_input |= 0x002;
-                if (GetAsyncKeyState(VK_UP) & 0x8000)    raw_input |= 0x004;
-                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  raw_input |= 0x008;
-                if (GetAsyncKeyState('Z') & 0x8000)      raw_input |= 0x010;
-                if (GetAsyncKeyState('X') & 0x8000)      raw_input |= 0x020;
-                if (GetAsyncKeyState('C') & 0x8000)      raw_input |= 0x040;
-                if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x080;
-                if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x100;
-                if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x200;
+                // P1: FM2K default controls - TFBH for directions, ASDQWE for buttons
+                if (GetAsyncKeyState('F') & 0x8000)      raw_input |= 0x001; // Left (F key)
+                if (GetAsyncKeyState('H') & 0x8000)      raw_input |= 0x002; // Right (H key)
+                if (GetAsyncKeyState('T') & 0x8000)      raw_input |= 0x004; // Up (T key)
+                if (GetAsyncKeyState('B') & 0x8000)      raw_input |= 0x008; // Down (B key)
+                if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x010; // Button 1
+                if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x020; // Button 2
+                if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x040; // Button 3
+                if (GetAsyncKeyState('Q') & 0x8000)      raw_input |= 0x080; // Button 4
+                if (GetAsyncKeyState('W') & 0x8000)      raw_input |= 0x100; // Button 5
+                if (GetAsyncKeyState('E') & 0x8000)      raw_input |= 0x200; // Button 6
+                if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) raw_input |= 0x400; // Button 7/Pause
             } else if (player_id == 1) {
-                // P2: WASD + UIOPJK
-                if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x001;
-                if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x002;
-                if (GetAsyncKeyState('W') & 0x8000)      raw_input |= 0x004;
-                if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x008;
-                if (GetAsyncKeyState('U') & 0x8000)      raw_input |= 0x010;
-                if (GetAsyncKeyState('I') & 0x8000)      raw_input |= 0x020;
-                if (GetAsyncKeyState('O') & 0x8000)      raw_input |= 0x040;
-                if (GetAsyncKeyState('P') & 0x8000)      raw_input |= 0x080;
-                if (GetAsyncKeyState('J') & 0x8000)      raw_input |= 0x100;
-                if (GetAsyncKeyState('K') & 0x8000)      raw_input |= 0x200;
+                // P2: FM2K default controls - Numpad for directions, JKLIOP for buttons
+                if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) raw_input |= 0x001; // Left (Numpad 4)
+                if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) raw_input |= 0x002; // Right (Numpad 6)
+                if (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) raw_input |= 0x004; // Up (Numpad 8)
+                if (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) raw_input |= 0x008; // Down (Numpad 2)
+                if (GetAsyncKeyState('J') & 0x8000)        raw_input |= 0x010; // Button 1
+                if (GetAsyncKeyState('K') & 0x8000)        raw_input |= 0x020; // Button 2
+                if (GetAsyncKeyState('L') & 0x8000)        raw_input |= 0x040; // Button 3
+                if (GetAsyncKeyState('I') & 0x8000)        raw_input |= 0x080; // Button 4
+                if (GetAsyncKeyState('O') & 0x8000)        raw_input |= 0x100; // Button 5
+                if (GetAsyncKeyState('P') & 0x8000)        raw_input |= 0x200; // Button 6
+                if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)  raw_input |= 0x400; // Button 7/Pause
             }
         }
     } else {
@@ -179,18 +182,19 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
         if (::player_index == 0) {
             // HOST: Controls P1, receives P2 from network
             if (player_id == 0) {
-                // P1 local keyboard
+                // P1 local keyboard - FM2K default controls
                 if (IsWindowFocused()) {
-                    if (GetAsyncKeyState(VK_LEFT) & 0x8000)  raw_input |= 0x001;
-                    if (GetAsyncKeyState(VK_RIGHT) & 0x8000) raw_input |= 0x002;
-                    if (GetAsyncKeyState(VK_UP) & 0x8000)    raw_input |= 0x004;
-                    if (GetAsyncKeyState(VK_DOWN) & 0x8000)  raw_input |= 0x008;
-                    if (GetAsyncKeyState('Z') & 0x8000)      raw_input |= 0x010;
-                    if (GetAsyncKeyState('X') & 0x8000)      raw_input |= 0x020;
-                    if (GetAsyncKeyState('C') & 0x8000)      raw_input |= 0x040;
-                    if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x080;
-                    if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x100;
-                    if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x200;
+                    if (GetAsyncKeyState('F') & 0x8000)      raw_input |= 0x001; // Left
+                    if (GetAsyncKeyState('H') & 0x8000)      raw_input |= 0x002; // Right
+                    if (GetAsyncKeyState('T') & 0x8000)      raw_input |= 0x004; // Up
+                    if (GetAsyncKeyState('B') & 0x8000)      raw_input |= 0x008; // Down
+                    if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x010; // Button 1
+                    if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x020; // Button 2
+                    if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x040; // Button 3
+                    if (GetAsyncKeyState('Q') & 0x8000)      raw_input |= 0x080; // Button 4
+                    if (GetAsyncKeyState('W') & 0x8000)      raw_input |= 0x100; // Button 5
+                    if (GetAsyncKeyState('E') & 0x8000)      raw_input |= 0x200; // Button 6
+                    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) raw_input |= 0x400; // Button 7/Pause
                 }
             } else if (player_id == 1) {
                 // P2 networked
@@ -202,18 +206,19 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 // P1 networked
                 raw_input = GetCurrentNetworkedP1Input();
             } else if (player_id == 1) {
-                // P2 local keyboard
+                // P2 local keyboard - FM2K default controls
                 if (IsWindowFocused()) {
-                    if (GetAsyncKeyState('A') & 0x8000)      raw_input |= 0x001;
-                    if (GetAsyncKeyState('D') & 0x8000)      raw_input |= 0x002;
-                    if (GetAsyncKeyState('W') & 0x8000)      raw_input |= 0x004;
-                    if (GetAsyncKeyState('S') & 0x8000)      raw_input |= 0x008;
-                    if (GetAsyncKeyState('U') & 0x8000)      raw_input |= 0x010;
-                    if (GetAsyncKeyState('I') & 0x8000)      raw_input |= 0x020;
-                    if (GetAsyncKeyState('O') & 0x8000)      raw_input |= 0x040;
-                    if (GetAsyncKeyState('P') & 0x8000)      raw_input |= 0x080;
-                    if (GetAsyncKeyState('J') & 0x8000)      raw_input |= 0x100;
-                    if (GetAsyncKeyState('K') & 0x8000)      raw_input |= 0x200;
+                    if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) raw_input |= 0x001; // Left
+                    if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) raw_input |= 0x002; // Right
+                    if (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) raw_input |= 0x004; // Up
+                    if (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) raw_input |= 0x008; // Down
+                    if (GetAsyncKeyState('J') & 0x8000)        raw_input |= 0x010; // Button 1
+                    if (GetAsyncKeyState('K') & 0x8000)        raw_input |= 0x020; // Button 2
+                    if (GetAsyncKeyState('L') & 0x8000)        raw_input |= 0x040; // Button 3
+                    if (GetAsyncKeyState('I') & 0x8000)        raw_input |= 0x080; // Button 4
+                    if (GetAsyncKeyState('O') & 0x8000)        raw_input |= 0x100; // Button 5
+                    if (GetAsyncKeyState('P') & 0x8000)        raw_input |= 0x200; // Button 6
+                    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)  raw_input |= 0x400; // Button 7/Pause
                 }
             }
         }

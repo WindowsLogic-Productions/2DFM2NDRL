@@ -1,1 +1,1 @@
-./make_build.sh && ./go.sh
+./make_build.sh && bash go.sh
