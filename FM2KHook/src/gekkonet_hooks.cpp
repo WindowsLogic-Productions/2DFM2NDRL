@@ -132,7 +132,6 @@ bool InitializeGekkoNet() {
     config.state_size = sizeof(int32_t); // 4 bytes for network state (exactly like bsnes)
     config.desync_detection = true;
     config.limited_saving = false;
-    config.post_sync_joining = false;
     config.spectator_delay = 0;
     
     // Create session like bsnes-netplay
@@ -235,8 +234,8 @@ bool InitializeGekkoNet() {
 
 void CleanupGekkoNet() {
     if (gekko_session) {
-        gekko_destroy(gekko_session);
-        gekko_session = nullptr;
+        gekko_destroy(&gekko_session);
+        // gekko_destroy sets session to nullptr
         gekko_initialized = false;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "FM2K HOOK: GekkoNet session closed");
     }

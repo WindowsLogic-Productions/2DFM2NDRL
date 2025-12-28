@@ -38,7 +38,23 @@
       "mcp__github_com_mrexodia_ida-pro-mcp__get_xrefs_to_field",
       "WebFetch(domain:github.com)",
       "Bash(git log:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "mcp__ida__decompile_function",
+      "mcp__ida__rename_function",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "mcp__ida__get_global_variable_value_by_name",
+      "mcp__ida__list_globals_filter",
+      "mcp__ida__list_globals",
+      "mcp__ida__rename_global_variable",
+      "Bash(cat:*)",
+      "Bash(bash:*)",
+      "mcp__ida__get_function_by_address",
+      "mcp__ida__get_global_variable_value_at_address",
+      "mcp__ida__get_function_by_name",
+      "mcp__ida__data_read_string",
+      "mcp__ida__disassemble_function"
     ],
     "deny": []
   }
