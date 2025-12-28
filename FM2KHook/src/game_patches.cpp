@@ -5,6 +5,25 @@
 #include <SDL3/SDL.h>
 #include <cstring>
 
+// Bypass multi-instance check so multiple game instances can run
+// FM2K uses FindWindowA("KGT2KGAME", 0) to check for existing instances
+// If found, WinMain returns 1 and exits. We patch the conditional jump to always skip.
+void BypassMultiInstanceCheck() {
+    // At 0x405d05: jz loc_405D15 (0x74 0x0E) - jump if no window found
+    // Change to: jmp loc_405D15 (0xEB 0x0E) - always jump (bypass instance check)
+    uint8_t* jz_addr = (uint8_t*)0x405d05;
+
+    DWORD old_protect;
+    if (VirtualProtect(jz_addr, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        // Change jz (0x74) to jmp short (0xEB)
+        *jz_addr = 0xEB;
+        VirtualProtect(jz_addr, 1, old_protect, &old_protect);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "FM2K PATCH: Bypassed multi-instance check at 0x405d05 (jz -> jmp)");
+    } else {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "FM2K PATCH: Failed to patch multi-instance check at 0x405d05");
+    }
+}
+
 // New hook for boot-to-character-select hack
 // This hook modifies the game's initialization to boot directly to character select screen
 // instead of showing the title screen and splash screens. It does this by:

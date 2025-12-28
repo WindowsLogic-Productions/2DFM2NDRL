@@ -6,13 +6,18 @@
 #include "gekkonet_hooks.h"
 #include "hooks.h"
 #include "imgui_overlay.h"
+#include "game_patches.h"
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         {
             DisableThreadLibraryCalls(hModule);
-            
+
+            // CRITICAL: Bypass multi-instance check FIRST before WinMain runs
+            // This allows multiple game instances for netplay testing
+            BypassMultiInstanceCheck();
+
             AllocConsole();
             FILE* fDummy;
             freopen_s(&fDummy, "CONOUT$", "w", stdout);
