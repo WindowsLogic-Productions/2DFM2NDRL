@@ -10,40 +10,35 @@ set(CMAKE_GENERATOR_PLATFORM Win32)
 set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
 
-# Create simple DLL target
+# ORGANIZED SOURCE FILES
 add_library(FM2KHook SHARED
-    src/dllmain.cpp
-    src/globals.cpp
-    src/gekkonet_hooks.cpp
-    src/logging.cpp
-    src/shared_mem.cpp
-    src/state_manager.cpp
-    src/game_state_detector.cpp
-    src/hooks.cpp
-    src/input_handler.cpp
-    src/savestate.cpp
-    src/debug_features.cpp
-    src/game_patches.cpp
-    src/state_monitor.cpp
-    # REMOVED: src/css_handler.cpp - CSS delayed input system eliminated
-    src/object_tracker.cpp
-    src/object_analysis.cpp
-    src/object_pool_scanner.cpp
-    src/imgui_overlay.cpp
-    ../LocalNetworkAdapter.cpp
+    # Core
+    src/core/dllmain.cpp
+    src/core/globals.cpp
+    # Hooks
+    src/hooks/hooks.cpp
+    src/hooks/input.cpp
+    src/hooks/game_patches.cpp
+    # Netplay
+    src/netplay/netplay.cpp
+    src/netplay/control_channel.cpp
+    src/netplay/savestate.cpp
+    # UI
+    src/ui/imgui_overlay.cpp
+    src/ui/shared_mem.cpp
 )
 
 # Export symbols for DLL
-target_compile_definitions(FM2KHook PRIVATE 
-    FM2KHOOK_EXPORTS 
+target_compile_definitions(FM2KHook PRIVATE
+    FM2KHOOK_EXPORTS
     _CRT_SECURE_NO_WARNINGS
     WIN32_LEAN_AND_MEAN
     GEKKONET_STATIC
     _WIN32_WINNT=0x0601
 )
 
-# Link against MinHook and GekkoNet
-target_link_libraries(FM2KHook PRIVATE 
+# Link against dependencies
+target_link_libraries(FM2KHook PRIVATE
     MinHook
     GekkoNet
     SDL3::SDL3-static
@@ -54,10 +49,14 @@ target_link_libraries(FM2KHook PRIVATE
     d3d9
 )
 
-# Include directories
-target_include_directories(FM2KHook PRIVATE 
+# Include directories - add all src subdirectories so includes work
+target_include_directories(FM2KHook PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hooks
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/netplay
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
     ${CMAKE_SOURCE_DIR}/vendored/minhook/include
     ${CMAKE_SOURCE_DIR}/vendored/SDL/include
     ${CMAKE_SOURCE_DIR}/vendored/SDL_net/include
@@ -78,4 +77,4 @@ install(TARGETS FM2KHook
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
-) 
+)

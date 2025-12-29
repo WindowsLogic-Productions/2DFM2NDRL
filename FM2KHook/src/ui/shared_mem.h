@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.h"
+#include <cstdint>
 
 // Forward declaration for DetailedObject
 namespace FM2K {
@@ -9,98 +9,36 @@ namespace ObjectPool {
 }
 }
 
-// Save state data structure - COMPREHENSIVE
+// ============================================================================
+// CHARACTER SLOT CONSTANTS - OPTIMIZED FOR ROLLBACK
+// Static data (sprites, animations, hitboxes) loaded from .player files doesn't change
+// Only save the dynamic portion for rollback (96% smaller!)
+// ============================================================================
+constexpr size_t CHAR_SLOT_SIZE = 57407;           // Full slot size from IDA
+constexpr size_t CHAR_SLOT_DYNAMIC_OFFSET = 55000; // Where dynamic data starts
+constexpr size_t CHAR_SLOT_DYNAMIC_SIZE = CHAR_SLOT_SIZE - CHAR_SLOT_DYNAMIC_OFFSET; // 2407 bytes
+constexpr size_t NUM_CHAR_SLOTS = 8;
+constexpr uintptr_t CHAR_SLOT_BASE = 0x4D1D80;     // g_character_data_base
+
+// ============================================================================
+// OPTIMIZED SAVE STATE DATA - ~420KB vs ~1MB original
+// ============================================================================
 struct SaveStateData {
-    // Basic player state (CheatEngine verified)
-    uint32_t p1_hp;                    // 0x004DFC85 - P1 HP
-    uint32_t p2_hp;                    // 0x004EDCC4 - P2 HP
-    uint32_t p1_x;                     // 0x004DFCC3 - P1 X coordinate
-    uint16_t p1_y;                     // 0x004DFCC7 - P1 Y coordinate (2 bytes)
-    uint32_t p2_x;                     // 0x004EDD02 - P2 X coordinate
-    uint16_t p2_y;                     // 0x004EDD06 - P2 Y coordinate (2 bytes)
-    
-    // Player meter/super/stock
-    uint32_t p1_super;                 // 0x004DFC9D - P1 Super
-    uint32_t p2_super;                 // 0x004EDCDC - P2 Super
-    uint32_t p1_special_stock;         // 0x004DFC95 - P1 Special Stock
-    uint32_t p2_special_stock;         // 0x004EDCD4 - P2 Special Stock
-    uint32_t p1_rounds_won;            // 0x004DFC6D - P1 Rounds Won
-    uint32_t p2_rounds_won;            // 0x004EDCAC - P2 Rounds Won
-    
-    // RNG seed for deterministic behavior
-    uint32_t rng_seed;                 // 0x41FB1C - Critical for rollback
-    
-    // Timers and state
-    uint32_t game_timer;               // 0x470050 - g_actual_wanwan_timer
-    uint32_t round_timer;              // 0x00470060 - g_round_timer
-    uint32_t round_state;              // 0x47004C - g_round_state
-    uint32_t round_limit;              // 0x470048 - g_round_limit
-    uint32_t round_setting;            // 0x470068 - g_round_setting
-    
-    // Game modes and flags
-    uint32_t fm2k_game_mode;           // 0x470040 - g_fm2k_game_mode
-    uint16_t game_mode;                // 0x00470054 - g_game_mode
-    uint32_t game_paused;              // 0x4701BC - g_game_paused
-    uint32_t replay_mode;              // 0x4701C0 - g_replay_mode
-    
-    // Camera position
-    uint32_t camera_x;                 // 0x00447F2C - g_camera_x (Map X Coor)
-    uint32_t camera_y;                 // 0x00447F30 - g_camera_y (Map Y Coor)
-    
-    // Character variables (A-P for each player)
-    int16_t p1_char_vars[16];          // 0x004DFD17-0x004DFD35
-    int16_t p2_char_vars[16];          // 0x004EDD56-0x004EDD74
-    
-    // System variables (A-P)
-    int16_t sys_vars[14];              // 0x004456B0-0x004456CA (A-N signed)
-    uint16_t sys_vars_unsigned[2];     // 0x004456CC-0x004456CE (O-P unsigned)
-    
-    // Task variables (A-P for each player)
-    uint16_t p1_task_vars[16];         // 0x00470311-0x0047032F (mostly unsigned, P is signed)
-    uint16_t p2_task_vars[16];         // 0x0047060D-0x0047062B
-    
-    // Move history
-    uint8_t player_move_history[16];   // 0x47006C - g_player_move_history
-    
-    // INPUT BUFFER - CRITICAL FOR ROLLBACK
-    // Motion inputs like quarter-circle forward (236+P) require input history
-    uint16_t p1_input_history[1024];   // 0x4280E0 - P1 input history buffer (1024 frames)
-    uint16_t p2_input_history[1024];   // 0x4290E0 - P2 input history buffer (1024 frames)
-    uint32_t input_buffer_index;       // Current position in circular input buffer
-    
-    // CSS INPUT STATE - CRITICAL FOR CSS: Input change detection for just-pressed buttons
-    uint32_t player_input_changes[8];  // 0x447f60 - g_player_input_changes[8] array
-    
-    // INPUT REPEAT LOGIC STATE - CRITICAL FOR ROLLBACK: Static variables from input processing
-    uint32_t prev_input_state[8];       // Previous frame input states for repeat logic
-    uint32_t input_repeat_state[8];     // Current repeat states for repeat logic  
-    uint32_t input_repeat_timer[8];     // Timers for repeat logic
-    
-    // IMMEDIATE INPUT APPLY STATE - CRITICAL FOR ROLLBACK: ApplyNetworkedInputsImmediately variables
-    uint32_t apply_prev_p1_input;       // Previous P1 input for immediate apply change detection
-    uint32_t apply_prev_p2_input;       // Previous P2 input for immediate apply change detection
-    
-    // Object pool (391KB - 1024 objects * 382 bytes each)
-    uint8_t object_pool[0x5F800];      // 0x4701E0 - Full object pool capture
-    
-    // Additional state
-    uint32_t object_count;             // 0x004246FC - g_object_count
-    uint32_t frame_sync_flag;          // 0x00424700 - g_frame_sync_flag
-    uint32_t hit_effect_target;        // 0x4701C4 - g_hit_effect_target
-    
-    // Character selection state
-    uint32_t menu_selection;           // 0x424780 - g_menu_selection
-    uint64_t p1_css_cursor;            // 0x00424E50 - p1Cursor (8 bytes)
-    uint64_t p2_css_cursor;            // 0x00424E58 - p2Cursor (8 bytes)
-    uint32_t p1_char_to_load;          // 0x470020 - p1CharToDisplayAndLoad
-    uint32_t p2_char_to_load;          // 0x470024 - p2CharToDisplayAndLoad
-    uint32_t p1_color_selection;       // 0x00470024 - g_iPlayer1_Color_Selection
-    
-    // Metadata
-    uint32_t frame_number;             // Frame when this state was saved
-    uint64_t timestamp_ms;             // When this save was created
-    bool valid;                        // Is this save slot occupied
-    uint32_t checksum;                 // Simple validation checksum
+    uint32_t frame_number;                                    // Frame when saved
+    uint32_t checksum;                                        // Validation checksum
+    uint32_t rng_seed;                                        // RNG seed for determinism
+
+    // Dynamic character data only (19KB vs 459KB for all 8 slots)
+    uint8_t char_dynamic[NUM_CHAR_SLOTS][CHAR_SLOT_DYNAMIC_SIZE];
+
+    // Object pool - projectiles, effects (391KB)
+    uint8_t object_pool[0x5F800];
+
+    // Input history (8KB)
+    uint8_t input_history[0x2000];
+
+    // Game state (512 bytes)
+    uint8_t game_state[0x200];
 };
 
 // Shared memory structure matching the launcher

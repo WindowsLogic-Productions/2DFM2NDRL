@@ -7,7 +7,7 @@
 #include "MinHook.h"
 #include "FM2K_GameInstance.h"
 #include "FM2K_Integration.h"
-#include "FM2KHook/src/shared_mem.h"
+#include "FM2KHook/src/ui/shared_mem.h"
 #include "LocalSession.h"
 #include "OnlineSession.h"
 
