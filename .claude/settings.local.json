@@ -54,7 +54,17 @@
       "mcp__ida__get_global_variable_value_at_address",
       "mcp__ida__get_function_by_name",
       "mcp__ida__data_read_string",
-      "mcp__ida__disassemble_function"
+      "mcp__ida__disassemble_function",
+      "mcp__ida__read_memory_bytes",
+      "Bash(./go.sh:*)",
+      "mcp__ida__list_strings_filter",
+      "mcp__ida__get_xrefs_to",
+      "Bash(cmake:*)",
+      "Bash(wc:*)",
+      "mcp__ida__check_connection",
+      "mcp__ida__get_metadata",
+      "mcp__ida__list_functions",
+      "mcp__ida__list_imports"
     ],
     "deny": []
   }

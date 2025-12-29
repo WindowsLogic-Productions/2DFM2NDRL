@@ -1,6 +1,6 @@
 #include "FM2K_GameInstance.h"
 #include "FM2K_Integration.h"
-#include "FM2KHook/src/shared_mem.h"  // Use canonical SharedInputData definition
+#include "FM2KHook/src/ui/shared_mem.h"  // Use canonical SharedInputData definition
 // DLL injection approach - no direct hooks needed
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -11,7 +11,7 @@
 
 // Save state profile removed - now using optimized FastGameState system
 
-// SharedInputData struct now comes from FM2KHook/src/shared_mem.h
+// SharedInputData struct now comes from FM2KHook/src/ui/shared_mem.h
 
 namespace {
 
@@ -154,16 +154,16 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Game process launched successfully");
-    
+
     // Simple DLL injection complete - no IPC needed
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hook DLL injected successfully");
-    
-    // Initialize shared memory for configuration passing BEFORE resuming thread
-    InitializeSharedMemory();
-    
+
+    // Note: Shared memory is no longer used - config is passed via environment variables
+    // (FM2K_PLAYER_INDEX, FM2K_LOCAL_PORT, FM2K_REMOTE_ADDR, etc.)
+
     // Resume the game process (hook DLL will start running now)
     ResumeThread(process_info_.hThread);
-    
+
     return true;
 }
 

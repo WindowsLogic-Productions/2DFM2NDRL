@@ -744,7 +744,6 @@ private:
     void RenderSaveStateTools();        // Save state management tab
     void RenderMultiClientTools();      // Multi-client testing tab
     void RenderNetworkTools();          // Network simulation tab
-    void RenderPerformanceStats();      // Performance statistics tab
     void RenderObjectAnalysis();        // Object inspection and analysis tab
     void RenderSlotInspectionWindow();  // Save slot inspection popup window
     
@@ -753,17 +752,12 @@ private:
     void ShowNetworkDiagnostics();
     bool ValidateNetworkConfig();
     
-    enum class UITheme { Dark, Light, System, DarkCyan };
+    // Simplified theme - always Dark
+    enum class UITheme { Dark };
     void SetTheme(UITheme theme);
     UITheme current_theme_;
 
-    // int selected_game_index_ = -1; // -1 means no selection
-    // bool scanning_games_ = false;  // True while background discovery is running
-    
     // Save state inspection
     int selected_inspection_slot_ = -1;
     bool show_slot_inspection_ = false;
-
-private:
-    void ApplyDarkCyanThemeStyle();
 }; 

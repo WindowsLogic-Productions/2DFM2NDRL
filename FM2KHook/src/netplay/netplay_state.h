@@ -1,0 +1,200 @@
+// Netplay State Machine Types
+// FM2K Rollback Netcode Implementation
+#pragma once
+
+#include <cstdint>
+
+// =============================================================================
+// STATE MACHINE
+// =============================================================================
+
+enum class NetplayState : uint8_t {
+    DISCONNECTED,       // No connection
+    CONNECTING,         // UDP handshake in progress
+    SYNCED,             // Initial sync complete (version, player assignment)
+
+    CSS_LOBBY,          // In CSS, syncing cursors, neither locked
+    CSS_LOCAL_READY,    // Local player locked, waiting for remote
+    CSS_REMOTE_READY,   // Remote player locked, waiting for local
+    CSS_BOTH_READY,     // Both locked, preparing GekkoNet session
+
+    BATTLE_INIT,        // Creating GekkoNet session
+    BATTLE_SYNCING,     // GekkoNet handshake in progress
+    BATTLE_RUNNING,     // Full rollback active
+    BATTLE_PAUSED,      // Game paused during battle
+    BATTLE_END,         // Match ended, cleanup
+};
+
+// Convert state to string for logging
+inline const char* NetplayStateToString(NetplayState state) {
+    switch (state) {
+        case NetplayState::DISCONNECTED:    return "DISCONNECTED";
+        case NetplayState::CONNECTING:      return "CONNECTING";
+        case NetplayState::SYNCED:          return "SYNCED";
+        case NetplayState::CSS_LOBBY:       return "CSS_LOBBY";
+        case NetplayState::CSS_LOCAL_READY: return "CSS_LOCAL_READY";
+        case NetplayState::CSS_REMOTE_READY:return "CSS_REMOTE_READY";
+        case NetplayState::CSS_BOTH_READY:  return "CSS_BOTH_READY";
+        case NetplayState::BATTLE_INIT:     return "BATTLE_INIT";
+        case NetplayState::BATTLE_SYNCING:  return "BATTLE_SYNCING";
+        case NetplayState::BATTLE_RUNNING:  return "BATTLE_RUNNING";
+        case NetplayState::BATTLE_PAUSED:   return "BATTLE_PAUSED";
+        case NetplayState::BATTLE_END:      return "BATTLE_END";
+        default:                            return "UNKNOWN";
+    }
+}
+
+// =============================================================================
+// CONTROL CHANNEL MESSAGES
+// =============================================================================
+
+// Magic byte to identify control packets (vs GekkoNet packets)
+constexpr uint8_t CTRL_MAGIC = 0xCC;
+
+// Control channel message types
+enum class CtrlMsg : uint8_t {
+    // Connection management
+    PING = 0,           // Heartbeat request
+    PONG,               // Heartbeat response
+    HELLO,              // Initial connection (includes player index)
+    HELLO_ACK,          // Connection accepted
+    DISCONNECT,         // Clean disconnect
+
+    // CSS synchronization
+    CSS_INPUT,          // Raw input for CSS (simple approach)
+    CSS_CURSOR,         // Cursor position update (x, y) [deprecated]
+    CSS_CHAR_SELECT,    // Character slot highlighted [deprecated]
+    CSS_LOCK,           // Character locked (ready)
+    CSS_UNLOCK,         // Character unlocked (cancel)
+
+    // Battle coordination
+    BATTLE_READY,       // Ready to start GekkoNet session
+    BATTLE_ACK,         // Acknowledged battle ready
+    BATTLE_START,       // Begin battle (both confirmed)
+    BATTLE_END,         // Match over
+};
+
+// Convert message type to string for logging
+inline const char* CtrlMsgToString(CtrlMsg msg) {
+    switch (msg) {
+        case CtrlMsg::PING:         return "PING";
+        case CtrlMsg::PONG:         return "PONG";
+        case CtrlMsg::HELLO:        return "HELLO";
+        case CtrlMsg::HELLO_ACK:    return "HELLO_ACK";
+        case CtrlMsg::DISCONNECT:   return "DISCONNECT";
+        case CtrlMsg::CSS_INPUT:    return "CSS_INPUT";
+        case CtrlMsg::CSS_CURSOR:   return "CSS_CURSOR";
+        case CtrlMsg::CSS_CHAR_SELECT: return "CSS_CHAR_SELECT";
+        case CtrlMsg::CSS_LOCK:     return "CSS_LOCK";
+        case CtrlMsg::CSS_UNLOCK:   return "CSS_UNLOCK";
+        case CtrlMsg::BATTLE_READY: return "BATTLE_READY";
+        case CtrlMsg::BATTLE_ACK:   return "BATTLE_ACK";
+        case CtrlMsg::BATTLE_START: return "BATTLE_START";
+        case CtrlMsg::BATTLE_END:   return "BATTLE_END";
+        default:                    return "UNKNOWN";
+    }
+}
+
+// =============================================================================
+// PACKET STRUCTURES
+// =============================================================================
+
+#pragma pack(push, 1)
+
+// Control channel packet header
+struct CtrlPacketHeader {
+    uint8_t magic;          // Always CTRL_MAGIC (0xCC)
+    uint16_t seq;           // Sequence number
+    uint16_t ack;           // Acknowledged sequence
+    CtrlMsg type;           // Message type
+    uint8_t player_id;      // Sender's player ID (0 or 1)
+};
+
+// Full control packet with data union (max 32 bytes total)
+struct CtrlPacket {
+    CtrlPacketHeader header;
+
+    union {
+        // CSS_INPUT data - raw input bits with frame for lockstep
+        struct {
+            uint16_t input;     // Input bits (same as GekkoNet format)
+            uint32_t frame;     // Frame number for synchronization
+        } css_input;
+
+        // CSS_CURSOR data
+        struct {
+            uint8_t x;
+            uint8_t y;
+        } cursor;
+
+        // CSS_CHAR_SELECT / CSS_LOCK data
+        struct {
+            uint8_t slot;       // Character slot index
+            uint8_t color;      // Color/palette selection
+        } character;
+
+        // HELLO data
+        struct {
+            uint8_t version;    // Protocol version
+            uint8_t player_id;  // Requested player ID
+            uint32_t game_hash; // Game version hash (for compatibility check)
+        } hello;
+
+        // BATTLE_START / frame sync data
+        struct {
+            uint32_t frame;     // Frame number
+        } sync;
+
+        // Raw bytes for unknown/future use
+        uint8_t raw[24];
+    } data;
+};
+
+#pragma pack(pop)
+
+// Ensure packet fits in single UDP datagram (plenty of room)
+static_assert(sizeof(CtrlPacket) <= 64, "CtrlPacket too large");
+
+// =============================================================================
+// CSS STATE TRACKING
+// =============================================================================
+
+struct CSSState {
+    // Cursor positions for both players
+    uint8_t cursor_x[2];
+    uint8_t cursor_y[2];
+
+    // Selected character slot (0xFF = none)
+    uint8_t selected_char[2];
+
+    // Color/palette selection
+    uint8_t selected_color[2];
+
+    // Lock status (true = character confirmed)
+    bool locked[2];
+
+    // Initialize to default state
+    void Reset() {
+        cursor_x[0] = cursor_x[1] = 0;
+        cursor_y[0] = cursor_y[1] = 0;
+        selected_char[0] = selected_char[1] = 0xFF;
+        selected_color[0] = selected_color[1] = 0;
+        locked[0] = locked[1] = false;
+    }
+};
+
+// =============================================================================
+// PROTOCOL CONSTANTS
+// =============================================================================
+
+constexpr uint8_t NETPLAY_PROTOCOL_VERSION = 1;
+
+// Timeouts (in milliseconds)
+constexpr uint32_t CONNECT_TIMEOUT_MS = 5000;       // 5 seconds to connect
+constexpr uint32_t PING_INTERVAL_MS = 1000;         // Ping every 1 second
+constexpr uint32_t PING_TIMEOUT_MS = 3000;          // 3 missed pings = disconnect
+constexpr uint32_t BATTLE_READY_TIMEOUT_MS = 5000;  // 5 seconds to start battle
+
+// Packet send intervals (in frames at 100 FPS)
+constexpr int CSS_CURSOR_SEND_INTERVAL = 3;         // Send cursor every 3 frames (30ms)
+constexpr int PING_SEND_INTERVAL = 100;             // Send ping every 100 frames (1s)
