@@ -80,11 +80,17 @@ void ControlChannel_SendCharLock(uint8_t slot, uint8_t color);
 // Send CSS character unlock (cancelled selection)
 void ControlChannel_SendCharUnlock();
 
-// Send battle ready signal
+// Send CSS start signal (both players synced, start counting frames NOW)
+void ControlChannel_SendCSSStart();
+
+// Send battle ready signal (for CSS sync)
 void ControlChannel_SendBattleReady();
 
 // Send battle acknowledgment
 void ControlChannel_SendBattleAck();
+
+// Send battle entering signal (game_mode changed to battle)
+void ControlChannel_SendBattleEntering();
 
 // Send battle start (both sides ready)
 void ControlChannel_SendBattleStart(uint32_t start_frame);

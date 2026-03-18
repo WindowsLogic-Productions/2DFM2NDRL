@@ -1,7 +1,7 @@
-// Netplay - State Machine + GekkoNet Integration
-// Two-layer networking:
-//   1. Control Channel (always active when connected) - CSS sync, transitions
-//   2. GekkoNet Session (battle only) - full rollback netcode
+// CCCaster-Style Netplay Implementation
+// - Control channel for CSS input sync using INPUT DELAY (not lockstep)
+// - GekkoNet for battle mode rollback
+// - Uses game's internal timer for frame counting
 #include "netplay.h"
 #include "control_channel.h"
 #include "input.h"
@@ -9,214 +9,183 @@
 #include "globals.h"
 #include "gekkonet.h"
 #include <SDL3/SDL_log.h>
+#include <windows.h>
 #include <cstring>
-#include <chrono>
 
 // =============================================================================
-// NETPLAY STATE - Minimal state sent to GekkoNet, checksum from full savestate
+// SIMPLIFIED STATE
 // =============================================================================
 
-// Only frame + RNG sent to GekkoNet - checksum comes from full SaveState
-struct NetplayFrameState {
-    uint32_t frame;
-    uint32_t rng_seed;  // For RNG restoration after rollback
+enum class SimpleState : uint8_t {
+    DISCONNECTED,   // No connection
+    CONNECTED,      // Control channel connected
+    BATTLE          // GekkoNet active for battle
 };
 
-static_assert(sizeof(NetplayFrameState) == 8, "NetplayFrameState size changed!");
+static SimpleState g_simple_state = SimpleState::DISCONNECTED;
 
-// Desync tracking
-static bool g_desync_detected = false;
+static NetplayState MapToLegacyState(SimpleState s) {
+    switch (s) {
+        case SimpleState::DISCONNECTED: return NetplayState::DISCONNECTED;
+        case SimpleState::CONNECTED: return NetplayState::CSS_LOBBY;
+        case SimpleState::BATTLE: return NetplayState::BATTLE_RUNNING;
+        default: return NetplayState::DISCONNECTED;
+    }
+}
 
 // =============================================================================
-// INTERNAL STATE
+// CCCASTER-STYLE INPUT DELAY SYSTEM
+// Inputs stored at (frame + delay), read at (frame)
+// Both clients always advance - delay ensures inputs arrive in time
 // =============================================================================
 
-// State machine
-static NetplayState g_state = NetplayState::DISCONNECTED;
-static CSSState g_css_state;
+static constexpr int CSS_INPUT_DELAY = 6;           // 6 frames delay like CCCaster - never stall
+static constexpr int CSS_INPUT_BUFFER_SIZE = 256;   // Ring buffer size
+static constexpr int CSS_CONFIRM_LOCKOUT = 150;     // Block confirm for first N frames (moon selector workaround)
+
+// Ring buffer for inputs indexed by frame
+struct InputRingBuffer {
+    uint16_t inputs[CSS_INPUT_BUFFER_SIZE];
+    uint32_t end_frame;  // Highest frame we have input for + 1
+
+    void Clear() {
+        memset(inputs, 0, sizeof(inputs));
+        end_frame = 0;
+    }
+
+    void Set(uint32_t frame, uint16_t input) {
+        int slot = frame % CSS_INPUT_BUFFER_SIZE;
+        inputs[slot] = input;
+        if (frame >= end_frame) {
+            end_frame = frame + 1;
+        }
+    }
+
+    uint16_t Get(uint32_t frame) const {
+        // Return 0 (neutral) if we don't have this frame yet
+        if (frame >= end_frame) {
+            return 0;
+        }
+        int slot = frame % CSS_INPUT_BUFFER_SIZE;
+        return inputs[slot];
+    }
+
+    bool HasFrame(uint32_t frame) const {
+        return frame < end_frame;
+    }
+
+    uint32_t GetEndFrame() const {
+        return end_frame;
+    }
+};
+
+// CSS state
+static InputRingBuffer g_local_inputs;
+static InputRingBuffer g_remote_inputs;
+static uint32_t g_css_start_timer = 0;  // Value of game timer when BOTH clients ready
+static uint32_t g_css_frame = 0;        // Current CSS frame (relative to start)
+static bool g_css_active = false;       // Currently in CSS mode
+static bool g_css_synced = false;       // BOTH clients ready, timer started
+static bool g_remote_css_ready = false; // Remote has entered CSS
+static bool g_local_css_ready = false;  // We've entered CSS
+
+// Explicit read frame - the frame the game is currently processing
+static uint32_t g_css_current_read_frame = 0;
 
 // GekkoNet session
 static GekkoSession* g_session = nullptr;
 static bool g_session_ready = false;
-
-// Note: g_player_index comes from globals.h
-
-// Synchronized inputs (from GekkoNet during battle)
 static uint16_t g_p1_input = 0;
 static uint16_t g_p2_input = 0;
-static bool g_can_advance = false;
-
-// CSS input synchronization
-static uint16_t g_local_css_input = 0;   // Our captured input
-static uint16_t g_remote_css_input = 0;  // Remote player's input
-static uint32_t g_remote_css_frame = 0;  // Frame number of last received input
-static uint32_t g_css_frame = 0;         // Current CSS frame counter
-static bool g_css_input_received = false; // Have we received remote input for this frame?
-
-// Frame counter
 static uint32_t g_netplay_frame = 0;
 
-// CSS tracking
-static uint8_t g_last_local_action_state = 0;
-static int g_cursor_send_timer = 0;
+// Rollback tracking
+static uint32_t g_rollback_count = 0;
+static uint32_t g_last_rollback_frame = 0;
+static uint32_t g_desync_count = 0;
+static uint32_t g_last_desync_log_tick = 0;
 
-// Battle ready handshake
-static bool g_local_battle_ready = false;
-static bool g_remote_battle_ready = false;
+// Battle entry sync barrier - ensures both clients enter battle at same time
+static bool g_local_battle_entered = false;   // We've detected battle mode
+static bool g_remote_battle_entered = false;  // Remote has detected battle mode
+static bool g_battle_synced = false;          // Both have entered, GekkoNet can start
 
-// Connection retry
-static uint32_t g_last_hello_time = 0;
-static constexpr uint32_t HELLO_RETRY_INTERVAL_MS = 500;  // Retry every 500ms
+// Handshake state
+static bool g_received_hello = false;
+static bool g_received_hello_ack = false;
 
-// Forward declarations
-static void ProcessConnectionRetry();
-static uint32_t GetTimeMs();
+// =============================================================================
+// Note: We use our own frame counter instead of game timer
+// The game timer at 0x470044 appears to be 0 during CSS
+// =============================================================================
 
 // =============================================================================
 // CONTROL MESSAGE HANDLER
 // =============================================================================
 
-static void OnControlMessage(const CtrlPacket* packet) {
-    int remote_player = 1 - g_player_index;
+static void CheckFullyConnected() {
+    if (g_received_hello && g_received_hello_ack) {
+        if (g_simple_state != SimpleState::CONNECTED) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Full handshake complete - CONNECTED!");
+            g_simple_state = SimpleState::CONNECTED;
+            ControlChannel_SetConnected(true);
 
+            // Sync RNG immediately
+            *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Synced RNG=0x12345678");
+        }
+    }
+}
+
+static void OnControlMessage(const CtrlPacket* packet) {
     switch (packet->header.type) {
         case CtrlMsg::HELLO:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Received HELLO from player %d (version=%d)",
-                        packet->data.hello.player_id, packet->data.hello.version);
-
-            // Send acknowledgment
+                "Netplay: Received HELLO from player %d",
+                packet->data.hello.player_id);
             ControlChannel_SendHelloAck(static_cast<uint8_t>(g_player_index));
-            Netplay_SetState(NetplayState::SYNCED);
+            g_received_hello = true;
+            CheckFullyConnected();
             break;
 
         case CtrlMsg::HELLO_ACK:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Received HELLO_ACK from player %d",
-                        packet->data.hello.player_id);
-
-            ControlChannel_SetConnected(true);
-            Netplay_SetState(NetplayState::SYNCED);
+                "Netplay: Received HELLO_ACK");
+            g_received_hello_ack = true;
+            CheckFullyConnected();
             break;
 
-        case CtrlMsg::PING:
-            // Respond with PONG
-            {
-                CtrlPacket pong = {};
-                pong.header.type = CtrlMsg::PONG;
-                pong.data.sync.frame = packet->data.sync.frame;  // Echo back for RTT
-                ControlChannel_Send(pong);
-            }
+        case CtrlMsg::CSS_INPUT: {
+            // Store remote input at the specified frame
+            uint32_t frame = packet->data.css_input.frame;
+            uint16_t input = packet->data.css_input.input;
+            g_remote_inputs.Set(frame, input);
+            // No logging - too spammy
             break;
-
-        case CtrlMsg::PONG:
-            ControlChannel_HandlePong(packet->data.sync.frame);
-            break;
-
-        case CtrlMsg::CSS_INPUT:
-            // Store remote player's CSS input with frame info for lockstep
-            g_remote_css_input = packet->data.css_input.input;
-            g_remote_css_frame = packet->data.css_input.frame;
-            g_css_input_received = true;
-            // Log first few receives
-            {
-                static uint32_t css_recv_count = 0;
-                if (++css_recv_count <= 5 || css_recv_count % 100 == 0) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "CSS_INPUT received: frame=%u input=0x%04x (recv #%u)",
-                        g_remote_css_frame, g_remote_css_input, css_recv_count);
-                }
-            }
-            break;
-
-        case CtrlMsg::CSS_CURSOR:
-            // Update remote player's cursor position [deprecated]
-            g_css_state.cursor_x[remote_player] = packet->data.cursor.x;
-            g_css_state.cursor_y[remote_player] = packet->data.cursor.y;
-            break;
-
-        case CtrlMsg::CSS_CHAR_SELECT:
-            // Update remote player's character selection
-            g_css_state.selected_char[remote_player] = packet->data.character.slot;
-            g_css_state.selected_color[remote_player] = packet->data.character.color;
-            break;
-
-        case CtrlMsg::CSS_LOCK:
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Remote player locked character (slot=%d, color=%d)",
-                        packet->data.character.slot, packet->data.character.color);
-
-            g_css_state.selected_char[remote_player] = packet->data.character.slot;
-            g_css_state.selected_color[remote_player] = packet->data.character.color;
-            g_css_state.locked[remote_player] = true;
-
-            // Check if both ready
-            if (g_css_state.locked[0] && g_css_state.locked[1]) {
-                Netplay_SetState(NetplayState::CSS_BOTH_READY);
-            } else {
-                Netplay_SetState(remote_player == 0 ?
-                    NetplayState::CSS_REMOTE_READY :
-                    NetplayState::CSS_LOCAL_READY);
-            }
-            break;
-
-        case CtrlMsg::CSS_UNLOCK:
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Remote player unlocked character");
-
-            g_css_state.locked[remote_player] = false;
-
-            // Reset to lobby if we were ready
-            if (g_state >= NetplayState::CSS_LOCAL_READY) {
-                Netplay_SetState(NetplayState::CSS_LOBBY);
-            }
-            break;
+        }
 
         case CtrlMsg::BATTLE_READY:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Remote player is battle ready");
-
-            g_remote_battle_ready = true;
-
-            // Acknowledge
-            ControlChannel_SendBattleAck();
+                "Netplay: Received BATTLE_READY from remote");
+            g_remote_css_ready = true;
             break;
 
-        case CtrlMsg::BATTLE_ACK:
+        case CtrlMsg::BATTLE_ENTERING:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Remote acknowledged battle ready");
-
-            g_remote_battle_ready = true;
-            break;
-
-        case CtrlMsg::BATTLE_START:
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Battle starting at frame %u",
-                        packet->data.sync.frame);
-
-            g_netplay_frame = packet->data.sync.frame;
-            Netplay_SetState(NetplayState::BATTLE_RUNNING);
-            break;
-
-        case CtrlMsg::BATTLE_END:
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Battle ended");
-
-            Netplay_SetState(NetplayState::BATTLE_END);
+                "Netplay: Received BATTLE_ENTERING from remote - they're in battle mode");
+            g_remote_battle_entered = true;
             break;
 
         case CtrlMsg::DISCONNECT:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Remote player disconnected");
-
+                "Netplay: Remote disconnected");
             ControlChannel_SetConnected(false);
-            Netplay_SetState(NetplayState::DISCONNECTED);
+            g_simple_state = SimpleState::DISCONNECTED;
             break;
 
         default:
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: Unknown control message type: %d",
-                        static_cast<int>(packet->header.type));
             break;
     }
 }
@@ -227,22 +196,44 @@ static void OnControlMessage(const CtrlPacket* packet) {
 
 bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr) {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Init player=%d port=%d remote=%s",
-                player_index, local_port, remote_addr);
+        "Netplay: Init player=%d port=%d remote=%s",
+        player_index, local_port, remote_addr);
 
     g_player_index = player_index;
-    g_css_state.Reset();
-    g_state = NetplayState::DISCONNECTED;
+    g_simple_state = SimpleState::DISCONNECTED;
     g_session = nullptr;
     g_session_ready = false;
-    g_local_battle_ready = false;
-    g_remote_battle_ready = false;
     g_netplay_frame = 0;
+    g_p1_input = 0;
+    g_p2_input = 0;
 
-    // Initialize control channel callback
+    // Reset CSS state
+    g_local_inputs.Clear();
+    g_remote_inputs.Clear();
+    g_css_start_timer = 0;
+    g_css_frame = 0;
+    g_css_current_read_frame = 0;
+    g_css_active = false;
+    g_css_synced = false;
+    g_remote_css_ready = false;
+    g_local_css_ready = false;
+
+    // Reset battle sync state
+    g_local_battle_entered = false;
+    g_remote_battle_entered = false;
+    g_battle_synced = false;
+
+    // Reset handshake
+    g_received_hello = false;
+    g_received_hello_ack = false;
+
+    // Store network config
+    g_local_port = local_port;
+    strncpy(g_remote_addr, remote_addr, sizeof(g_remote_addr) - 1);
+
+    // Initialize control channel
     ControlChannel_SetCallback(OnControlMessage);
 
-    // Initialize socket (if not already done by dllmain)
     if (!NetSocket_IsInitialized()) {
         if (!NetSocket_Init(local_port, remote_addr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Failed to init socket");
@@ -250,12 +241,8 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
         }
     }
 
-    // Start connection process
-    Netplay_SetState(NetplayState::CONNECTING);
-
-    // Send HELLO to initiate connection
-    uint32_t game_hash = 0;  // TODO: Calculate from game files
-    ControlChannel_SendHello(static_cast<uint8_t>(player_index), game_hash);
+    // Send HELLO
+    ControlChannel_SendHello(static_cast<uint8_t>(player_index), 0);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Initialized, connecting...");
     return true;
@@ -264,526 +251,507 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
 void Netplay_Shutdown() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Shutting down");
 
-    // Stop GekkoNet session if active
-    Netplay_StopGekkoSession();
+    if (g_session) {
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+    }
 
-    // Send disconnect notification
     if (ControlChannel_IsConnected()) {
         ControlChannel_SendDisconnect();
     }
 
-    // Don't shutdown socket here - that's done by NetSocket_Shutdown()
-
-    g_state = NetplayState::DISCONNECTED;
-    g_css_state.Reset();
+    g_simple_state = SimpleState::DISCONNECTED;
+    g_received_hello = false;
+    g_received_hello_ack = false;
 }
 
 // =============================================================================
-// STATE MACHINE
+// STATE ACCESSORS
 // =============================================================================
 
 NetplayState Netplay_GetState() {
-    return g_state;
+    return MapToLegacyState(g_simple_state);
 }
 
 void Netplay_SetState(NetplayState state) {
-    if (g_state != state) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Netplay: State %s -> %s",
-                    NetplayStateToString(g_state),
-                    NetplayStateToString(state));
-        g_state = state;
-    }
+    (void)state;  // Ignored - we use simplified state
 }
 
-const CSSState& Netplay_GetCSSState() {
-    return g_css_state;
+bool Netplay_IsConnected() {
+    return g_simple_state >= SimpleState::CONNECTED;
 }
 
-// =============================================================================
-// CSS PROCESSING
-// =============================================================================
-
-bool Netplay_ProcessCSS() {
-    // Poll control channel for incoming messages
-    ControlChannel_Poll();
-
-    // If not connected yet, retry connection
-    if (g_state == NetplayState::CONNECTING) {
-        ProcessConnectionRetry();
-        return false;  // Don't advance until connected
-    }
-
-    // If disconnected, nothing to do
-    if (g_state == NetplayState::DISCONNECTED) {
-        return true;  // Run offline
-    }
-
-    // Transition from SYNCED to CSS_LOBBY when we enter CSS mode
-    if (g_state == NetplayState::SYNCED) {
-        Netplay_SetState(NetplayState::CSS_LOBBY);
-        g_css_frame = 0;
-        g_css_input_received = false;
-    }
-
-    // ========================================================================
-    // ASYNC CSS: Exchange inputs without blocking (like CCCaster)
-    // No lockstep needed - CSS doesn't require frame-perfect sync
-    // ========================================================================
-
-    // Capture local input
-    g_local_css_input = Input_CaptureLocal();
-
-    // Send our input periodically (every few frames to reduce traffic)
-    static uint32_t last_send_frame = 0;
-    if (g_css_frame - last_send_frame >= 2) {  // Send every 2 frames
-        ControlChannel_SendCSSInput(g_local_css_input, g_css_frame);
-        last_send_frame = g_css_frame;
-    }
-
-    // Always advance - no waiting for remote input
-    g_css_frame++;
-
-    // Detect character lock/unlock changes for state machine
-    uint8_t* p1_action = (uint8_t*)FM2K::ADDR_P1_ACTION_STATE;
-    uint8_t* p2_action = (uint8_t*)FM2K::ADDR_P2_ACTION_STATE;
-    uint8_t local_action_state = (g_player_index == 0) ? *p1_action : *p2_action;
-
-    if (local_action_state != g_last_local_action_state) {
-        if (local_action_state == 1) {
-            // Character locked
-            int32_t* stage_pos = (int32_t*)FM2K::ADDR_PLAYER_STAGE_POSITIONS;
-            uint8_t slot = (g_player_index == 0) ?
-                static_cast<uint8_t>(stage_pos[0]) :
-                static_cast<uint8_t>(stage_pos[1]);
-
-            ControlChannel_SendCharLock(slot, 0);
-
-            g_css_state.selected_char[g_player_index] = slot;
-            g_css_state.locked[g_player_index] = true;
-
-            // Check if both ready
-            if (g_css_state.locked[0] && g_css_state.locked[1]) {
-                Netplay_SetState(NetplayState::CSS_BOTH_READY);
-            } else {
-                Netplay_SetState(g_player_index == 0 ?
-                    NetplayState::CSS_LOCAL_READY :
-                    NetplayState::CSS_REMOTE_READY);
-            }
-        } else {
-            // Character unlocked
-            ControlChannel_SendCharUnlock();
-
-            g_css_state.locked[g_player_index] = false;
-
-            // Reset to lobby if we were ready
-            if (g_state >= NetplayState::CSS_LOCAL_READY) {
-                Netplay_SetState(NetplayState::CSS_LOBBY);
-                g_local_battle_ready = false;
-                g_remote_battle_ready = false;
-            }
-        }
-        g_last_local_action_state = local_action_state;
-    }
-
-    return true;  // OK to advance
-}
-
-// =============================================================================
-// BATTLE PROCESSING
-// =============================================================================
-
-bool Netplay_ProcessBattle() {
-    if (!g_session) return true;  // No session, let game run
-
-    g_can_advance = false;
-
-    // Poll network
-    gekko_network_poll(g_session);
-
-    // Capture and send local input
-    uint16_t local_input = Input_CaptureLocal();
-    gekko_add_local_input(g_session, g_player_index, &local_input);
-
-    // Process session events
-    int event_count = 0;
-    auto events = gekko_session_events(g_session, &event_count);
-    for (int i = 0; i < event_count; i++) {
-        auto event = events[i];
-        switch (event->type) {
-            case PlayerConnected:
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet player %d connected (ProcessBattle)",
-                            event->data.connected.handle);
-                g_session_ready = true;
-                break;
-
-            case PlayerDisconnected:
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet player %d disconnected",
-                            event->data.disconnected.handle);
-                break;
-
-            case SessionStarted:
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet session started");
-                g_session_ready = true;
-                break;
-
-            case PlayerSyncing: {
-                unsigned char cur = event->data.syncing.current;
-                unsigned char mx = event->data.syncing.max;
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet syncing %u/%u (ProcessBattle)",
-                            (unsigned)cur, (unsigned)mx);
-                if (cur >= mx) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Netplay: Sync complete in ProcessBattle, marking ready");
-                    g_session_ready = true;
-                }
-                break;
-            }
-
-            case DesyncDetected: {
-                auto& d = event->data.desynced;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "!!! DESYNC DETECTED !!! frame=%d local=0x%08X remote=0x%08X",
-                    d.frame, d.local_checksum, d.remote_checksum);
-
-                // Log current game state for diagnostics
-                uint32_t rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-                uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-                uint32_t p1_hp = *(uint32_t*)FM2K::ADDR_P1_HP;
-                uint32_t p2_hp = *(uint32_t*)FM2K::ADDR_P2_HP;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "DESYNC state: rng=0x%08X mode=%u p1_hp=%u p2_hp=%u",
-                    rng, mode, p1_hp, p2_hp);
-
-                // Mark desync and terminate
-                g_desync_detected = true;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "FATAL: Desync detected - terminating client!");
-
-                // Stop session and exit
-                Netplay_StopGekkoSession();
-                ExitProcess(1);
-                break;
-            }
-
-            default:
-                break;
-        }
-    }
-
-    // Process game events
-    int update_count = 0;
-    auto updates = gekko_update_session(g_session, &update_count);
-
-    for (int i = 0; i < update_count; i++) {
-        auto update = updates[i];
-        switch (update->type) {
-            case SaveEvent: {
-                int frame = update->data.save.frame;
-
-                // CRITICAL: Force RNG sync on initial frames (before game logic runs)
-                // This ensures both clients start with identical state
-                if (frame <= 0) {
-                    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
-                }
-
-                // Save full game state locally, get checksum from that
-                SaveState_Save(frame);
-
-                // Minimal state for GekkoNet (just frame + RNG for restoration)
-                NetplayFrameState fs;
-                fs.frame = frame;
-                fs.rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-
-                // Checksum from FULL saved state (not just this small struct)
-                *update->data.save.state_len = sizeof(NetplayFrameState);
-                *update->data.save.checksum = SaveState_GetLastChecksum(frame);
-                memcpy(update->data.save.state, &fs, sizeof(NetplayFrameState));
-
-                // Log first few saves
-                static int save_log_count = 0;
-                if (++save_log_count <= 5) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "SAVE #%d: frame=%d checksum=0x%08X",
-                        save_log_count, frame, SaveState_GetLastChecksum(frame));
-                }
-                break;
-            }
-
-            case LoadEvent: {
-                // Load state from GekkoNet buffer (only frame + RNG)
-                NetplayFrameState fs;
-                memcpy(&fs, update->data.load.state, sizeof(NetplayFrameState));
-
-                // Load our full local state first
-                SaveState_Load(fs.frame);
-
-                // CRITICAL: Restore RNG from NETWORK state AFTER local load
-                // This ensures both clients have identical RNG even if local saves diverged
-                *(uint32_t*)FM2K::ADDR_RANDOM_SEED = fs.rng_seed;
-                break;
-            }
-
-            case AdvanceEvent: {
-                if (update->data.adv.inputs && update->data.adv.input_len >= sizeof(uint16_t) * 2) {
-                    uint16_t* inputs = (uint16_t*)update->data.adv.inputs;
-                    g_p1_input = inputs[0] & 0x7FF;
-                    g_p2_input = inputs[1] & 0x7FF;
-                }
-                g_can_advance = true;
-                g_netplay_frame++;
-                break;
-            }
-
-            default:
-                break;
-        }
-    }
-
-    return g_can_advance;
-}
-
-// Helper to get current time in ms (from control_channel.cpp)
-static uint32_t GetTimeMs() {
-    auto now = std::chrono::steady_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
-    return static_cast<uint32_t>(ms.count());
-}
-
-// Process connection retry logic
-static void ProcessConnectionRetry() {
-    if (g_state != NetplayState::CONNECTING) return;
-
-    uint32_t now = GetTimeMs();
-    if (now - g_last_hello_time >= HELLO_RETRY_INTERVAL_MS) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Retrying HELLO...");
-        uint32_t game_hash = 0;  // TODO: Calculate from game files
-        ControlChannel_SendHello(static_cast<uint8_t>(g_player_index), game_hash);
-        g_last_hello_time = now;
-    }
-}
-
-void Netplay_ProcessMenu() {
-    // Keep control channel alive
-    ControlChannel_Poll();
-
-    // Retry connection if needed
-    ProcessConnectionRetry();
-}
-
-// =============================================================================
-// GEKKONET SESSION LIFECYCLE
-// =============================================================================
-
-bool Netplay_StartGekkoSession() {
-    if (g_session) {
-        // Already active
-        return true;
-    }
-
-    // Send battle ready signal (only once)
-    if (!g_local_battle_ready) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Starting GekkoNet session");
-        ControlChannel_SendBattleReady();
-        g_local_battle_ready = true;
-    }
-
-    // Wait for remote to be ready
-    if (!g_remote_battle_ready) {
-        // Keep polling for their BATTLE_READY
-        ControlChannel_Poll();
-        return false;  // Not ready yet
-    }
-
-    // Both players ready - now initialize savestate and create session
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Both ready, creating GekkoNet session");
-
-    // CRITICAL: Synchronize RNG seed before battle starts
-    // Both clients must start with identical RNG state
-    // Use a deterministic seed based on player 0 being the "host"
-    uint32_t sync_rng_seed = 0x12345678;  // Fixed seed for now - TODO: exchange via control channel
-    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = sync_rng_seed;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Synchronized RNG seed to 0x%08X", sync_rng_seed);
-
-    SaveState_Init();
-
-    gekko_create(&g_session);
-
-    GekkoConfig config{};
-    config.num_players = 2;
-    config.max_spectators = 0;
-    config.input_prediction_window = 7;
-    config.input_size = sizeof(uint16_t);
-    config.state_size = sizeof(NetplayFrameState);
-    config.desync_detection = true;
-    config.limited_saving = false;
-
-    gekko_start(g_session, &config);
-
-    // Use our multiplexed adapter
-    gekko_net_adapter_set(g_session, CreateMultiplexAdapter());
-
-    // Add players in order
-    const sockaddr_in* remote = NetSocket_GetRemoteAddr();
-    char addr_str[64];
-    snprintf(addr_str, sizeof(addr_str), "%s:%d",
-             inet_ntoa(remote->sin_addr), ntohs(remote->sin_port));
-
-    GekkoNetAddress addr;
-    addr.data = addr_str;
-    addr.size = strlen(addr_str);
-
-    for (int i = 0; i < 2; i++) {
-        if (i == g_player_index) {
-            gekko_add_actor(g_session, LocalPlayer, nullptr);
-            gekko_set_local_delay(g_session, i, 2);
-        } else {
-            gekko_add_actor(g_session, RemotePlayer, &addr);
-        }
-    }
-
-    g_session_ready = false;  // Will be set true by SessionStarted event
-    Netplay_SetState(NetplayState::BATTLE_INIT);
-
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created, waiting for sync");
-    return true;
-}
-
-void Netplay_StopGekkoSession() {
-    if (!g_session) return;
-
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Stopping GekkoNet session");
-
-    DestroyMultiplexAdapter();
-    gekko_destroy(&g_session);
-    g_session = nullptr;
-    g_session_ready = false;
-    g_local_battle_ready = false;
-    g_remote_battle_ready = false;
+bool Netplay_IsActive() {
+    return g_simple_state == SimpleState::BATTLE && g_session != nullptr;
 }
 
 bool Netplay_IsSessionReady() {
     return g_session_ready;
 }
 
-void Netplay_PollGekkoNet() {
-    if (!g_session) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Netplay_PollGekkoNet: No session!");
-        return;
+// =============================================================================
+// CSS PROCESSING - CCCaster-Style Input Delay
+//
+// Key insight: NEVER BLOCK THE GAME
+// - Capture input every frame, store at frame + DELAY
+// - Read input from frame (which we stored DELAY frames ago)
+// - Send inputs to remote as fast as possible
+// - Both clients advance at same rate, delay ensures sync
+// =============================================================================
+
+void Netplay_PollCSS() {
+    ControlChannel_Poll();
+}
+
+bool Netplay_CanAdvanceCSS() {
+    // Not synced yet - let game run freely (pre-CSS or waiting for remote)
+    if (!g_css_synced) {
+        return true;
+    }
+    // Check if we have remote input for the frame we're about to process
+    return g_remote_inputs.HasFrame(g_css_frame);
+}
+
+bool Netplay_ProcessCSS() {
+    // Poll for incoming messages
+    ControlChannel_Poll();
+
+    // Not connected yet - let game run with local input
+    if (g_simple_state < SimpleState::CONNECTED) {
+        return true;
     }
 
-    // Poll network
+    uint32_t now = GetTickCount();
+
+    // Signal we're in CSS
+    if (!g_css_active) {
+        g_css_active = true;
+        g_local_css_ready = true;
+        ControlChannel_SendBattleReady();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
+    }
+
+    // Resend until remote is ready
+    static uint32_t last_ready_send = 0;
+    if (!g_remote_css_ready && now - last_ready_send > 100) {
+        ControlChannel_SendBattleReady();
+        last_ready_send = now;
+    }
+
+    // Wait for both clients to be in CSS before starting frame count
+    if (!g_remote_css_ready) {
+        return true;  // Let game run but don't count CSS frames yet
+    }
+
+    // Initialize on first synced frame
+    if (!g_css_synced) {
+        g_css_synced = true;
+        g_css_frame = 0;
+        g_css_current_read_frame = 0;
+        g_local_inputs.Clear();
+        g_remote_inputs.Clear();
+
+        // CRITICAL: Re-seed RNG now that both clients are synced.
+        // Pre-CSS frames ran unsynchronized and diverged the RNG.
+        // Stage selection uses RNG during CSS->battle transition,
+        // so it MUST be identical from this point forward.
+        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "CSS SYNCED: Both ready, delay=%d, RNG reseeded", CSS_INPUT_DELAY);
+    }
+
+    // Capture input, store at frame + DELAY, send to remote
+    uint16_t local_raw = Input_CaptureLocal();
+    uint32_t store_frame = g_css_frame + CSS_INPUT_DELAY;
+    g_local_inputs.Set(store_frame, local_raw);
+    ControlChannel_SendCSSInput(local_raw, store_frame);
+
+    // Set read frame for GetCSSInput, then advance
+    g_css_current_read_frame = g_css_frame;
+    g_css_frame++;
+
+    // Log occasionally
+    if ((g_css_frame - 1) % 100 == 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "CSS: frame=%u local_end=%u remote_end=%u",
+            g_css_frame - 1, g_local_inputs.GetEndFrame(), g_remote_inputs.GetEndFrame());
+    }
+
+    return true;
+}
+
+uint16_t Netplay_GetCSSInput(int player_id) {
+    uint32_t read_frame = g_css_current_read_frame;
+
+    uint16_t input;
+    if (player_id == g_player_index) {
+        input = g_local_inputs.Get(read_frame);
+    } else {
+        input = g_remote_inputs.Get(read_frame);
+
+        // Warn if remote data is missing (shouldn't happen with delay=6 on localhost)
+        static uint32_t miss_count = 0;
+        if (!g_remote_inputs.HasFrame(read_frame) && miss_count < 5) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "CSS: Missing remote frame %u (remote_end=%u) - returning neutral",
+                read_frame, g_remote_inputs.GetEndFrame());
+            miss_count++;
+        }
+    }
+
+    // CCCaster-style: Block confirm/cancel for first 150 frames (moon selector workaround)
+    if (read_frame < CSS_CONFIRM_LOCKOUT) {
+        // Mask out confirm (bit 8 = 0x100) and cancel (bit 9 = 0x200)
+        // Note: FM2K uses different bit layout than MBAACC
+        // Check what bits are confirm/cancel in FM2K and mask appropriately
+        // For now, just mask bits 8-10 which are typically button presses
+        input &= 0x0FF;  // Keep only direction bits
+    }
+
+    return input;
+}
+
+// =============================================================================
+// BATTLE ENTRY SYNC BARRIER
+// Ensures both clients enter battle mode at the same time
+// =============================================================================
+
+void Netplay_SignalBattleEntry() {
+    if (g_local_battle_entered) {
+        return;  // Already signaled
+    }
+
+    g_local_battle_entered = true;
+    ControlChannel_SendBattleEntering();
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "BATTLE SYNC: Local entered battle mode, signaling remote...");
+}
+
+bool Netplay_IsBattleSynced() {
+    // Check if sync just completed
+    if (!g_battle_synced && g_local_battle_entered && g_remote_battle_entered) {
+        g_battle_synced = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "BATTLE SYNC: Both clients in battle mode - sync complete!");
+    }
+    return g_battle_synced;
+}
+
+void Netplay_PollBattleSync() {
+    // Poll control channel to receive BATTLE_ENTERING from remote
+    ControlChannel_Poll();
+
+    // Resend BATTLE_ENTERING until remote acknowledges
+    static uint32_t last_send = 0;
+    uint32_t now = GetTickCount();
+    if (g_local_battle_entered && !g_remote_battle_entered && now - last_send > 50) {
+        ControlChannel_SendBattleEntering();
+        last_send = now;
+    }
+}
+
+// =============================================================================
+// GEKKONET SESSION - Battle Mode
+// =============================================================================
+
+bool Netplay_StartBattle() {
+    if (g_session) {
+        return true;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Starting GekkoNet session");
+
+    // Reset CSS state when entering battle
+    g_css_active = false;
+    g_css_synced = false;
+    g_local_css_ready = false;
+    g_remote_css_ready = false;
+
+    GekkoConfig config = {};
+    config.num_players = 2;
+    config.max_spectators = 0;
+    config.input_prediction_window = 8;
+    config.input_size = sizeof(uint16_t);
+    config.state_size = sizeof(uint32_t);
+    config.desync_detection = true;
+    config.limited_saving = false;
+
+    gekko_create(&g_session, GekkoGameSession);
+    gekko_start(g_session, &config);
+
+    auto adapter = CreateMultiplexAdapter();
+    gekko_net_adapter_set(g_session, adapter);
+
+    for (int i = 0; i < 2; i++) {
+        if (i == g_player_index) {
+            gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
+            gekko_set_local_delay(g_session, i, 1);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Added local player at slot %d", i);
+        } else {
+            GekkoNetAddress addr = {};
+            addr.data = (void*)g_remote_addr;
+            addr.size = (int)strlen(g_remote_addr);
+            gekko_add_actor(g_session, GekkoRemotePlayer, &addr);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Added remote player at slot %d -> %s", i, g_remote_addr);
+        }
+    }
+
+    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+    SaveState_Init();
+
+    g_simple_state = SimpleState::BATTLE;
+    g_session_ready = false;
+    g_netplay_frame = 0;
+    g_rollback_count = 0;
+    g_last_rollback_frame = 0;
+    g_desync_count = 0;
+    g_last_desync_log_tick = 0;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created");
+    return true;
+}
+
+void Netplay_EndBattle() {
+    if (g_session) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Ending GekkoNet session");
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+    }
+
+    g_session_ready = false;
+    g_simple_state = SimpleState::CONNECTED;
+
+    // Reset CSS state for rematch
+    g_css_active = false;
+    g_css_synced = false;
+    g_local_css_ready = false;
+    g_remote_css_ready = false;
+
+    // Reset battle sync state for next battle
+    g_local_battle_entered = false;
+    g_remote_battle_entered = false;
+    g_battle_synced = false;
+}
+
+// =============================================================================
+// BATTLE FRAME PROCESSING
+// =============================================================================
+
+bool Netplay_ProcessBattleInputPhase() {
+    if (!g_session) return true;
+
     gekko_network_poll(g_session);
 
-    // Process session events (to get SessionStarted)
+    uint16_t local_input = Input_CaptureLocal();
+    gekko_add_local_input(g_session, g_player_index, &local_input);
+
     int event_count = 0;
     auto events = gekko_session_events(g_session, &event_count);
     for (int i = 0; i < event_count; i++) {
         auto event = events[i];
         switch (event->type) {
-            case SessionStarted:
+            case GekkoPlayerConnected:
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet SessionStarted event!");
+                    "Netplay: GekkoNet player %d connected",
+                    event->data.connected.handle);
                 g_session_ready = true;
                 break;
 
-            case PlayerConnected:
+            case GekkoSessionStarted:
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet player %d connected",
-                            event->data.connected.handle);
-                // Player connected means session is ready for battle
+                    "Netplay: GekkoNet session started");
                 g_session_ready = true;
                 break;
 
-            case PlayerSyncing: {
-                unsigned char cur = event->data.syncing.current;
-                unsigned char mx = event->data.syncing.max;
+            case GekkoPlayerSyncing:
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet syncing %u/%u (cur=0x%02X, max=0x%02X, cur>=max: %s)",
-                            (unsigned)cur, (unsigned)mx,
-                            (unsigned)cur, (unsigned)mx,
-                            (cur >= mx) ? "YES" : "NO");
-                Netplay_SetState(NetplayState::BATTLE_SYNCING);
-                // Check if sync complete (current == max means done)
-                if (cur >= mx) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Netplay: GekkoNet sync complete, marking ready");
-                    g_session_ready = true;
+                    "Netplay: GekkoNet syncing %u/%u",
+                    event->data.syncing.current, event->data.syncing.max);
+                break;
+
+            case GekkoDesyncDetected: {
+                g_desync_count++;
+                // Log first 5 with full region detail, then throttle
+                uint32_t now_tick = GetTickCount();
+                if (g_desync_count <= 5) {
+                    auto& rc = SaveState_GetRegionChecksums();
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
+                        g_desync_count,
+                        event->data.desynced.frame,
+                        event->data.desynced.local_checksum,
+                        event->data.desynced.remote_checksum);
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "  SAVED: rng=0x%08X game=0x%08X obj=0x%08X char=0x%08X inp=0x%08X",
+                        rc.rng, rc.game_state, rc.object_pool, rc.char_dynamic, rc.input_tracking);
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "  UNSAVED: eff1=0x%08X eff2=0x%08X shake=0x%08X",
+                        rc.effect_sys1, rc.effect_sys2, rc.shake_effects);
+                } else if (now_tick - g_last_desync_log_tick > 1000) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
+                        g_desync_count,
+                        event->data.desynced.frame,
+                        event->data.desynced.local_checksum,
+                        event->data.desynced.remote_checksum);
+                    g_last_desync_log_tick = now_tick;
                 }
                 break;
             }
 
-            case PlayerDisconnected:
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet player %d disconnected",
-                            event->data.disconnected.handle);
+            default:
                 break;
+        }
+    }
 
-            case DesyncDetected: {
-                auto& d = event->data.desynced;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "!!! DESYNC DETECTED (Poll) !!! frame=%d local=0x%08X remote=0x%08X",
-                    d.frame, d.local_checksum, d.remote_checksum);
+    int update_count = 0;
+    auto updates = gekko_update_session(g_session, &update_count);
 
-                // Log current game state for diagnostics
-                uint32_t rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-                uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-                uint32_t p1_hp = *(uint32_t*)FM2K::ADDR_P1_HP;
-                uint32_t p2_hp = *(uint32_t*)FM2K::ADDR_P2_HP;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "DESYNC state: rng=0x%08X mode=%u p1_hp=%u p2_hp=%u",
-                    rng, mode, p1_hp, p2_hp);
+    bool has_advance = false;
+    for (int i = 0; i < update_count; i++) {
+        auto update = updates[i];
+        switch (update->type) {
+            case GekkoSaveEvent: {
+                int frame = update->data.save.frame;
+                SaveState_Save(frame);
+                uint32_t checksum = SaveState_GetLastChecksum(frame);
+                *update->data.save.state_len = sizeof(uint32_t);
+                *update->data.save.checksum = checksum;
+                memcpy(update->data.save.state, &frame, sizeof(uint32_t));
+                break;
+            }
 
-                g_desync_detected = true;
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "FATAL: Desync detected - terminating client!");
+            case GekkoLoadEvent: {
+                int frame = update->data.load.frame;
+                g_rollback_count++;
+                g_last_rollback_frame = g_netplay_frame;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "ROLLBACK #%u: loading frame %d (current=%u, rewinding %u frames)",
+                    g_rollback_count, frame, g_netplay_frame,
+                    g_netplay_frame - (uint32_t)frame);
+                SaveState_Load(frame);
+                break;
+            }
 
-                Netplay_StopGekkoSession();
-                ExitProcess(1);
+            case GekkoAdvanceEvent: {
+                // Set inputs for THIS frame
+                if (update->data.adv.inputs && update->data.adv.input_len >= sizeof(uint16_t) * 2) {
+                    uint16_t* inputs = (uint16_t*)update->data.adv.inputs;
+                    g_p1_input = inputs[0] & 0x7FF;
+                    g_p2_input = inputs[1] & 0x7FF;
+                }
+
+                // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
+                // The game loop must NOT run its own tick - we handle everything here.
+                if (original_process_game_inputs) {
+                    original_process_game_inputs();
+                }
+                if (original_update_game) {
+                    original_update_game();
+                }
+
+                g_netplay_frame++;
+                has_advance = true;
+
+                // Periodic status every 500 frames (~5 sec)
+                if (g_netplay_frame % 500 == 0) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "BATTLE STATUS: frame=%u rollbacks=%u desyncs=%u",
+                        g_netplay_frame, g_rollback_count, g_desync_count);
+                }
+
+                // Dense state logging around desync boundary (frames 5000-5500)
+                // Also log every 1000 frames for baseline comparison
+                if (g_netplay_frame % 1000 == 0 ||
+                    (g_netplay_frame >= 5000 && g_netplay_frame <= 5500 && g_netplay_frame % 50 == 0)) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "STATE f=%u: rng=0x%08X game_timer=%u round_timer_ctr=%u render_fc=%u",
+                        g_netplay_frame,
+                        *(uint32_t*)0x41FB1C,   // RNG seed
+                        *(uint32_t*)0x470044,   // g_game_timer
+                        *(uint32_t*)0x47008E,   // g_round_timer_counter
+                        *(uint32_t*)0x4456FC);  // g_render_frame_counter
+                }
                 break;
             }
 
             default:
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Netplay: GekkoNet event type %d", event->type);
                 break;
         }
     }
-}
 
-// =============================================================================
-// INPUT
-// =============================================================================
+    return has_advance;
+}
 
 uint16_t Netplay_GetInput(int player_id) {
     return (player_id == 0) ? g_p1_input : g_p2_input;
 }
 
-uint16_t Netplay_GetCSSInput(int player_id) {
-    // Return the appropriate input based on player
-    if (player_id == g_player_index) {
-        // Local player - return our captured input
-        return g_local_css_input;
-    } else {
-        // Remote player - return received input
-        return g_remote_css_input;
+// =============================================================================
+// LEGACY API
+// =============================================================================
+
+bool Netplay_StartGekkoSession() {
+    return Netplay_StartBattle();
+}
+
+void Netplay_StopGekkoSession() {
+    Netplay_EndBattle();
+}
+
+void Netplay_PollGekkoNet() {
+    if (g_session) {
+        gekko_network_poll(g_session);
+        int event_count = 0;
+        auto events = gekko_session_events(g_session, &event_count);
+        for (int i = 0; i < event_count; i++) {
+            auto event = events[i];
+            if (event->type == GekkoSessionStarted || event->type == GekkoPlayerConnected) {
+                g_session_ready = true;
+            }
+        }
     }
 }
 
-// =============================================================================
-// STATUS QUERIES
-// =============================================================================
-
-bool Netplay_IsActive() {
-    return g_session != nullptr;
+void Netplay_ResetCSSState() {
+    g_local_inputs.Clear();
+    g_remote_inputs.Clear();
+    g_css_start_timer = 0;
+    g_css_frame = 0;
+    g_css_current_read_frame = 0;
+    g_css_active = false;
+    g_css_synced = false;
+    g_remote_css_ready = false;
+    g_local_css_ready = false;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Reset state for new sync");
 }
 
-bool Netplay_IsConnected() {
-    return ControlChannel_IsConnected();
+bool Netplay_IsRemoteCSSReady() {
+    return g_remote_css_ready;
+}
+
+bool Netplay_IsCSSFullySynced() {
+    return g_css_synced;
+}
+
+void Netplay_SetLocalCSSReady(bool ready) {
+    g_local_css_ready = ready;
+    if (ready) {
+        ControlChannel_SendBattleReady();
+    }
+}
+
+void Netplay_ProcessMenu() {
+    ControlChannel_Poll();
+}
+
+const CSSState& Netplay_GetCSSState() {
+    static CSSState dummy;
+    return dummy;
 }
 
 uint32_t Netplay_GetFrame() {
@@ -791,5 +759,6 @@ uint32_t Netplay_GetFrame() {
 }
 
 uint32_t Netplay_GetPingMs() {
-    return ControlChannel_GetRttMs();
+    // TODO: Calculate from control channel RTT
+    return 0;
 }

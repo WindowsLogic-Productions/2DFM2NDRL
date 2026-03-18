@@ -27,6 +27,11 @@ struct SaveStateData {
     uint32_t frame_number;                                    // Frame when saved
     uint32_t checksum;                                        // Validation checksum
     uint32_t rng_seed;                                        // RNG seed for determinism
+    uint32_t input_buffer_index;                              // Input history buffer index (0x447EE0)
+
+    // Input tracking state (160 bytes) - CRITICAL for correct input change detection
+    // Includes: g_prev_input_state, g_processed_input, g_input_changes at 0x447EE0-0x447F80
+    uint8_t input_tracking_state[0xA0];
 
     // Dynamic character data only (19KB vs 459KB for all 8 slots)
     uint8_t char_dynamic[NUM_CHAR_SLOTS][CHAR_SLOT_DYNAMIC_SIZE];
@@ -34,11 +39,11 @@ struct SaveStateData {
     // Object pool - projectiles, effects (391KB)
     uint8_t object_pool[0x5F800];
 
-    // Input history (8KB)
-    uint8_t input_history[0x2000];
+    // Input history (8KB + 8 bytes for g_combined_input_changes at 0x4280D8)
+    uint8_t input_history[0x2008];
 
-    // Game state (512 bytes)
-    uint8_t game_state[0x200];
+    // Game state (544 bytes) - includes player_stage_positions at 0x470020
+    uint8_t game_state[0x220];
 };
 
 // Shared memory structure matching the launcher

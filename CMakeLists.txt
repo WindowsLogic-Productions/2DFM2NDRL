@@ -182,7 +182,9 @@ add_library(GekkoNet STATIC
     vendored/GekkoNet/GekkoLib/src/gekkonet.cpp
     vendored/GekkoNet/GekkoLib/src/backend.cpp
     vendored/GekkoNet/GekkoLib/src/event.cpp
-    vendored/GekkoNet/GekkoLib/src/gekko.cpp
+    vendored/GekkoNet/GekkoLib/src/game_session.cpp
+    vendored/GekkoNet/GekkoLib/src/spectator_session.cpp
+    vendored/GekkoNet/GekkoLib/src/stress_session.cpp
     vendored/GekkoNet/GekkoLib/src/input.cpp
     vendored/GekkoNet/GekkoLib/src/net.cpp
     vendored/GekkoNet/GekkoLib/src/player.cpp

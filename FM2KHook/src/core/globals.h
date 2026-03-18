@@ -57,6 +57,9 @@ namespace FM2K {
     // Round timer counter: frames since both players locked (>100 triggers battle)
     constexpr uintptr_t ADDR_ROUND_TIMER_COUNTER = 0x47008E;  // g_round_timer_counter
 
+    // Internal game timer - equivalent to CCCaster's CC_WORLD_TIMER_ADDR
+    constexpr uintptr_t ADDR_GAME_TIMER = 0x470044;  // g_game_timer (increments every game frame)
+
     // CSS active player (for stage select mode)
     constexpr uintptr_t ADDR_CSS_ACTIVE_PLAYER = 0x424F24;  // g_css_active_player
 

@@ -66,10 +66,12 @@ enum class CtrlMsg : uint8_t {
     CSS_CHAR_SELECT,    // Character slot highlighted [deprecated]
     CSS_LOCK,           // Character locked (ready)
     CSS_UNLOCK,         // Character unlocked (cancel)
+    CSS_START,          // CSS sync complete - start counting frames NOW
 
     // Battle coordination
-    BATTLE_READY,       // Ready to start GekkoNet session
+    BATTLE_READY,       // Ready to start GekkoNet session (CSS sync)
     BATTLE_ACK,         // Acknowledged battle ready
+    BATTLE_ENTERING,    // Game mode changed to battle, waiting for sync
     BATTLE_START,       // Begin battle (both confirmed)
     BATTLE_END,         // Match over
 };
@@ -87,8 +89,10 @@ inline const char* CtrlMsgToString(CtrlMsg msg) {
         case CtrlMsg::CSS_CHAR_SELECT: return "CSS_CHAR_SELECT";
         case CtrlMsg::CSS_LOCK:     return "CSS_LOCK";
         case CtrlMsg::CSS_UNLOCK:   return "CSS_UNLOCK";
+        case CtrlMsg::CSS_START:    return "CSS_START";
         case CtrlMsg::BATTLE_READY: return "BATTLE_READY";
         case CtrlMsg::BATTLE_ACK:   return "BATTLE_ACK";
+        case CtrlMsg::BATTLE_ENTERING: return "BATTLE_ENTERING";
         case CtrlMsg::BATTLE_START: return "BATTLE_START";
         case CtrlMsg::BATTLE_END:   return "BATTLE_END";
         default:                    return "UNKNOWN";

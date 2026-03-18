@@ -362,6 +362,14 @@ void ControlChannel_SendCharUnlock() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent CSS_UNLOCK");
 }
 
+void ControlChannel_SendCSSStart() {
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::CSS_START;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent CSS_START");
+}
+
 void ControlChannel_SendBattleReady() {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_READY;
@@ -376,6 +384,14 @@ void ControlChannel_SendBattleAck() {
     ControlChannel_Send(pkt);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ACK");
+}
+
+void ControlChannel_SendBattleEntering() {
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::BATTLE_ENTERING;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ENTERING");
 }
 
 void ControlChannel_SendBattleStart(uint32_t start_frame) {

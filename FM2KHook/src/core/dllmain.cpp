@@ -120,6 +120,49 @@ static void ApplyCharacterSelectModePatches() {
     }
 }
 
+static void DisableCursorHiding() {
+    // In InitializeDirectDraw, the game hides cursor and clips it to 1x1 pixel in fullscreen:
+    //   0x4049e0: call ds:ClipCursor   ; clips to tiny rect
+    //   0x4049e6: push ebx (0)         ; arg for ShowCursor
+    //   0x4049e7: call ds:ShowCursor   ; hides cursor
+    //
+    // Patch 1: Replace ClipCursor call with pop eax + 5 NOPs (removes pushed rect arg)
+    // Patch 2: Replace push + ShowCursor call with 7 NOPs
+
+    DWORD old_protect;
+
+    // Patch ClipCursor at 0x4049e0 (6 bytes)
+    // Original: FF 15 AC C1 41 00 (call ds:ClipCursor)
+    // Patched:  58 90 90 90 90 90 (pop eax + 5 nops) - pops the pushed rect pointer
+    uint8_t* clip_cursor_addr = (uint8_t*)0x4049e0;
+    if (VirtualProtect(clip_cursor_addr, 6, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        clip_cursor_addr[0] = 0x58;  // pop eax
+        clip_cursor_addr[1] = 0x90;  // nop
+        clip_cursor_addr[2] = 0x90;  // nop
+        clip_cursor_addr[3] = 0x90;  // nop
+        clip_cursor_addr[4] = 0x90;  // nop
+        clip_cursor_addr[5] = 0x90;  // nop
+        VirtualProtect(clip_cursor_addr, 6, old_protect, &old_protect);
+    }
+
+    // Patch ShowCursor at 0x4049e6 (7 bytes: push + call)
+    // Original: 53 FF 15 74 C1 41 00 (push ebx; call ds:ShowCursor)
+    // Patched:  90 90 90 90 90 90 90 (7 nops)
+    uint8_t* show_cursor_addr = (uint8_t*)0x4049e6;
+    if (VirtualProtect(show_cursor_addr, 7, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        show_cursor_addr[0] = 0x90;  // nop (was push ebx)
+        show_cursor_addr[1] = 0x90;  // nop
+        show_cursor_addr[2] = 0x90;  // nop
+        show_cursor_addr[3] = 0x90;  // nop
+        show_cursor_addr[4] = 0x90;  // nop
+        show_cursor_addr[5] = 0x90;  // nop
+        show_cursor_addr[6] = 0x90;  // nop
+        VirtualProtect(show_cursor_addr, 7, old_protect, &old_protect);
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Patch: Disabled cursor hiding in fullscreen");
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
@@ -130,6 +173,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             BypassMultiInstanceCheck();
             ApplyBootToCharacterSelectPatches();
             ApplyCharacterSelectModePatches();
+            DisableCursorHiding();
 
             // Create our own console
             FreeConsole();
