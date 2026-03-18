@@ -64,7 +64,14 @@
       "mcp__ida__check_connection",
       "mcp__ida__get_metadata",
       "mcp__ida__list_functions",
-      "mcp__ida__list_imports"
+      "mcp__ida__list_imports",
+      "mcp__ida__get_callers",
+      "mcp__ida__get_struct_at_address",
+      "Bash(xxd:*)",
+      "mcp__ida__lookup_funcs",
+      "mcp__ida__decompile",
+      "mcp__ida__xrefs_to",
+      "Bash(git config:*)"
     ],
     "deny": []
   }
