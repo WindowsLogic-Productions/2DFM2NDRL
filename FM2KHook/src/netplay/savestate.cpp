@@ -37,7 +37,7 @@ namespace {
 }
 
 // Rollback buffer
-static constexpr int MAX_ROLLBACK_FRAMES = 8;
+static constexpr int MAX_ROLLBACK_FRAMES = 64;
 static SaveStateData g_state_buffer[MAX_ROLLBACK_FRAMES];
 
 // Simple Fletcher32 checksum

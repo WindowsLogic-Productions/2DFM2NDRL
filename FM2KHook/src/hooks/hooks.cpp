@@ -308,18 +308,23 @@ void __cdecl Hook_RenderGame() {
         g_last_fps_time = now;
     }
 
-    // Update window title - simplified states
+    // Update window title with state + desync/rollback info
     static int last_fps = 0;
     static bool last_connected = false;
     static bool last_active = false;
+    static uint32_t last_desync = 0;
+    static uint32_t last_rollback = 0;
 
     bool connected = Netplay_IsConnected();
     bool active = Netplay_IsActive();
+    uint32_t desyncs = Netplay_GetDesyncCount();
+    uint32_t rollbacks = Netplay_GetRollbackCount();
 
-    if (g_current_fps != last_fps || connected != last_connected || active != last_active) {
+    if (g_current_fps != last_fps || connected != last_connected ||
+        active != last_active || desyncs != last_desync || rollbacks != last_rollback) {
         HWND game_window = GetOurGameWindow();
         if (game_window) {
-            char title[128];
+            char title[256];
             const char* state_str = "Offline";
 
             if (!g_offline_mode) {
@@ -332,13 +337,24 @@ void __cdecl Hook_RenderGame() {
                 }
             }
 
-            snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS",
-                     g_player_index + 1, state_str, g_current_fps);
+            if (desyncs > 0) {
+                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS | DESYNC x%u | RB x%u",
+                         g_player_index + 1, state_str, g_current_fps, desyncs, rollbacks);
+            } else if (active) {
+                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS | RB x%u | Frame %u",
+                         g_player_index + 1, state_str, g_current_fps, rollbacks, Netplay_GetFrame());
+            } else {
+                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS",
+                         g_player_index + 1, state_str, g_current_fps);
+            }
+
             SetWindowTextA(game_window, title);
 
             last_fps = g_current_fps;
             last_connected = connected;
             last_active = active;
+            last_desync = desyncs;
+            last_rollback = rollbacks;
         }
     }
 
@@ -359,6 +375,19 @@ void __cdecl Hook_RenderGame() {
 
     if (protect_rng) {
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
+    }
+
+    // GekkoNet frame pacing (matches GekkoNet examples' handle_frame_time).
+    // Called after render, same position as SDL_DelayNS in the examples.
+    // When ahead of remote, slow down to prevent rollback cascade.
+    // Without this, P1 runs full speed while P2 drowns in rollbacks.
+    if (Netplay_IsActive()) {
+        float frames_ahead = Netplay_GetFramesAhead();
+        if (frames_ahead > 0.5f) {
+            // Ahead of remote: delay ~1.6% extra (10ms * 1.016 = ~10.16ms)
+            // With timeBeginPeriod(1), Sleep(1) is ~1ms accurate
+            Sleep(1);
+        }
     }
 }
 

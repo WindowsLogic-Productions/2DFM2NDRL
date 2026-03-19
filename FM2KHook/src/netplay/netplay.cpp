@@ -546,6 +546,18 @@ bool Netplay_ProcessBattleInputPhase() {
 
     gekko_network_poll(g_session);
 
+    // Frame advantage time sync (matches GekkoNet examples exactly)
+    // When ahead by >0.5 frames, sleep 1.6% longer to gently slow down
+    float frames_ahead = gekko_frames_ahead(g_session);
+    if (frames_ahead > 0.5f) {
+        // FM2K runs at 100 FPS = 10ms per frame. Add 1.6% = 0.16ms
+        Sleep(0);  // Yield timeslice - gentlest possible throttle
+        // For larger advantage, sleep proportionally
+        if (frames_ahead > 2.0f) {
+            Sleep(1);  // 1ms extra delay when significantly ahead
+        }
+    }
+
     uint16_t local_input = Input_CaptureLocal();
     gekko_add_local_input(g_session, g_player_index, &local_input);
 
@@ -659,9 +671,12 @@ bool Netplay_ProcessBattleInputPhase() {
 
                 // Periodic status every 500 frames (~5 sec)
                 if (g_netplay_frame % 500 == 0) {
+                    float fa = g_session ? gekko_frames_ahead(g_session) : 0.0f;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "BATTLE STATUS: frame=%u rollbacks=%u desyncs=%u",
-                        g_netplay_frame, g_rollback_count, g_desync_count);
+                        "BATTLE STATUS: frame=%u rb=%u desync=%u ahead=%.1f frame_time_ms=%u skip=%u",
+                        g_netplay_frame, g_rollback_count, g_desync_count, fa,
+                        *(uint32_t*)0x41E2F0,    // g_frame_time_ms (should be 10)
+                        *(uint32_t*)0x4246F4);   // g_frame_skip_count
                 }
 
                 // Dense state logging around desync boundary (frames 5000-5500)
@@ -761,4 +776,19 @@ uint32_t Netplay_GetFrame() {
 uint32_t Netplay_GetPingMs() {
     // TODO: Calculate from control channel RTT
     return 0;
+}
+
+uint32_t Netplay_GetDesyncCount() {
+    return g_desync_count;
+}
+
+uint32_t Netplay_GetRollbackCount() {
+    return g_rollback_count;
+}
+
+float Netplay_GetFramesAhead() {
+    if (g_session) {
+        return gekko_frames_ahead(g_session);
+    }
+    return 0.0f;
 }
