@@ -361,14 +361,7 @@ void LauncherUI::RenderInGameUI() {
 // Note: ShowGameValidationStatus removed ? UI simplified
 /* void LauncherUI::ShowGameValidationStatus(const FM2K::FM2KGameInfo& game) {} */
 
-void LauncherUI::ShowNetworkDiagnostics() {
-    // Remove window creation - this is now rendered inline within the debug tools panel
-    ImGui::Text("Network Performance:");
-    
-    // Network diagnostics placeholder
-    ImGui::Text("Frames Ahead: %.2f", frames_ahead_);
-    
-}
+void LauncherUI::ShowNetworkDiagnostics() {}
 
 bool LauncherUI::ValidateNetworkConfig() {
     // Check if remote address is valid format
@@ -531,292 +524,47 @@ void LauncherUI::RenderSessionControls() {
 }
 
 void LauncherUI::RenderDebugTools() {
-    ImGui::Text("Debug & Testing Tools");
-    ImGui::Separator();
-    
-    // Tabbed interface for organized debug tools
     if (ImGui::BeginTabBar("DebugTabs", ImGuiTabBarFlags_None)) {
-        
-        // Tab 1: Save States (existing functionality)
-        if (ImGui::BeginTabItem("Save States")) {
-            RenderSaveStateTools();
-            ImGui::EndTabItem();
-        }
-        
-        // Tab 2: Multi-Client Testing (new)
+
         if (ImGui::BeginTabItem("Multi-Client")) {
             RenderMultiClientTools();
             ImGui::EndTabItem();
         }
-        
-        // Tab 3: Network Simulation (new)
+
         if (ImGui::BeginTabItem("Network")) {
             RenderNetworkTools();
             ImGui::EndTabItem();
         }
-        
-        // Tab 4: Object Analysis
-        if (ImGui::BeginTabItem("Objects")) {
-            RenderObjectAnalysis();
+
+        if (ImGui::BeginTabItem("Log")) {
+            RenderConsoleLog();
             ImGui::EndTabItem();
         }
 
         ImGui::EndTabBar();
     }
-    
-    // Render save slot inspection window if requested
-    RenderSlotInspectionWindow();
 }
 
-void LauncherUI::RenderSaveStateTools() {
-    
-    // Auto-save controls
-    if (ImGui::CollapsingHeader("Auto-Save", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Get current auto-save settings from hook DLL
-        bool auto_save_enabled = true;  // default fallback
-        int auto_save_interval = 120;   // default fallback
-        bool settings_available = false;
-        
-        if (on_get_auto_save_config) {
-            AutoSaveConfig current_config;
-            if (on_get_auto_save_config(current_config)) {
-                auto_save_enabled = current_config.enabled;
-                auto_save_interval = (int)current_config.interval_frames;
-                settings_available = true;
-            }
-        }
-        
-        if (!settings_available) {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "⚠ Auto-save settings unavailable");
-        }
-        
-        bool enabled_changed = false;
-        bool interval_changed = false;
-        
-        if (ImGui::Checkbox("Enable Auto-Save (Slot 0)", &auto_save_enabled)) {
-            enabled_changed = true;
-        }
-        
-        ImGui::SetNextItemWidth(150);
-        if (ImGui::SliderInt("Interval (frames)", &auto_save_interval, 30, 600)) {
-            interval_changed = true;
-        }
-        ImGui::SameLine();
-        ImGui::Text("(%.1fs)", auto_save_interval / 100.0f);
-        
-        // Only send updates when something actually changed
-        if ((enabled_changed || interval_changed) && on_debug_auto_save_config) {
-            bool success = on_debug_auto_save_config(auto_save_enabled, auto_save_interval);
-            if (success) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Auto-save config updated: %s, %d frames", 
-                            auto_save_enabled ? "enabled" : "disabled", auto_save_interval);
-            } else {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to update auto-save config");
-            }
-        }
-        
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "ℹ Auto-save uses Slot 0");
-        if (auto_save_enabled && settings_available) {
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "✓ Auto-save active every %.1fs", auto_save_interval / 100.0f);
-        } else if (!auto_save_enabled && settings_available) {
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "○ Auto-save disabled");
-        }
-        
-        // Save State Profile Selection removed - now using optimized FastGameState system
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.8f, 1.0f, 0.8f, 1.0f), "⚡ FastGameState - Optimized 10-50KB saves with bitfield compression");
-        ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "   Active object detection with sub-millisecond performance");
-    }
-    
-    ImGui::Separator();
-    
-    // Save Slots
-    if (ImGui::CollapsingHeader("Save Slots", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Columns(5, "SaveSlots", true);
-        ImGui::Text("Slot");
-        ImGui::NextColumn();
-        ImGui::Text("Status");
-        ImGui::NextColumn();
-        ImGui::Text("Save");
-        ImGui::NextColumn();
-        ImGui::Text("Load");
-        ImGui::NextColumn();
-        ImGui::Text("Inspect");
-        ImGui::NextColumn();
-        ImGui::Separator();
-        
-        for (int slot = 0; slot < 8; slot++) {
-            ImGui::PushID(slot);
-            
-            // Slot number with clearer auto-save indication
-            if (slot == 0) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%d (AUTO)", slot);
-                ImGui::SetItemTooltip("Auto-save slot - automatically saves at configured intervals");
-            } else {
-                ImGui::Text("%d", slot);
-                ImGui::SetItemTooltip("Manual save slot");
-            }
-            ImGui::NextColumn();
-            
-            // Status - get real status from hook DLL
-            if (on_get_slot_status) {
-                SlotStatusInfo status;
-                if (on_get_slot_status(slot, status)) {
-                    if (status.occupied) {
-                        // Calculate time ago
-                        uint64_t current_time = SDL_GetTicks();
-                        uint64_t time_diff = current_time - status.timestamp_ms;
-                        
-                        if (time_diff < 1000) {
-                            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "F%u (%u objs)", status.frame_number, status.active_object_count);
-                        } else if (time_diff < 60000) {
-                            ImGui::TextColored(ImVec4(0.8f, 1.0f, 0.8f, 1.0f), "F%u (%u objs, %.1fs)", status.frame_number, status.active_object_count, time_diff / 1000.0f);
-                        } else {
-                            ImGui::TextColored(ImVec4(0.6f, 0.8f, 0.6f, 1.0f), "F%u (%u objs, %llus)", status.frame_number, status.active_object_count, time_diff / 1000);
-                        }
-                        
-                        // Enhanced tooltip with performance data
-                        std::string tooltip = "Frame " + std::to_string(status.frame_number) +
-                                            "\nChecksum: 0x" + std::to_string(status.checksum) +
-                                            "\nSaved " + std::to_string(time_diff / 1000.0f) + " seconds ago";
-                        
-                        if (status.state_size_kb > 0) {
-                            tooltip += "\nSize: " + std::to_string(status.state_size_kb) + " KB";
-                        }
-                        if (status.active_object_count > 0) {
-                            tooltip += "\nObjects: " + std::to_string(status.active_object_count) + " active";
-                        }
-                        if (status.save_time_us > 0) {
-                            tooltip += "\nSave time: " + std::to_string(status.save_time_us) + " μs";
-                        }
-                        if (status.load_time_us > 0) {
-                            tooltip += "\nLast load: " + std::to_string(status.load_time_us) + " μs";
-                        }
-                        
-                        ImGui::SetItemTooltip("%s", tooltip.c_str());
-                    } else {
-                        ImGui::TextDisabled("Empty");
-                    }
-                } else {
-                    ImGui::TextDisabled("Error");
-                }
-            } else {
-                ImGui::TextDisabled("Unknown");
-            }
-            ImGui::NextColumn();
-            
-            // Save button
-            if (ImGui::Button("Save")) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "UI: Save button clicked for slot %d", slot);
-                if (on_debug_save_to_slot) {
-                    bool success = on_debug_save_to_slot(slot);
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "UI: Save to slot %d %s", slot, success ? "triggered" : "failed");
-                } else {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "UI: on_debug_save_to_slot callback is null!");
-                }
-            }
-            ImGui::NextColumn();
-            
-            // Load button
-            if (ImGui::Button("Load")) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "UI: Load button clicked for slot %d", slot);
-                if (on_debug_load_from_slot) {
-                    bool success = on_debug_load_from_slot(slot);
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "UI: Load from slot %d %s", slot, success ? "triggered" : "failed");
-                } else {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "UI: on_debug_load_from_slot callback is null!");
-                }
-            }
-            ImGui::NextColumn();
-            
-            // Inspect button
-            if (on_get_slot_status) {
-                SlotStatusInfo status;
-                if (on_get_slot_status(slot, status) && status.occupied) {
-                    if (ImGui::Button("Inspect")) {
-                        // Set the selected slot for inspection
-                        selected_inspection_slot_ = slot;
-                        show_slot_inspection_ = true;
-                    }
-                } else {
-                    ImGui::BeginDisabled();
-                    ImGui::Button("Inspect");
-                    ImGui::EndDisabled();
-                }
-            } else {
-                ImGui::BeginDisabled();
-                ImGui::Button("Inspect");
-                ImGui::EndDisabled();
-            }
-            ImGui::NextColumn();
-            
-            ImGui::PopID();
-        }
-        
-        ImGui::Columns(1);
-    }
-    
-    ImGui::Separator();
-    
-    // Quick save/load (legacy)
-    ImGui::Text("Quick Actions");
-    if (ImGui::Button("Quick Save")) {
-        if (on_debug_save_state) {
-            bool success = on_debug_save_state();
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quick save %s", success ? "triggered" : "failed");
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Quick Load")) {
-        if (on_debug_load_state) {
-            bool success = on_debug_load_state();
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quick load %s", success ? "triggered" : "failed");
-        }
+void LauncherUI::RenderConsoleLog() {
+    SDL_LockMutex(log_buffer_mutex_);
+
+    if (ImGui::Button("Clear")) {
+        ClearLog();
     }
 
-    static int rollback_frames = 3;  // Default to 3 frames
-    ImGui::SetNextItemWidth(100);
-    ImGui::InputInt("Force Rollback Frames", &rollback_frames);
-    if (rollback_frames < 0) rollback_frames = 0;
-    if (rollback_frames > 60) rollback_frames = 60;  // Reasonable limit
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Force")) {
-        if (on_debug_force_rollback && rollback_frames > 0) {
-            bool success = on_debug_force_rollback(static_cast<uint32_t>(rollback_frames));
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Force rollback of %d frames %s", rollback_frames, success ? "triggered" : "failed");
-        }
-    }
-    
     ImGui::Separator();
-    
-    ShowNetworkDiagnostics();
 
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Console Log", ImGuiTreeNodeFlags_DefaultOpen)) {
-        SDL_LockMutex(log_buffer_mutex_);
+    ImGui::BeginChild("LogScrollingRegion", ImVec2(0, -1), false, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::InputTextMultiline("##console", (char*)log_buffer_.c_str(), log_buffer_.size(),
+        ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
 
-        if (ImGui::Button("Clear")) {
-            ClearLog();
-        }
-        
-        ImGui::Separator();
-        
-        ImGui::BeginChild("LogScrollingRegion", ImVec2(0, 200), false, ImGuiWindowFlags_HorizontalScrollbar);
-        
-        // Use InputTextMultiline to make the log selectable.
-        ImGui::InputTextMultiline("##console", (char*)log_buffer_.c_str(), log_buffer_.size(), ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
-        
-        if (scroll_to_bottom_) {
-            ImGui::SetScrollHereY(1.0f);
-            scroll_to_bottom_ = false;
-        }
-        
-        ImGui::EndChild();
-
-        SDL_UnlockMutex(log_buffer_mutex_);
+    if (scroll_to_bottom_) {
+        ImGui::SetScrollHereY(1.0f);
+        scroll_to_bottom_ = false;
     }
+
+    ImGui::EndChild();
+    SDL_UnlockMutex(log_buffer_mutex_);
 }
 
 void LauncherUI::RenderMultiClientTools() {
@@ -970,7 +718,7 @@ void LauncherUI::RenderMultiClientTools() {
         ImGui::SameLine();
         if (ImGui::Button("Copy Client 1 Log")) {
             // Read Client 1 log file and copy to clipboard
-            std::ifstream log_file("FM2K_Client1_Debug.log");
+            std::ifstream log_file("FM2K_P1_Debug.log");
             if (log_file.is_open()) {
                 std::stringstream buffer;
                 buffer << log_file.rdbuf();
@@ -990,7 +738,7 @@ void LauncherUI::RenderMultiClientTools() {
         
         // Display last few lines of Client 1 log
         {
-            std::ifstream log_file("FM2K_Client1_Debug.log");
+            std::ifstream log_file("FM2K_P1_Debug.log");
             if (log_file.is_open()) {
                 std::vector<std::string> lines;
                 std::string line;
@@ -1033,7 +781,7 @@ void LauncherUI::RenderMultiClientTools() {
         ImGui::SameLine();
         if (ImGui::Button("Copy Client 2 Log")) {
             // Read Client 2 log file and copy to clipboard
-            std::ifstream log_file("FM2K_Client2_Debug.log");
+            std::ifstream log_file("FM2K_P2_Debug.log");
             if (log_file.is_open()) {
                 std::stringstream buffer;
                 buffer << log_file.rdbuf();
@@ -1053,7 +801,7 @@ void LauncherUI::RenderMultiClientTools() {
         
         // Display last few lines of Client 2 log
         {
-            std::ifstream log_file("FM2K_Client2_Debug.log");
+            std::ifstream log_file("FM2K_P2_Debug.log");
             if (log_file.is_open()) {
                 std::vector<std::string> lines;
                 std::string line;
@@ -1095,8 +843,8 @@ void LauncherUI::RenderMultiClientTools() {
         ImGui::Text("Log Management:");
         if (ImGui::Button("Clear All Logs")) {
             // Clear both log files
-            std::ofstream("FM2K_Client1_Debug.log", std::ios::trunc).close();
-            std::ofstream("FM2K_Client2_Debug.log", std::ios::trunc).close();
+            std::ofstream("FM2K_P1_Debug.log", std::ios::trunc).close();
+            std::ofstream("FM2K_P2_Debug.log", std::ios::trunc).close();
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "All debug logs cleared");
         }
         
@@ -1106,213 +854,29 @@ void LauncherUI::RenderMultiClientTools() {
             system("explorer .");
         }
         
-        ImGui::SameLine();
-        if (ImGui::Button("Export Input Recordings")) {
-            // Show input recording files in explorer
-            std::ifstream client1_record("FM2K_InputRecord_Client1.dat");
-            std::ifstream client2_record("FM2K_InputRecord_Client2.dat");
-            
-            if (client1_record.is_open() || client2_record.is_open()) {
-                system("explorer .");
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Input recording files shown in explorer");
-            } else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "No input recording files found - enable recording first");
-            }
-        }
-    }
-    
-    ImGui::Separator();
-    
-    // Testing Tools
-    if (ImGui::CollapsingHeader("Testing Tools", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Production Mode Settings
-        ImGui::Text("Debug Settings:");
-        
-        static bool production_mode = false;
-        static bool input_recording = true;
-        
-        if (ImGui::Checkbox("Production Mode (Reduced Logging)", &production_mode)) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Production mode: %s", production_mode ? "Enabled" : "Disabled");
-            if (on_set_production_mode) {
-                on_set_production_mode(production_mode);
-            }
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Reduces log spam from ~100 msgs/sec to ~5 msgs/sec\nSaves state every 32 frames instead of 8");
-        }
-        
-        if (ImGui::Checkbox("Input Recording", &input_recording)) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Input recording: %s", input_recording ? "Enabled" : "Disabled");
-            if (on_set_input_recording) {
-                on_set_input_recording(input_recording);
-            }
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Records all inputs to .dat files for desync analysis\nFiles: FM2K_InputRecord_Client1.dat, FM2K_InputRecord_Client2.dat");
-        }
-        
-        static bool use_minimal_gamestate_testing = false;
-        if (ImGui::Checkbox("MinimalGameState Testing (48 bytes)", &use_minimal_gamestate_testing)) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "MinimalGameState testing checkbox: %s", use_minimal_gamestate_testing ? "Enabled" : "Disabled");
-            if (on_set_minimal_gamestate_testing) {
-                bool success = on_set_minimal_gamestate_testing(use_minimal_gamestate_testing);
-                // Success includes both immediate application and deferred settings
-                if (!success) {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "MinimalGameState testing config failed completely");
-                }
-            } else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "MinimalGameState testing callback not available");
-            }
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Uses 48-byte minimal state for GekkoNet rollback testing\nShows detailed field-by-field desync analysis:\n• HP values, positions, timers, RNG\n• Frame-to-frame deltas\n• Checksum validation");
-        }
-        
-        ImGui::Separator();
-        
-        // Testing Buttons
-        ImGui::Text("Rollback Testing:");
-        
-        if (ImGui::Button("Test Rollback Detection")) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "🚧 Rollback stress testing - coming soon");
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Will artificially create rollback scenarios to test stability");
-        }
-        
-        if (ImGui::Button("Generate Desync Test")) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "🚧 Desync generation testing - coming soon");
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Will create artificial input differences to trigger desync detection");
-        }
-        
-        ImGui::Separator();
-        
-        // File Status
-        ImGui::Text("Recording Status:");
-        
-        // Check if input recording files exist and show their sizes
-        std::ifstream client1_record("FM2K_InputRecord_Client1.dat", std::ios::binary | std::ios::ate);
-        std::ifstream client2_record("FM2K_InputRecord_Client2.dat", std::ios::binary | std::ios::ate);
-        
-        if (client1_record.is_open()) {
-            size_t size1 = client1_record.tellg();
-            ImGui::Text("Client 1 Recording: %.1f KB", size1 / 1024.0f);
-        } else {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Client 1 Recording: Not started");
-        }
-        
-        if (client2_record.is_open()) {
-            size_t size2 = client2_record.tellg();
-            ImGui::Text("Client 2 Recording: %.1f KB", size2 / 1024.0f);
-        } else {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Client 2 Recording: Not started");
-        }
-    }
-    
-    // Live Rollback Performance Statistics
-    if (ImGui::CollapsingHeader("Live Rollback Statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
-        RollbackStats rollback_stats = {};
-        bool stats_available = false;
-        
-        if (on_get_rollback_stats) {
-            stats_available = on_get_rollback_stats(rollback_stats);
-        }
-        
-        if (stats_available) {
-            // Current performance metrics
-            ImGui::Text("Real-time Rollback Performance:");
-            ImGui::Separator();
-            
-            // Key performance indicators
-            ImGui::Columns(2, "rollback_stats", false);
-            ImGui::Text("Rollbacks/Second:");
-            ImGui::NextColumn();
-            if (rollback_stats.rollbacks_per_second == 0) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%u (Stable)", rollback_stats.rollbacks_per_second);
-            } else if (rollback_stats.rollbacks_per_second <= 5) {
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.5f, 1.0f), "%u (Good)", rollback_stats.rollbacks_per_second);
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%u (High)", rollback_stats.rollbacks_per_second);
-            }
-            ImGui::NextColumn();
-            
-            ImGui::Text("Max Rollback:");
-            ImGui::NextColumn();
-            if (rollback_stats.max_rollback_frames <= 3) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%u frames", rollback_stats.max_rollback_frames);
-            } else if (rollback_stats.max_rollback_frames <= 8) {
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.5f, 1.0f), "%u frames", rollback_stats.max_rollback_frames);
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%u frames", rollback_stats.max_rollback_frames);
-            }
-            ImGui::NextColumn();
-            
-            ImGui::Text("Average Rollback:");
-            ImGui::NextColumn();
-            ImGui::Text("%u frames", rollback_stats.avg_rollback_frames);
-            ImGui::NextColumn();
-            
-            ImGui::Text("Current Frame:");
-            ImGui::NextColumn();
-            ImGui::Text("%u", rollback_stats.confirmed_frames);
-            ImGui::NextColumn();
-            
-            ImGui::Columns(1);
-            
-            ImGui::Separator();
-            
-            // Additional diagnostic info
-            ImGui::Text("Input Delay: %u frames", rollback_stats.input_delay_frames);
-            ImGui::Text("Speculative Frames: %u", rollback_stats.speculative_frames);
-            ImGui::Text("Frame Advantage: %.1f", rollback_stats.frame_advantage);
-        } else {
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "⏳ Rollback statistics unavailable");
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Launch clients to view real-time rollback performance");
-        }
     }
 }
 
 void LauncherUI::RenderNetworkTools() {
-    ImGui::Text("Network Status & Rollback Performance");
-    ImGui::Separator();
-    
-    // Rollback Statistics (keep this part - it's useful)
-    if (ImGui::CollapsingHeader("Rollback Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
-        RollbackStats rollback_stats = {};
-        bool stats_available = false;
-        
-        if (on_get_rollback_stats) {
-            stats_available = on_get_rollback_stats(rollback_stats);
-        }
-        
-        if (stats_available) {
-            ImGui::Text("Rollbacks/Second: %u", rollback_stats.rollbacks_per_second);
-            ImGui::Text("Frame Advantage: %.1f", rollback_stats.frame_advantage);
-            ImGui::Text("Input Delay: %u frames", rollback_stats.input_delay_frames);
-            ImGui::Text("Max Rollback: %u frames", rollback_stats.max_rollback_frames);
-            ImGui::Text("Avg Rollback: %u frames", rollback_stats.avg_rollback_frames);
-            ImGui::Text("Confirmed Frames: %u", rollback_stats.confirmed_frames);
-            ImGui::Text("Speculative Frames: %u", rollback_stats.speculative_frames);
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "⚠ Rollback statistics unavailable");
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Start an online session to view rollback stats");
-        }
+    RollbackStats stats = {};
+    bool stats_available = false;
+
+    if (on_get_rollback_stats) {
+        stats_available = on_get_rollback_stats(stats);
     }
-    
-    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "Network simulation handled by LocalNetworkAdapter");
+
+    if (!stats_available) {
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No active session");
+        return;
+    }
+
+    ImGui::Text("Frame: %u", stats.confirmed_frames);
+    ImGui::Text("Rollbacks: %u", stats.speculative_frames);
+    ImGui::Text("Frame Advantage: %.1f", stats.frame_advantage);
+
+    if (stats.speculative_frames == 0) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "No desyncs");
+    }
 }
 
 // RenderPerformanceStats removed - was just static info
@@ -1356,313 +920,5 @@ void LauncherUI::ClearLog() {
     SDL_UnlockMutex(log_buffer_mutex_);
 }
 
-void LauncherUI::RenderObjectAnalysis() {
-    ImGui::Text("FM2K Action Pool Analysis");
-    ImGui::Separator();
-    
-    // Frame Stepping Controls
-    ImGui::Text("Frame Stepping:");
-    static bool frame_stepping_paused = false;
-    
-    if (ImGui::Button(frame_stepping_paused ? "Resume Game" : "Pause Game")) {
-        frame_stepping_paused = !frame_stepping_paused;
-        if (on_frame_step_pause) {
-            on_frame_step_pause(frame_stepping_paused);
-        }
-    }
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Step 1 Frame")) {
-        if (on_frame_step_single) {
-            on_frame_step_single();
-        }
-    }
-    
-    ImGui::SameLine();
-    if (ImGui::Button("Step 10 Frames")) {
-        if (on_frame_step_multi) {
-            on_frame_step_multi(10);
-        }
-    }
-    
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), 
-                      frame_stepping_paused ? "(Game Paused)" : "(Game Running)");
-    
-    ImGui::Separator();
-    
-    // Check if we have the callback connected
-    if (!on_get_enhanced_actions) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Action analysis not available");
-        ImGui::BulletText("Connect to FM2K game session to enable action inspection");
-        return;
-    }
-    
-    // Refresh controls and timing
-    static auto last_refresh = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    
-    bool force_refresh = false;
-    if (ImGui::Button("Refresh Now")) {
-        force_refresh = true;
-    }
-    ImGui::SameLine();
-    
-    static bool auto_refresh = true;
-    ImGui::Checkbox("Auto-refresh (1 Hz)", &auto_refresh);
-    
-    // Only refresh automatically every second, not every frame
-    bool should_refresh = force_refresh || 
-                         (auto_refresh && 
-                          std::chrono::duration_cast<std::chrono::milliseconds>(now - last_refresh).count() > 1000);
-    
-    // Get current action data (FM2K "objects" are actually "actions" in 2DFM editor)
-    static std::vector<EnhancedActionInfo> cached_actions;
-    
-    if (should_refresh) {
-        cached_actions = on_get_enhanced_actions();
-        last_refresh = now;
-    }
-    
-    auto& enhanced_actions = cached_actions;
-    
-    ImGui::Separator();
-    
-    // Overview statistics
-    ImGui::Text("Live Action Analysis:");
-    ImGui::Separator();
-    
-    uint32_t character_count = 0, projectile_count = 0, effect_count = 0, system_count = 0, other_count = 0;
-    for (const auto& action : enhanced_actions) {
-        if (action.IsCharacter()) character_count++;
-        else if (action.IsProjectile()) projectile_count++;
-        else if (action.IsEffect()) effect_count++;
-        else if (action.IsSystem()) system_count++;
-        else other_count++;
-    }
-    
-    ImGui::Text("Total Active Actions: %zu", enhanced_actions.size());
-    ImGui::BulletText("Characters: %u", character_count);
-    ImGui::BulletText("Projectiles: %u", projectile_count);
-    ImGui::BulletText("Effects: %u", effect_count);
-    ImGui::BulletText("System: %u", system_count);
-    if (other_count > 0) {
-        ImGui::BulletText("Other: %u", other_count);
-    }
-    
-    ImGui::Separator();
-    
-    // Action list with detailed inspection
-    if (enhanced_actions.empty()) {
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No active actions detected");
-        return;
-    }
-    
-    // Scrollable region for action list
-    if (ImGui::BeginChild("ActionList", ImVec2(0, -1), true)) {
-        
-        for (const auto& action : enhanced_actions) {
-            // Create a tree node for each action
-            char action_label[256];
-            snprintf(action_label, sizeof(action_label), "[Slot %u] %s (ID: %u)", 
-                     action.slot_index, action.type_name.c_str(), action.id);
-            
-            if (ImGui::TreeNode(action_label)) {
-                
-                // Basic action info
-                if (ImGui::CollapsingHeader("Basic Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::Text("Slot Index: %u", action.slot_index);
-                    ImGui::Text("Type: %u (%s)", action.type, action.type_name.c_str());
-                    ImGui::Text("Action ID: %u", action.id);
-                    ImGui::Text("Position: (%u, %u)", action.position_x, action.position_y);
-                    if (action.HasMovement()) {
-                        ImGui::Text("Velocity: (%u, %u)", action.velocity_x, action.velocity_y);
-                    } else {
-                        ImGui::TextDisabled("Velocity: (0, 0) - Static");
-                    }
-                    ImGui::Text("Animation State: %u", action.animation_state);
-                    ImGui::Text("Health/Damage: %u", action.health_damage);
-                    ImGui::Text("State Flags: 0x%08X", action.state_flags);
-                    ImGui::Text("Timer/Counter: %u", action.timer_counter);
-                }
-                
-                // Type-specific analysis
-                if (action.IsCharacter()) {
-                    if (ImGui::CollapsingHeader("Character Data")) {
-                        if (!action.character_name.empty()) {
-                            ImGui::Text("Character: %s", action.character_name.c_str());
-                        }
-                        if (!action.current_move.empty()) {
-                            ImGui::Text("Current Move: %s", action.current_move.c_str());
-                        }
-                        ImGui::Text("Facing: %s", action.facing_direction == 0 ? "Left" : "Right");
-                        if (action.combo_count > 0) {
-                            ImGui::Text("Combo Count: %u", action.combo_count);
-                        }
-                    }
-                } else if (action.IsProjectile()) {
-                    if (ImGui::CollapsingHeader("Projectile Data")) {
-                        ImGui::Text("Movement: %s", action.HasMovement() ? "Active" : "Static");
-                        if (action.HasMovement()) {
-                            float speed = sqrt(action.velocity_x * action.velocity_x + action.velocity_y * action.velocity_y);
-                            ImGui::Text("Speed: %.1f units", speed);
-                        }
-                    }
-                } else if (action.IsEffect()) {
-                    if (ImGui::CollapsingHeader("Effect Data")) {
-                        ImGui::Text("Animation Frame: %u", action.animation_frame);
-                        ImGui::Text("Effect Timer: %u", action.timer_counter);
-                    }
-                }
-                
-                // Script/Action data
-                if (ImGui::CollapsingHeader("Script Data")) {
-                    if (action.script_id > 0) {
-                        ImGui::Text("Script ID: %u", action.script_id);
-                    } else {
-                        ImGui::TextDisabled("Script ID: None");
-                    }
-                    if (!action.action_name.empty()) {
-                        ImGui::Text("Action: %s", action.action_name.c_str());
-                    } else {
-                        ImGui::TextDisabled("Action: Unknown");
-                    }
-                    if (action.animation_frame > 0) {
-                        ImGui::Text("Animation Frame: %u", action.animation_frame);
-                    }
-                }
-                
-                // Raw memory inspection
-                if (ImGui::CollapsingHeader("Raw Memory")) {
-                    ImGui::Text("Complete Action Data (382 bytes):");
-                    
-                    // Display first 128 bytes as hex dump
-                    for (int row = 0; row < 8; row++) {
-                        ImGui::Text("%04X:", row * 16);
-                        ImGui::SameLine();
-                        
-                        // Hex bytes
-                        for (int col = 0; col < 16; col++) {
-                            int byte_idx = row * 16 + col;
-                            if (byte_idx < 382) {
-                                ImGui::SameLine();
-                                ImGui::Text("%02X", action.raw_data[byte_idx]);
-                            }
-                        }
-                        
-                        // ASCII representation
-                        ImGui::SameLine();
-                        ImGui::Text(" |");
-                        for (int col = 0; col < 16; col++) {
-                            int byte_idx = row * 16 + col;
-                            if (byte_idx < 382) {
-                                char c = action.raw_data[byte_idx];
-                                ImGui::SameLine();
-                                ImGui::Text("%c", (c >= 32 && c <= 126) ? c : '.');
-                            }
-                        }
-                        ImGui::SameLine();
-                        ImGui::Text("|");
-                    }
-                    
-                }
-                
-                ImGui::TreePop();
-            }
-        }
-    }
-    ImGui::EndChild();
-}
-
-void LauncherUI::RenderSlotInspectionWindow() {
-    if (!show_slot_inspection_ || selected_inspection_slot_ < 0 || selected_inspection_slot_ >= 8) {
-        return;
-    }
-    
-    // Create a modal popup window for slot inspection
-    ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Save State Inspector", &show_slot_inspection_, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Inspecting Save Slot %d", selected_inspection_slot_);
-        ImGui::Separator();
-        
-        // Get slot status first
-        if (on_get_slot_status) {
-            SlotStatusInfo status;
-            if (on_get_slot_status(selected_inspection_slot_, status) && status.occupied) {
-                // Show slot metadata
-                ImGui::Text("Slot Metadata:");
-                ImGui::BulletText("Frame: %u", status.frame_number);
-                ImGui::BulletText("Objects: %u active", status.active_object_count);
-                ImGui::BulletText("Size: %u KB", status.state_size_kb);
-                ImGui::BulletText("Checksum: 0x%08X", status.checksum);
-                
-                if (status.save_time_us > 0) {
-                    ImGui::BulletText("Save time: %u μs", status.save_time_us);
-                }
-                if (status.load_time_us > 0) {
-                    ImGui::BulletText("Last load time: %u μs", status.load_time_us);
-                }
-                
-                // Calculate and show timestamp
-                uint64_t current_time = SDL_GetTicks();
-                uint64_t time_diff = current_time - status.timestamp_ms;
-                ImGui::BulletText("Saved: %.1f seconds ago", time_diff / 1000.0f);
-                
-                ImGui::Separator();
-                
-                // Action/Object breakdown
-                ImGui::Text("Saved Objects Analysis:");
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "ℹ This shows objects that were active when the state was saved");
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "  For live object analysis, use the 'Objects' tab");
-                
-                ImGui::Separator();
-                
-                // Show basic object count info from save state
-                if (status.active_object_count > 0) {
-                    ImGui::Text("Objects in this save state:");
-                    ImGui::BulletText("Total active objects: %u", status.active_object_count);
-                    ImGui::BulletText("Object pool size: 391 KB (1024 slots × 382 bytes)");
-                    ImGui::BulletText("Memory efficiency: %.1f%% used", (status.active_object_count * 100.0f) / 1024.0f);
-                    
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "💡 To inspect individual objects:");
-                    ImGui::BulletText("1. Load this save state");
-                    ImGui::BulletText("2. Go to the 'Objects' tab for live analysis");
-                    ImGui::BulletText("3. Use the enhanced 2DFM script analysis features");
-                    
-                } else {
-                    ImGui::Text("No active objects in this save state");
-                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "This may indicate:");
-                    ImGui::BulletText("Empty game state (menu/loading screen)");
-                    ImGui::BulletText("Objects not properly detected during save");
-                    ImGui::BulletText("Game in transitional state");
-                }
-                
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "Slot %d is empty or unreadable", selected_inspection_slot_);
-            }
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "Cannot inspect slot - no connection to game");
-        }
-        
-        ImGui::Separator();
-        
-        // Action buttons
-        if (ImGui::Button("Load This State")) {
-            if (on_debug_load_from_slot) {
-                bool success = on_debug_load_from_slot(selected_inspection_slot_);
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Slot inspector: Load from slot %d %s", 
-                           selected_inspection_slot_, success ? "triggered" : "failed");
-                if (success) {
-                    show_slot_inspection_ = false; // Close inspector after load
-                }
-            }
-        }
-        
-        ImGui::SameLine();
-        if (ImGui::Button("Close")) {
-            show_slot_inspection_ = false;
-        }
-    }
-    ImGui::End();
-} 
+void LauncherUI::RenderObjectAnalysis() {}
+void LauncherUI::RenderSlotInspectionWindow() {}

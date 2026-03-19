@@ -1,7 +1,6 @@
 // Optimized savestate - only save dynamic portions of character slots
 // Static character data (sprites, animations, hitboxes) loaded from .player files doesn't change
 #include "savestate.h"
-#include "shared_mem.h"
 #include "globals.h"
 #include <SDL3/SDL_log.h>
 #include <cstring>
