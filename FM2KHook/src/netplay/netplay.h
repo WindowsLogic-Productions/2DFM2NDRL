@@ -133,3 +133,11 @@ uint32_t Netplay_GetFrame();
 
 // Get round-trip time in milliseconds
 uint32_t Netplay_GetPingMs();
+
+// Get desync and rollback counts for UI display
+uint32_t Netplay_GetDesyncCount();
+uint32_t Netplay_GetRollbackCount();
+
+// Get how many frames ahead of remote we are (for frame pacing)
+// Positive = we're ahead (should slow down), negative = behind
+float Netplay_GetFramesAhead();

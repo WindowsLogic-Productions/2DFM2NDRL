@@ -6,6 +6,7 @@
 #include "control_channel.h"
 #include <SDL3/SDL_log.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -169,6 +170,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         {
             DisableThreadLibraryCalls(hModule);
 
+            // Force 1ms timer resolution for accurate 100fps frame timing.
+            // Without this, timeGetTime() has ~15.6ms resolution and
+            // background windows drop to ~64fps (appears as 60fps).
+            timeBeginPeriod(1);
+
             // Apply game patches FIRST before anything else
             BypassMultiInstanceCheck();
             ApplyBootToCharacterSelectPatches();
@@ -245,6 +251,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
     case DLL_PROCESS_DETACH:
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "FM2K Hook shutting down...");
+
+        // Restore default timer resolution
+        timeEndPeriod(1);
 
         // Shutdown in reverse order
         ShutdownHooks();
