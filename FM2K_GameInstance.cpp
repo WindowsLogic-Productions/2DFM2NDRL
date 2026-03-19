@@ -1,6 +1,6 @@
 #include "FM2K_GameInstance.h"
 #include "FM2K_Integration.h"
-#include "FM2KHook/src/ui/shared_mem.h"  // Use canonical SharedInputData definition
+#include "FM2KHook/src/ui/shared_mem.h"  // FM2KSharedMemData (read-only stats from hook)
 // DLL injection approach - no direct hooks needed
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -11,7 +11,7 @@
 
 // Save state profile removed - now using optimized FastGameState system
 
-// SharedInputData struct now comes from FM2KHook/src/ui/shared_mem.h
+// FM2KSharedMemData struct now comes from FM2KHook/src/ui/shared_mem.h
 
 namespace {
 
@@ -348,31 +348,8 @@ void FM2KGameInstance::ProcessDLLEvents() {
 }
 
 void FM2KGameInstance::SetNetworkConfig(bool is_online, bool is_host, const std::string& remote_addr, uint16_t port, uint8_t input_delay) {
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Setting network config - Online: %s, Host: %s, Addr: %s, Port: %d, Delay: %d",
-                is_online ? "YES" : "NO", is_host ? "YES" : "NO", remote_addr.c_str(), port, input_delay);
-    
-    // If shared memory is not initialized, initialize it first
-    if (!shared_memory_data_) {
-        InitializeSharedMemory();
-    }
-    
-    // Write configuration to shared memory
-    if (shared_memory_data_) {
-        SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-        shared_data->is_online_mode = is_online;
-        shared_data->is_host = is_host;
-        shared_data->port = port;
-        shared_data->input_delay = input_delay;
-        shared_data->config_updated = true;
-        
-        // Copy remote address safely
-        strncpy_s(shared_data->remote_address, sizeof(shared_data->remote_address), 
-                  remote_addr.c_str(), _TRUNCATE);
-        
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Network configuration written to shared memory");
-    } else {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Cannot set network config - shared memory not available");
-    }
+    // Removed - hook reads config from env vars
+    (void)is_online; (void)is_host; (void)remote_addr; (void)port; (void)input_delay;
 }
 
 void FM2KGameInstance::HandleDLLEvent(const SDL_Event& event) {
@@ -458,34 +435,43 @@ bool FM2KGameInstance::ExecuteRemoteFunction(HANDLE process, uintptr_t function_
 
 void FM2KGameInstance::InitializeSharedMemory() {
     // Create unique shared memory name using process ID
-    std::string shared_memory_name = "FM2K_InputSharedMemory_" + std::to_string(process_id_);
-    
+    std::string shared_memory_name = "FM2K_SharedMem_" + std::to_string(process_id_);
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "LAUNCHER: Opening shared memory with name: %s (PID=%lu)", shared_memory_name.c_str(), process_id_);
-    
+
     // Retry opening shared memory for up to 2 seconds (hook DLL needs time to initialize)
     for (int attempt = 0; attempt < 40; attempt++) {
         shared_memory_handle_ = OpenFileMappingA(
-            FILE_MAP_ALL_ACCESS,
+            FILE_MAP_READ,
             FALSE,
             shared_memory_name.c_str()
         );
-        
+
         if (shared_memory_handle_ != nullptr) {
             shared_memory_data_ = MapViewOfFile(
                 shared_memory_handle_,
-                FILE_MAP_ALL_ACCESS,
+                FILE_MAP_READ,
                 0,
                 0,
-                sizeof(SharedInputData)
+                sizeof(FM2KSharedMemData)
             );
-            
+
             if (shared_memory_data_) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Shared memory opened successfully on attempt %d", attempt + 1);
+                // Validate magic number
+                FM2KSharedMemData* shared_data = static_cast<FM2KSharedMemData*>(shared_memory_data_);
+                if (shared_data->magic != FM2K_SHARED_MEM_MAGIC) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory magic mismatch: 0x%08X (expected 0x%08X)",
+                                shared_data->magic, FM2K_SHARED_MEM_MAGIC);
+                    UnmapViewOfFile(shared_memory_data_);
+                    shared_memory_data_ = nullptr;
+                    CloseHandle(shared_memory_handle_);
+                    shared_memory_handle_ = nullptr;
+                    return;
+                }
+
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Shared memory opened successfully on attempt %d (version=%u)",
+                           attempt + 1, shared_data->version);
                 last_processed_frame_ = 0;
-                
-                // Apply any deferred settings now that shared memory is available
-                ApplyDeferredSettings();
-                
                 return;
             } else {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to map shared memory view");
@@ -494,11 +480,11 @@ void FM2KGameInstance::InitializeSharedMemory() {
                 return;
             }
         }
-        
+
         // Wait 50ms before next attempt
         SDL_Delay(50);
     }
-    
+
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to open shared memory after 40 attempts (2 seconds)");
 }
 
@@ -520,313 +506,103 @@ void FM2KGameInstance::PollInputs() {
 
 // Debug state management functions
 bool FM2KGameInstance::TriggerManualSaveState() {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for debug command");
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->debug_save_state_requested = true;
-    shared_data->debug_command_id++;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Triggered manual save state (command ID: %u)", shared_data->debug_command_id);
-    return true;
+    // Removed - hook reads config from env vars
+    return false;
 }
 
 bool FM2KGameInstance::TriggerManualLoadState() {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for debug command");
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->debug_load_state_requested = true;
-    shared_data->debug_command_id++;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Triggered manual load state (command ID: %u)", shared_data->debug_command_id);
-    return true;
+    // Removed - hook reads config from env vars
+    return false;
 }
 
 bool FM2KGameInstance::TriggerForceRollback(uint32_t frames) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for debug command");
-        return false;
-    }
-    
-    if (frames == 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Invalid rollback frame count: %u", frames);
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->debug_rollback_frames = frames;
-    shared_data->debug_rollback_requested = true;
-    shared_data->debug_command_id++;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Triggered force rollback of %u frames (command ID: %u)", frames, shared_data->debug_command_id);
-    return true;
+    // Removed - hook reads config from env vars
+    (void)frames;
+    return false;
 }
 
 // Frame stepping functions
 void FM2KGameInstance::SetFrameStepPause(bool pause) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for frame stepping");
-        return;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    if (pause) {
-        shared_data->frame_step_pause_requested = true;
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Frame stepping: Pause requested");
-    } else {
-        shared_data->frame_step_resume_requested = true;
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Frame stepping: Resume requested");
-    }
+    // Removed - hook reads config from env vars
+    (void)pause;
 }
 
 void FM2KGameInstance::StepSingleFrame() {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for frame stepping");
-        return;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->frame_step_single_requested = true;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Frame stepping: Single step requested");
+    // Removed - hook reads config from env vars
 }
 
 void FM2KGameInstance::StepMultipleFrames(uint32_t frames) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for frame stepping");
-        return;
-    }
-    
-    if (frames == 0) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Invalid frame step count: %u", frames);
-        return;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->frame_step_multi_count = frames;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Frame stepping: Multi-step requested (%u frames)", frames);
+    // Removed - hook reads config from env vars
+    (void)frames;
 }
 
 // Slot-based save/load functions
 bool FM2KGameInstance::TriggerSaveToSlot(uint32_t slot) {
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: TriggerSaveToSlot called for slot %u", slot);
-    
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Shared memory not available for save to slot command");
-        return false;
-    }
-    
-    if (slot >= 8) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Invalid slot number: %u (must be 0-7)", slot);
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->debug_target_slot = slot;
-    shared_data->debug_save_to_slot_requested = true;
-    shared_data->debug_command_id++;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Triggered save to slot %u (command ID: %u)", slot, shared_data->debug_command_id);
-    return true;
+    // Removed - hook reads config from env vars
+    (void)slot;
+    return false;
 }
 
 bool FM2KGameInstance::TriggerLoadFromSlot(uint32_t slot) {
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: TriggerLoadFromSlot called for slot %u", slot);
-    
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Shared memory not available for load from slot command");
-        return false;
-    }
-    
-    if (slot >= 8) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Invalid slot number: %u (must be 0-7)", slot);
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->debug_target_slot = slot;
-    shared_data->debug_load_from_slot_requested = true;
-    shared_data->debug_command_id++;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GAME_INSTANCE: Triggered load from slot %u (command ID: %u)", slot, shared_data->debug_command_id);
-    return true;
+    // Removed - hook reads config from env vars
+    (void)slot;
+    return false;
 }
 
 // Auto-save configuration
 bool FM2KGameInstance::SetAutoSaveEnabled(bool enabled) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for auto-save config");
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->auto_save_enabled = enabled;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Auto-save %s", enabled ? "enabled" : "disabled");
-    return true;
+    // Removed - hook reads config from env vars
+    (void)enabled;
+    return false;
 }
 
 bool FM2KGameInstance::SetAutoSaveInterval(uint32_t frames) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for auto-save config");
-        return false;
-    }
-    
-    if (frames < 30 || frames > 6000) {  // Reasonable bounds: 0.3 to 60 seconds at 100 FPS
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Invalid auto-save interval: %u frames (must be 30-6000)", frames);
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->auto_save_interval_frames = frames;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Auto-save interval set to %u frames (%.1f seconds)", frames, frames / 100.0f);
-    return true;
+    // Removed - hook reads config from env vars
+    (void)frames;
+    return false;
 }
 
 bool FM2KGameInstance::GetAutoSaveConfig(AutoSaveConfig& config) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for auto-save config read");
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    config.enabled = shared_data->auto_save_enabled;
-    config.interval_frames = shared_data->auto_save_interval_frames;
-    
-    return true;
+    // Removed - hook reads config from env vars
+    (void)config;
+    return false;
 }
 
 // Get slot status information
 bool FM2KGameInstance::GetSlotStatus(uint32_t slot, SlotStatus& status) {
-    if (!shared_memory_data_ || slot >= 8) {
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    status.occupied = shared_data->slot_status[slot].occupied;
-    status.frame_number = shared_data->slot_status[slot].frame_number;
-    status.timestamp_ms = shared_data->slot_status[slot].timestamp_ms;
-    status.checksum = shared_data->slot_status[slot].checksum;
-    status.state_size_kb = shared_data->slot_status[slot].state_size_kb;
-    status.save_time_us = shared_data->slot_status[slot].save_time_us;
-    status.load_time_us = shared_data->slot_status[slot].load_time_us;
-    status.active_object_count = shared_data->slot_status[slot].active_object_count;
-    
-    // Debug logging removed - slot status now working correctly
-    
-    return true;
+    // Removed - hook reads config from env vars
+    (void)slot; (void)status;
+    return false;
 }
-
-// SetSaveStateProfile method removed - now using optimized FastGameState system
 
 // Set client role for LocalNetworkAdapter (HOST = 0, GUEST = 1)
 bool FM2KGameInstance::SetClientRole(uint8_t player_index, bool is_host) {
-    if (!shared_memory_data_) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not available for client role configuration");
-        return false;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->player_index = player_index;
-    shared_data->session_role = is_host ? 0 : 1;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Client role configured: Player %u, Role: %s", 
-                player_index, is_host ? "Host" : "Guest");
-    
-    return true;
+    // Removed - hook reads config from env vars
+    (void)player_index; (void)is_host;
+    return false;
 }
 
 // Debug and testing configuration
 bool FM2KGameInstance::SetProductionMode(bool enabled) {
-    if (!shared_memory_data_) {
-        SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not yet available, deferring production mode config: %s", enabled ? "enabled" : "disabled");
-        deferred_settings_.has_production_mode = true;
-        deferred_settings_.production_mode_value = enabled;
-        return false;  // Return false to indicate deferred
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->production_mode = enabled;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Production mode %s", enabled ? "enabled" : "disabled");
-    return true;
+    // Removed - hook reads config from env vars
+    (void)enabled;
+    return false;
 }
 
 bool FM2KGameInstance::SetInputRecording(bool enabled) {
-    if (!shared_memory_data_) {
-        SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not yet available, deferring input recording config: %s", enabled ? "enabled" : "disabled");
-        deferred_settings_.has_input_recording = true;
-        deferred_settings_.input_recording_value = enabled;
-        return false;  // Return false to indicate deferred
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->enable_input_recording = enabled;
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Input recording %s", enabled ? "enabled" : "disabled");
-    return true;
+    // Removed - hook reads config from env vars
+    (void)enabled;
+    return false;
 }
 
 bool FM2KGameInstance::SetMinimalGameStateTesting(bool enabled) {
-    if (!shared_memory_data_) {
-        SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Shared memory not yet available, deferring MinimalGameState testing config: %s", enabled ? "enabled" : "disabled");
-        deferred_settings_.has_minimal_gamestate_testing = true;
-        deferred_settings_.minimal_gamestate_testing_value = enabled;
-        return false;  // Return false to indicate deferred
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    shared_data->use_minimal_gamestate_testing = enabled;
-    shared_data->config_version++;  // Force hook to re-read configuration
-    
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "MinimalGameState testing %s (config_version: %u)", enabled ? "enabled" : "disabled", shared_data->config_version);
-    return true;
+    // Removed - hook reads config from env vars
+    (void)enabled;
+    return false;
 }
 
 void FM2KGameInstance::ApplyDeferredSettings() {
-    if (!shared_memory_data_) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Cannot apply deferred settings - shared memory not available");
-        return;
-    }
-    
-    SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_data_);
-    bool settings_applied = false;
-    
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Applying deferred settings to shared memory");
-    
-    if (deferred_settings_.has_minimal_gamestate_testing) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Applying deferred MinimalGameState testing: %s", 
-                   deferred_settings_.minimal_gamestate_testing_value ? "enabled" : "disabled");
-        shared_data->use_minimal_gamestate_testing = deferred_settings_.minimal_gamestate_testing_value;
-        deferred_settings_.has_minimal_gamestate_testing = false;
-        settings_applied = true;
-    }
-    
-    if (deferred_settings_.has_production_mode) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Applying deferred production mode: %s", 
-                   deferred_settings_.production_mode_value ? "enabled" : "disabled");
-        shared_data->production_mode = deferred_settings_.production_mode_value;
-        deferred_settings_.has_production_mode = false;
-        settings_applied = true;
-    }
-    
-    if (deferred_settings_.has_input_recording) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Applying deferred input recording: %s", 
-                   deferred_settings_.input_recording_value ? "enabled" : "disabled");
-        shared_data->enable_input_recording = deferred_settings_.input_recording_value;
-        deferred_settings_.has_input_recording = false;
-        settings_applied = true;
-    }
-    
-    if (settings_applied) {
-        shared_data->config_version++;  // Increment version to force hook to re-read
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Deferred settings applied successfully (config_version: %u)", shared_data->config_version);
-    }
+    // Removed - hook reads config from env vars
 }
 
 // Environment variable configuration for OnlineSession-style networking

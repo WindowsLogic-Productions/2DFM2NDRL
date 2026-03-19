@@ -4,6 +4,7 @@
 #include "netplay.h"
 #include "netplay_state.h"
 #include "control_channel.h"
+#include "shared_mem.h"
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -206,6 +207,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
 
+            // Initialize shared memory for launcher status reporting
+            if (!InitializeSharedMemory()) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: Init failed (non-fatal)");
+            }
+
             // Parse network config from environment
             char* env_offline = getenv("FM2K_TRUE_OFFLINE");
             g_offline_mode = (env_offline && strcmp(env_offline, "1") == 0);
@@ -257,6 +263,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         // Shutdown in reverse order
         ShutdownHooks();
+
+        // Cleanup shared memory
+        CleanupSharedMemory();
 
         // Shutdown netplay (GekkoNet session if active)
         Netplay_Shutdown();

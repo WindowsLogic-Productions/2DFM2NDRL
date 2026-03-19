@@ -68,7 +68,7 @@ namespace FM2K {
 
     // Character slots - OPTIMIZED: only save dynamic portion for rollback
     // Static data (sprites, animations, hitboxes) loaded from .player files doesn't change
-    // See shared_mem.h for CHAR_SLOT_* constants
+    // See savestate.h for CHAR_SLOT_* constants
     constexpr uintptr_t ADDR_CHAR_SLOTS = 0x4D1D80;  // g_character_data_base
     constexpr size_t CHAR_SLOT_TOTAL_SIZE = 57407;   // Per-slot size from IDA
 

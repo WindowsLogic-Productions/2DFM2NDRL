@@ -771,86 +771,9 @@ bool FM2KLauncher::Initialize() {
         return false;
     };
     
-    // Connect enhanced actions callback for action analysis (FM2K "objects" are actually "actions")
+    // Enhanced actions removed from shared memory - no longer available
     ui_->on_get_enhanced_actions = [this]() -> std::vector<LauncherUI::EnhancedActionInfo> {
         std::vector<LauncherUI::EnhancedActionInfo> enhanced_actions;
-        
-        if (!game_instance_) {
-            return enhanced_actions; // Return empty vector if no game instance
-        }
-        
-        // Get shared memory data from the active game instance
-        void* shared_memory_ptr = game_instance_->GetSharedMemoryData();
-        if (!shared_memory_ptr) {
-            return enhanced_actions; // Return empty vector if no shared memory
-        }
-        
-        SharedInputData* shared_data = static_cast<SharedInputData*>(shared_memory_ptr);
-        
-        // Debug: Log what the launcher is reading from shared memory (throttled)
-        static uint32_t debug_counter = 0;
-        if (debug_counter++ % 100 == 0) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "LAUNCHER: Reading shared memory - updated=%s, count=%u", 
-                       shared_data->enhanced_actions_updated ? "true" : "false", 
-                       shared_data->enhanced_actions_count);
-        }
-        
-        // Check if we have action data (don't rely on updated flag due to race conditions)
-        if (shared_data->enhanced_actions_count == 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "LAUNCHER: No enhanced actions available - count=%u", 
-                       shared_data->enhanced_actions_count);
-            return enhanced_actions; // Return empty vector if no actions
-        }
-        
-        // Convert SharedInputData::EnhancedActionData to LauncherUI::EnhancedActionInfo
-        enhanced_actions.reserve(shared_data->enhanced_actions_count);
-        
-        // Throttled logging for conversion
-        if (debug_counter % 100 == 1) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "LAUNCHER: Converting %u actions from shared memory", shared_data->enhanced_actions_count);
-        }
-        
-        for (uint32_t i = 0; i < shared_data->enhanced_actions_count; i++) {
-            const auto& shared_action = shared_data->enhanced_actions[i];
-            LauncherUI::EnhancedActionInfo ui_action;
-            
-            // Copy core action data
-            ui_action.slot_index = shared_action.slot_index;
-            ui_action.type = shared_action.type;
-            ui_action.id = shared_action.id;
-            ui_action.position_x = shared_action.position_x;
-            ui_action.position_y = shared_action.position_y;
-            ui_action.velocity_x = shared_action.velocity_x;
-            ui_action.velocity_y = shared_action.velocity_y;
-            ui_action.animation_state = shared_action.animation_state;
-            ui_action.health_damage = shared_action.health_damage;
-            ui_action.state_flags = shared_action.state_flags;
-            ui_action.timer_counter = shared_action.timer_counter;
-            
-            // Copy 2DFM integration data
-            ui_action.type_name = std::string(shared_action.type_name);
-            ui_action.action_name = std::string(shared_action.action_name);
-            ui_action.script_id = shared_action.script_id;
-            ui_action.animation_frame = shared_action.animation_frame;
-            
-            // Copy character-specific data
-            ui_action.character_name = std::string(shared_action.character_name);
-            ui_action.current_move = std::string(shared_action.current_move);
-            ui_action.facing_direction = shared_action.facing_direction;
-            ui_action.combo_count = shared_action.combo_count;
-            
-            // Copy raw action data
-            memcpy(ui_action.raw_data, shared_action.raw_data, 382);
-            
-            enhanced_actions.push_back(std::move(ui_action));
-        }
-        
-        // Don't reset updated flag - let hook manage it
-        
-        // Throttled success logging
-        if (debug_counter % 100 == 2) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "LAUNCHER: Successfully converted %zu enhanced actions", enhanced_actions.size());
-        }
         return enhanced_actions;
     };
     
@@ -1403,22 +1326,46 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
         return;
     }
 
-    if (!LaunchGame(selected_game_)) {
+    // Terminate existing game if running
+    if (game_instance_ && game_instance_->IsRunning()) {
+        game_instance_->Terminate();
+    }
+
+    // Create new instance and set env vars BEFORE launch
+    game_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(game_instance_.get());
+
+    uint8_t player_index = is_host ? 0 : 1;
+    // Host listens on 7000, connects to remote:7001
+    // Client listens on 7001, connects to remote:7000
+    uint16_t local_port = is_host ? 7000 : 7001;
+
+    // remote_address already contains "ip:port" (e.g. "127.0.0.1:7001")
+    // For host: remote is ip:7001, for client: remote is ip:7000
+    // Extract just the IP from config.remote_address (strip existing port)
+    std::string remote_ip = config.remote_address;
+    auto colon_pos = remote_ip.find(':');
+    if (colon_pos != std::string::npos) {
+        remote_ip = remote_ip.substr(0, colon_pos);
+    }
+    uint16_t remote_port = is_host ? 7001 : 7000;
+    std::string remote_addr = remote_ip + ":" + std::to_string(remote_port);
+
+    game_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX", std::to_string(player_index));
+    game_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT", std::to_string(local_port));
+    game_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR", remote_addr);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Online session: P%d port=%d remote=%s",
+        player_index + 1, local_port, remote_addr.c_str());
+
+    if (!game_instance_->Launch(selected_game_.exe_path)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game for online session.");
+        game_instance_.reset();
         return;
     }
-    
+
     network_config_ = config;
-    // For hosting, we might want to clear the remote address
-    if (is_host) {
-        // Potentially configure to listen on 0.0.0.0
-    }
-
-    // Configure DLL for online mode
-    if (game_instance_) {
-        game_instance_->SetNetworkConfig(true, is_host, config.remote_address, config.local_port, config.input_delay);
-    }
-
     SetState(LauncherState::Connecting);
     std::cout << "? ONLINE session started (" << (is_host ? "Hosting" : "Joining") << ")\n";
 }
@@ -1556,65 +1503,38 @@ bool FM2KLauncher::TerminateAllClients() {
 
 bool FM2KLauncher::ReadRollbackStatsFromSharedMemory(RollbackStats& stats) {
     // Try to read from both client processes (prioritize the first active one)
-    bool stats_read = false;
-    
-    // Check Client 1 first
-    if (client1_process_id_ != 0) {
-        std::string shared_memory_name = "FM2K_InputSharedMemory_" + std::to_string(client1_process_id_);
+    auto try_read_stats = [&stats](DWORD process_id) -> bool {
+        if (process_id == 0) return false;
+
+        std::string shared_memory_name = "FM2K_SharedMem_" + std::to_string(process_id);
         HANDLE shared_memory_handle = OpenFileMappingA(FILE_MAP_READ, FALSE, shared_memory_name.c_str());
-        
-        if (shared_memory_handle != nullptr) {
-            SharedInputData* shared_data = static_cast<SharedInputData*>(
-                MapViewOfFile(shared_memory_handle, FILE_MAP_READ, 0, 0, sizeof(SharedInputData))
-            );
-            
-            if (shared_data != nullptr) {
-                // Read rollback statistics from shared memory
-                stats.rollbacks_per_second = shared_data->perf_stats.rollbacks_this_second;
-                stats.max_rollback_frames = shared_data->perf_stats.max_rollback_frames;
-                stats.avg_rollback_frames = shared_data->perf_stats.avg_rollback_frames;
-                stats.frame_advantage = 0.0f; // TODO: Calculate from timing data
-                stats.input_delay_frames = 2; // TODO: Read from GekkoNet config
-                stats.confirmed_frames = shared_data->frame_number; // Current frame as confirmed
-                stats.speculative_frames = shared_data->perf_stats.rollback_count; // Estimate
-                
-                stats_read = true;
-                
-                UnmapViewOfFile(shared_data);
-            }
-            CloseHandle(shared_memory_handle);
+        if (!shared_memory_handle) return false;
+
+        FM2KSharedMemData* shared_data = static_cast<FM2KSharedMemData*>(
+            MapViewOfFile(shared_memory_handle, FILE_MAP_READ, 0, 0, sizeof(FM2KSharedMemData))
+        );
+
+        bool ok = false;
+        if (shared_data && shared_data->magic == FM2K_SHARED_MEM_MAGIC) {
+            stats.rollbacks_per_second = 0;                        // not available in new struct
+            stats.max_rollback_frames = 0;                         // not available
+            stats.avg_rollback_frames = 0;                         // not available
+            stats.frame_advantage = shared_data->frames_ahead;
+            stats.input_delay_frames = 2;                          // placeholder
+            stats.confirmed_frames = shared_data->frame_number;
+            stats.speculative_frames = shared_data->rollback_count;
+            ok = true;
         }
-    }
-    
-    // If Client 1 stats weren't available, try Client 2
-    if (!stats_read && client2_process_id_ != 0) {
-        std::string shared_memory_name = "FM2K_InputSharedMemory_" + std::to_string(client2_process_id_);
-        HANDLE shared_memory_handle = OpenFileMappingA(FILE_MAP_READ, FALSE, shared_memory_name.c_str());
-        
-        if (shared_memory_handle != nullptr) {
-            SharedInputData* shared_data = static_cast<SharedInputData*>(
-                MapViewOfFile(shared_memory_handle, FILE_MAP_READ, 0, 0, sizeof(SharedInputData))
-            );
-            
-            if (shared_data != nullptr) {
-                // Read rollback statistics from shared memory
-                stats.rollbacks_per_second = shared_data->perf_stats.rollbacks_this_second;
-                stats.max_rollback_frames = shared_data->perf_stats.max_rollback_frames;
-                stats.avg_rollback_frames = shared_data->perf_stats.avg_rollback_frames;
-                stats.frame_advantage = 0.0f; // TODO: Calculate from timing data
-                stats.input_delay_frames = 2; // TODO: Read from GekkoNet config
-                stats.confirmed_frames = shared_data->frame_number; // Current frame as confirmed
-                stats.speculative_frames = shared_data->perf_stats.rollback_count; // Estimate
-                
-                stats_read = true;
-                
-                UnmapViewOfFile(shared_data);
-            }
-            CloseHandle(shared_memory_handle);
-        }
-    }
-    
-    return stats_read;
+
+        if (shared_data) UnmapViewOfFile(shared_data);
+        CloseHandle(shared_memory_handle);
+        return ok;
+    };
+
+    // Check Client 1 first, then Client 2
+    if (try_read_stats(client1_process_id_)) return true;
+    if (try_read_stats(client2_process_id_)) return true;
+    return false;
 }
 
 // Apply pending configuration to a game instance

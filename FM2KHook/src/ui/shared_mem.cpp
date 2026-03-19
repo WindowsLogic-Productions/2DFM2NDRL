@@ -1,51 +1,49 @@
-// Minimal shared memory implementation for launcher communication
+// Minimal shared memory: hook -> launcher status reporting
 #include "shared_mem.h"
+#include "globals.h"
+#include "netplay.h"
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
 
 static HANDLE g_shared_mem_handle = nullptr;
-static SharedInputData* g_shared_mem = nullptr;
+static FM2KSharedMemData* g_shared_mem = nullptr;
 
 bool InitializeSharedMemory() {
-    // Create shared memory with PID-based name (launcher expects this format)
     char name[64];
-    snprintf(name, sizeof(name), "FM2K_InputSharedMemory_%d", GetCurrentProcessId());
+    snprintf(name, sizeof(name), "FM2K_SharedMem_%d", GetCurrentProcessId());
 
-    size_t size = sizeof(SharedInputData);
+    size_t size = sizeof(FM2KSharedMemData);
 
     g_shared_mem_handle = CreateFileMappingA(
-        INVALID_HANDLE_VALUE,
-        nullptr,
-        PAGE_READWRITE,
-        0,
-        (DWORD)size,
-        name
-    );
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, (DWORD)size, name);
 
     if (!g_shared_mem_handle) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: CreateFileMapping failed: %lu", GetLastError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SharedMem: CreateFileMapping failed: %lu", GetLastError());
         return false;
     }
 
-    g_shared_mem = (SharedInputData*)MapViewOfFile(
-        g_shared_mem_handle,
-        FILE_MAP_ALL_ACCESS,
-        0, 0, size
-    );
+    g_shared_mem = (FM2KSharedMemData*)MapViewOfFile(
+        g_shared_mem_handle, FILE_MAP_ALL_ACCESS, 0, 0, size);
 
     if (!g_shared_mem) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: MapViewOfFile failed: %lu", GetLastError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SharedMem: MapViewOfFile failed: %lu", GetLastError());
         CloseHandle(g_shared_mem_handle);
         g_shared_mem_handle = nullptr;
         return false;
     }
 
-    // Initialize to zero
     memset(g_shared_mem, 0, size);
+    g_shared_mem->magic = FM2K_SHARED_MEM_MAGIC;
+    g_shared_mem->version = FM2K_SHARED_MEM_VERSION;
+    g_shared_mem->player_index = (uint8_t)g_player_index;
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: Created '%s' (%zu KB)", name, size / 1024);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SharedMem: Created '%s' (%zu bytes)", name, size);
     return true;
 }
 
@@ -58,20 +56,24 @@ void CleanupSharedMemory() {
         CloseHandle(g_shared_mem_handle);
         g_shared_mem_handle = nullptr;
     }
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: Cleaned up");
 }
 
-SharedInputData* GetSharedMemory() {
+FM2KSharedMemData* GetSharedMemory() {
     return g_shared_mem;
 }
 
-// Stubs for functions declared in header but not needed for minimal implementation
-void ProcessDebugCommands() {}
-bool CheckConfigurationUpdates() { return false; }
-void UpdateRollbackStats(uint32_t) {}
-void UpdateEnhancedActionData() {}
+void SharedMem_Update() {
+    if (!g_shared_mem) return;
 
-// Forward declare DetailedObject if needed
-namespace FM2K { namespace ObjectPool { struct DetailedObject; } }
-void PopulateEnhancedActionInfo(const FM2K::ObjectPool::DetailedObject&, SharedInputData::EnhancedActionData&) {}
-void AnalyzeScriptCommand(const FM2K::ObjectPool::DetailedObject&, SharedInputData::EnhancedActionData&) {}
+    g_shared_mem->player_index = (uint8_t)g_player_index;
+    g_shared_mem->game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    g_shared_mem->frame_number = Netplay_GetFrame();
+    g_shared_mem->rollback_count = Netplay_GetRollbackCount();
+    g_shared_mem->desync_count = Netplay_GetDesyncCount();
+    g_shared_mem->frames_ahead = Netplay_GetFramesAhead();
+    g_shared_mem->rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+
+    g_shared_mem->netplay_state = Netplay_IsActive() ? 2 :
+                                  Netplay_IsConnected() ? 1 : 0;
+    g_shared_mem->session_ready = Netplay_IsSessionReady() ? 1 : 0;
+}

@@ -5,6 +5,7 @@
 #include "netplay.h"
 #include "control_channel.h"
 #include "imgui_overlay.h"
+#include "shared_mem.h"
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -376,6 +377,9 @@ void __cdecl Hook_RenderGame() {
     if (protect_rng) {
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
     }
+
+    // Update shared memory with current stats for launcher
+    SharedMem_Update();
 
     // GekkoNet frame pacing (matches GekkoNet examples' handle_frame_time).
     // Called after render, same position as SDL_DelayNS in the examples.

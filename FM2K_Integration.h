@@ -741,15 +741,15 @@ private:
     void RenderMenuBar();
     void RenderSessionControls();
     void RenderDebugTools();
-    void RenderSaveStateTools();        // Save state management tab
-    void RenderMultiClientTools();      // Multi-client testing tab
-    void RenderNetworkTools();          // Network simulation tab
-    void RenderObjectAnalysis();        // Object inspection and analysis tab
-    void RenderSlotInspectionWindow();  // Save slot inspection popup window
-    
+    void RenderMultiClientTools();
+    void RenderNetworkTools();
+    void RenderConsoleLog();
+    void RenderObjectAnalysis();        // Stub
+    void RenderSlotInspectionWindow();  // Stub
+
     // Helper methods
     void ShowGameValidationStatus(const FM2K::FM2KGameInfo& game);
-    void ShowNetworkDiagnostics();
+    void ShowNetworkDiagnostics();      // Stub
     bool ValidateNetworkConfig();
     
     // Simplified theme - always Dark
