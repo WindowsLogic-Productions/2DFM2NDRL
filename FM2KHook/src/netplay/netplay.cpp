@@ -541,22 +541,62 @@ void Netplay_EndBattle() {
 // BATTLE FRAME PROCESSING
 // =============================================================================
 
+// Frame pacing state (matches GekkoNet examples' handle_frame_time)
+static LARGE_INTEGER g_perf_freq = {};
+static LARGE_INTEGER g_frame_start = {};
+static bool g_frame_timer_initialized = false;
+
+// Called at the END of each frame to delay until target frame time
+// FM2K runs at 100 FPS = 10ms per frame = 10,000,000 ns
+static void HandleFrameTime(float frames_ahead) {
+    if (!g_frame_timer_initialized) {
+        QueryPerformanceFrequency(&g_perf_freq);
+        QueryPerformanceCounter(&g_frame_start);
+        g_frame_timer_initialized = true;
+        return;
+    }
+
+    constexpr uint64_t BASE_FRAME_NS = 10000000;  // 10ms = 100fps
+
+    LARGE_INTEGER frame_end;
+    QueryPerformanceCounter(&frame_end);
+    uint64_t elapsed_ns = ((frame_end.QuadPart - g_frame_start.QuadPart) * 1000000000ULL) / g_perf_freq.QuadPart;
+
+    // Scale throttle proportionally to advantage:
+    // 0.5-1.0 ahead: +1.6% (standard GekkoNet)
+    // 1.0-2.0 ahead: +5%
+    // 2.0+ ahead:    +10%
+    // This converges the gap in ~1-2 seconds instead of 15+
+    uint64_t target_ns = BASE_FRAME_NS;
+    if (frames_ahead > 2.0f) {
+        target_ns = (uint64_t)(BASE_FRAME_NS * 1.10);
+    } else if (frames_ahead > 1.0f) {
+        target_ns = (uint64_t)(BASE_FRAME_NS * 1.05);
+    } else if (frames_ahead > 0.5f) {
+        target_ns = (uint64_t)(BASE_FRAME_NS * 1.016);
+    }
+
+    if (target_ns > elapsed_ns) {
+        uint64_t sleep_ns = target_ns - elapsed_ns;
+        // Use Sleep for the ms portion, busy-wait for sub-ms precision
+        if (sleep_ns > 2000000) {  // > 2ms
+            Sleep((DWORD)((sleep_ns - 1000000) / 1000000));  // Sleep ms portion
+        }
+        // Busy-wait for remainder
+        do {
+            QueryPerformanceCounter(&frame_end);
+            elapsed_ns = ((frame_end.QuadPart - g_frame_start.QuadPart) * 1000000000ULL) / g_perf_freq.QuadPart;
+        } while (elapsed_ns < target_ns);
+    }
+
+    // Reset frame start for next frame
+    QueryPerformanceCounter(&g_frame_start);
+}
+
 bool Netplay_ProcessBattleInputPhase() {
     if (!g_session) return true;
 
     gekko_network_poll(g_session);
-
-    // Frame advantage time sync (matches GekkoNet examples exactly)
-    // When ahead by >0.5 frames, sleep 1.6% longer to gently slow down
-    float frames_ahead = gekko_frames_ahead(g_session);
-    if (frames_ahead > 0.5f) {
-        // FM2K runs at 100 FPS = 10ms per frame. Add 1.6% = 0.16ms
-        Sleep(0);  // Yield timeslice - gentlest possible throttle
-        // For larger advantage, sleep proportionally
-        if (frames_ahead > 2.0f) {
-            Sleep(1);  // 1ms extra delay when significantly ahead
-        }
-    }
 
     uint16_t local_input = Input_CaptureLocal();
     gekko_add_local_input(g_session, g_player_index, &local_input);
@@ -587,8 +627,9 @@ bool Netplay_ProcessBattleInputPhase() {
 
             case GekkoDesyncDetected: {
                 g_desync_count++;
-                // Log first 5 with full region detail, then throttle
                 uint32_t now_tick = GetTickCount();
+
+                // Always log the first desync with full detail
                 if (g_desync_count <= 5) {
                     auto& rc = SaveState_GetRegionChecksums();
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -611,6 +652,15 @@ bool Netplay_ProcessBattleInputPhase() {
                         event->data.desynced.local_checksum,
                         event->data.desynced.remote_checksum);
                     g_last_desync_log_tick = now_tick;
+                }
+
+                // BBBR-style: Dump per-region CRC + hex to file on first desync
+                if (g_desync_count == 1) {
+                    SaveState_DumpDesyncDiagnostic(
+                        event->data.desynced.frame,
+                        event->data.desynced.local_checksum,
+                        event->data.desynced.remote_checksum,
+                        g_player_index);
                 }
                 break;
             }
@@ -657,6 +707,12 @@ bool Netplay_ProcessBattleInputPhase() {
                     g_p2_input = inputs[1] & 0x7FF;
                 }
 
+                // Track rollback state (matching BBBR reference implementation).
+                // During rollback replay, input edge detection globals must NOT
+                // be overwritten - they get restored by LoadEvent and should only
+                // be updated on the authoritative (non-rollback) frame.
+                g_is_rolling_back = update->data.adv.rolling_back;
+
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
                 if (original_process_game_inputs) {
@@ -666,6 +722,7 @@ bool Netplay_ProcessBattleInputPhase() {
                     original_update_game();
                 }
 
+                g_is_rolling_back = false;
                 g_netplay_frame++;
                 has_advance = true;
 
@@ -791,4 +848,9 @@ float Netplay_GetFramesAhead() {
         return gekko_frames_ahead(g_session);
     }
     return 0.0f;
+}
+
+void Netplay_HandleFrameTime() {
+    float ahead = g_session ? gekko_frames_ahead(g_session) : 0.0f;
+    HandleFrameTime(ahead);
 }

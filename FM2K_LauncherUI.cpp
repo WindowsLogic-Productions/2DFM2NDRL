@@ -1,4 +1,7 @@
 #include "FM2K_Integration.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <wininet.h>
 #include <iostream>
 #include <algorithm>
 #include <fstream>
@@ -280,43 +283,93 @@ void LauncherUI::RenderGameSelection() {
 void LauncherUI::RenderNetworkConfig() {
     if (ImGui::CollapsingHeader("Network Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent();
-        
+
         // Session Type (Host/Join)
         static int session_type = 0; // 0: Host, 1: Join
         ImGui::RadioButton("Host", &session_type, 0); ImGui::SameLine();
         ImGui::RadioButton("Join", &session_type, 1);
-        
+
         network_config_.is_host = (session_type == 0);
 
-        // Port Configuration
-        ImGui::SetNextItemWidth(100);
-        ImGui::InputInt("Port", &network_config_.local_port, 0, 0, ImGuiInputTextFlags_CharsDecimal);
-
         if (network_config_.is_host) {
-            // Host-specific UI
-            char local_ip[64] = "127.0.0.1"; // In a real app, get this dynamically
-            ImGui::InputText("Your IP", local_ip, sizeof(local_ip), ImGuiInputTextFlags_ReadOnly);
+            // HOST: Show ip:port and copy to clipboard on click
+            // Get actual local IP from first non-loopback adapter
+            // Get external IP via HTTP (same approach as CCCaster).
+            // Queries checkip.amazonaws.com which returns just the IP as text.
+            static char local_ip[64] = "Resolving...";
+            static bool ip_resolved = false;
+            if (!ip_resolved) {
+                ip_resolved = true;
+                HINTERNET hInternet = InternetOpenA("FM2K", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+                if (hInternet) {
+                    // Try multiple services like CCCaster does
+                    const char* services[] = {
+                        "http://checkip.amazonaws.com",
+                        "http://ipv4.icanhazip.com",
+                        "http://ifcfg.net",
+                    };
+                    for (const char* url : services) {
+                        HINTERNET hUrl = InternetOpenUrlA(hInternet, url, NULL, 0,
+                            INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
+                        if (hUrl) {
+                            char buf[256] = {};
+                            DWORD bytesRead = 0;
+                            if (InternetReadFile(hUrl, buf, sizeof(buf) - 1, &bytesRead) && bytesRead >= 7) {
+                                buf[bytesRead] = '\0';
+                                // Trim whitespace/newlines
+                                char* p = buf;
+                                while (*p == ' ' || *p == '\r' || *p == '\n') p++;
+                                char* end = p + strlen(p) - 1;
+                                while (end > p && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
+                                strncpy(local_ip, p, sizeof(local_ip) - 1);
+                                InternetCloseHandle(hUrl);
+                                break;
+                            }
+                            InternetCloseHandle(hUrl);
+                        }
+                    }
+                    InternetCloseHandle(hInternet);
+                }
+                if (strcmp(local_ip, "Resolving...") == 0) {
+                    strncpy(local_ip, "Could not resolve", sizeof(local_ip));
+                }
+            }
+            char address_with_port[128];
+            snprintf(address_with_port, sizeof(address_with_port), "%s:%d", local_ip, network_config_.local_port);
+
+            ImGui::Text("Your address:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", address_with_port);
             ImGui::SameLine();
             if (ImGui::Button("Copy")) {
-                char address_with_port[128];
-                snprintf(address_with_port, sizeof(address_with_port), "%s:%d", local_ip, network_config_.local_port);
                 SDL_SetClipboardText(address_with_port);
             }
+
+            // Port (editable for host)
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputInt("Port", &network_config_.local_port, 0, 0, ImGuiInputTextFlags_CharsDecimal);
         } else {
-            // Client-specific UI
-            char remote_addr_buf[128];
-            strncpy(remote_addr_buf, network_config_.remote_address.c_str(), sizeof(remote_addr_buf) - 1);
-            remote_addr_buf[sizeof(remote_addr_buf) - 1] = '\0';
-            
-            if (ImGui::InputText("Host Address", remote_addr_buf, sizeof(remote_addr_buf))) {
-                network_config_.remote_address = remote_addr_buf;
+            // JOIN: Single paste field for ip:port
+            static char paste_buf[128] = "";
+            ImGui::SetNextItemWidth(200);
+            if (ImGui::InputTextWithHint("##join_addr", "Paste host ip:port here", paste_buf, sizeof(paste_buf))) {
+                network_config_.remote_address = paste_buf;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Paste")) {
+                const char* clipboard = SDL_GetClipboardText();
+                if (clipboard && clipboard[0]) {
+                    strncpy(paste_buf, clipboard, sizeof(paste_buf) - 1);
+                    paste_buf[sizeof(paste_buf) - 1] = '\0';
+                    network_config_.remote_address = paste_buf;
+                }
             }
         }
 
         // Input Delay
         ImGui::SetNextItemWidth(100);
         ImGui::SliderInt("Input Delay (frames)", &network_config_.input_delay, 0, 10);
-        
+
         ImGui::Unindent();
     }
 }
