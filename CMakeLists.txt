@@ -302,6 +302,7 @@ target_link_libraries(FM2K_RollbackLauncher PRIVATE
     version
     imm32
     oleaut32
+    wininet
 )
 
 # Preprocessor definitions

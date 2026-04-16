@@ -381,17 +381,11 @@ void __cdecl Hook_RenderGame() {
     // Update shared memory with current stats for launcher
     SharedMem_Update();
 
-    // GekkoNet frame pacing (matches GekkoNet examples' handle_frame_time).
-    // Called after render, same position as SDL_DelayNS in the examples.
-    // When ahead of remote, slow down to prevent rollback cascade.
-    // Without this, P1 runs full speed while P2 drowns in rollbacks.
+    // GekkoNet frame pacing - called after render, matching GekkoNet examples.
+    // Uses precise QPC timing to hit 10ms target (100fps).
+    // When ahead of remote, slows down by 1.6% to prevent rollback cascade.
     if (Netplay_IsActive()) {
-        float frames_ahead = Netplay_GetFramesAhead();
-        if (frames_ahead > 0.5f) {
-            // Ahead of remote: delay ~1.6% extra (10ms * 1.016 = ~10.16ms)
-            // With timeBeginPeriod(1), Sleep(1) is ~1ms accurate
-            Sleep(1);
-        }
+        Netplay_HandleFrameTime();
     }
 }
 

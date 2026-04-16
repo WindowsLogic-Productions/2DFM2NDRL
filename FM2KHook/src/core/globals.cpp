@@ -11,6 +11,7 @@ ProcessGameInputsFunc original_process_game_inputs = nullptr;
 // Minimal global state
 int g_player_index = 0;
 uint32_t g_frame_counter = 0;
+bool g_is_rolling_back = false;
 
 // Network config (parsed at startup, used when entering battle)
 bool g_offline_mode = false;

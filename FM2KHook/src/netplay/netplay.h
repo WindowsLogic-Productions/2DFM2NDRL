@@ -141,3 +141,6 @@ uint32_t Netplay_GetRollbackCount();
 // Get how many frames ahead of remote we are (for frame pacing)
 // Positive = we're ahead (should slow down), negative = behind
 float Netplay_GetFramesAhead();
+
+// Precise frame pacing - call after render (matches GekkoNet examples' handle_frame_time)
+void Netplay_HandleFrameTime();

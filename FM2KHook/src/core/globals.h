@@ -87,6 +87,10 @@ extern int g_player_index;  // 0 = P1/Host, 1 = P2/Client
 // Frame counter (for logging)
 extern uint32_t g_frame_counter;
 
+// Rollback state flag - true during GekkoNet rollback replay frames
+// Used by input hooks to avoid corrupting edge detection state during replay
+extern bool g_is_rolling_back;
+
 // Network config (parsed at startup, used when entering battle)
 extern bool g_offline_mode;
 extern uint16_t g_local_port;

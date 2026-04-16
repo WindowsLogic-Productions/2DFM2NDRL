@@ -21,6 +21,7 @@ struct SaveStateData {
     uint32_t checksum;
     uint32_t rng_seed;
     uint32_t input_buffer_index;
+    uint32_t render_frame_counter;                         // 0x4456FC - diverges during rollback replay
 
     uint8_t input_tracking_state[0xA0];                    // 160 bytes
     uint8_t char_dynamic[NUM_CHAR_SLOTS][CHAR_SLOT_DYNAMIC_SIZE]; // ~19KB
@@ -69,3 +70,6 @@ struct StateSnapshot {
 StateSnapshot SaveState_CaptureSnapshot();
 bool SaveState_CompareSnapshots(const StateSnapshot& a, const StateSnapshot& b, char* diff_buf, size_t buf_size);
 bool SaveState_TestRoundtrip();
+
+// BBBR-style desync diagnostic - dumps per-region CRC + hex to log file
+void SaveState_DumpDesyncDiagnostic(int frame, uint32_t local_crc, uint32_t remote_crc, int player_index);
