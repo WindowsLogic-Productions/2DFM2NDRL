@@ -28,6 +28,9 @@ struct SaveStateData {
     uint8_t object_pool[0x5F800];                          // ~391KB
     uint8_t input_history[0x2008];                         // ~8KB
     uint8_t game_state[0x220];                             // 544 bytes
+    uint8_t effect_sys1[42];                               // Effect system P1
+    uint8_t effect_sys2[44];                               // Effect system P2
+    uint8_t shake_effects[40];                             // Shake structures
 };
 
 // ============================================================================

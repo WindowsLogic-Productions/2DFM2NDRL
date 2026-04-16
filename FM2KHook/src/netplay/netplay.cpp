@@ -104,6 +104,7 @@ static uint32_t g_rollback_count = 0;
 static uint32_t g_last_rollback_frame = 0;
 static uint32_t g_desync_count = 0;
 static uint32_t g_last_desync_log_tick = 0;
+static int g_local_delay = 1;  // Computed from RTT at battle start
 
 // Battle entry sync barrier - ensures both clients enter battle at same time
 static bool g_local_battle_entered = false;   // We've detected battle mode
@@ -299,6 +300,20 @@ bool Netplay_IsSessionReady() {
 // - Both clients advance at same rate, delay ensures sync
 // =============================================================================
 
+// Send last N CSS inputs as a batch for redundancy against packet loss.
+// CCCaster-style: every packet carries recent history so dropped packets
+// are recovered automatically from subsequent packets.
+static void SendCSSInputBatch() {
+    // Send last (DELAY + 2) frames of inputs to cover any gaps
+    constexpr int BATCH_SIZE = CSS_INPUT_DELAY + 2;
+    uint32_t end = g_local_inputs.GetEndFrame();
+    uint32_t start = (end > BATCH_SIZE) ? end - BATCH_SIZE : 0;
+
+    for (uint32_t f = start; f < end; f++) {
+        ControlChannel_SendCSSInput(g_local_inputs.Get(f), f);
+    }
+}
+
 void Netplay_PollCSS() {
     ControlChannel_Poll();
 }
@@ -361,13 +376,20 @@ bool Netplay_ProcessCSS() {
             "CSS SYNCED: Both ready, delay=%d, RNG reseeded", CSS_INPUT_DELAY);
     }
 
-    // Capture input, store at frame + DELAY, send to remote
+    // ALWAYS capture local input and send to remote -- even during stalls.
+    // This prevents deadlock where both sides wait for each other.
     uint16_t local_raw = Input_CaptureLocal();
     uint32_t store_frame = g_css_frame + CSS_INPUT_DELAY;
     g_local_inputs.Set(store_frame, local_raw);
-    ControlChannel_SendCSSInput(local_raw, store_frame);
+    SendCSSInputBatch();  // Send batch for redundancy against packet loss
 
-    // Set read frame for GetCSSInput, then advance
+    // CCCaster-style stall: if remote input isn't ready, DON'T advance the game.
+    // Our inputs are already sent above, so remote will eventually receive them.
+    if (!g_remote_inputs.HasFrame(g_css_frame)) {
+        return false;  // Stall - don't advance game
+    }
+
+    // Both sides have input -- advance
     g_css_current_read_frame = g_css_frame;
     g_css_frame++;
 
@@ -469,10 +491,32 @@ bool Netplay_StartBattle() {
     g_local_css_ready = false;
     g_remote_css_ready = false;
 
+    // Calculate delay from RTT (CCCaster formula adapted for 100fps)
+    // CCCaster: delay = ceil(worst_latency_ms / frame_time_ms) + 1
+    // FM2K: 100fps = 10ms per frame
+    uint32_t rtt_ms = ControlChannel_GetRttMs();
+    uint32_t one_way_ms = rtt_ms / 2;
+    if (one_way_ms < 10) one_way_ms = 10;  // Minimum 1 frame
+
+    // Local delay: covers one-way latency so inputs arrive on time
+    // With delay, the game runs smoothly without stalling
+    int local_delay = (int)((one_way_ms + 9) / 10) + 1;  // ceil(latency/10) + 1
+    if (local_delay < 1) local_delay = 1;
+    if (local_delay > 15) local_delay = 15;  // Cap at 150ms equivalent
+
+    // Prediction window: safety net for jitter beyond what delay covers.
+    // GekkoNet standard is 8. The local_delay handles the bulk of latency,
+    // prediction only kicks in for unexpected spikes.
+    int prediction_window = 8;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: RTT=%ums, one_way=%ums -> local_delay=%d frames, prediction_window=%d",
+        rtt_ms, one_way_ms, local_delay, prediction_window);
+
     GekkoConfig config = {};
     config.num_players = 2;
     config.max_spectators = 0;
-    config.input_prediction_window = 8;
+    config.input_prediction_window = prediction_window;
     config.input_size = sizeof(uint16_t);
     config.state_size = sizeof(uint32_t);
     config.desync_detection = true;
@@ -487,9 +531,10 @@ bool Netplay_StartBattle() {
     for (int i = 0; i < 2; i++) {
         if (i == g_player_index) {
             gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
-            gekko_set_local_delay(g_session, i, 1);
+            gekko_set_local_delay(g_session, i, local_delay);
+            g_local_delay = local_delay;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Added local player at slot %d", i);
+                "Netplay: Added local player at slot %d (delay=%d)", i, local_delay);
         } else {
             GekkoNetAddress addr = {};
             addr.data = (void*)g_remote_addr;
@@ -546,51 +591,37 @@ static LARGE_INTEGER g_perf_freq = {};
 static LARGE_INTEGER g_frame_start = {};
 static bool g_frame_timer_initialized = false;
 
-// Called at the END of each frame to delay until target frame time
-// FM2K runs at 100 FPS = 10ms per frame = 10,000,000 ns
+// Called at the END of each frame to apply frame advantage throttle.
+// The game already has its OWN 10ms frame limiter (timeGetTime in WinMain).
+// We only add EXTRA delay when ahead of remote to prevent rollback cascade.
+// Without this, we'd double-limit (game's 10ms + our 10ms = 20ms = 50fps).
 static void HandleFrameTime(float frames_ahead) {
-    if (!g_frame_timer_initialized) {
-        QueryPerformanceFrequency(&g_perf_freq);
-        QueryPerformanceCounter(&g_frame_start);
-        g_frame_timer_initialized = true;
+    // Only throttle when ahead -- the game handles base frame timing
+    if (frames_ahead <= 0.5f) {
+        return;  // Not ahead, let game's own limiter handle timing
+    }
+
+    // Scale extra delay proportionally to advantage:
+    // 0.5-1.0 ahead: +0.16ms (1.6% of 10ms)
+    // 1.0-2.0 ahead: +0.5ms
+    // 2.0-4.0 ahead: +1.0ms
+    // 4.0+ ahead:    +2.0ms
+    DWORD extra_ms;
+    if (frames_ahead > 4.0f) {
+        extra_ms = 2;
+    } else if (frames_ahead > 2.0f) {
+        extra_ms = 1;
+    } else if (frames_ahead > 1.0f) {
+        // Sleep(0) yields timeslice, ~0.5ms effective
+        Sleep(0);
+        return;
+    } else {
+        // 0.5-1.0: minimal throttle, just yield
+        Sleep(0);
         return;
     }
 
-    constexpr uint64_t BASE_FRAME_NS = 10000000;  // 10ms = 100fps
-
-    LARGE_INTEGER frame_end;
-    QueryPerformanceCounter(&frame_end);
-    uint64_t elapsed_ns = ((frame_end.QuadPart - g_frame_start.QuadPart) * 1000000000ULL) / g_perf_freq.QuadPart;
-
-    // Scale throttle proportionally to advantage:
-    // 0.5-1.0 ahead: +1.6% (standard GekkoNet)
-    // 1.0-2.0 ahead: +5%
-    // 2.0+ ahead:    +10%
-    // This converges the gap in ~1-2 seconds instead of 15+
-    uint64_t target_ns = BASE_FRAME_NS;
-    if (frames_ahead > 2.0f) {
-        target_ns = (uint64_t)(BASE_FRAME_NS * 1.10);
-    } else if (frames_ahead > 1.0f) {
-        target_ns = (uint64_t)(BASE_FRAME_NS * 1.05);
-    } else if (frames_ahead > 0.5f) {
-        target_ns = (uint64_t)(BASE_FRAME_NS * 1.016);
-    }
-
-    if (target_ns > elapsed_ns) {
-        uint64_t sleep_ns = target_ns - elapsed_ns;
-        // Use Sleep for the ms portion, busy-wait for sub-ms precision
-        if (sleep_ns > 2000000) {  // > 2ms
-            Sleep((DWORD)((sleep_ns - 1000000) / 1000000));  // Sleep ms portion
-        }
-        // Busy-wait for remainder
-        do {
-            QueryPerformanceCounter(&frame_end);
-            elapsed_ns = ((frame_end.QuadPart - g_frame_start.QuadPart) * 1000000000ULL) / g_perf_freq.QuadPart;
-        } while (elapsed_ns < target_ns);
-    }
-
-    // Reset frame start for next frame
-    QueryPerformanceCounter(&g_frame_start);
+    Sleep(extra_ms);
 }
 
 bool Netplay_ProcessBattleInputPhase() {
@@ -831,8 +862,21 @@ uint32_t Netplay_GetFrame() {
 }
 
 uint32_t Netplay_GetPingMs() {
-    // TODO: Calculate from control channel RTT
-    return 0;
+    return ControlChannel_GetRttMs();
+}
+
+int Netplay_GetLocalDelay() {
+    return g_local_delay;
+}
+
+GekkoNetworkStats Netplay_GetNetworkStats() {
+    GekkoNetworkStats stats = {};
+    if (g_session) {
+        // Get stats for the remote player (whichever slot isn't us)
+        int remote_handle = (g_player_index == 0) ? 1 : 0;
+        gekko_network_stats(g_session, remote_handle, &stats);
+    }
+    return stats;
 }
 
 uint32_t Netplay_GetDesyncCount() {

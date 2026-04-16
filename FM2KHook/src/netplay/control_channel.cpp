@@ -218,7 +218,19 @@ static void RawReceive() {
                 }
                 g_recv_ack = packet->header.ack;
 
-                // Handle via callback
+                // Handle PING/PONG internally before callback
+                if (packet->header.type == CtrlMsg::PING) {
+                    // Respond with PONG containing the sender's timestamp
+                    CtrlPacket pong = {};
+                    pong.header.type = CtrlMsg::PONG;
+                    pong.data.sync.frame = packet->data.sync.frame;  // Echo back sender's time
+                    ControlChannel_Send(pong);
+                } else if (packet->header.type == CtrlMsg::PONG) {
+                    // Calculate RTT from echoed timestamp
+                    ControlChannel_HandlePong(packet->data.sync.frame);
+                }
+
+                // Forward all messages to callback (including PING/PONG for logging)
                 if (g_msg_callback) {
                     g_msg_callback(packet);
                 }
