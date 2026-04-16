@@ -40,6 +40,16 @@ namespace {
     constexpr size_t    SIZE_GAME_STATE    = 0x220;  // Ends at 0x470240
 }
 
+// Effect/shake region addresses - saved for rollback determinism
+namespace EffectAddrs {
+    constexpr uintptr_t EFFECT_SYS1     = 0x447D7D;
+    constexpr size_t    EFFECT_SYS1_SZ  = 42;
+    constexpr uintptr_t EFFECT_SYS2     = 0x4456D0;
+    constexpr size_t    EFFECT_SYS2_SZ  = 44;
+    constexpr uintptr_t SHAKE_EFFECTS   = 0x447DA9;
+    constexpr size_t    SHAKE_EFFECTS_SZ = 40;
+}
+
 // Rollback buffer
 static constexpr int MAX_ROLLBACK_FRAMES = 64;
 static SaveStateData g_state_buffer[MAX_ROLLBACK_FRAMES];
@@ -143,6 +153,11 @@ bool SaveState_Save(int frame) {
     // Save game state
     memcpy(state->game_state, (void*)ADDR_GAME_STATE, SIZE_GAME_STATE);
 
+    // Save effect/shake state - affects animation script execution during rollback
+    memcpy(state->effect_sys1, (void*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
+    memcpy(state->effect_sys2, (void*)EffectAddrs::EFFECT_SYS2, EffectAddrs::EFFECT_SYS2_SZ);
+    memcpy(state->shake_effects, (void*)EffectAddrs::SHAKE_EFFECTS, EffectAddrs::SHAKE_EFFECTS_SZ);
+
     // Calculate checksum for desync detection using full Fletcher32
     // Covers RNG, input tracking, character dynamic state, object pool, game state
     state->checksum = SaveState_CalculateFullChecksum();
@@ -207,6 +222,11 @@ bool SaveState_Load(int frame) {
 
     // Restore game state
     memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
+
+    // Restore effect/shake state
+    memcpy((void*)EffectAddrs::EFFECT_SYS1, state->effect_sys1, EffectAddrs::EFFECT_SYS1_SZ);
+    memcpy((void*)EffectAddrs::EFFECT_SYS2, state->effect_sys2, EffectAddrs::EFFECT_SYS2_SZ);
+    memcpy((void*)EffectAddrs::SHAKE_EFFECTS, state->shake_effects, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     return true;
 }
@@ -284,15 +304,7 @@ const RegionChecksums& SaveState_GetRegionChecksums() {
     return g_region_checksums;
 }
 
-// Unsaved region addresses (for diagnostic checksums)
-namespace UnsavedAddrs {
-    constexpr uintptr_t EFFECT_SYS1     = 0x447D7D;  // Effect system P1
-    constexpr size_t    EFFECT_SYS1_SZ  = 42;
-    constexpr uintptr_t EFFECT_SYS2     = 0x4456D0;  // Effect system P2
-    constexpr size_t    EFFECT_SYS2_SZ  = 44;
-    constexpr uintptr_t SHAKE_EFFECTS   = 0x447DA9;  // Shake structures
-    constexpr size_t    SHAKE_EFFECTS_SZ = 40;
-}
+
 
 uint32_t SaveState_CalculateFullChecksum() {
     // Compute per-region checksums for diagnostic comparison
@@ -325,10 +337,10 @@ uint32_t SaveState_CalculateFullChecksum() {
     uint32_t it3 = Fletcher32((uint8_t*)0x447F40, 0x447F80 - 0x447F40);   // g_processed_input + g_input_changes
     g_region_checksums.input_tracking = it1 ^ it2 ^ it3;
 
-    // Unsaved regions (diagnostic only - not part of combined)
-    g_region_checksums.effect_sys1 = Fletcher32((uint8_t*)UnsavedAddrs::EFFECT_SYS1, UnsavedAddrs::EFFECT_SYS1_SZ);
-    g_region_checksums.effect_sys2 = Fletcher32((uint8_t*)UnsavedAddrs::EFFECT_SYS2, UnsavedAddrs::EFFECT_SYS2_SZ);
-    g_region_checksums.shake_effects = Fletcher32((uint8_t*)UnsavedAddrs::SHAKE_EFFECTS, UnsavedAddrs::SHAKE_EFFECTS_SZ);
+    // Effect/shake regions (now saved for rollback)
+    g_region_checksums.effect_sys1 = Fletcher32((uint8_t*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
+    g_region_checksums.effect_sys2 = Fletcher32((uint8_t*)EffectAddrs::EFFECT_SYS2, EffectAddrs::EFFECT_SYS2_SZ);
+    g_region_checksums.shake_effects = Fletcher32((uint8_t*)EffectAddrs::SHAKE_EFFECTS, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     // Combined CRC for GekkoNet desync detection.
     // INCLUDES: RNG, game_state (excl hInstance), input_tracking

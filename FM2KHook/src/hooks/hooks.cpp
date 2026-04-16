@@ -186,15 +186,11 @@ int __cdecl Hook_UpdateGameState() {
     // We must block ALL of them during stalls to prevent edge detection desync
     // ========================================================================
     if (IsCSSMode(game_mode)) {
-        // Check if we can advance (have remote input)
-        // ProcessGameInputs hook also checks this - both must agree
-        if (!Netplay_CanAdvanceCSS()) {
-            Netplay_PollCSS();  // Try to receive pending data
+        // ProcessCSS handles everything: poll, stall, capture, send batch.
+        // Returns false if stalling (waiting for remote input + resending ours).
+        if (!Netplay_ProcessCSS()) {
             return 0;  // Stall - don't update game state
         }
-
-        // Remote input available - capture, send, advance CSS frame
-        Netplay_ProcessCSS();
 
         g_frame_counter++;
         return original_update_game ? original_update_game() : 0;
@@ -309,53 +305,54 @@ void __cdecl Hook_RenderGame() {
         g_last_fps_time = now;
     }
 
-    // Update window title with state + desync/rollback info
-    static int last_fps = 0;
-    static bool last_connected = false;
-    static bool last_active = false;
-    static uint32_t last_desync = 0;
-    static uint32_t last_rollback = 0;
-
-    bool connected = Netplay_IsConnected();
-    bool active = Netplay_IsActive();
-    uint32_t desyncs = Netplay_GetDesyncCount();
-    uint32_t rollbacks = Netplay_GetRollbackCount();
-
-    if (g_current_fps != last_fps || connected != last_connected ||
-        active != last_active || desyncs != last_desync || rollbacks != last_rollback) {
+    // Update window title with BBBR-style stats (throttled to 500ms)
+    static DWORD last_title_update = 0;
+    DWORD title_now = GetTickCount();
+    if (title_now - last_title_update >= 500) {
+        last_title_update = title_now;
         HWND game_window = GetOurGameWindow();
         if (game_window) {
             char title[256];
-            const char* state_str = "Offline";
+            const char* role = (g_player_index == 0) ? "HOST" : "CLIENT";
+            bool active = Netplay_IsActive();
+            bool connected = Netplay_IsConnected();
 
-            if (!g_offline_mode) {
-                if (active) {
-                    state_str = "Battle";
-                } else if (connected) {
-                    state_str = "Connected";
+            if (active) {
+                // BBBR format: FM2K [HOST] Battle | FPS:100 | P:12ms A:0.5ms | D:2 FA:0.1 | RB:3
+                GekkoNetworkStats stats = Netplay_GetNetworkStats();
+                float ahead = Netplay_GetFramesAhead();
+                int delay = Netplay_GetLocalDelay();
+                uint32_t desyncs = Netplay_GetDesyncCount();
+                uint32_t rollbacks = Netplay_GetRollbackCount();
+
+                if (desyncs > 0) {
+                    snprintf(title, sizeof(title),
+                        "FM2K [%s] Battle | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u | DESYNC x%u",
+                        role, g_current_fps,
+                        stats.last_ping, stats.avg_ping,
+                        delay, ahead, rollbacks, desyncs);
                 } else {
-                    state_str = "Connecting...";
+                    snprintf(title, sizeof(title),
+                        "FM2K [%s] Battle | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u",
+                        role, g_current_fps,
+                        stats.last_ping, stats.avg_ping,
+                        delay, ahead, rollbacks);
                 }
-            }
-
-            if (desyncs > 0) {
-                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS | DESYNC x%u | RB x%u",
-                         g_player_index + 1, state_str, g_current_fps, desyncs, rollbacks);
-            } else if (active) {
-                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS | RB x%u | Frame %u",
-                         g_player_index + 1, state_str, g_current_fps, rollbacks, Netplay_GetFrame());
+            } else if (connected) {
+                uint32_t ping = Netplay_GetPingMs();
+                snprintf(title, sizeof(title),
+                    "FM2K [%s] CSS | FPS:%d | RTT:%ums",
+                    role, g_current_fps, ping);
+            } else if (!g_offline_mode) {
+                snprintf(title, sizeof(title),
+                    "FM2K [%s] Connecting... | FPS:%d",
+                    role, g_current_fps);
             } else {
-                snprintf(title, sizeof(title), "FM2K P%d [%s] %d FPS",
-                         g_player_index + 1, state_str, g_current_fps);
+                snprintf(title, sizeof(title),
+                    "FM2K [Offline] %d FPS", g_current_fps);
             }
 
             SetWindowTextA(game_window, title);
-
-            last_fps = g_current_fps;
-            last_connected = connected;
-            last_active = active;
-            last_desync = desyncs;
-            last_rollback = rollbacks;
         }
     }
 
