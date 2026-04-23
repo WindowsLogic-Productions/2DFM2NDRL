@@ -15,6 +15,7 @@ add_library(FM2KHook SHARED
     # Core
     src/core/dllmain.cpp
     src/core/globals.cpp
+    src/core/main_loop_trampoline.cpp
     # Hooks
     src/hooks/hooks.cpp
     src/hooks/input.cpp
@@ -23,6 +24,8 @@ add_library(FM2KHook SHARED
     src/netplay/netplay.cpp
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
+    # Audio — Mike Z rollback-safe sound layer
+    src/audio/sound_rollback.cpp
     # UI
     src/ui/imgui_overlay.cpp
     src/ui/shared_mem.cpp
@@ -56,6 +59,7 @@ target_include_directories(FM2KHook PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/hooks
     ${CMAKE_CURRENT_SOURCE_DIR}/src/netplay
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
     ${CMAKE_SOURCE_DIR}/vendored/minhook/include
     ${CMAKE_SOURCE_DIR}/vendored/SDL/include

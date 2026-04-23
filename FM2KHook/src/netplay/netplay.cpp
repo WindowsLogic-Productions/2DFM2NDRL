@@ -8,6 +8,7 @@
 #include "savestate.h"
 #include "globals.h"
 #include "gekkonet.h"
+#include "../audio/sound_rollback.h"
 #include <SDL3/SDL_log.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -108,6 +109,23 @@ static uint32_t g_last_rollback_frame = 0;
 static uint32_t g_desync_count = 0;
 static uint32_t g_last_desync_log_tick = 0;
 static int g_local_delay = 1;  // Computed from RTT at battle start
+// Local delay proposed by the REMOTE peer (received in BATTLE_READY). Both
+// peers send their own RTT-derived proposal; Netplay_StartBattle takes
+// max(local, remote) so both use the same value and input lag is symmetric.
+static uint8_t g_remote_proposed_delay = 0;
+
+// Compute the local-side proposed input delay from current RTT. Single
+// source of truth used by every BATTLE_READY sender and by the final
+// Netplay_StartBattle symmetrisation.
+static uint8_t ComputeLocalProposedDelay() {
+    uint32_t rtt_ms = ControlChannel_GetRttMs();
+    uint32_t one_way_ms = rtt_ms / 2;
+    if (one_way_ms < 10) one_way_ms = 10;
+    int d = (int)((one_way_ms + 9) / 10) + 1;
+    if (d < 2)  d = 2;
+    if (d > 15) d = 15;
+    return (uint8_t)d;
+}
 
 // Battle entry sync barrier - ensures both clients enter battle at same time
 static bool g_local_battle_entered = false;   // We've detected battle mode
@@ -170,11 +188,21 @@ static void OnControlMessage(const CtrlPacket* packet) {
             break;
         }
 
-        case CtrlMsg::BATTLE_READY:
+        case CtrlMsg::BATTLE_READY: {
+            // BATTLE_READY now carries the remote peer's proposed local delay
+            // in sync.frame's low byte. Track the max across all BATTLE_READY
+            // packets received so startup-jitter RTT samples can't make the
+            // two peers disagree on the final delay.
+            uint8_t proposed = (uint8_t)(packet->data.sync.frame & 0xFF);
+            if (proposed > g_remote_proposed_delay) {
+                g_remote_proposed_delay = proposed;
+            }
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received BATTLE_READY from remote");
+                "Netplay: Received BATTLE_READY from remote (proposed_delay=%u, tracked_max=%u)",
+                (unsigned)proposed, (unsigned)g_remote_proposed_delay);
             g_remote_css_ready = true;
             break;
+        }
 
         case CtrlMsg::BATTLE_ENTERING:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -345,7 +373,7 @@ bool Netplay_ProcessCSS() {
     if (!g_css_active) {
         g_css_active = true;
         g_local_css_ready = true;
-        ControlChannel_SendBattleReady();
+        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
     }
 
@@ -355,7 +383,7 @@ bool Netplay_ProcessCSS() {
     static uint32_t last_ready_send = 0;
     bool remote_has_css_data = g_remote_inputs.GetEndFrame() > 0;
     if ((!g_remote_css_ready || !remote_has_css_data) && now - last_ready_send > 100) {
-        ControlChannel_SendBattleReady();
+        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
         last_ready_send = now;
     }
 
@@ -497,27 +525,30 @@ bool Netplay_StartBattle() {
     g_local_css_ready = false;
     g_remote_css_ready = false;
 
-    // Calculate delay from RTT (CCCaster formula adapted for 100fps)
-    // CCCaster: delay = ceil(worst_latency_ms / frame_time_ms) + 1
-    // FM2K: 100fps = 10ms per frame
+    // Calculate delay from RTT (CCCaster formula adapted for 100fps).
+    //   local_proposed = ceil(one_way_ms / 10) + 1
+    // Each peer computes this independently. Without synchronising, peer A's
+    // RTT sample at startup can differ from peer B's (one peer's first PONG
+    // might not have arrived yet), giving different local_delay values and
+    // ASYMMETRIC input lag — each peer's own inputs delayed by a different
+    // amount. Fix: BATTLE_READY now carries each peer's proposed_delay; we
+    // take max(local, remote) so both use the same value.
     uint32_t rtt_ms = ControlChannel_GetRttMs();
     uint32_t one_way_ms = rtt_ms / 2;
-    if (one_way_ms < 10) one_way_ms = 10;  // Minimum 1 frame
+    if (one_way_ms < 10) one_way_ms = 10;
+    int local_proposed = (int)((one_way_ms + 9) / 10) + 1;
+    if (local_proposed < 2)  local_proposed = 2;
+    if (local_proposed > 15) local_proposed = 15;
 
-    // Local delay: covers one-way latency so inputs arrive on time
-    // With delay, the game runs smoothly without stalling
-    int local_delay = (int)((one_way_ms + 9) / 10) + 1;  // ceil(latency/10) + 1
-    if (local_delay < 1) local_delay = 1;
-    if (local_delay > 15) local_delay = 15;  // Cap at 150ms equivalent
+    int remote_proposed = (int)g_remote_proposed_delay;
+    int local_delay = (local_proposed > remote_proposed) ? local_proposed : remote_proposed;
+    if (local_delay < 2) local_delay = 2;
 
-    // Prediction window: safety net for jitter beyond what delay covers.
-    // GekkoNet standard is 8. The local_delay handles the bulk of latency,
-    // prediction only kicks in for unexpected spikes.
     int prediction_window = 8;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: RTT=%ums, one_way=%ums -> local_delay=%d frames, prediction_window=%d",
-        rtt_ms, one_way_ms, local_delay, prediction_window);
+        "Netplay: RTT=%ums one_way=%ums | local_proposed=%d remote_proposed=%d -> agreed_delay=%d, prediction_window=%d",
+        rtt_ms, one_way_ms, local_proposed, remote_proposed, local_delay, prediction_window);
 
     GekkoConfig config = {};
     config.num_players = 2;
@@ -567,6 +598,7 @@ bool Netplay_StartBattle() {
 
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
     SaveState_Init();
+    SoundRollback::Init();
 
     g_simple_state = SimpleState::BATTLE;
     g_session_ready = false;
@@ -618,6 +650,7 @@ bool Netplay_StartStressBattle() {
     // Deterministic initial RNG seed (matches Netplay_StartBattle).
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
     SaveState_Init();
+    SoundRollback::Init();
 
     g_simple_state = SimpleState::BATTLE;
     g_session_ready = true;   // no handshake needed for stress
@@ -639,6 +672,11 @@ void Netplay_EndBattle() {
         gekko_destroy(&g_session);
         g_session = nullptr;
     }
+
+    // Stop any pending SFX "desired" entries and clear the channel map so
+    // the next battle rescans the channel table (handles character-load
+    // changes between matches).
+    SoundRollback::OnBattleEnd();
 
     // Flush the rngtrace ring on clean battle exit too, so a desync-free
     // round still produces a trace to diff against a future desync run.
@@ -828,6 +866,10 @@ bool Netplay_ProcessBattleInputPhase() {
     auto updates = gekko_update_session(g_session, &update_count);
 
     bool has_advance = false;
+    // Track the advance-batch window for the Mike Z sound sync. Forward-only
+    // batches have earliest == latest; rollback batches span the rewind range.
+    uint32_t earliest_advance = UINT32_MAX;
+    uint32_t latest_advance = g_netplay_frame;
     for (int i = 0; i < update_count; i++) {
         auto update = updates[i];
         switch (update->type) {
@@ -851,10 +893,31 @@ bool Netplay_ProcessBattleInputPhase() {
                 int frame = update->data.load.frame;
                 g_rollback_count++;
                 g_last_rollback_frame = g_netplay_frame;
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "ROLLBACK #%u: loading frame %d (current=%u, rewinding %u frames)",
-                    g_rollback_count, frame, g_netplay_frame,
-                    g_netplay_frame - (uint32_t)frame);
+                // Rolling stats only — per-rollback SDL_LogInfo at 100 fps
+                // chewed framerate under stress. Ring buffer + summary every
+                // 100 events keeps the signal (rollback count, last frame,
+                // typical rewind distance) without the cost.
+                static uint32_t s_rb_window_start = 0;
+                static uint32_t s_rb_window_rewind_sum = 0;
+                static uint32_t s_rb_window_rewind_max = 0;
+                if (g_rollback_count == 1) {
+                    s_rb_window_start = 0;
+                    s_rb_window_rewind_sum = 0;
+                    s_rb_window_rewind_max = 0;
+                }
+                uint32_t rewind = g_netplay_frame - (uint32_t)frame;
+                s_rb_window_rewind_sum += rewind;
+                if (rewind > s_rb_window_rewind_max) s_rb_window_rewind_max = rewind;
+                if (g_rollback_count % 100 == 0) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "ROLLBACK stats: total=%u, last-100 avg_rewind=%.1f max_rewind=%u (last frame=%d current=%u)",
+                        g_rollback_count,
+                        (double)s_rb_window_rewind_sum / 100.0,
+                        s_rb_window_rewind_max,
+                        frame, g_netplay_frame);
+                    s_rb_window_rewind_sum = 0;
+                    s_rb_window_rewind_max = 0;
+                }
                 SaveState_Load(frame);
                 // Rewind the deterministic virtual clock to match the loaded
                 // frame. Without this g_virtual_time_ms stays at its forward-sim
@@ -873,6 +936,15 @@ bool Netplay_ProcessBattleInputPhase() {
             }
 
             case GekkoAdvanceEvent: {
+                // Record the pre-sim frame for the Mike Z sound sync window.
+                // `g_netplay_frame` here is the frame we're about to *produce*;
+                // Hook_DispatchScriptSoundCommand tags desired[] with this same
+                // value (via Netplay_GetFrame) so earliest/latest compare apples
+                // to apples.
+                if (g_netplay_frame < earliest_advance) {
+                    earliest_advance = g_netplay_frame;
+                }
+
                 // Set inputs for THIS frame
                 if (update->data.adv.inputs && update->data.adv.input_len >= sizeof(uint16_t) * 2) {
                     uint16_t* inputs = (uint16_t*)update->data.adv.inputs;
@@ -946,27 +1018,36 @@ bool Netplay_ProcessBattleInputPhase() {
                     g_frame_pending_render = true;
                 }
 
-                // Periodic status every 500 frames (~5 sec)
-                if (g_netplay_frame % 500 == 0) {
-                    float fa = g_session ? gekko_frames_ahead(g_session) : 0.0f;
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "BATTLE STATUS: frame=%u rb=%u desync=%u ahead=%.1f frame_time_ms=%u skip=%u",
-                        g_netplay_frame, g_rollback_count, g_desync_count, fa,
-                        *(uint32_t*)0x41E2F0,    // g_frame_time_ms (should be 10)
-                        *(uint32_t*)0x4246F4);   // g_frame_skip_count
-                }
+                // Periodic status every 500 frames (~5 sec). Gate on
+                // NON-rolling_back advances only — in stress mode g_netplay_frame
+                // hits any given value N times (once forward, N-1 times on
+                // replay) so a naive `% 500 == 0` fires on every replay
+                // pass and floods the log. Also dedupe by last-logged frame
+                // so rollback that re-hits a multiple-of-500 frame doesn't
+                // re-log.
+                if (!update->data.adv.rolling_back) {
+                    static uint32_t last_status_frame = 0;
+                    if (g_netplay_frame >= last_status_frame + 500) {
+                        last_status_frame = g_netplay_frame;
+                        float fa = g_session ? gekko_frames_ahead(g_session) : 0.0f;
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "BATTLE STATUS: frame=%u rb=%u desync=%u ahead=%.1f frame_time_ms=%u skip=%u",
+                            g_netplay_frame, g_rollback_count, g_desync_count, fa,
+                            *(uint32_t*)0x41E2F0,
+                            *(uint32_t*)0x4246F4);
+                    }
 
-                // Dense state logging around desync boundary (frames 5000-5500)
-                // Also log every 1000 frames for baseline comparison
-                if (g_netplay_frame % 1000 == 0 ||
-                    (g_netplay_frame >= 5000 && g_netplay_frame <= 5500 && g_netplay_frame % 50 == 0)) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "STATE f=%u: rng=0x%08X game_timer=%u round_timer_ctr=%u render_fc=%u",
-                        g_netplay_frame,
-                        *(uint32_t*)0x41FB1C,   // RNG seed
-                        *(uint32_t*)0x470044,   // g_game_timer
-                        *(uint32_t*)0x47008E,   // g_round_timer_counter
-                        *(uint32_t*)0x4456FC);  // g_render_frame_counter
+                    static uint32_t last_state_frame = 0;
+                    if (g_netplay_frame >= last_state_frame + 1000) {
+                        last_state_frame = g_netplay_frame;
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "STATE f=%u: rng=0x%08X game_timer=%u round_timer_ctr=%u render_fc=%u",
+                            g_netplay_frame,
+                            *(uint32_t*)0x41FB1C,
+                            *(uint32_t*)0x470044,
+                            *(uint32_t*)0x47008E,
+                            *(uint32_t*)0x4456FC);
+                    }
                 }
                 break;
             }
@@ -974,6 +1055,15 @@ bool Netplay_ProcessBattleInputPhase() {
             default:
                 break;
         }
+    }
+
+    // Mike Z sound sync: once per displayed frame, AFTER all advances have
+    // completed and BEFORE render. Desired[] now reflects the authoritative
+    // sim history for this frame; reconcile to actual DSound plays, applying
+    // the rollback-window filter that prevents erased/re-triggered sounds.
+    if (has_advance && earliest_advance != UINT32_MAX) {
+        latest_advance = g_netplay_frame;
+        SoundRollback::SyncAfterAdvance(earliest_advance, latest_advance);
     }
 
     return has_advance;
@@ -1033,7 +1123,7 @@ bool Netplay_IsCSSFullySynced() {
 void Netplay_SetLocalCSSReady(bool ready) {
     g_local_css_ready = ready;
     if (ready) {
-        ControlChannel_SendBattleReady();
+        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
     }
 }
 

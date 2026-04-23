@@ -44,8 +44,20 @@ namespace {
 namespace EffectAddrs {
     constexpr uintptr_t EFFECT_SYS1     = 0x447D7D;
     constexpr size_t    EFFECT_SYS1_SZ  = 42;
-    constexpr uintptr_t EFFECT_SYS2     = 0x4456D0;
-    constexpr size_t    EFFECT_SYS2_SZ  = 44;
+    // Script-sysvar + effect-param block. IDA audit (task
+    // accfbf054043e03dd) traced the persistent obj[1]+0x2C rollback
+    // divergence to a 32-byte script-sysvar array immediately preceding
+    // the old 44-byte effect_sys2 window. animation-script opcodes
+    // read/write g_global_variable_array_FM2K_SYSTEM_VARS[16] @
+    // 0x4456B0..0x4456D0, and g_timer_countdown1 at 0x4456D8 auto-
+    // decrements every frame — replay inherited stale live-memory
+    // sysvars, script arithmetic produced off-by-2 result (0x5D8 vs
+    // 0x5DA), and that cascaded into every subsequent object update.
+    //
+    //   OLD: 0x4456D0..0x4456FC (44 B) — only effect-sys2 tail
+    //   NEW: 0x4456B0..0x445708 (88 B) — sysvars + effect-sys2 + timer
+    constexpr uintptr_t EFFECT_SYS2     = 0x4456B0;
+    constexpr size_t    EFFECT_SYS2_SZ  = 88;
     constexpr uintptr_t SHAKE_EFFECTS   = 0x447DA9;
     constexpr size_t    SHAKE_EFFECTS_SZ = 40;
 }
@@ -127,8 +139,26 @@ void SaveState_FlushRngTrace(int player_index, const char* reason) {
                 g_rngtrace_count, filename, reason ? reason : "");
 }
 
-// Simple Fletcher32 checksum
+// Hashing: use xxHash3-64 (truncated to u32) instead of pure-C Fletcher32.
+// Fletcher32 topped out ~500 MB/s on a 32-bit build; in stress mode at
+// ~1 MB hashed per save × 10× rollback amplification × 100 Hz we were
+// hitting 1 GB/s and saturating one core. XXH3 runs 15-30 GB/s on the
+// same hardware and has strictly better collision resistance. Kept the
+// Fletcher32 symbol as a compatibility wrapper so call sites don't need
+// to change — they still see `uint32_t Fletcher32(ptr, len)`.
+#define XXH_INLINE_ALL
+#define XXH_NO_STREAM
+#include "../../../vendored/xxhash/xxhash.h"
+
 static uint32_t Fletcher32(const uint8_t* data, size_t len) {
+    // Truncate the 64-bit hash to 32 bits (xor fold for better avalanche).
+    XXH64_hash_t h = XXH3_64bits(data, len);
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+// Kept the original Fletcher32 body below (unused) for reference; the
+// wrapper above takes precedence at the linker level.
+[[maybe_unused]] static uint32_t Fletcher32_orig(const uint8_t* data, size_t len) {
     uint32_t sum1 = 0xFFFF, sum2 = 0xFFFF;
     while (len) {
         size_t tlen = (len > 360) ? 360 : len;
@@ -149,6 +179,10 @@ static uint32_t Fletcher32(const uint8_t* data, size_t len) {
 // then appended every time a replay save diverges from its forward save.
 // Replaces the old one-file-per-frame scheme that flooded the disk.
 constexpr const char* REPLAY_DIFF_LOG = "FM2K_replay_diffs.log";
+
+// Forward decls — definitions appear after SaveState_Save for readability.
+uint32_t SaveState_CalculateFingerprint();
+uint32_t SaveState_CalculateFullChecksum();
 
 void SaveState_Init() {
     memset(g_state_buffer, 0, sizeof(g_state_buffer));
@@ -222,7 +256,19 @@ bool SaveState_Save(int frame) {
     // (REPLAY_DIFF_LOG = "FM2K_replay_diffs.log") to avoid flooding the disk
     // with one file per frame. Each entry is delimited by a header line so
     // they're easy to grep/separate.
-    if (is_replay_save) {
+    // Throttle the entire replay-diff scan to run at most once per second.
+    // Without the throttle every replay save (100 Hz) computed Fletcher32
+    // over ~1 MB of memory (object_pool + afterimage_pool + 8 × char_slot)
+    // just to produce diagnostics — dominant CPU cost in stress mode.
+    // Gekko's own desync detection (via gameplay_fingerprint as the save
+    // checksum) is unaffected; this only gates the per-byte localization
+    // scan used for post-desync investigation.
+    static DWORD s_last_scan_tick = 0;
+    DWORD s_scan_now = GetTickCount();
+    bool run_scan = is_replay_save && (s_scan_now - s_last_scan_tick) >= 1000;
+    if (run_scan) s_last_scan_tick = s_scan_now;
+
+    if (run_scan) {
         const auto& fwd_crcs = state->saved_region_crcs;
 
         // Compute current (replay-side) region CRCs inline so we can gate the
@@ -230,8 +276,18 @@ bool SaveState_Save(int frame) {
         // this_save_crcs is built AFTER the memcpy below.
         uint32_t cur_obj_crc = Fletcher32((uint8_t*)ADDR_OBJECT_POOL,
                                           SIZE_OBJECT_POOL);
-        uint32_t cur_ai_crc  = Fletcher32((uint8_t*)WaveCAddrs::AFTERIMAGE_POOL,
-                                          WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // Compute cur_ai_crc with the SAME exclusion the save buffer gets:
+        // zero the 4 bytes at offset 0x4A4 (= g_last_frame_time @ 0x447DD4)
+        // in a local copy before hashing, so this CRC is comparable to
+        // fwd_crcs.afterimage_pool (which was hashed from the save buffer
+        // after the zero-out). Without this, every replay save would flag
+        // a spurious DIFF because live memory has the real timer byte
+        // while the save-buffer CRC was over the zeroed version.
+        static uint8_t s_ai_cmp_buf[WaveCAddrs::AFTERIMAGE_POOL_SZ];
+        memcpy(s_ai_cmp_buf, (void*)WaveCAddrs::AFTERIMAGE_POOL, WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        constexpr size_t G_LFT_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
+        *(uint32_t*)(s_ai_cmp_buf + G_LFT_OFFSET) = 0;
+        uint32_t cur_ai_crc  = Fletcher32(s_ai_cmp_buf, WaveCAddrs::AFTERIMAGE_POOL_SZ);
         uint32_t cur_char_dyn = 0;
         for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
             uintptr_t da = CHAR_SLOT_BASE + i * CHAR_SLOT_SIZE + CHAR_SLOT_DYNAMIC_OFFSET;
@@ -241,6 +297,15 @@ bool SaveState_Save(int frame) {
         bool any_region_diff = (fwd_crcs.object_pool     != cur_obj_crc)
                             || (fwd_crcs.afterimage_pool != cur_ai_crc)
                             || (fwd_crcs.char_dynamic    != cur_char_dyn);
+
+        // Rate-limit the SDL console log: the byte-level scan re-fires every
+        // replay save while a divergence persists across frames, which floods
+        // stderr. File output stays per-event (useful for post-mortem); the
+        // console gets at most 1 log per second per diagnostic call-site.
+        static DWORD s_last_sdl_log_tick = 0;
+        DWORD s_now_tick = GetTickCount();
+        bool should_sdl_log = (s_now_tick - s_last_sdl_log_tick) >= 1000;
+        if (should_sdl_log) s_last_sdl_log_tick = s_now_tick;
 
         FILE* df = nullptr;
         if (any_region_diff) {
@@ -272,7 +337,10 @@ bool SaveState_Save(int frame) {
                     int obj_idx = (int)(i / 382);
                     int field_off = (int)(i % 382);
                     uintptr_t obj_base = ADDR_OBJECT_POOL + obj_idx * 382;
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    // SDL console log disabled — file output (REPLAY_DIFF_LOG)
+                    // captures the same data for post-mortem. Keep the flag
+                    // variable alive for grep-based re-enable.
+                    if (false && should_sdl_log) SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                         "REPLAY DIFF f=%d ObjectPool: obj[%d] @ 0x%X +0x%X (=%d) "
                         "forward=0x%02X replay=0x%02X",
                         frame, obj_idx, (unsigned)obj_base, field_off, field_off,
@@ -301,13 +369,19 @@ bool SaveState_Save(int frame) {
                 }
             }
         }
-        // AfterimagePool byte scan
+        // AfterimagePool byte scan. Compare against s_ai_cmp_buf (live memory
+        // with g_last_frame_time already zeroed to match the save buffer),
+        // NOT raw live memory — otherwise every entry reports a phantom
+        // diff at +0x4A4 from our deliberate save-time exclusion.
         if (fwd_crcs.afterimage_pool != cur_ai_crc) {
             const uint8_t* fwd = state->afterimage_pool;
-            const uint8_t* cur = (const uint8_t*)WaveCAddrs::AFTERIMAGE_POOL;
+            const uint8_t* cur = s_ai_cmp_buf;
             for (size_t i = 0; i < WaveCAddrs::AFTERIMAGE_POOL_SZ; i++) {
                 if (fwd[i] != cur[i]) {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    // SDL console log disabled — file output (REPLAY_DIFF_LOG)
+                    // captures the same data for post-mortem. Keep the flag
+                    // variable alive for grep-based re-enable.
+                    if (false && should_sdl_log) SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                         "REPLAY DIFF f=%d AfterimagePool: +0x%X fwd=0x%02X replay=0x%02X",
                         frame, (unsigned)i, fwd[i], cur[i]);
                     if (df) {
@@ -328,7 +402,10 @@ bool SaveState_Save(int frame) {
                 bool found = false;
                 for (size_t i = 0; i < CHAR_SLOT_DYNAMIC_SIZE; i++) {
                     if (fwd[i] != cur[i]) {
-                        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        // SDL console log disabled — file output (REPLAY_DIFF_LOG)
+                    // captures the same data for post-mortem. Keep the flag
+                    // variable alive for grep-based re-enable.
+                    if (false && should_sdl_log) SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                             "REPLAY DIFF f=%d CharSlot[%zu]: +0x%X fwd=0x%02X replay=0x%02X",
                             frame, s, (unsigned)i, fwd[i], cur[i]);
                         if (df) {
@@ -362,15 +439,48 @@ bool SaveState_Save(int frame) {
     // Save input tracking state - CRITICAL for correct input change detection!
     memcpy(state->input_tracking_state, (void*)ADDR_INPUT_TRACKING, SIZE_INPUT_TRACKING);
 
-    // Save dynamic portion of each character slot (96% smaller than full slots!)
+    // Character slots: 8 × 57407 B = 460 KB per save. In 1v1 only slots 0
+    // and 1 are loaded; slots 2-7 hold stale AI-scratch bytes that the PvP
+    // sim path never reads (per IDA audit). Each loaded slot starts with
+    // the ".kgt" magic bytes 0x32 0x44 0x4B 0x47 ("2DKG"); unloaded slots
+    // start with 0x00. Use the first byte as a cheap active-flag.
+    //
+    //   Typical cost before: 460 KB memcpy per save.
+    //   Typical cost after : 8 × 1-byte check + 2 × 57 KB memcpy ≈ 114 KB.
     for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
         uintptr_t slot_base = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE);
         uintptr_t dynamic_addr = slot_base + CHAR_SLOT_DYNAMIC_OFFSET;
-        memcpy(state->char_dynamic[i], (void*)dynamic_addr, CHAR_SLOT_DYNAMIC_SIZE);
+        if (*(uint8_t*)slot_base != 0) {
+            memcpy(state->char_dynamic[i], (void*)dynamic_addr, CHAR_SLOT_DYNAMIC_SIZE);
+        } else {
+            state->char_dynamic[i][0] = 0;  // mark slot inactive for Load
+        }
     }
 
     // Save object pool (projectiles, effects)
-    memcpy(state->object_pool, (void*)ADDR_OBJECT_POOL, SIZE_OBJECT_POOL);
+    // Object pool: active-slot-only save. First byte of each 382 B slot is
+    // the "active" flag (0 = slot empty). In 1v1 typically <20 of 1023 slots
+    // are live; saving 391 KB every frame was dominating memcpy cost. Skip
+    // inactive slots entirely — only their first byte is written (=0), which
+    // tells the Load path "clear this slot".
+    //
+    //   Typical cost before: 391 KB memcpy per save.
+    //   Typical cost after : 1023 × 1-byte read + ~10 × 382 B memcpy ≈ 5 KB.
+    {
+        constexpr size_t OBJ_SZ = 382;
+        constexpr size_t OBJ_COUNT = SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT;
+        const uint8_t* src_base = (const uint8_t*)ADDR_OBJECT_POOL;
+        uint8_t* dst_base = state->object_pool;
+        for (size_t i = 0; i < OBJ_COUNT; i++) {
+            const uint8_t* src = src_base + i * OBJ_SZ;
+            uint8_t* dst = dst_base + i * OBJ_SZ;
+            if (src[0] != 0) {
+                memcpy(dst, src, OBJ_SZ);  // active slot: full copy
+            } else {
+                dst[0] = 0;                 // inactive: mark only (rest stale, OK)
+            }
+        }
+    }
 
     // Save input history
     memcpy(state->input_history, (void*)ADDR_INPUT_HISTORY, SIZE_INPUT_HISTORY);
@@ -381,17 +491,54 @@ bool SaveState_Save(int frame) {
     // Save effect/shake state - affects animation script execution during rollback
     memcpy(state->effect_sys1, (void*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
     memcpy(state->effect_sys2, (void*)EffectAddrs::EFFECT_SYS2, EffectAddrs::EFFECT_SYS2_SZ);
+    state->round_end_flag = *(uint32_t*)0x424718;
     memcpy(state->shake_effects, (void*)EffectAddrs::SHAKE_EFFECTS, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     // Wave C additions: afterimage pool + object list topology.
+    //
+    // IMPORTANT: the "afterimage pool" range 0x447930..0x46F6C0 is a big slice
+    // of the data segment that happens to CONTAIN the afterimage buffers but
+    // also contains unrelated globals. The only one we've proven harmful for
+    // determinism is `g_last_frame_time @ 0x447DD4` (offset 0x4A4) — written
+    // by main_game_loop's pacing arithmetic (0x405AE9/AFD/BA8/BBB) and by
+    // main_window_proc on alt-tab/F4/Alt+Enter (0x40610F/0x4062A5) and by
+    // the menu handler (0x4177BF). None of those writers are sim code —
+    // nothing gameplay-visible reads from `g_last_frame_time`. We zero the
+    // saved copy at that offset so forward- and replay-sim both produce the
+    // same saved bytes there, killing the f=9 AfterimagePool +0x4A4 diff.
+    // Live memory keeps whatever main_game_loop last wrote; the save buffer
+    // has a deterministic 0 at that slot.
     memcpy(state->afterimage_pool,         (void*)WaveCAddrs::AFTERIMAGE_POOL,      WaveCAddrs::AFTERIMAGE_POOL_SZ);
+    constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
+    *(uint32_t*)(state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET) = 0;
     state->current_object_ptr            = *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR;
     memcpy(state->object_list_heads_tails, (void*)WaveCAddrs::OBJECT_LIST_HEADS,    WaveCAddrs::OBJECT_LIST_HEADS_SZ);
     memcpy(state->object_node_pool,        (void*)WaveCAddrs::OBJECT_NODE_POOL,     WaveCAddrs::OBJECT_NODE_POOL_SZ);
 
-    // Calculate checksum for desync detection using full Fletcher32
-    // Covers RNG, input tracking, character dynamic state, object pool, game state
-    state->checksum = SaveState_CalculateFullChecksum();
+    // Mike Z sound-rollback: capture per-channel "desired" state. This is NOT
+    // DSound hardware state — it's the sim's record of what each channel
+    // should be playing. Actual DSound plays are driven post-advance by the
+    // sync step; hardware state is deliberately not rolled back.
+    SoundRollback::CaptureDesired(state->sound_desired);
+
+    // Checksum path split for perf:
+    //   - Always compute the cheap gameplay fingerprint (~44 B hash). This
+    //     is what GekkoNet compares for desync detection via
+    //     *update->data.save.checksum in netplay.cpp.
+    //   - Only run the full ~1 MB per-region diagnostic hash when the
+    //     replay-diff scan is due to run (same 1/sec throttle). At other
+    //     times saved_region_crcs contains only fingerprint + rng;
+    //     per-region fields are zeroed (not a problem because nothing
+    //     reads them outside the throttled scan path).
+    SaveState_CalculateFingerprint();
+    static DWORD last_full_crc_tick = 0;
+    DWORD full_crc_now = GetTickCount();
+    bool full_crcs_due = (full_crc_now - last_full_crc_tick) >= 1000;
+    if (full_crcs_due) {
+        last_full_crc_tick = full_crc_now;
+        SaveState_CalculateFullChecksum();
+    }
+    state->checksum = g_region_checksums.combined;  // zero on non-due saves, fine
     uint32_t checksum = state->checksum;
 
     // Build a fresh per-region CRC snapshot for THIS save (forward or replay).
@@ -408,18 +555,22 @@ bool SaveState_Save(int frame) {
         this_save_crcs.shake_effects          = rc.shake_effects;
         this_save_crcs.gameplay_fingerprint   = rc.gameplay_fingerprint;
         this_save_crcs.combined               = rc.combined;
-        this_save_crcs.afterimage_pool        = Fletcher32((uint8_t*)WaveCAddrs::AFTERIMAGE_POOL,      WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // Hash the SAVED copy of afterimage_pool (with g_last_frame_time zeroed
+        // above), NOT live memory — this is what makes the exclusion work
+        // across forward- and replay-sim.
+        this_save_crcs.afterimage_pool        = Fletcher32(state->afterimage_pool,                     WaveCAddrs::AFTERIMAGE_POOL_SZ);
         this_save_crcs.list_heads_tails       = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_LIST_HEADS,    WaveCAddrs::OBJECT_LIST_HEADS_SZ);
         this_save_crcs.node_pool              = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_NODE_POOL,     WaveCAddrs::OBJECT_NODE_POOL_SZ);
         this_save_crcs.current_object_ptr_val = *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR;
 
-        // Per-object-slot CRCs. Cheap (~400 KB of Fletcher32/tick) and lets
-        // the desync dump report the exact slot index that diverged without
-        // needing to scrape the SDL console for the REPLAY DIFF line.
-        for (size_t i = 0; i < SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT; i++) {
-            const uint8_t* p = (const uint8_t*)(ADDR_OBJECT_POOL + i * SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE);
-            this_save_crcs.object_slot_crcs[i] = Fletcher32(p, SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE);
-        }
+        // Per-object-slot CRCs: NOT computed here. ~400 KB of Fletcher32 per
+        // save × 10 saves/check_distance × rollback-every-10-frames = ~14 MB/s
+        // of hashing overhead in stress mode. At dump time we compute these
+        // on demand from state->object_pool (forward bytes are still stored).
+        // Slot CRCs stay zeroed until then; the dump path recomputes both
+        // sides from the saved byte buffers to do its per-slot diff.
+        memset(this_save_crcs.object_slot_crcs, 0,
+               sizeof(this_save_crcs.object_slot_crcs));
 
         this_save_crcs.valid = true;
     }
@@ -499,11 +650,36 @@ bool SaveState_Load(int frame) {
     for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
         uintptr_t slot_base = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE);
         uintptr_t dynamic_addr = slot_base + CHAR_SLOT_DYNAMIC_OFFSET;
-        memcpy((void*)dynamic_addr, state->char_dynamic[i], CHAR_SLOT_DYNAMIC_SIZE);
+        // Mirror of the active-slot save: only restore loaded slots (save
+        // buffer's first byte != 0). Unloaded slots are left alone; if the
+        // game hasn't loaded a character there nothing reads those bytes.
+        if (state->char_dynamic[i][0] != 0) {
+            memcpy((void*)dynamic_addr, state->char_dynamic[i], CHAR_SLOT_DYNAMIC_SIZE);
+        }
     }
 
     // Restore object pool
-    memcpy((void*)ADDR_OBJECT_POOL, state->object_pool, SIZE_OBJECT_POOL);
+    // Object pool: mirror of the active-slot save. If the save buffer's
+    // first byte is 0 the slot was inactive at save time — zero the live
+    // slot to match (and prevent stale active data from bleeding through
+    // if the slot is currently live but was dead at the saved frame).
+    {
+        constexpr size_t OBJ_SZ = 382;
+        constexpr size_t OBJ_COUNT = SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT;
+        const uint8_t* src_base = state->object_pool;
+        uint8_t* dst_base = (uint8_t*)ADDR_OBJECT_POOL;
+        for (size_t i = 0; i < OBJ_COUNT; i++) {
+            const uint8_t* src = src_base + i * OBJ_SZ;
+            uint8_t* dst = dst_base + i * OBJ_SZ;
+            if (src[0] != 0) {
+                memcpy(dst, src, OBJ_SZ);  // active: full restore
+            } else if (dst[0] != 0) {
+                // Currently live-active but save says dead — zero to match.
+                // Skip the memset when live is already inactive.
+                memset(dst, 0, OBJ_SZ);
+            }
+        }
+    }
 
     // Restore input history
     memcpy((void*)ADDR_INPUT_HISTORY, state->input_history, SIZE_INPUT_HISTORY);
@@ -514,13 +690,34 @@ bool SaveState_Load(int frame) {
     // Restore effect/shake state
     memcpy((void*)EffectAddrs::EFFECT_SYS1, state->effect_sys1, EffectAddrs::EFFECT_SYS1_SZ);
     memcpy((void*)EffectAddrs::EFFECT_SYS2, state->effect_sys2, EffectAddrs::EFFECT_SYS2_SZ);
+    *(uint32_t*)0x424718 = state->round_end_flag;
     memcpy((void*)EffectAddrs::SHAKE_EFFECTS, state->shake_effects, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     // Wave C additions: afterimage pool + object list topology.
-    memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,      state->afterimage_pool,         WaveCAddrs::AFTERIMAGE_POOL_SZ);
+    // Restore afterimage_pool EXCEPT the 4 bytes at 0x447DD4 (g_last_frame_time).
+    // Those were zeroed in the saved copy so forward/replay CRCs match;
+    // restoring them into live memory would overwrite main_game_loop's current
+    // pacing anchor and cause frame-skip math to go wild. Split restore:
+    //   [start .. 0x4A4)          <- from save
+    //   [0x4A4 .. 0x4A8)          <- SKIP (leave live value untouched)
+    //   [0x4A8 .. end)            <- from save
+    constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
+    constexpr size_t G_LAST_FRAME_TIME_SIZE   = 4;
+    memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
+           state->afterimage_pool,
+           G_LAST_FRAME_TIME_OFFSET);
+    memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE),
+           state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE,
+           WaveCAddrs::AFTERIMAGE_POOL_SZ - G_LAST_FRAME_TIME_OFFSET - G_LAST_FRAME_TIME_SIZE);
     *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR    = state->current_object_ptr;
     memcpy((void*)WaveCAddrs::OBJECT_LIST_HEADS,    state->object_list_heads_tails, WaveCAddrs::OBJECT_LIST_HEADS_SZ);
     memcpy((void*)WaveCAddrs::OBJECT_NODE_POOL,     state->object_node_pool,        WaveCAddrs::OBJECT_NODE_POOL_SZ);
+
+    // Mike Z sound-rollback: restore per-channel "desired" state. Actual DSound
+    // hardware state is NOT touched — the post-advance sync decides which
+    // restored desires cross into "play now" vs. "leave the channel alone"
+    // based on whether the play frame falls inside the rollback window.
+    SoundRollback::RestoreDesired(state->sound_desired);
 
     return true;
 }
@@ -599,8 +796,41 @@ const RegionChecksums& SaveState_GetRegionChecksums() {
 
 
 
+// Cheap path: gameplay fingerprint only — what GekkoNet actually compares
+// for desync detection. Called on every save. ~44 B of hashing.
+uint32_t SaveState_CalculateFingerprint() {
+    g_region_checksums.rng = *(uint32_t*)ADDR_RNG_SEED;
+
+    uint32_t buf_idx = *(uint32_t*)0x447EE0;
+    uint32_t idx     = buf_idx & 0x3FF;
+    uint16_t p1_in = ((const uint16_t*)0x4280E0)[idx];
+    uint16_t p2_in = ((const uint16_t*)0x4290E0)[idx];
+    struct __attribute__((packed)) Fingerprint {
+        uint32_t rng;
+        uint32_t p1_hp;
+        uint32_t p2_hp;
+        uint32_t round_timer;
+        uint32_t game_timer;
+        uint16_t p1_input;
+        uint16_t p2_input;
+    } fp = {
+        *(uint32_t*)0x41FB1C,
+        *(uint32_t*)0x4DFC85,
+        *(uint32_t*)0x4EDCC4,
+        *(uint32_t*)0x470060,
+        *(uint32_t*)0x470044,
+        p1_in, p2_in,
+    };
+    g_region_checksums.gameplay_fingerprint =
+        Fletcher32((const uint8_t*)&fp, sizeof(fp));
+    return g_region_checksums.gameplay_fingerprint;
+}
+
 uint32_t SaveState_CalculateFullChecksum() {
-    // Compute per-region checksums for diagnostic comparison
+    // Expensive diagnostic path: ~1 MB hashing per call. Callers should
+    // only hit this when they need per-region CRCs (the replay-diff scan,
+    // throttled to 1/sec). Every normal save uses
+    // SaveState_CalculateFingerprint() above instead.
     g_region_checksums.rng = *(uint32_t*)ADDR_RNG_SEED;
 
     // Game state CRC: split to EXCLUDE known per-process/CSS-residue fields:
@@ -619,10 +849,14 @@ uint32_t SaveState_CalculateFullChecksum() {
     // so ANY object mutation shows up in the combined checksum immediately.
     g_region_checksums.object_pool = Fletcher32((uint8_t*)ADDR_OBJECT_POOL, SIZE_OBJECT_POOL);
 
-    // Character dynamic state
+    // Character dynamic state — only hash loaded slots (first byte != 0
+    // indicates .kgt magic "2DKG"). In 1v1 that's 2 of 8, trimming this
+    // cost from 460 KB to ~115 KB.
     uint32_t char_ck = 0;
     for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
-        uintptr_t dynamic_addr = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE) + CHAR_SLOT_DYNAMIC_OFFSET;
+        uintptr_t slot_base = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE);
+        if (*(uint8_t*)slot_base == 0) continue;
+        uintptr_t dynamic_addr = slot_base + CHAR_SLOT_DYNAMIC_OFFSET;
         char_ck ^= Fletcher32((uint8_t*)dynamic_addr, CHAR_SLOT_DYNAMIC_SIZE);
     }
     g_region_checksums.char_dynamic = char_ck;
@@ -687,51 +921,8 @@ uint32_t SaveState_CalculateFullChecksum() {
         g_region_checksums.combined = combined;
     }
 
-    // Gameplay fingerprint: a curated hash over only game-visible fields.
-    // Addresses VERIFIED against live IDA symbols (2026-04-23):
-    //   - RNG seed:   g_rand_seed @ 0x41FB1C
-    //   - P1 HP:      g_p1_hp     @ 0x4DFC85        (per Wave C audit)
-    //   - P2 HP:      g_p2_hp     @ g_p1_hp + 57407 = 0x4EDCC4
-    //   - game/round: g_game_timer @ 0x470044, g_round_timer @ 0x470060
-    //   - P1/P2 current input: g_p1_input_history[buf_idx], g_p2_input_history[buf_idx]
-    // PREVIOUS BUG: the fingerprint read 0x47010C / 0x470110 / 0x47030C / 0x470310
-    // thinking those were HP fields. They are actually g_demo_mode_player_id and
-    // g_demo_mode_hp (per IDA). The fingerprint was hashing demo-mode state, not
-    // gameplay HP. During intro (HP=0/0) it coincidentally matched; during
-    // actual combat the HP mismatch would hide behind an always-equal demo field.
-    //
-    // Stage positions are intentionally NOT in the fingerprint because
-    // g_player_stage_positions is a 36-byte block with slot sentinels (0xFF
-    // fills) that are legitimately process-local CSS residue. Player world
-    // position is instead captured via the object pool (obj[0]/obj[1] +0x8/+0xC)
-    // which is part of char_dynamic saves.
-    {
-        uint32_t buf_idx = *(uint32_t*)0x447EE0;     // g_input_buffer_index
-        uint32_t idx     = buf_idx & 0x3FF;          // 1024-frame ring
-        // Per-frame sampled inputs
-        uint16_t p1_in = ((const uint16_t*)0x4280E0)[idx];  // g_p1_input_history
-        uint16_t p2_in = ((const uint16_t*)0x4290E0)[idx];  // g_p2_input_history
-        struct __attribute__((packed)) Fingerprint {
-            uint32_t rng;
-            uint32_t p1_hp;
-            uint32_t p2_hp;
-            uint32_t round_timer;
-            uint32_t game_timer;
-            uint16_t p1_input;
-            uint16_t p2_input;
-        } fp = {
-            *(uint32_t*)0x41FB1C,   // g_rand_seed
-            *(uint32_t*)0x4DFC85,   // g_p1_hp          (Wave C)
-            *(uint32_t*)0x4EDCC4,   // g_p2_hp = g_p1_hp + 57407
-            *(uint32_t*)0x470060,   // g_round_timer
-            *(uint32_t*)0x470044,   // g_game_timer
-            p1_in,
-            p2_in,
-        };
-        g_region_checksums.gameplay_fingerprint =
-            Fletcher32((const uint8_t*)&fp, sizeof(fp));
-    }
-
+    // Fingerprint is populated by SaveState_CalculateFingerprint() on every
+    // save; no need to recompute here.
     return g_region_checksums.combined;
 }
 
@@ -951,31 +1142,39 @@ void SaveState_DumpDesyncDiagnostic(int frame, uint32_t local_crc, uint32_t remo
                 saved_frame, saved_frame);
 
             // Per-object-slot breakdown. If ObjectPool(full) differed, this
-            // pinpoints the exact slot indices. Cross-reference obj_base with
-            // IDA (ADDR_OBJECT_POOL + idx*382) to find the writer code.
+            // pinpoints the exact slot indices. The per-slot CRCs aren't
+            // computed at save time any more (too expensive — see
+            // SaveState_Save) so we derive them here from the FORWARD save
+            // buffer (state->object_pool, which is still live in the rollback
+            // ring). Replay bytes aren't retained, so we compute replay-side
+            // per-slot CRCs from live memory — valid as long as we're dumping
+            // shortly after the desync before many more frames have run.
             if (fwd.object_pool != replay.object_pool) {
                 fprintf(f, "\n=== Object Slot Divergence ===\n");
                 int printed = 0;
+                const uint8_t* fwd_bytes = g_state_buffer[slot].object_pool;
+                const uint8_t* rep_bytes = (const uint8_t*)ADDR_OBJECT_POOL;
                 for (size_t i = 0; i < SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT; i++) {
-                    if (fwd.object_slot_crcs[i] != replay.object_slot_crcs[i]) {
+                    const size_t off = i * SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE;
+                    uint32_t fwd_c = Fletcher32(fwd_bytes + off,
+                                                 SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE);
+                    uint32_t rep_c = Fletcher32(rep_bytes + off,
+                                                 SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE);
+                    if (fwd_c != rep_c) {
                         uintptr_t obj_base =
                             0x4701E0 + i * SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE;
                         fprintf(f, "  obj[%4zu] base=0x%08X  forward_crc=0x%08X  replay_crc=0x%08X\n",
-                                i, (unsigned)obj_base,
-                                fwd.object_slot_crcs[i], replay.object_slot_crcs[i]);
+                                i, (unsigned)obj_base, fwd_c, rep_c);
                         if (++printed >= 32) {
-                            fprintf(f, "  ... (truncated; %zu total diverging slots scanned)\n",
-                                    SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT);
+                            fprintf(f, "  ... (truncated)\n");
                             break;
                         }
                     }
                 }
                 if (printed == 0) {
-                    fprintf(f, "  (aggregate object_pool CRC differs but no per-slot CRC does —\n"
-                               "   divergence is in the trailing bytes past slot %zu × 382 = 0x%X)\n",
-                            SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT,
-                            (unsigned)(SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT *
-                                       SaveStateData::SavedRegionCRCs::OBJ_SLOT_SIZE));
+                    fprintf(f, "  (aggregate ObjectPool CRC differed but no slot matched on-demand —\n"
+                               "   either the live-memory state shifted between save and dump, or\n"
+                               "   the divergence is in inter-slot padding)\n");
                 }
             }
         }

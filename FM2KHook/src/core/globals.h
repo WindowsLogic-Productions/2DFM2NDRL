@@ -33,6 +33,7 @@ namespace FM2K {
     constexpr uintptr_t ADDR_RENDER_GAME = 0x404DD0;
     constexpr uintptr_t ADDR_GAME_RAND = 0x417A22;
     constexpr uintptr_t ADDR_PROCESS_INPUTS = 0x4146D0;
+    constexpr uintptr_t ADDR_DISPATCH_SCRIPT_SOUND = 0x403430;  // SFX dispatcher — rollback sound hook
 
     // Game state addresses
     constexpr uintptr_t ADDR_FRAME_COUNTER = 0x4456FC;

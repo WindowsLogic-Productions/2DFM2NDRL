@@ -83,8 +83,11 @@ void ControlChannel_SendCharUnlock();
 // Send CSS start signal (both players synced, start counting frames NOW)
 void ControlChannel_SendCSSStart();
 
-// Send battle ready signal (for CSS sync)
-void ControlChannel_SendBattleReady();
+// Send battle ready signal (for CSS sync). Carries the sender's proposed
+// local input delay so both peers can agree on max() before starting the
+// GekkoNet session — otherwise mismatched RTT samples produce asymmetric
+// per-peer local delay and one side feels more input lag than the other.
+void ControlChannel_SendBattleReady(uint8_t proposed_local_delay);
 
 // Send battle acknowledgment
 void ControlChannel_SendBattleAck();
