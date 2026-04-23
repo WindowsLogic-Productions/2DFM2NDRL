@@ -53,6 +53,18 @@ static uint8_t s_render_saved_object_pool[FM2K::SIZE_OBJECT_POOL];
 static uint8_t s_render_saved_afterimage[WaveCAddrs::AFTERIMAGE_POOL_SZ];
 static uint8_t s_render_saved_input_tracking[0xA0];
 
+// SHAKE_EFFECTS block (40 B at 0x447DA9..0x447DD1) must be carved out of
+// the render-side afterimage snapshot so ProcessShakeEffect's per-render
+// timer decrement (a1[3]--) reaches sim memory. The dev-scripted
+// Duration in each character's KGT drives how long shake lasts; we need
+// that countdown to propagate. Without this carve, the snapshot reverts
+// the decrement every render, sim state is permanently pinned at
+// timer == duration, and any character whose script re-SETs the opcode
+// each frame rumbles forever.
+constexpr uintptr_t SHAKE_EFFECTS_ADDR  = 0x447DA9;
+constexpr size_t    SHAKE_EFFECTS_SZ    = 40;
+constexpr size_t    SHAKE_OFFSET_IN_AI  = SHAKE_EFFECTS_ADDR - WaveCAddrs::AFTERIMAGE_POOL;  // 0x479
+
 static void RenderFrameWithSnapshot() {
     if (!original_render_game) return;
 
@@ -60,13 +72,20 @@ static void RenderFrameWithSnapshot() {
     // to do this; in trampoline mode render goes through here instead.
     Hook_RenderDiagnostics_Tick();
 
-    // Save
     const bool protect = Netplay_IsActive();
     uint32_t saved_rng = 0;
     if (protect) {
         saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
         memcpy(s_render_saved_object_pool,    (void*)FM2K::ADDR_OBJECT_POOL,       FM2K::SIZE_OBJECT_POOL);
-        memcpy(s_render_saved_afterimage,     (void*)WaveCAddrs::AFTERIMAGE_POOL,  WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // Afterimage save: two halves skipping the shake block so render's
+        // decrement of the shake timer propagates into sim memory and the
+        // KGT-scripted duration actually plays out.
+        memcpy(s_render_saved_afterimage,
+               (void*)WaveCAddrs::AFTERIMAGE_POOL,
+               SHAKE_OFFSET_IN_AI);
+        memcpy(s_render_saved_afterimage + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ),
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_OFFSET_IN_AI - SHAKE_EFFECTS_SZ);
         memcpy(s_render_saved_input_tracking, (void*)0x447EE0,                     0xA0);
     }
 
@@ -75,11 +94,17 @@ static void RenderFrameWithSnapshot() {
     if (protect) {
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
         memcpy((void*)FM2K::ADDR_OBJECT_POOL,      s_render_saved_object_pool,    FM2K::SIZE_OBJECT_POOL);
-        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL, s_render_saved_afterimage,     WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // Afterimage restore: mirror of the split save — shake block in
+        // live memory keeps whatever ProcessShakeEffect just wrote.
+        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
+               s_render_saved_afterimage,
+               SHAKE_OFFSET_IN_AI);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ),
+               s_render_saved_afterimage + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ,
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_OFFSET_IN_AI - SHAKE_EFFECTS_SZ);
         memcpy((void*)0x447EE0,                    s_render_saved_input_tracking, 0xA0);
     }
 
-    // Launcher stats handshake (was in Hook_RenderGame).
     SharedMem_Update();
 }
 
