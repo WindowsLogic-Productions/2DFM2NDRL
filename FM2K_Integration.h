@@ -497,6 +497,7 @@ public:
 
     void StartOfflineSession();
     void StartOnlineSession(const NetworkConfig& config, bool is_host);
+    void StartStressSession();  // GekkoStressSession determinism test (single instance)
     void StopSession();
     
     std::vector<FM2K::FM2KGameInfo> DiscoverGames();
@@ -597,6 +598,7 @@ public:
     std::function<void(const FM2K::FM2KGameInfo&)> on_game_selected;
     std::function<void()> on_offline_session_start;
     std::function<void(const NetworkConfig&)> on_online_session_start;
+    std::function<void()> on_stress_session_start;  // Single-instance GekkoStressSession determinism test
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     std::function<void(const std::string&)> on_games_folder_set;

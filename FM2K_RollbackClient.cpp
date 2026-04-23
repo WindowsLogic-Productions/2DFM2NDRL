@@ -561,6 +561,9 @@ bool FM2KLauncher::Initialize() {
     ui_->on_online_session_start = [this](const NetworkConfig& config) {
         StartOnlineSession(config, config.is_host);
     };
+    ui_->on_stress_session_start = [this]() {
+        StartStressSession();
+    };
     ui_->on_session_stop = [this]() {
         StopSession();
     };
@@ -1320,6 +1323,46 @@ void FM2KLauncher::StartOfflineSession() {
     std::cout << "? LOCAL session started (offline mode)\n";
 }
 
+// Launch a single game instance with GekkoStressSession enabled.
+// No second instance, no networking. The hook DLL detects FM2K_STRESS_MODE=1
+// and creates a GekkoStressSession with both players local; GekkoNet then
+// artificially rewinds and re-simulates on a check_distance cadence, flagging
+// any sim nondeterminism via the normal DESYNC event path.
+// If the game survives a match without DESYNC firing, the save/load/tick
+// pipeline is deterministic. If it fires, we have a pure local repro.
+void FM2KLauncher::StartStressSession() {
+    if (selected_game_.exe_path.empty()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Cannot start stress session: no game selected.");
+        return;
+    }
+
+    if (game_instance_ && game_instance_->IsRunning()) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Terminating existing game instance before stress launch");
+        game_instance_->Terminate();
+    }
+
+    game_instance_ = std::make_unique<FM2KGameInstance>();
+
+    // Env vars: stress mode ON, true-offline OFF (we still need GekkoNet running)
+    game_instance_->SetEnvironmentVariable("FM2K_TRUE_OFFLINE", "0");
+    game_instance_->SetEnvironmentVariable("FM2K_STRESS_MODE", "1");
+    game_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX", "0");  // irrelevant in stress mode but keep consistent
+    game_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");  // verbose logging so we see desync diagnostics
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Starting STRESS session: GekkoStressSession will force rollbacks "
+        "every check_distance frames. Any DESYNC is a local determinism bug.");
+
+    if (!game_instance_->Launch(selected_game_.exe_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game for stress session.");
+        game_instance_.reset();
+        return;
+    }
+
+    SetState(LauncherState::InGame);
+    std::cout << "? STRESS session started (determinism check, single instance)\n";
+}
+
 void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host) {
     if (selected_game_.exe_path.empty()) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Cannot start online session: no game selected.");
@@ -1336,20 +1379,20 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
     ApplyPendingConfigToInstance(game_instance_.get());
 
     uint8_t player_index = is_host ? 0 : 1;
-    // Host listens on 7000, connects to remote:7001
-    // Client listens on 7001, connects to remote:7000
-    uint16_t local_port = is_host ? 7000 : 7001;
+    uint16_t local_port = static_cast<uint16_t>(config.local_port);
 
-    // remote_address already contains "ip:port" (e.g. "127.0.0.1:7001")
-    // For host: remote is ip:7001, for client: remote is ip:7000
-    // Extract just the IP from config.remote_address (strip existing port)
-    std::string remote_ip = config.remote_address;
-    auto colon_pos = remote_ip.find(':');
-    if (colon_pos != std::string::npos) {
-        remote_ip = remote_ip.substr(0, colon_pos);
+    // Remote address:
+    //   - JOIN: user-pasted "ip:port" is authoritative.
+    //   - HOST: leave empty so the hook learns the peer from the first HELLO.
+    //     (The default "127.0.0.1:7001" from NetworkConfig ctor is a placeholder
+    //     used for the UI copy-button preview; it is NOT a real peer address.)
+    std::string remote_addr;
+    if (!is_host) {
+        remote_addr = config.remote_address;
+        if (remote_addr.find(':') == std::string::npos && !remote_addr.empty()) {
+            remote_addr += ":7500";  // fallback if user pasted a bare IP
+        }
     }
-    uint16_t remote_port = is_host ? 7001 : 7000;
-    std::string remote_addr = remote_ip + ":" + std::to_string(remote_port);
 
     game_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX", std::to_string(player_index));
     game_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT", std::to_string(local_port));

@@ -99,36 +99,42 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
         return false;
     }
 
-    // Parse remote address (format: "ip:port")
-    std::string addr_str(remote_addr);
-    size_t colon_pos = addr_str.find(':');
-    if (colon_pos == std::string::npos) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: Invalid remote address format: %s", remote_addr);
-        closesocket(g_socket);
-        g_socket = INVALID_SOCKET;
-        WSACleanup();
-        return false;
-    }
-
-    std::string ip = addr_str.substr(0, colon_pos);
-    uint16_t port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
-
+    // Parse remote address (format: "ip:port"). Empty/missing is allowed for
+    // pure hosts: we'll learn the peer from the first inbound HELLO.
+    g_remote_sockaddr = {};
     g_remote_sockaddr.sin_family = AF_INET;
-    g_remote_sockaddr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip.c_str(), &g_remote_sockaddr.sin_addr) != 1) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: Invalid IP address: %s", ip.c_str());
-        closesocket(g_socket);
-        g_socket = INVALID_SOCKET;
-        WSACleanup();
-        return false;
+    bool have_remote = false;
+    if (remote_addr && remote_addr[0]) {
+        std::string addr_str(remote_addr);
+        size_t colon_pos = addr_str.find(':');
+        if (colon_pos != std::string::npos) {
+            std::string ip = addr_str.substr(0, colon_pos);
+            uint16_t port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+            if (inet_pton(AF_INET, ip.c_str(), &g_remote_sockaddr.sin_addr) == 1 && port != 0) {
+                g_remote_sockaddr.sin_port = htons(port);
+                have_remote = true;
+            }
+        }
+        if (!have_remote) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "NetSocket: Ignoring invalid remote '%s', waiting for peer HELLO",
+                        remote_addr);
+            g_remote_sockaddr.sin_port = 0;
+            g_remote_sockaddr.sin_addr.s_addr = 0;
+        }
     }
 
     g_socket_initialized = true;
     g_local_player_id = static_cast<uint8_t>(g_player_index);
     g_last_recv_time = GetTimeMs();
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: Initialized on port %d, remote=%s",
-                local_port, remote_addr);
+    if (have_remote) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: Initialized on port %d, remote=%s",
+                    local_port, remote_addr);
+    } else {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "NetSocket: Initialized on port %d, awaiting peer HELLO", local_port);
+    }
 
     return true;
 }
@@ -170,6 +176,7 @@ const sockaddr_in* NetSocket_GetRemoteAddr() {
 
 static void RawSend(const void* data, size_t len) {
     if (g_socket == INVALID_SOCKET) return;
+    if (g_remote_sockaddr.sin_port == 0) return;  // peer address not known yet (host waiting for client)
 
     int result = sendto(g_socket, (const char*)data, (int)len, 0,
                         (sockaddr*)&g_remote_sockaddr, sizeof(g_remote_sockaddr));
@@ -208,6 +215,22 @@ static void RawReceive() {
 
         // Check if this is a control packet (magic byte 0xCC)
         if (recv_len >= 1 && static_cast<uint8_t>(g_recv_buffer[0]) == CTRL_MAGIC) {
+            // Learn the peer's actual source address from the first authenticated
+            // packet. The host's configured remote is only a best-guess default
+            // (e.g. "127.0.0.1:7001"); the client may be bound on any port.
+            // Updating here makes HELLO_ACK / subsequent traffic reach the real peer.
+            if (!g_connected &&
+                (g_remote_sockaddr.sin_addr.s_addr != from_addr.sin_addr.s_addr ||
+                 g_remote_sockaddr.sin_port != from_addr.sin_port)) {
+                char ip_buf[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &from_addr.sin_addr, ip_buf, sizeof(ip_buf));
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "NetSocket: Learned peer address %s:%u (was %u)",
+                            ip_buf, ntohs(from_addr.sin_port),
+                            ntohs(g_remote_sockaddr.sin_port));
+                g_remote_sockaddr = from_addr;
+            }
+
             // Control packet - process immediately
             if (recv_len >= sizeof(CtrlPacketHeader)) {
                 const CtrlPacket* packet = reinterpret_cast<const CtrlPacket*>(g_recv_buffer);

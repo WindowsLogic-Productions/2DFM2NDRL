@@ -6,10 +6,75 @@
 #include "control_channel.h"
 #include "imgui_overlay.h"
 #include "shared_mem.h"
+#include "savestate.h"  // CHAR_SLOT_BASE, CHAR_SLOT_SIZE (corrected by Wave C audit)
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <cstdio>
+#include <cfloat>   // _controlfp_s, _PC_53, _MCW_PC, _RC_NEAR, _MCW_RC, _MCW_EM
+#include <cstdint>
+
+// Pin the x87 FPU control word to a fixed precision + rounding mode on the
+// game thread. IDA audit found the binary never calls _controlfp / fldcw and
+// DirectDraw's SetCooperativeLevel is invoked without DDSCL_FPUPRESERVE, so
+// the default precision is whatever DirectDraw/driver/OS happens to leave.
+// That varies across machines and is almost certainly why peer simulations
+// diverge on movement (velocity, collision, normalization all use floats).
+// Call this before every gameplay tick to override any mid-frame changes.
+// MXCSR bit layout (SSE control/status register):
+//   bit 15 FZ (flush-to-zero)
+//   bits 13-14 RC (round control): 00 nearest, 01 down, 10 up, 11 truncate
+//   bits 7-12 exception masks (we set all = masked)
+//   bit 6 DAZ (denormals-are-zero)
+//   bits 0-5 exception flags (sticky, we clear)
+// We want: round-to-nearest-even, all exceptions masked, no FZ/DAZ, flags clear.
+// Value 0x1F80 is the x86 default but we pin it explicitly to ensure both
+// peers use the same value regardless of prior state.
+static inline void SetMXCSR(unsigned int v) {
+    __asm__ volatile("ldmxcsr %0" : : "m"(v));
+}
+
+static inline void PinFPUControlWord() {
+    unsigned int cur = 0;
+    // x87: 53-bit precision, round-to-nearest-even, all exceptions masked.
+    _controlfp_s(&cur, _PC_53 | _RC_NEAR | _MCW_EM,
+                       _MCW_PC | _MCW_RC | _MCW_EM);
+    // SSE: also pin MXCSR. FM2K's hit-detection and physics likely emit SSE
+    // float ops under -mfpmath or vectorizer, and MXCSR rounding mode is
+    // independent of the x87 control word. Both peers must agree.
+    SetMXCSR(0x1F80u);
+}
+
+// Deterministic timeGetTime: during an active GekkoNet battle session the
+// return value is derived from the authoritative advance count, NOT wall
+// clock. main_game_loop writes timeGetTime() into g_last_frame_time @
+// 0x447DD4 every iteration, which lives inside our saved "afterimage_pool"
+// region. If forward-sim wrote wall-clock T1 and replay-sim wrote T2 at
+// the same frame, the saved afterimage_pool diverges by that timestamp
+// byte — this is the exact "REPLAY DIFF AfterimagePool +0x4A4" signature
+// we caught at f=9 in the stress test.
+//
+// Virtual clock is advanced by 10 ms EACH TIME an AdvanceEvent completes
+// (see netplay.cpp). Within a single main_game_loop iteration the game
+// polls timeGetTime() multiple times — we return the same value on every
+// call until the next advance. Forward-sim and replay-sim both consume
+// the same advance sequence, so both produce identical virtual timestamps
+// at the same logical frame.
+//
+// Outside an active session we pass through — menus/CSS rely on real wall
+// clock for music/animation pacing, and determinism doesn't matter there.
+extern bool Netplay_IsActive();
+using timeGetTime_t = DWORD(WINAPI*)();
+static timeGetTime_t original_timeGetTime = nullptr;
+uint32_t g_virtual_time_ms = 0;  // bumped by 10 per AdvanceEvent in netplay.cpp
+
+static DWORD WINAPI Hook_timeGetTime() {
+    if (Netplay_IsActive()) {
+        return g_virtual_time_ms;
+    }
+    return original_timeGetTime ? original_timeGetTime() : 0;
+}
 
 // ============================================================================
 // GAME MODE DETECTION
@@ -79,18 +144,34 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     if (Netplay_IsActive()) {
         uint16_t input = Netplay_GetInput(player_id);
 
-        // Apply facing direction swap (same logic as original get_player_input)
-        // During battle (3000-3999), if character is active and not in special state,
-        // left/right are swapped based on facing direction
-        constexpr uintptr_t ADDR_CHAR_ACTIVE_FLAG = 0x4DFCD1;
-        constexpr uintptr_t ADDR_CHAR_STATE_FLAGS = 0x4D9A36;
-        constexpr size_t CHAR_SLOT_SIZE = 57407;
+        // Apply facing direction swap (same logic as original get_player_input).
+        // During battle (3000-3999), if character is active and not in special
+        // state, left/right are swapped based on facing direction.
+        //
+        // CRITICAL: these are OFFSETS inside the character slot, NOT absolute
+        // addresses. Hard-coding absolute addresses broke when we corrected
+        // CHAR_SLOT_BASE from 0x4D1D80 to 0x4D1D90 — the hook was reading
+        // from 16 bytes into the wrong memory, decisions were garbage, and
+        // the two peers could pick different facing-swap values from
+        // non-deterministic residue. This is almost certainly the "HP
+        // differs by 2 after a hit" signature we've been chasing.
+        //
+        // Offsets are relative to the CORRECTED base CHAR_SLOT_BASE=0x4D1D90.
+        // First attempt computed these against the old 0x4D1D80 base, which was
+        // 16 bytes too low for the new base — that made facing-swap read the
+        // wrong bytes and the symptom was "left/right flip when you switch
+        // sides". Absolute addresses of the fields are unchanged:
+        //   0x4DFCD1 - 0x4D1D90 = 0xDF41   (char_active)
+        //   0x4D9A36 - 0x4D1D90 = 0x7CA6   (char_state_flags)
+        constexpr size_t CHAR_ACTIVE_FLAG_OFFSET = 0xDF41;
+        constexpr size_t CHAR_STATE_FLAGS_OFFSET = 0x7CA6;
 
         bool facing_reversed = true;  // Default: no swap (normal directions)
         if (game_mode >= 3000 && game_mode < 4000) {
-            uint8_t char_active = *(uint8_t*)(ADDR_CHAR_ACTIVE_FLAG + input_type * CHAR_SLOT_SIZE);
+            uintptr_t slot_base = CHAR_SLOT_BASE + (size_t)input_type * CHAR_SLOT_SIZE;
+            uint8_t char_active = *(uint8_t*)(slot_base + CHAR_ACTIVE_FLAG_OFFSET);
             if (char_active != 0) {
-                uint8_t char_flags = *(uint8_t*)(ADDR_CHAR_STATE_FLAGS + input_type * CHAR_SLOT_SIZE);
+                uint8_t char_flags = *(uint8_t*)(slot_base + CHAR_STATE_FLAGS_OFFSET);
                 if ((char_flags & 8) == 0) {
                     facing_reversed = false;  // Character active, facing applies
                 }
@@ -134,6 +215,35 @@ int __cdecl Hook_UpdateGameState() {
 
     // Offline mode - just pass through
     if (g_offline_mode) {
+        g_frame_counter++;
+        return original_update_game ? original_update_game() : 0;
+    }
+
+    // ========================================================================
+    // STRESS-TEST MODE (FM2K_STRESS_MODE=1) - single-instance determinism check
+    // GekkoStressSession artificially rolls back every check_distance frames.
+    // No network, no sync barriers. Menu/CSS run pass-through; battle mode
+    // starts a GekkoStressSession and drives sim via the Save/Load/Advance
+    // event loop (same path as online, minus the network).
+    // Any desync fired here = local determinism bug. Pure repro.
+    // ========================================================================
+    if (g_stress_mode) {
+        if (IsBattleMode(game_mode)) {
+            if (!Netplay_IsActive()) {
+                if (!Netplay_StartStressBattle()) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "Stress: Failed to start GekkoStressSession, falling through");
+                    g_frame_counter++;
+                    return original_update_game ? original_update_game() : 0;
+                }
+            }
+            if (!Netplay_ProcessBattleInputPhase()) {
+                return 0;
+            }
+            g_frame_counter++;
+            return 0;
+        }
+        // Menu / CSS / results: run game normally
         g_frame_counter++;
         return original_update_game ? original_update_game() : 0;
     }
@@ -292,6 +402,17 @@ static int g_fps_frame_count = 0;
 static int g_current_fps = 0;
 
 // Hook: RenderGame
+// Set in the GekkoNet AdvanceEvent handler (netplay.cpp). Each advance
+// produces exactly one new simulation tick; this flag says "that tick is
+// unrendered". Cleared inside Hook_RenderGame after original_render_game()
+// has drawn it. Any extra Hook_RenderGame invocations between advances skip
+// the real render entirely, so render count cannot outpace sim count on
+// either peer — both peers render exactly as many frames as GekkoNet has
+// advanced. Without this gate, render mutates object-pool animation counters
+// on wall-clock cadence, producing asymmetric state that feeds back into
+// the next sim tick's RNG draws.
+bool g_frame_pending_render = false;
+
 void __cdecl Hook_RenderGame() {
     // Check F9 hotkey for debug overlay
     CheckOverlayHotkey();
@@ -359,20 +480,52 @@ void __cdecl Hook_RenderGame() {
     // CRITICAL: Save/restore RNG around render to prevent render-path RNG
     // consumption from breaking determinism. ProcessShakeEffect and
     // ProcessColorInterpolation call game_rand() during rendering, and
-    // render counts differ between clients (P2 has rollback overhead).
-    // Without this, RNG diverges after ~5000 frames once effects trigger.
+    // Render-path state protection.
+    //
+    // Stress-mode desync dump (FM2K_stress_desync_f158.log) showed that
+    // after a LOAD+replay the four regions below diverged from the forward
+    // save even though memcpy restore ran correctly. Cause: the render
+    // path (ProcessShakeEffect / ProcessColorInterpolation / sprite
+    // updates) mutates these regions, and our render gate skips render
+    // during replay frames. Forward ran N renders, replay ran 0 renders,
+    // so render-side mutations accumulated only in forward. Result:
+    //   RNG_Seed, ObjectPool, AfterimagePool, InputTracking all drifted.
+    // CharDynamic / GameState / Object topology stayed matched because
+    // render doesn't touch them.
+    //
+    // Fix: snapshot these regions before render, restore after render.
+    // Same idea as the existing RNG protection, extended to the other
+    // three. That way render can freely update visual counters but the
+    // gameplay-authoritative memory image is unchanged across renders.
+    bool protect_regions = Netplay_IsActive();
+
     uint32_t saved_rng = 0;
-    bool protect_rng = Netplay_IsActive();
-    if (protect_rng) {
+    static uint8_t s_saved_object_pool[0x5F800];
+    static uint8_t s_saved_afterimage_pool[WaveCAddrs::AFTERIMAGE_POOL_SZ];
+    static uint8_t s_saved_input_tracking[0xA0];
+
+    if (protect_regions) {
         saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+        memcpy(s_saved_object_pool,     (void*)FM2K::ADDR_OBJECT_POOL,       FM2K::SIZE_OBJECT_POOL);
+        memcpy(s_saved_afterimage_pool, (void*)WaveCAddrs::AFTERIMAGE_POOL,  WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        memcpy(s_saved_input_tracking,  (void*)0x447EE0,                     0xA0);
     }
 
-    if (original_render_game) {
+    // In battle mode under GekkoNet, render only when a new sim tick has
+    // been produced since the last render. Otherwise render mutates
+    // object-pool animation state on wall-clock cadence and desyncs peers.
+    bool gate_render = Netplay_IsActive();
+    bool do_render = !gate_render || g_frame_pending_render;
+    if (do_render && original_render_game) {
         original_render_game();
+        g_frame_pending_render = false;
     }
 
-    if (protect_rng) {
+    if (protect_regions) {
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
+        memcpy((void*)FM2K::ADDR_OBJECT_POOL,      s_saved_object_pool,     FM2K::SIZE_OBJECT_POOL);
+        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL, s_saved_afterimage_pool, WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        memcpy((void*)0x447EE0,                    s_saved_input_tracking,  0xA0);
     }
 
     // Update shared memory with current stats for launcher
@@ -412,7 +565,26 @@ uint32_t __cdecl Hook_GameRand() {
 // Hook: ProcessGameInputs
 // During battle: get synced inputs from GekkoNet and write to game memory
 int __cdecl Hook_ProcessGameInputs() {
+    // Re-pin the FPU control word on every game tick. DirectDraw's
+    // SetCooperativeLevel is called without DDSCL_FPUPRESERVE, so DD is
+    // allowed to mutate x87 precision at fullscreen toggle / driver callback
+    // time. Without this line, two peers can run at different float
+    // precision and float-heavy code (movement vectors, hit-rect math)
+    // diverges on the first substantial physics tick — which matches the
+    // "desync starts when you move" signature exactly.
+    PinFPUControlWord();
+
     uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+
+    // Stress-test mode: block game's own process_game_inputs during battle -
+    // GekkoNet drives sim via AdvanceEvent (which calls original_process_game_inputs
+    // internally). Outside battle, pass through normally.
+    if (g_stress_mode) {
+        if (IsBattleMode(game_mode) && Netplay_IsActive()) {
+            return 0;
+        }
+        return original_process_game_inputs ? original_process_game_inputs() : 0;
+    }
 
     // Battle mode with GekkoNet - block during sync, override inputs when active
     if (IsBattleMode(game_mode) && !g_offline_mode && Netplay_IsConnected()) {
@@ -473,6 +645,10 @@ int __cdecl Hook_ProcessGameInputs() {
 bool InitializeHooks() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Initializing MinHook...");
 
+    PinFPUControlWord();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hooks: Pinned x87 FPU control word to _PC_53 | _RC_NEAR");
+
     if (MH_Initialize() != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: MH_Initialize failed");
         return false;
@@ -524,6 +700,30 @@ bool InitializeHooks() {
         MH_EnableHook((void*)FM2K::ADDR_PROCESS_INPUTS) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook ProcessGameInputs");
         return false;
+    }
+
+    // Hook timeGetTime (winmm.dll) — make the game's frame-skip pacing
+    // deterministic across peers. See comment on Hook_timeGetTime for the
+    // rationale. Resolve the real address dynamically so the hook works
+    // regardless of IAT layout.
+    HMODULE winmm = GetModuleHandleA("winmm.dll");
+    if (!winmm) winmm = LoadLibraryA("winmm.dll");
+    if (winmm) {
+        void* real_timeGetTime = (void*)GetProcAddress(winmm, "timeGetTime");
+        if (real_timeGetTime) {
+            if (MH_CreateHook(real_timeGetTime, (void*)Hook_timeGetTime,
+                              (void**)&original_timeGetTime) != MH_OK ||
+                MH_EnableHook(real_timeGetTime) != MH_OK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Hooks: Failed to hook timeGetTime");
+                return false;
+            }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hooks: timeGetTime hooked for deterministic frame pacing");
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hooks: GetProcAddress(timeGetTime) failed");
+        }
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: All hooks installed successfully");

@@ -35,6 +35,7 @@ LauncherUI::LauncherUI()
     on_game_selected = nullptr;
     on_offline_session_start = nullptr;
     on_online_session_start = nullptr;
+    on_stress_session_start = nullptr;
     on_session_stop = nullptr;
     on_exit = nullptr;
     on_games_folder_set = nullptr;
@@ -364,6 +365,10 @@ void LauncherUI::RenderNetworkConfig() {
                     network_config_.remote_address = paste_buf;
                 }
             }
+
+            // Local port (editable for client — required to avoid collisions when both peers run on localhost)
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputInt("Local Port", &network_config_.local_port, 0, 0, ImGuiInputTextFlags_CharsDecimal);
         }
 
         // Input Delay
@@ -494,6 +499,17 @@ void LauncherUI::RenderSessionControls() {
             }
         }
         ImGui::SetItemTooltip("Network play using the configuration below");
+
+        if (ImGui::Button("Stress Test (Determinism Check)", ImVec2(-1, 0))) {
+            if (on_stress_session_start) {
+                on_stress_session_start();
+            }
+        }
+        ImGui::SetItemTooltip(
+            "Single-instance GekkoStressSession. No network. GekkoNet artificially rolls back "
+            "every 10 frames and compares checksums. If the sim is deterministic the session "
+            "runs silently; if not, DESYNC fires with full diagnostic - exact repro of any "
+            "nondeterminism bug in save/load/tick without needing a second peer.");
 
         ImGui::Spacing();
         ImGui::Text("Local Testing:");
