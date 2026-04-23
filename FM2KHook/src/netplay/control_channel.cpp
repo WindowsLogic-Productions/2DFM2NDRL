@@ -405,12 +405,17 @@ void ControlChannel_SendCSSStart() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent CSS_START");
 }
 
-void ControlChannel_SendBattleReady() {
+void ControlChannel_SendBattleReady(uint8_t proposed_local_delay) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_READY;
+    // Reuse the sync.frame field as a generic u32 payload to carry our
+    // proposed local delay. Low byte = delay; other bytes reserved.
+    pkt.data.sync.frame = (uint32_t)proposed_local_delay;
     ControlChannel_Send(pkt);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_READY");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent BATTLE_READY (proposed_local_delay=%u)",
+                (unsigned)proposed_local_delay);
 }
 
 void ControlChannel_SendBattleAck() {

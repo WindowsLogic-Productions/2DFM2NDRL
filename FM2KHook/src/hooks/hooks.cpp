@@ -7,6 +7,8 @@
 #include "imgui_overlay.h"
 #include "shared_mem.h"
 #include "savestate.h"  // CHAR_SLOT_BASE, CHAR_SLOT_SIZE (corrected by Wave C audit)
+#include "../core/main_loop_trampoline.h"  // TrampolineMainLoop — owns the outer loop
+#include "../audio/sound_rollback.h"        // Mike Z desired/actual sound layer
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -90,10 +92,20 @@ static bool IsBattleMode(uint32_t mode) {
     return mode >= 3000 && mode < 4000;
 }
 
-// Battle sync state - ensures both clients start GekkoNet together
-static bool g_battle_entry_signaled = false;
+// Battle sync state - ensures both clients start GekkoNet together.
+// Exposed non-static so the trampoline (main_loop_trampoline.cpp) can see it;
+// the trampoline replaces main_game_loop wholesale and needs to drive the
+// battle-entry handshake.
+bool g_battle_entry_signaled_pub = false;
+#define g_battle_entry_signaled g_battle_entry_signaled_pub
 
 // Called every frame to check for game mode transitions
+// Public shim so the trampoline (main_loop_trampoline.cpp) can invoke the
+// same transition detector the hooks use.
+extern "C" void Hook_CheckGameModeTransition_Public();
+static void CheckGameModeTransition();
+extern "C" void Hook_CheckGameModeTransition_Public() { CheckGameModeTransition(); }
+
 static void CheckGameModeTransition() {
     uint32_t current_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
 
@@ -185,9 +197,12 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             input = (input & ~0x003) | (left_bit << 1) | (right_bit >> 1);
         }
 
-        // Log periodically
+        // Log only the first 4 calls (initial handshake verification). After
+        // that stay silent — Hook_GetPlayerInput fires 2x per sim tick, and
+        // during stress-mode rollback replay that's thousands of calls per
+        // second. Per-100 throttling was still showing up on screen.
         static uint32_t battle_log_count = 0;
-        if (battle_log_count < 10 || battle_log_count % 100 == 0) {
+        if (battle_log_count < 4) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "[BATTLE INPUT #%u] player=%d type=%d -> 0x%03X (facing=%s)",
                 battle_log_count, player_id, input_type, input,
@@ -413,8 +428,10 @@ static int g_current_fps = 0;
 // the next sim tick's RNG draws.
 bool g_frame_pending_render = false;
 
-void __cdecl Hook_RenderGame() {
-    // Check F9 hotkey for debug overlay
+// Public — called by the trampoline's render step so FPS + title bar stats
+// keep updating even though Hook_RenderGame is bypassed in battle mode.
+extern "C" void Hook_RenderDiagnostics_Tick();
+extern "C" void Hook_RenderDiagnostics_Tick() {
     CheckOverlayHotkey();
 
     // Track FPS
@@ -439,23 +456,23 @@ void __cdecl Hook_RenderGame() {
             bool connected = Netplay_IsConnected();
 
             if (active) {
-                // BBBR format: FM2K [HOST] Battle | FPS:100 | P:12ms A:0.5ms | D:2 FA:0.1 | RB:3
                 GekkoNetworkStats stats = Netplay_GetNetworkStats();
                 float ahead = Netplay_GetFramesAhead();
                 int delay = Netplay_GetLocalDelay();
                 uint32_t desyncs = Netplay_GetDesyncCount();
                 uint32_t rollbacks = Netplay_GetRollbackCount();
+                const char* tag = g_stress_mode ? "STRESS" : "Battle";
 
                 if (desyncs > 0) {
                     snprintf(title, sizeof(title),
-                        "FM2K [%s] Battle | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u | DESYNC x%u",
-                        role, g_current_fps,
+                        "FM2K [%s] %s | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u | DESYNC x%u",
+                        role, tag, g_current_fps,
                         stats.last_ping, stats.avg_ping,
                         delay, ahead, rollbacks, desyncs);
                 } else {
                     snprintf(title, sizeof(title),
-                        "FM2K [%s] Battle | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u",
-                        role, g_current_fps,
+                        "FM2K [%s] %s | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u",
+                        role, tag, g_current_fps,
                         stats.last_ping, stats.avg_ping,
                         delay, ahead, rollbacks);
                 }
@@ -476,6 +493,50 @@ void __cdecl Hook_RenderGame() {
             SetWindowTextA(game_window, title);
         }
     }
+}
+
+// Mike Z sound rollback: intercept the SFX branch of FM2K's script sound
+// dispatcher. During battle, instead of playing immediately we record the
+// requested play into `desired[channel]`. Once per displayed frame (after
+// the advance batch completes) SoundRollback::SyncAfterAdvance reconciles
+// desired ↔ actual and issues real DSound stops/plays with the rollback-
+// window filter that prevents erased/re-triggered sounds from clipping.
+//
+// Script item layout (42 bytes, from DispatchScriptSoundCommand decomp):
+//   +36  void*  SoundBufferArray ptr       (SFX case)
+//   +40  uint8  cmd byte (low nibble: 0=stop 1=SFX 2=MIDI 3=CD; bit 0x10=volume flag)
+//   +41  uint8  CD track number             (CD case)
+//
+// MIDI and CD paths (music) pass through unchanged — music-restart on
+// rollback is a v2 concern.
+typedef int(__cdecl* DispatchScriptSoundFunc)(int);
+static DispatchScriptSoundFunc original_dispatch_script_sound = nullptr;
+
+int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
+    if (!Netplay_IsActive() || script_item == 0) {
+        return original_dispatch_script_sound(script_item);
+    }
+
+    uint8_t cmd = *reinterpret_cast<uint8_t*>(script_item + 40);
+    if ((cmd & 0xF) != 1) {
+        // Not SFX — let MIDI/CD/stop pass through as before.
+        return original_dispatch_script_sound(script_item);
+    }
+
+    void* arr = *reinterpret_cast<void**>(script_item + 36);
+    if (arr) {
+        SoundRollback::RecordDesired(arr, Netplay_GetFrame());
+    }
+    // Non-zero return so callers reading the result as "play succeeded"
+    // don't treat it as a failure path.
+    return 1;
+}
+
+void __cdecl Hook_RenderGame() {
+    // In trampoline mode, render goes through RenderFrameWithSnapshot in
+    // main_loop_trampoline.cpp. This hook still catches direct calls from
+    // the game (e.g. init/menu paths) — run diagnostics and pass through.
+    Hook_RenderDiagnostics_Tick();
 
     // CRITICAL: Save/restore RNG around render to prevent render-path RNG
     // consumption from breaking determinism. ProcessShakeEffect and
@@ -540,6 +601,9 @@ void __cdecl Hook_RenderGame() {
 }
 
 // Hook: RunGameLoop
+// Detours to the main-loop trampoline; we own the outer game loop from this
+// point forward. Pre-trampoline side effects (VS-mode patch) fire before the
+// hand-off so CSS behavior is unchanged.
 BOOL __cdecl Hook_RunGameLoop() {
     // Set VS player mode once
     static bool vs_mode_set = false;
@@ -554,7 +618,7 @@ BOOL __cdecl Hook_RunGameLoop() {
         }
     }
 
-    return original_run_game_loop ? original_run_game_loop() : FALSE;
+    return TrampolineMainLoop();
 }
 
 // Hook: GameRand - pass through
@@ -699,6 +763,18 @@ bool InitializeHooks() {
                       (void**)&original_process_game_inputs) != MH_OK ||
         MH_EnableHook((void*)FM2K::ADDR_PROCESS_INPUTS) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook ProcessGameInputs");
+        return false;
+    }
+
+    // Hook DispatchScriptSoundCommand — Mike Z desired/actual sound layer.
+    // During battle the hook records `desired[channel]` instead of playing;
+    // SoundRollback::SyncAfterAdvance reconciles once per displayed frame.
+    if (MH_CreateHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND,
+                      (void*)Hook_DispatchScriptSoundCommand,
+                      (void**)&original_dispatch_script_sound) != MH_OK ||
+        MH_EnableHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND) != MH_OK) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Hooks: Failed to hook DispatchScriptSoundCommand");
         return false;
     }
 

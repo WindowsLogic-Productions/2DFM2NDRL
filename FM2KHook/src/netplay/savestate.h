@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include "../audio/sound_rollback.h"  // DesiredState, MAX_CHANNELS
 
 // ============================================================================
 // CHARACTER SLOT CONSTANTS
@@ -35,8 +36,20 @@ struct SaveStateData {
     uint8_t input_history[0x2008];                         // ~8KB
     uint8_t game_state[0x220];                             // 544 bytes
     uint8_t effect_sys1[42];                               // Effect system P1
-    uint8_t effect_sys2[44];                               // Effect system P2
+    uint8_t effect_sys2[88];                               // 0x4456B0..0x445708: sysvars + effect-sys2 + timer_countdown1
     uint8_t shake_effects[40];                             // Shake structures
+
+    // g_round_end_flag — written/read by vs_round_function, drives round
+    // transitions. Not previously saved; IDA audit flagged it as unsaved
+    // state that rollback must cover for clean round-boundary replay.
+    uint32_t round_end_flag;                               // 0x424718
+
+    // Mike Z rollback-safe sound layer: per-channel "desired" state. Not
+    // DSound hardware state — only the sim's authoritative record of what
+    // should be playing on each channel. Sound-layer sync at end of each
+    // displayed frame reconciles this to the real DSound buffers with the
+    // rollback-window filter (see sound_rollback.h).
+    SoundRollback::DesiredState sound_desired[SoundRollback::MAX_CHANNELS];
 
     // Wave C audit additions: these regions were unsaved and are the prime
     // suspects for post-rollback determinism drift.
