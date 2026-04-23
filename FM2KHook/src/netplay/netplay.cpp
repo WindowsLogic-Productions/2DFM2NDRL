@@ -992,6 +992,15 @@ bool Netplay_ProcessBattleInputPhase() {
                 g_netplay_frame++;
                 has_advance = true;
 
+                // Shake safety cap removed — the real fix is letting the
+                // render-path timer decrement persist (see carve-out in
+                // main_loop_trampoline.cpp:RenderFrameWithSnapshot). With
+                // that in place, the KGT-scripted `Duration` value the
+                // character author wrote drives how long shake lasts, and
+                // the timer naturally reaches 0 -> ProcessShakeEffect zeros
+                // the visible offset -> shake ends at exactly the designed
+                // frame count. No per-frame force-clear needed.
+
                 // Advance the deterministic virtual clock used by Hook_timeGetTime.
                 // Exactly one bump per AdvanceEvent.
                 extern uint32_t g_virtual_time_ms;
