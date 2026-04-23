@@ -29,10 +29,11 @@ namespace SoundRollback {
 
 // Per-channel desired state. Saved in the rollback ring.
 struct DesiredState {
-    uint32_t wave_ptr;       // identity: SoundBufferArray.wave_data pointer
-    uint32_t play_frame;     // frame this was triggered on
-    uint16_t seq_in_frame;   // tiebreaker when the same chan plays twice in one frame
-    uint8_t  stopped;        // 1 = "silence was played on play_frame" (post-rollback-erase)
+    uint32_t script_item_ptr;  // script item ptr for re-invoking DispatchScriptSoundCommand at sync time
+    uint32_t wave_ptr;         // identity: SoundBufferArray.wave_data pointer
+    uint32_t play_frame;       // frame this was triggered on
+    uint16_t seq_in_frame;     // tiebreaker when the same chan plays twice in one frame
+    uint8_t  stopped;          // 1 = "silence was played on play_frame" (post-rollback-erase)
     uint8_t  _pad;
 };
 
@@ -42,9 +43,22 @@ constexpr int MAX_CHANNELS = 2816;  // = (0x433240 - 0x430640) / 4
 void Init();
 void OnBattleEnd();
 
+// Hook/sync thunk registration. Called once at MinHook install so the sync
+// step can invoke the original DispatchScriptSoundCommand trampoline for
+// each channel at sync time (which issues the full Stop+Prepare+Play+Volume
+// sequence that DSound actually needs — PlaySoundFromBufferArray alone only
+// prepares the buffer, it never calls IDirectSoundBuffer::Play).
+typedef int(__cdecl* OriginalDispatcherFn)(int script_item);
+void SetOriginalDispatcher(OriginalDispatcherFn fn);
+
 // Called from Hook_DispatchScriptSoundCommand on the SFX branch.
 // `arr` is the SoundBufferArray pointer (script_item + 36).
-void RecordDesired(void* arr, uint32_t current_frame);
+// `script_item` is the 42-byte script item — stored in desired[] so the sync
+// step can replay the full original dispatcher for this channel.
+// Returns true if the channel was recognised (caller should skip the real play);
+// false means the caller MUST fall through to the original dispatcher so the
+// sound still plays — unknown channels just aren't rollback-tracked.
+bool RecordDesired(void* arr, int script_item, uint32_t current_frame);
 
 // Called once per displayed frame from Netplay_ProcessBattleInputPhase,
 // AFTER the advance batch completes and BEFORE render. Walks desired[] vs
@@ -55,5 +69,13 @@ void SyncAfterAdvance(uint32_t earliest_frame, uint32_t current_frame);
 // Savestate integration — called from SaveState_Save / SaveState_Load.
 void CaptureDesired(DesiredState* out);
 void RestoreDesired(const DesiredState* in);
+
+// Music-path dedup. MIDI/CD dispatches use MCI which hates repeated open+play
+// cycles; the GekkoNet save ring scrolls the forward advance across music
+// trigger frames many times per match, so without dedup music cuts in and out.
+// Returns true if (cmd, payload) matches the most recent non-replay dispatch
+// and should be skipped; false means it's new — caller fires the original
+// dispatcher. State is cleared by OnBattleEnd so next match always plays.
+bool IsRedundantMusicDispatch(uint8_t cmd, uint32_t payload);
 
 } // namespace SoundRollback

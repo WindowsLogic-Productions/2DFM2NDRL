@@ -519,16 +519,47 @@ int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
 
     uint8_t cmd = *reinterpret_cast<uint8_t*>(script_item + 40);
     if ((cmd & 0xF) != 1) {
-        // Not SFX — let MIDI/CD/stop pass through as before.
+        // Not SFX — MIDI (case 2), CD audio (case 3), or full stop (case 0).
+        // These paths use MCI (mciSendCommandA), which is heavy/stateful and
+        // doesn't survive the rapid-fire repeats that rollback replays cause.
+        // In stress mode every displayed frame replays ~10 sim frames, so if
+        // a music trigger is anywhere in that window it fires ~10 times per
+        // displayed frame (1 forward + 9 replay). Even after we suppress the
+        // replay branch, the FORWARD pass still re-fires every time the save
+        // ring scrolls past that frame — music cuts in and out.
+        //
+        // Apply a "dedup by payload" filter: a (cmd, buf_ptr_or_track)
+        // dispatch identical to the previous non-replay dispatch is treated
+        // as a no-op. Any change — new track, stop-then-same-track, fanfare
+        // switch, CD ↔ MIDI — updates the stored key and fires normally, so
+        // mid-match music transitions still work. Only the GekkoNet save-ring
+        // scroll's identical re-trigger gets filtered.
+        // Also skip during replay so the forward-first dispatch wins.
+        if (g_is_rolling_back) {
+            return 0;
+        }
+        // +36 = buffer_array ptr (MIDI/CD paths don't use it but reading is
+        // harmless since the script item is always 42 bytes of valid memory)
+        // +41 = CD track number (case 3 only)
+        uint32_t payload = *reinterpret_cast<uint32_t*>(script_item + 36)
+                         ^ *reinterpret_cast<uint8_t*> (script_item + 41);
+        if (SoundRollback::IsRedundantMusicDispatch(cmd, payload)) {
+            return 0;  // identical music command as last time — leave MCI alone
+        }
         return original_dispatch_script_sound(script_item);
     }
 
     void* arr = *reinterpret_cast<void**>(script_item + 36);
-    if (arr) {
-        SoundRollback::RecordDesired(arr, Netplay_GetFrame());
+    if (!arr || !SoundRollback::RecordDesired(arr, script_item, Netplay_GetFrame())) {
+        // Unknown / null channel — not in g_sound_channel_table. Fall through
+        // to the original dispatcher so the sound still plays (without
+        // rollback tracking). The vast majority of FM2K SFX buffer_arrays
+        // appear to be allocated outside the system table; we only Mike-Z the
+        // ones we can identify.
+        return original_dispatch_script_sound(script_item);
     }
-    // Non-zero return so callers reading the result as "play succeeded"
-    // don't treat it as a failure path.
+    // Known channel — desired[] updated; defer the real play to
+    // SoundRollback::SyncAfterAdvance at end of the displayed frame.
     return 1;
 }
 
@@ -768,7 +799,8 @@ bool InitializeHooks() {
 
     // Hook DispatchScriptSoundCommand — Mike Z desired/actual sound layer.
     // During battle the hook records `desired[channel]` instead of playing;
-    // SoundRollback::SyncAfterAdvance reconciles once per displayed frame.
+    // SoundRollback::SyncAfterAdvance reconciles once per displayed frame by
+    // calling back through the original trampoline.
     if (MH_CreateHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND,
                       (void*)Hook_DispatchScriptSoundCommand,
                       (void**)&original_dispatch_script_sound) != MH_OK ||
@@ -777,6 +809,7 @@ bool InitializeHooks() {
                      "Hooks: Failed to hook DispatchScriptSoundCommand");
         return false;
     }
+    SoundRollback::SetOriginalDispatcher(original_dispatch_script_sound);
 
     // Hook timeGetTime (winmm.dll) — make the game's frame-skip pacing
     // deterministic across peers. See comment on Hook_timeGetTime for the
