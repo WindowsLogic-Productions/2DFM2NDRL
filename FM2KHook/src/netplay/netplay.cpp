@@ -9,7 +9,10 @@
 #include "globals.h"
 #include "gekkonet.h"
 #include <SDL3/SDL_log.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <cstdio>
 #include <cstring>
 
 // =============================================================================
@@ -346,9 +349,12 @@ bool Netplay_ProcessCSS() {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
     }
 
-    // Resend until remote is ready
+    // Keep resending BATTLE_READY until remote is synced AND sending CSS inputs.
+    // Without this, if P1 syncs first and sends only one BATTLE_READY that gets
+    // lost, P2 never syncs and gets stuck forever.
     static uint32_t last_ready_send = 0;
-    if (!g_remote_css_ready && now - last_ready_send > 100) {
+    bool remote_has_css_data = g_remote_inputs.GetEndFrame() > 0;
+    if ((!g_remote_css_ready || !remote_has_css_data) && now - last_ready_send > 100) {
         ControlChannel_SendBattleReady();
         last_ready_send = now;
     }
@@ -528,6 +534,20 @@ bool Netplay_StartBattle() {
     auto adapter = CreateMultiplexAdapter();
     gekko_net_adapter_set(g_session, adapter);
 
+    // Refresh remote address string from the actually-learned peer sockaddr.
+    // g_remote_addr was written at Netplay_Init from the env var (often stale, e.g.
+    // "127.0.0.1:7001" for a host before the client connects). The adapter formats
+    // inbound packet addresses from the real sockaddr ("ip:port"), so the string we
+    // give gekko_add_actor must match that same formatting or every packet is dropped.
+    if (const sockaddr_in* learned = NetSocket_GetRemoteAddr()) {
+        if (learned->sin_port != 0) {
+            char ip_buf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, (void*)&learned->sin_addr, ip_buf, sizeof(ip_buf));
+            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s:%u",
+                     ip_buf, ntohs(learned->sin_port));
+        }
+    }
+
     for (int i = 0; i < 2; i++) {
         if (i == g_player_index) {
             gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
@@ -560,12 +580,69 @@ bool Netplay_StartBattle() {
     return true;
 }
 
+// Single-instance determinism test: GekkoStressSession with both players local
+// and no network adapter. GekkoNet rewinds every check_distance frames and
+// compares checksums, flagging any sim divergence as a desync event.
+bool Netplay_StartStressBattle() {
+    if (g_session) {
+        return true;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: Starting GekkoStressSession (single-instance determinism test)");
+
+    GekkoConfig config = {};
+    config.num_players = 2;
+    config.max_spectators = 0;
+    config.input_prediction_window = 8;
+    config.input_size = sizeof(uint16_t);
+    config.state_size = sizeof(uint32_t);
+    config.desync_detection = true;
+    config.limited_saving = false;
+    // StressSession-specific: force a rollback every 10 frames so GekkoNet
+    // re-simulates from a saved state and compares checksums against the
+    // original advance. Any mismatch fires GekkoDesyncDetected.
+    config.check_distance = 10;
+
+    // StressSession mode: ignores network, forces rollbacks from a single instance.
+    gekko_create(&g_session, GekkoStressSession);
+    gekko_start(g_session, &config);
+
+    // Both actors local. No adapter set -> no network calls.
+    for (int i = 0; i < 2; i++) {
+        gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
+        gekko_set_local_delay(g_session, i, 1);
+    }
+    g_local_delay = 1;
+
+    // Deterministic initial RNG seed (matches Netplay_StartBattle).
+    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+    SaveState_Init();
+
+    g_simple_state = SimpleState::BATTLE;
+    g_session_ready = true;   // no handshake needed for stress
+    g_netplay_frame = 0;
+    g_rollback_count = 0;
+    g_last_rollback_frame = 0;
+    g_desync_count = 0;
+    g_last_desync_log_tick = 0;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: GekkoStressSession created (check_distance=%d, prediction_window=%d)",
+        10, config.input_prediction_window);
+    return true;
+}
+
 void Netplay_EndBattle() {
     if (g_session) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Ending GekkoNet session");
         gekko_destroy(&g_session);
         g_session = nullptr;
     }
+
+    // Flush the rngtrace ring on clean battle exit too, so a desync-free
+    // round still produces a trace to diff against a future desync run.
+    SaveState_FlushRngTrace(g_player_index, "battle end");
 
     g_session_ready = false;
     g_simple_state = SimpleState::CONNECTED;
@@ -627,10 +704,22 @@ static void HandleFrameTime(float frames_ahead) {
 bool Netplay_ProcessBattleInputPhase() {
     if (!g_session) return true;
 
-    gekko_network_poll(g_session);
+    // In stress mode, skip the network poll (no adapter, no socket).
+    if (!g_stress_mode) {
+        gekko_network_poll(g_session);
+    }
 
     uint16_t local_input = Input_CaptureLocal();
-    gekko_add_local_input(g_session, g_player_index, &local_input);
+    if (g_stress_mode) {
+        // Single-instance determinism test: add the same input for BOTH players.
+        // StressSession replays each frame to detect any sim-state divergence
+        // between the initial simulate pass and the rollback-re-simulate pass.
+        // Using identical input on both slots keeps the test self-contained.
+        gekko_add_local_input(g_session, 0, &local_input);
+        gekko_add_local_input(g_session, 1, &local_input);
+    } else {
+        gekko_add_local_input(g_session, g_player_index, &local_input);
+    }
 
     int event_count = 0;
     auto events = gekko_session_events(g_session, &event_count);
@@ -675,6 +764,11 @@ bool Netplay_ProcessBattleInputPhase() {
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                         "  UNSAVED: eff1=0x%08X eff2=0x%08X shake=0x%08X",
                         rc.effect_sys1, rc.effect_sys2, rc.shake_effects);
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "  FINGERPRINT: gameplay=0x%08X (HP/pos/rng/timer only — "
+                        "if this MATCHES across peers the desync is a memory-residue "
+                        "false positive)",
+                        rc.gameplay_fingerprint);
                 } else if (now_tick - g_last_desync_log_tick > 1000) {
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                         "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
@@ -692,6 +786,35 @@ bool Netplay_ProcessBattleInputPhase() {
                         event->data.desynced.local_checksum,
                         event->data.desynced.remote_checksum,
                         g_player_index);
+                    // Also flush the in-memory rngtrace ring so we can diff
+                    // the two peers' per-frame rng history offline.
+                    SaveState_FlushRngTrace(g_player_index, "first desync");
+
+                    // Stress mode is a determinism test - once we've caught a
+                    // desync we have full diagnostic evidence already. Kill the
+                    // game process immediately so the user can inspect the dump
+                    // without having to manually close the window, and so
+                    // subsequent divergences don't scribble over the diagnostic
+                    // region's frozen state (the object pool / player slots /
+                    // afterimage pool contents captured at the moment of the
+                    // first divergence are the valuable evidence; later frames'
+                    // values drift further from ground truth and obscure it).
+                    if (g_stress_mode) {
+                        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                            "STRESS: Desync detected on frame %d. "
+                            "Dump written to FM2K_stress_desync_f%d.log. "
+                            "Terminating game for clean inspection.",
+                            event->data.desynced.frame,
+                            event->data.desynced.frame);
+                        // Flush any pending log output before exit
+                        fflush(stdout);
+                        fflush(stderr);
+                        // Hard-exit the game process. We use TerminateProcess on
+                        // the current process so we don't get stuck in atexit
+                        // handlers running on the injected DLL's static objects
+                        // (which can race with the hook shutdown path).
+                        TerminateProcess(GetCurrentProcess(), 1);
+                    }
                 }
                 break;
             }
@@ -711,7 +834,13 @@ bool Netplay_ProcessBattleInputPhase() {
             case GekkoSaveEvent: {
                 int frame = update->data.save.frame;
                 SaveState_Save(frame);
-                uint32_t checksum = SaveState_GetLastChecksum(frame);
+                (void)SaveState_GetLastChecksum(frame);  // updates RegionChecksums via side effect
+                // Use the gameplay fingerprint as GekkoNet's desync checksum.
+                // If both peers see the same HP/pos/rng/timer values at this
+                // frame, fingerprints match and GekkoNet stays happy even when
+                // per-process memory residue differs. Full combined hash is
+                // still computed and available for the diagnostic dump.
+                uint32_t checksum = SaveState_GetRegionChecksums().gameplay_fingerprint;
                 *update->data.save.state_len = sizeof(uint32_t);
                 *update->data.save.checksum = checksum;
                 memcpy(update->data.save.state, &frame, sizeof(uint32_t));
@@ -727,6 +856,19 @@ bool Netplay_ProcessBattleInputPhase() {
                     g_rollback_count, frame, g_netplay_frame,
                     g_netplay_frame - (uint32_t)frame);
                 SaveState_Load(frame);
+                // Rewind the deterministic virtual clock to match the loaded
+                // frame. Without this g_virtual_time_ms stays at its forward-sim
+                // value, replay main_game_loop iterations read timeGetTime()
+                // values AHEAD of where forward was at the same frame, and the
+                // self-referential arithmetic at main_game_loop 0x405BA8/0x405BBB
+                // (g_last_frame_time += N*10) writes a different byte pattern
+                // into g_last_frame_time @ 0x447DD4 — which is what produced
+                // the "AfterimagePool +0x4A4" divergence at f=9.
+                extern uint32_t g_virtual_time_ms;
+                g_virtual_time_ms = (uint32_t)frame * 10;
+                // Also rewind g_netplay_frame so the per-advance increments
+                // below produce the same frame numbers the forward pass did.
+                g_netplay_frame = (uint32_t)frame;
                 break;
             }
 
@@ -744,6 +886,27 @@ bool Netplay_ProcessBattleInputPhase() {
                 // be updated on the authoritative (non-rollback) frame.
                 g_is_rolling_back = update->data.adv.rolling_back;
 
+                // ----------------------------------------------------------------
+                // Per-slot buf-idx fan-out must run BEFORE the sim so input
+                // processing sees the correct slot indices. g_last_frame_time
+                // is written AFTER the sim / virtual-time increment below —
+                // otherwise it reflects the pre-advance frame and replay lags
+                // forward by one (main_game_loop runs a post-advance iteration
+                // on forward that replay doesn't, ending on N*10 vs (N-1)*10).
+                // ----------------------------------------------------------------
+                {
+                    // main_game_loop @ 0x405BC7 walks character slots writing:
+                    //   slot[+0xDF75] = 0   (g_net_sync_frame_counter)
+                    //   slot[+0xDF79] = g_input_buffer_index
+                    // across all 8 slots (base 0x4D1D90, stride 57407).
+                    const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                    for (size_t s = 0; s < 8; s++) {
+                        uintptr_t slot_base = 0x4D1D90 + s * 57407;
+                        *(uint32_t*)(slot_base + 0xDF75) = 0;
+                        *(uint32_t*)(slot_base + 0xDF79) = buf_idx;
+                    }
+                }
+
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
                 if (original_process_game_inputs) {
@@ -756,6 +919,32 @@ bool Netplay_ProcessBattleInputPhase() {
                 g_is_rolling_back = false;
                 g_netplay_frame++;
                 has_advance = true;
+
+                // Advance the deterministic virtual clock used by Hook_timeGetTime.
+                // Exactly one bump per AdvanceEvent.
+                extern uint32_t g_virtual_time_ms;
+                g_virtual_time_ms += 10;
+
+                // NOTE: we intentionally do NOT write g_last_frame_time here.
+                // Setting it equal to g_virtual_time_ms made
+                // main_game_loop's frame-skip check
+                //   Time (= timeGetTime = g_virtual_time_ms) >= g_last_frame_time + 10
+                // always false, so the game stopped running new iterations
+                // (session hang at the save just before the write would have
+                // fired). Leave g_last_frame_time to main_game_loop's own
+                // prologue writes; if the forward-vs-replay divergence at
+                // 0x447DD4 reappears we'll mask it at save time instead of
+                // trying to drive it from here.
+
+                // Tell Hook_RenderGame there is an unrendered authoritative
+                // tick. The render hook is allowed to draw exactly this one
+                // sim state, then clears the flag. Rolled-back replay ticks
+                // do not set the flag — we only render the final resolved
+                // state of an advance, never the intermediate replay frames.
+                extern bool g_frame_pending_render;
+                if (!update->data.adv.rolling_back) {
+                    g_frame_pending_render = true;
+                }
 
                 // Periodic status every 500 frames (~5 sec)
                 if (g_netplay_frame % 500 == 0) {

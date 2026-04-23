@@ -69,7 +69,7 @@ namespace FM2K {
     // Character slots - OPTIMIZED: only save dynamic portion for rollback
     // Static data (sprites, animations, hitboxes) loaded from .player files doesn't change
     // See savestate.h for CHAR_SLOT_* constants
-    constexpr uintptr_t ADDR_CHAR_SLOTS = 0x4D1D80;  // g_character_data_base
+    constexpr uintptr_t ADDR_CHAR_SLOTS = 0x4D1D90;  // g_character_data_base (Wave C audit corrected from 0x4D1D80)
     constexpr size_t CHAR_SLOT_TOTAL_SIZE = 57407;   // Per-slot size from IDA
 
     // Object pool - projectiles, effects (still need full save)
@@ -95,5 +95,14 @@ extern bool g_is_rolling_back;
 extern bool g_offline_mode;
 extern uint16_t g_local_port;
 extern char g_remote_addr[64];
+
+// Stress-test mode: single-instance determinism check via GekkoStressSession.
+// When enabled, FM2KHook creates a GekkoStressSession with both players local,
+// no network, and GekkoNet artificially rolls back every `check_distance` frames.
+// If the sim is deterministic, desync_detection stays silent. If it isn't,
+// we get a local-only repro of the nondeterminism bug without needing a peer.
+// Set via FM2K_STRESS_MODE=1 env var. Implies !g_offline_mode (we still want
+// GekkoNet active to drive save/load/advance events) but skips socket setup.
+extern bool g_stress_mode;
 
 #endif // GLOBALS_H

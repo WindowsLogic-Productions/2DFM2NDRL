@@ -216,7 +216,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             char* env_offline = getenv("FM2K_TRUE_OFFLINE");
             g_offline_mode = (env_offline && strcmp(env_offline, "1") == 0);
 
-            if (!g_offline_mode) {
+            // Stress-test mode: single-instance GekkoStressSession determinism check.
+            // Mutually exclusive with true offline (stress still needs GekkoNet active).
+            char* env_stress = getenv("FM2K_STRESS_MODE");
+            g_stress_mode = (env_stress && strcmp(env_stress, "1") == 0);
+            if (g_stress_mode) {
+                g_offline_mode = false;  // stress requires GekkoNet session to be alive
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Stress-test mode ENABLED (GekkoStressSession): "
+                    "single-instance determinism check, no network");
+            }
+
+            if (!g_offline_mode && !g_stress_mode) {
                 char* env_port = getenv("FM2K_LOCAL_PORT");
                 char* env_remote = getenv("FM2K_REMOTE_ADDR");
 
@@ -241,6 +252,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                         "Failed to initialize netplay!");
                     // Continue anyway - will run offline
                 }
+            } else if (g_stress_mode) {
+                // Stress-test mode: no network, no socket, no control channel.
+                // GekkoStressSession runs single-instance with both players local.
+                // The battle-mode handler in Hook_UpdateGameState will call
+                // Netplay_StartStressBattle() directly when game enters battle,
+                // bypassing the remote-peer sync barrier.
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Stress mode - skipping socket init, GekkoStressSession will start at battle entry");
             } else {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Offline mode - netplay disabled");
             }

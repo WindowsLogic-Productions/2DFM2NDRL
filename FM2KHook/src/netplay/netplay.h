@@ -92,6 +92,14 @@ void Netplay_PollBattleSync();
 // Returns true if session started successfully
 bool Netplay_StartBattle();
 
+// Start a single-instance GekkoStressSession (no network, both players local).
+// Used when FM2K_STRESS_MODE=1 / g_stress_mode=true. GekkoNet artificially
+// rolls back every `check_distance` frames and verifies state determinism
+// via checksum. Any desync fired here is a local-determinism bug in our
+// save/load or sim path — not a network issue.
+// Returns true if session started successfully.
+bool Netplay_StartStressBattle();
+
 // End GekkoNet session when leaving battle mode
 // Keeps control channel connected for rematch
 void Netplay_EndBattle();

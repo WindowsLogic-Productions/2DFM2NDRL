@@ -17,3 +17,6 @@ bool g_is_rolling_back = false;
 bool g_offline_mode = false;
 uint16_t g_local_port = 7000;
 char g_remote_addr[64] = "127.0.0.1:7001";
+
+// Stress-test mode (FM2K_STRESS_MODE=1): single-instance determinism test
+bool g_stress_mode = false;
