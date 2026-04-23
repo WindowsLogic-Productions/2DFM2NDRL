@@ -160,6 +160,20 @@ static void RunBattleTick() {
         return;
     }
 
+    // Offline path: no peer, no GekkoNet, no sync barrier. Just run the sim
+    // natively — same shape as RunNativeTick but invoked from the battle
+    // phase. Without this branch, g_battle_entry_signaled_pub stays true and
+    // Netplay_IsBattleSynced never returns true (there's no remote to sync
+    // with), so RunBattleTick would hang forever the moment game_mode hits
+    // 3000. Sound rollback / GekkoNet-driven state machine are inert here;
+    // the hook gates on Netplay_IsActive() which stays false.
+    if (g_offline_mode) {
+        if (original_process_game_inputs) original_process_game_inputs();
+        if (original_update_game)         original_update_game();
+        RenderFrameWithSnapshot();
+        return;
+    }
+
     // Networked path: wait for remote peer to also enter battle mode, then
     // start GekkoNet.
     extern bool g_battle_entry_signaled_pub;
