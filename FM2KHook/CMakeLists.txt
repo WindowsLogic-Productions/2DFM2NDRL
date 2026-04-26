@@ -26,6 +26,7 @@ add_library(FM2KHook SHARED
     src/netplay/savestate.cpp
     src/netplay/replay.cpp
     src/netplay/spectator_node.cpp
+    src/netplay/nat_traversal.cpp
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI
