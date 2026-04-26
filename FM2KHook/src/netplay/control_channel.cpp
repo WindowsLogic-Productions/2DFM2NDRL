@@ -310,6 +310,19 @@ SOCKET ControlChannel_GetSocket() {
     return g_socket;
 }
 
+void ControlChannel_LatchPeerAddr(const sockaddr_in& peer) {
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+    if (g_remote_sockaddr.sin_addr.s_addr != peer.sin_addr.s_addr ||
+        g_remote_sockaddr.sin_port        != peer.sin_port) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "ControlChannel: peer addr latched -> %s:%u (was %u)",
+            ip, (unsigned)ntohs(peer.sin_port),
+            (unsigned)ntohs(g_remote_sockaddr.sin_port));
+    }
+    g_remote_sockaddr = peer;
+}
+
 void ControlChannel_Poll() {
     if (!g_socket_initialized) return;
 

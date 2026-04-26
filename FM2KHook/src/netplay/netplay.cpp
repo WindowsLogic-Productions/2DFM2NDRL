@@ -8,10 +8,14 @@
 #include "savestate.h"
 #include "replay.h"
 #include "spectator_node.h"
+#include "nat_traversal.h"
 #include "globals.h"
 #include "gekkonet.h"
 #include "../audio/sound_rollback.h"
 #include <SDL3/SDL_log.h>
+#include <ws2tcpip.h>
+#include <cstdlib>
+#include <string>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -290,6 +294,56 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
         if (!NetSocket_Init(local_port, remote_addr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Failed to init socket");
             return false;
+        }
+    }
+
+    // Hub-driven NAT traversal. If FM2K_HUB_* env vars are present,
+    // the launcher started this match via the hub — fire a STUN probe
+    // (so the hub can reflect our public mapping) and start the
+    // peer-to-peer burst-punch using the supplied match_token. If the
+    // env vars aren't set, this match was a legacy direct-connect:
+    // we skip and rely on the existing 0xCC HELLO loop alone.
+    {
+        const char* hub_udp     = std::getenv("FM2K_HUB_UDP_ADDR");
+        const char* hub_user_id = std::getenv("FM2K_HUB_USER_ID");
+        const char* match_tok   = std::getenv("FM2K_HUB_MATCH_TOKEN");
+
+        if (hub_udp && hub_user_id) {
+            ::fm2k::nat::SendStunProbe();
+        }
+
+        if (match_tok && remote_addr && *remote_addr) {
+            // Decode the 32-hex-char match token into 16 binary bytes.
+            uint8_t token_bytes[16] = {};
+            size_t hex_len = std::strlen(match_tok);
+            if (hex_len > 32) hex_len = 32;
+            auto nibble = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+                if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+                return -1;
+            };
+            for (size_t i = 0; i + 1 < hex_len; i += 2) {
+                int hi = nibble(match_tok[i]);
+                int lo = nibble(match_tok[i + 1]);
+                if (hi < 0 || lo < 0) break;
+                token_bytes[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
+            }
+
+            // Parse "ip:port" from FM2K_REMOTE_ADDR (= remote_addr param).
+            std::string addr(remote_addr);
+            auto colon = addr.rfind(':');
+            if (colon != std::string::npos) {
+                std::string ip_s = addr.substr(0, colon);
+                int port_i = std::atoi(addr.c_str() + colon + 1);
+                in_addr peer_ia{};
+                if (inet_pton(AF_INET, ip_s.c_str(), &peer_ia) == 1 &&
+                    port_i > 0 && port_i <= 65535) {
+                    ::fm2k::nat::StartPunch(peer_ia.s_addr,
+                                             static_cast<uint16_t>(port_i),
+                                             token_bytes);
+                }
+            }
         }
     }
 

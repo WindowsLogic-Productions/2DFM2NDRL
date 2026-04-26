@@ -45,6 +45,13 @@ void ControlChannel_Poll();
 // not closesocket() — the socket is owned by control_channel.
 SOCKET ControlChannel_GetSocket();
 
+// Latch a verified peer address into the slot used by ControlChannel_Send.
+// Called from nat_traversal when the first authenticated CTRL_PUNCH packet
+// lands — the existing 0xCC HELLO/HELLO_ACK loop then sends to the right
+// place. Idempotent; subsequent calls overwrite (which is fine, the peer
+// addr should only update on legitimate authentication).
+void ControlChannel_LatchPeerAddr(const sockaddr_in& peer);
+
 // Send a control packet to remote peer
 void ControlChannel_Send(const CtrlPacket& packet);
 

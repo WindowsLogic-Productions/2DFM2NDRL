@@ -21,12 +21,15 @@
 
 #include <SDL3/SDL_log.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <ws2tcpip.h>
+#include <mmsystem.h>
 
 namespace fm2k::nat {
 
@@ -45,6 +48,16 @@ sockaddr_in g_reflexive{};
 
 uint8_t g_match_token[MATCH_TOKEN_LEN] = {};
 bool    g_match_token_set = false;
+
+// Burst-punch state. The burst thread loops until either the 30
+// packets are out OR g_punching latches false (set by a successful
+// authenticated peer punch landing in HandleDatagram).
+std::atomic<bool> g_punching{false};
+std::thread       g_punch_thread;
+sockaddr_in       g_punch_peer{};
+
+constexpr int PUNCH_PACKETS  = 30;
+constexpr int PUNCH_PERIOD_MS = 10;   // ~300 ms total burst
 
 bool ParseHostPort(const std::string& s, std::string& host, uint16_t& port) {
     auto colon = s.rfind(':');
@@ -117,18 +130,67 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         g_match_token_set = true;
     }
 
-    // TODO(nat-traversal): port bbbr_holepunch.cpp's burst+priority
-    // driver here. Plan:
-    //   - timeBeginPeriod(1) + THREAD_PRIORITY_TIME_CRITICAL
-    //   - 30 packets over ~300 ms, ~10 ms apart
-    //   - On each tick, sendto peer with payload [0xCD 0x10 token...]
-    //   - Auto-stop when control_channel sees first inbound from peer
-    //     (existing peer-learning latches g_remote_sockaddr — we just
-    //     consume the matched addr and stop punching)
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "NAT: StartPunch peer=%s:%u (token-auth: %s) — burst driver TODO",
-        ip_str, (unsigned)peer_port,
-        g_match_token_set ? "set" : "missing");
+    // Stop any prior burst (e.g. user reconnecting / new match) before
+    // launching a fresh one. join() is bounded — the loop checks
+    // g_punching every iteration.
+    if (g_punching.exchange(false) && g_punch_thread.joinable()) {
+        g_punch_thread.join();
+    }
+
+    g_punch_peer = {};
+    g_punch_peer.sin_family      = AF_INET;
+    g_punch_peer.sin_addr.s_addr = peer_ip_be;
+    g_punch_peer.sin_port        = htons(peer_port);
+
+    g_punching.store(true);
+    g_punch_thread = std::thread([ip_str_copy = std::string(ip_str), peer_port]() {
+        // Boost only this thread's priority — process-wide boost would
+        // starve the game's main loop. timeBeginPeriod(1) tightens
+        // Sleep granularity so 10 ms means ~10 ms instead of ~16 ms
+        // (Windows default scheduler tick).
+        HANDLE th = GetCurrentThread();
+        int prev_pri = GetThreadPriority(th);
+        SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
+        timeBeginPeriod(1);
+
+        SOCKET sock = ControlChannel_GetSocket();
+        if (sock == INVALID_SOCKET) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "NAT: punch aborted — control socket unavailable");
+            timeEndPeriod(1);
+            SetThreadPriority(th, prev_pri);
+            g_punching.store(false);
+            return;
+        }
+
+        uint8_t pkt[2 + MATCH_TOKEN_LEN] = {MAGIC, TAG_CTRL_PUNCH};
+        std::memcpy(pkt + 2, g_match_token, MATCH_TOKEN_LEN);
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: burst punch -> %s:%u (%d packets, ~%d ms)",
+            ip_str_copy.c_str(), (unsigned)peer_port,
+            PUNCH_PACKETS, PUNCH_PACKETS * PUNCH_PERIOD_MS);
+
+        int sent_ok = 0;
+        for (int i = 0; i < PUNCH_PACKETS; ++i) {
+            if (!g_punching.load()) break;  // peer latched, stop early
+            int sent = sendto(sock,
+                              reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                              reinterpret_cast<sockaddr*>(&g_punch_peer),
+                              sizeof(g_punch_peer));
+            if (sent == (int)sizeof(pkt)) ++sent_ok;
+            Sleep(PUNCH_PERIOD_MS);
+        }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: burst complete — %d/%d sent (%s)",
+            sent_ok, PUNCH_PACKETS,
+            g_punching.load() ? "no peer ack yet" : "peer-latch fired");
+
+        timeEndPeriod(1);
+        SetThreadPriority(th, prev_pri);
+        g_punching.store(false);
+    });
 }
 
 void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
@@ -175,14 +237,16 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
                     from_ip, (unsigned)ntohs(from.sin_port));
                 return;
             }
-            // TODO(nat-traversal): on first authentic peer punch:
-            //   - Latch peer_addr into control_channel's
-            //     g_remote_sockaddr (existing peer-learning slot).
-            //   - Stop the burst driver (Phase-1 stub doesn't run one).
-            //   - Existing 0xCC HELLO/HELLO_ACK + GekkoNet then
-            //     proceeds on the now-open pinhole.
+            // First authentic peer punch: latch the address into
+            // control_channel's gameplay peer slot and signal the
+            // burst thread to stop early. The 0xCC HELLO loop will
+            // start hitting the right address from this point on, and
+            // the existing peer-learning code in RawReceive's 0xCC
+            // branch will keep tracking it across NAT remapping.
+            ControlChannel_LatchPeerAddr(from);
+            g_punching.store(false);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "NAT: CTRL_PUNCH from %s:%u authenticated — peer-learn TODO",
+                "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
                 from_ip, (unsigned)ntohs(from.sin_port));
             return;
         }
