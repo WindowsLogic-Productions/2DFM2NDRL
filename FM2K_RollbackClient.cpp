@@ -1418,16 +1418,21 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
     uint16_t local_port = static_cast<uint16_t>(config.local_port);
 
     // Remote address:
-    //   - JOIN: user-pasted "ip:port" is authoritative.
-    //   - HOST: leave empty so the hook learns the peer from the first HELLO.
-    //     (The default "127.0.0.1:7001" from NetworkConfig ctor is a placeholder
-    //     used for the UI copy-button preview; it is NOT a real peer address.)
-    std::string remote_addr;
-    if (!is_host) {
-        remote_addr = config.remote_address;
-        if (remote_addr.find(':') == std::string::npos && !remote_addr.empty()) {
-            remote_addr += ":7500";  // fallback if user pasted a bare IP
-        }
+    //   - HUB-DRIVEN: match_start carries the peer's udp_addr in config
+    //     for BOTH host and guest. Use it directly.
+    //   - JOIN (legacy direct connect): user-pasted "ip:port" in
+    //     config.remote_address.
+    //   - HOST (legacy direct connect): leave empty so the hook
+    //     listens on its socket and learns the peer's address from
+    //     the first inbound HELLO. The default "127.0.0.1:7001" from
+    //     NetworkConfig's ctor is a UI copy-button placeholder, not
+    //     a real peer — clear it for legacy host.
+    std::string remote_addr = config.remote_address;
+    if (is_host && remote_addr == "127.0.0.1:7001") {
+        remote_addr.clear();   // legacy-host placeholder; let hook learn
+    }
+    if (remote_addr.find(':') == std::string::npos && !remote_addr.empty()) {
+        remote_addr += ":7500";  // fallback if user pasted a bare IP
     }
 
     game_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX", std::to_string(player_index));
