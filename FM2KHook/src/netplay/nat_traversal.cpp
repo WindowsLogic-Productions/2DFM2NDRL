@@ -274,12 +274,18 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
             // start hitting the right address from this point on, and
             // the existing peer-learning code in RawReceive's 0xCC
             // branch will keep tracking it across NAT remapping.
-            ControlChannel_LatchPeerAddr(from);
-            g_punching.store(false);
-            g_peer_authenticated.store(true);
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
-                from_ip, (unsigned)ntohs(from.sin_port));
+            //
+            // Subsequent valid CTRL_PUNCH packets are common (peer's
+            // burst sends 30) — log only the first to avoid spamming
+            // the debug log; remaining drops are benign.
+            const bool first_auth = !g_peer_authenticated.exchange(true);
+            if (first_auth) {
+                ControlChannel_LatchPeerAddr(from);
+                g_punching.store(false);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
+                    from_ip, (unsigned)ntohs(from.sin_port));
+            }
             return;
         }
         default:
