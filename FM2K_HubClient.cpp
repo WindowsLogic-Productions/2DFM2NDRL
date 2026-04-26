@@ -23,6 +23,7 @@
 #define WINVER 0x0602
 
 #include "FM2K_HubClient.h"
+#include <winhttp.h>
 
 #include <SDL3/SDL_log.h>
 

@@ -32,6 +32,17 @@ from websockets.exceptions import ConnectionClosed
 USERS: dict[str, "User"] = {}
 ROOMS: dict[str, "Room"] = {}
 
+# Pre-populated rooms — visible to clients on connect even before
+# anyone joins. Keyed by canonical game id (later: master game list
+# will provide stable ids). Display name shown in the launcher UI.
+SEED_ROOMS: list[tuple[str, str]] = [
+    ("pkmncc",            "Pokemon: CardCaptor"),
+    ("SCWU",              "SCWU Infinity"),
+    ("WonderfulWorld",    "Wonderful World"),
+    ("StudioS_Fighters",  "StudioS Fighters"),
+    ("STRIPFIGHTER_ZERO", "Strip Fighter Zero"),
+]
+
 
 class User:
     def __init__(self, ws: ServerConnection, nick: str, peer_addr: tuple[str, int]):
@@ -58,9 +69,10 @@ class User:
 
 
 class Room:
-    def __init__(self, room_id: str, name: str):
+    def __init__(self, room_id: str, name: str, *, seeded: bool = False):
         self.id = room_id
         self.name = name
+        self.seeded = seeded     # if True, do not delete when last user leaves
         self.user_ids: set[str] = set()
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,7 +107,7 @@ async def leave_room(user: User) -> None:
     if room is not None and user.id in room.user_ids:
         room.user_ids.remove(user.id)
         await broadcast_room(room, {"type": "user_left", "room_id": room.id, "user_id": user.id})
-        if not room.user_ids:
+        if not room.user_ids and not room.seeded:
             ROOMS.pop(room.id, None)
     user.room_id = None
 
@@ -280,9 +292,12 @@ async def main() -> None:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7711)
     args = ap.parse_args()
+    for game_id, display_name in SEED_ROOMS:
+        ROOMS[game_id] = Room(game_id, display_name, seeded=True)
     asyncio.create_task(ping_loop())
     async with serve(handler, args.host, args.port):
         print(f"FM2K Hub listening on {args.host}:{args.port}")
+        print(f"  seeded rooms: {[r.id for r in ROOMS.values()]}")
         await asyncio.Future()
 
 
