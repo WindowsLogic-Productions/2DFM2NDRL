@@ -949,9 +949,21 @@ void LauncherUI::RenderHubPanel() {
             // getsockname, close. Same-machine multi-launcher tests
             // get distinct ports automatically; users never need to
             // think about it. Cross-machine: any free port works.
+            //
+            // WSAStartup is required before socket() on Windows. It's
+            // idempotent — internal refcount, fine to call repeatedly.
+            // Without it socket() fails with WSANOTINITIALISED and the
+            // fallback picks 7000, which then collides between two
+            // launchers on the same box.
             int picked = 7000;
+            WSADATA wsa{};
+            WSAStartup(MAKEWORD(2, 2), &wsa);
             SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
-            if (s != INVALID_SOCKET) {
+            if (s == INVALID_SOCKET) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hub: auto-pick socket() failed (err=%d) — falling back to 7000",
+                    WSAGetLastError());
+            } else {
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = 0;
@@ -962,6 +974,9 @@ void LauncherUI::RenderHubPanel() {
                     if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
                         picked = ntohs(bound.sin_port);
                     }
+                } else {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: auto-pick bind() failed (err=%d)", WSAGetLastError());
                 }
                 closesocket(s);
             }
