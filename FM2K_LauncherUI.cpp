@@ -929,19 +929,35 @@ void LauncherUI::RenderHubPanel() {
     if (!hs.client.IsConnected()) {
         ImGui::PushItemWidth(-120);
         ImGui::InputText("Nick", s_nick, sizeof(s_nick));
-        // Local UDP port — the socket the hook binds for game traffic.
-        // Same-machine testing requires distinct ports per launcher,
-        // otherwise the second one hits WSAEADDRINUSE on bind. Real
-        // network play: any single port works since each box is its
-        // own bind namespace.
-        ImGui::InputInt("Port", &network_config_.local_port);
-        if (network_config_.local_port < 1024)  network_config_.local_port = 7000;
-        if (network_config_.local_port > 65535) network_config_.local_port = 7000;
         ImGui::PopItemWidth();
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
         if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
             hs.my_nick = s_nick;
+            // Auto-pick a free UDP port: bind a socket to port 0
+            // (OS-assigned ephemeral), read back the chosen port via
+            // getsockname, close. Same-machine multi-launcher tests
+            // get distinct ports automatically; users never need to
+            // think about it. Cross-machine: any free port works.
+            int picked = 7000;
+            SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s != INVALID_SOCKET) {
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = 0;
+                addr.sin_addr.s_addr = INADDR_ANY;
+                if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                    sockaddr_in bound{};
+                    int len = sizeof(bound);
+                    if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
+                        picked = ntohs(bound.sin_port);
+                    }
+                }
+                closesocket(s);
+            }
+            network_config_.local_port = picked;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: auto-picked UDP port %d for this session", picked);
             // TODO(settings): hub address belongs in a Settings panel.
             // Hardcoded to localhost for the demo.
             hs.client.Connect("127.0.0.1", 7711, "/", hs.my_nick);
