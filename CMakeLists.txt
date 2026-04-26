@@ -267,6 +267,7 @@ add_executable(FM2K_RollbackLauncher
     OnlineSession.cpp
     LocalSession.cpp
     FM2K_LauncherUI.cpp
+    FM2K_HubClient.cpp
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
     # DLL injection approach - hooks are in FM2KHook DLL
@@ -303,6 +304,7 @@ target_link_libraries(FM2K_RollbackLauncher PRIVATE
     imm32
     oleaut32
     wininet
+    winhttp
 )
 
 # Preprocessor definitions
