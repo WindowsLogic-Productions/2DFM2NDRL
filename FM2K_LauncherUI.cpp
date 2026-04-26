@@ -1,4 +1,5 @@
 #include "FM2K_Integration.h"
+#include "FM2K_HubClient.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <wininet.h>
@@ -16,6 +17,26 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+
+// Local-only state owned by LauncherUI for the Hub panel. Defined here
+// rather than in the header to keep FM2K_HubClient.h out of the public
+// integration surface. unique_ptr<HubState> destructor needs the full
+// type, which it has thanks to this definition + the LauncherUI dtor
+// living in this file (line 82 onwards).
+struct LauncherUI::HubState {
+    fm2k::HubClient client;
+    std::string my_id;
+    std::string my_nick;
+    std::string current_room_id;
+
+    std::vector<fm2k::HubRoom> rooms;                     // discovered rooms
+    std::unordered_map<std::string, fm2k::HubUser> users; // users in current room
+    std::string pending_challenge_from_id;
+    std::string pending_challenge_from_nick;
+    std::string status_line;
+    bool show_challenge_modal = false;
+};
 
 // LauncherUI Implementation
 LauncherUI::LauncherUI() 
@@ -40,6 +61,8 @@ LauncherUI::LauncherUI()
         env_dev && std::strcmp(env_dev, "1") == 0) {
         developer_mode_ = true;
     }
+
+    hub_state_ = std::make_unique<HubState>();
 
     // Initialize callbacks to null
     on_game_selected = nullptr;
@@ -716,53 +739,227 @@ void LauncherUI::RenderSessionControls() {
 }
 
 void LauncherUI::RenderHubPanel() {
-    // Phase-1 lobby UI scaffold. HubClient (C++ WebSocket transport)
-    // not yet wired — Connect/Join/Challenge are TODO markers. The
-    // hub server URL belongs in a Settings panel later; for now the
-    // launcher will hardcode `ws://127.0.0.1:7711` when HubClient
-    // lands. UI shows empty states so it's clear nothing is fake.
+    auto& hs = *hub_state_;
 
-    static char s_nick[32]    = "";
-    static bool s_connected   = false;
+    // Drain hub events into local state once per frame.
+    hs.client.Poll([&](const fm2k::HubEvent& ev) {
+        using K = fm2k::HubEvent::Kind;
+        switch (ev.kind) {
+            case K::Connected:
+                hs.my_id = ev.user_id;
+                hs.rooms = ev.rooms;
+                hs.status_line = "connected";
+                break;
+            case K::Disconnected:
+                hs.users.clear();
+                hs.current_room_id.clear();
+                hs.my_id.clear();
+                hs.status_line = ev.error.empty() ? "disconnected" : ("disconnected: " + ev.error);
+                break;
+            case K::RoomList:
+                hs.rooms = ev.rooms;
+                break;
+            case K::RoomJoined:
+                if (!ev.rooms.empty()) hs.current_room_id = ev.rooms.front().id;
+                hs.users.clear();
+                for (auto& u : ev.users) hs.users[u.id] = u;
+                break;
+            case K::RoomLeft:
+                hs.current_room_id.clear();
+                hs.users.clear();
+                break;
+            case K::UserJoined:
+                if (ev.room_id == hs.current_room_id) hs.users[ev.user.id] = ev.user;
+                break;
+            case K::UserLeft:
+                if (ev.room_id == hs.current_room_id) hs.users.erase(ev.user_id);
+                break;
+            case K::UserStatus:
+                hs.users[ev.user.id] = ev.user;
+                break;
+            case K::UserRtt:
+                if (auto it = hs.users.find(ev.user_id); it != hs.users.end()) {
+                    it->second.rtt_ms = ev.rtt_ms;
+                }
+                break;
+            case K::ChallengeReceived:
+                hs.pending_challenge_from_id   = ev.challenge.from_id;
+                hs.pending_challenge_from_nick = ev.challenge.from_nick;
+                hs.show_challenge_modal = true;
+                break;
+            case K::ChallengeFailed:
+                hs.status_line = "challenge failed: " + ev.error;
+                break;
+            case K::ChallengeCancelled:
+                hs.show_challenge_modal = false;
+                hs.pending_challenge_from_id.clear();
+                hs.status_line = "challenge cancelled";
+                break;
+            case K::ChallengeDeclined:
+                hs.status_line = "challenge declined";
+                break;
+            case K::MatchStart:
+                // TODO(nat-traversal): wire ev.match.peer_udp_ip/port into
+                // ControlChannel + start the punch. For now just log.
+                hs.status_line = "match_start: " + ev.match.role +
+                    " peer=" + ev.match.peer.nick +
+                    " udp=" + ev.match.peer_udp_ip + ":" +
+                    std::to_string(ev.match.peer_udp_port);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: %s", hs.status_line.c_str());
+                break;
+            case K::PeerDisconnected:
+                hs.status_line = "peer disconnected";
+                break;
+            case K::Error:
+                hs.status_line = "error: " + ev.error;
+                break;
+        }
+    });
 
+    // ---- UI ----
     ImGui::SeparatorText("Hub");
-    ImGui::PushItemWidth(-120);
-    ImGui::InputText("Nick", s_nick, sizeof(s_nick));
-    ImGui::PopItemWidth();
 
-    if (!s_connected) {
+    static char s_nick[32] = "";
+    if (!hs.client.IsConnected()) {
+        ImGui::PushItemWidth(-120);
+        ImGui::InputText("Nick", s_nick, sizeof(s_nick));
+        ImGui::PopItemWidth();
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
         if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
-            // TODO(hubclient): HubClient::Connect(<configured server>, s_nick).
-            // s_connected only flips on actual hello_ack from server.
-            s_connected = true;
+            hs.my_nick = s_nick;
+            // TODO(settings): hub address belongs in a Settings panel.
+            // Hardcoded to localhost for the demo.
+            hs.client.Connect("127.0.0.1", 7711, "/", hs.my_nick);
+            hs.status_line = "connecting...";
         }
         if (!can_connect) ImGui::EndDisabled();
     } else {
-        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "Connected as %s", s_nick);
+        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
+                           "Connected as %s", hs.my_nick.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Disconnect")) {
-            // TODO(hubclient): HubClient::Disconnect().
-            s_connected = false;
+            hs.client.Disconnect();
+        }
+    }
+    if (!hs.status_line.empty()) {
+        ImGui::TextDisabled("%s", hs.status_line.c_str());
+    }
+    if (!hs.client.IsConnected()) return;
+
+    // ---- Rooms ----
+    ImGui::SeparatorText("Rooms");
+    if (hs.rooms.empty()) {
+        ImGui::TextDisabled("No rooms yet — join one with the selected game below.");
+    }
+    if (ImGui::BeginTable("##rooms", 3,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Game");
+        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableHeadersRow();
+        for (auto& r : hs.rooms) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%d", r.user_count);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushID(r.id.c_str());
+            if (r.id == hs.current_room_id) {
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "joined");
+            } else if (ImGui::SmallButton("Join")) {
+                hs.client.JoinRoom(r.id, r.name);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // Quick-create room from the selected game (until a master list ships).
+    bool game_selected = selected_game_index_ >= 0 &&
+                         selected_game_index_ < (int)games_.size();
+    if (game_selected && hs.current_room_id.empty()) {
+        ImGui::Spacing();
+        const auto& g = games_[selected_game_index_];
+        // Use exe path stem as the room/game id so two clients with the
+        // same exe land in the same room. Master list will replace this
+        // with a stable canonical id.
+        std::filesystem::path exe(g.exe_path);
+        std::string game_id = exe.stem().string();
+        std::string label = "Join room for: " + game_id;
+        if (ImGui::Button(label.c_str(), ImVec2(-1, 0))) {
+            hs.client.JoinRoom(game_id, game_id);
         }
     }
 
-    if (!s_connected) return;
+    // ---- Users in current room ----
+    ImGui::SeparatorText(hs.current_room_id.empty()
+        ? "Players in current room"
+        : ("Players in " + hs.current_room_id).c_str());
+    if (hs.current_room_id.empty()) {
+        ImGui::TextDisabled("Join a room to see players.");
+    } else if (hs.users.empty()) {
+        ImGui::TextDisabled("Empty room — wait for someone else to join.");
+    } else {
+        if (ImGui::BeginTable("##users", 4,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Nick");
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Ping",   ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableHeadersRow();
 
-    ImGui::SeparatorText("Rooms");
-    // TODO(hubclient): replace empty state with real room_list payload.
-    // Rows will be populated from HubClient::GetRooms() once a hello_ack
-    // arrives. Future: room games map to entries from the upcoming
-    // master game list (exe-name → game metadata + title screen).
-    ImGui::TextDisabled("No rooms loaded.");
+            for (auto& [uid, u] : hs.users) {
+                if (uid == hs.my_id) continue;  // don't list self
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(u.nick.c_str());
 
-    ImGui::SeparatorText("Players in current room");
-    // TODO(hubclient): replace with HubClient::GetUsers(current_room_).
-    // Each row will show nick / status (idle | challenging | in_match) /
-    // ping (server-relayed RTT for now, peer-direct probe Phase 2) /
-    // challenge button.
-    ImGui::TextDisabled("Join a room to see players.");
+                ImGui::TableSetColumnIndex(1);
+                ImVec4 c(0.6f, 0.6f, 0.6f, 1.0f);
+                if (u.status == "idle")        c = ImVec4(0.3f, 0.9f, 0.4f, 1.0f);
+                else if (u.status == "in_match") c = ImVec4(0.95f, 0.7f, 0.2f, 1.0f);
+                else if (u.status == "challenging") c = ImVec4(0.6f, 0.7f, 1.0f, 1.0f);
+                ImGui::TextColored(c, "%s", u.status.c_str());
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%dms", u.rtt_ms);
+
+                ImGui::TableSetColumnIndex(3);
+                ImGui::PushID(uid.c_str());
+                bool can_challenge = (u.status == "idle");
+                if (!can_challenge) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("Challenge")) {
+                    hs.client.Challenge(uid);
+                }
+                if (!can_challenge) ImGui::EndDisabled();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    // ---- Incoming-challenge modal ----
+    if (hs.show_challenge_modal) {
+        ImGui::OpenPopup("Incoming challenge");
+        hs.show_challenge_modal = false;
+    }
+    if (ImGui::BeginPopupModal("Incoming challenge", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%s wants to play.", hs.pending_challenge_from_nick.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Accept", ImVec2(120, 0))) {
+            hs.client.AcceptChallenge(hs.pending_challenge_from_id);
+            hs.pending_challenge_from_id.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Decline", ImVec2(120, 0))) {
+            hs.client.DeclineChallenge(hs.pending_challenge_from_id);
+            hs.pending_challenge_from_id.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void LauncherUI::RenderDebugTools() {

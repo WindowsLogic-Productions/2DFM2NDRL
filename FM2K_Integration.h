@@ -771,13 +771,20 @@ private:
     void RenderConsoleLog();
     void RenderObjectAnalysis();        // Stub
     void RenderSlotInspectionWindow();  // Stub
-    void RenderHubPanel();              // Fightcade-style lobby (placeholder)
+    void RenderHubPanel();              // Fightcade-style lobby
 
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
     // chain test. Enabled via FM2K_DEV_MODE=1 env var on launch or
     // via View → Developer Mode in the menu bar.
     bool developer_mode_ = false;
+
+    // Hub client + per-frame drained state. Owned by the launcher
+    // (forward-declared in LauncherUI scope to avoid pulling
+    // FM2K_HubClient.h into the header). Defined out-of-line in
+    // FM2K_LauncherUI.cpp.
+    struct HubState;
+    std::unique_ptr<HubState> hub_state_;
 
     // Helper methods
     void ShowGameValidationStatus(const FM2K::FM2KGameInfo& game);
