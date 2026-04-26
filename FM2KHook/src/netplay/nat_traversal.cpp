@@ -53,11 +53,23 @@ bool    g_match_token_set = false;
 // packets are out OR g_punching latches false (set by a successful
 // authenticated peer punch landing in HandleDatagram).
 std::atomic<bool> g_punching{false};
+std::atomic<bool> g_peer_authenticated{false};
 std::thread       g_punch_thread;
 sockaddr_in       g_punch_peer{};
 
 constexpr int PUNCH_PACKETS  = 30;
 constexpr int PUNCH_PERIOD_MS = 10;   // ~300 ms total burst
+
+// Relay fallback state. Configured at init from FM2K_HUB_RELAY_ADDR /
+// FM2K_HUB_RELAY_SESSION. Activated when burst-punch fails to latch a
+// peer within the burst window.
+constexpr uint8_t TAG_RELAY_DATA = 0x01;        // matches hub.py RELAY_TAG_DATA
+constexpr uint8_t MAGIC_RELAY    = 0xCF;        // matches hub.py RELAY_MAGIC
+
+bool        g_relay_configured = false;
+sockaddr_in g_relay_addr{};
+uint8_t     g_relay_session[16] = {};
+std::atomic<bool> g_relay_mode{false};
 
 bool ParseHostPort(const std::string& s, std::string& host, uint16_t& port) {
     auto colon = s.rfind(':');
@@ -190,6 +202,25 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         timeEndPeriod(1);
         SetThreadPriority(th, prev_pri);
         g_punching.store(false);
+
+        // Final fallback gate: give the peer a few more frames to
+        // hit us back via direct UDP (their burst may be slightly
+        // staggered relative to ours due to launcher-spawn timing).
+        // If still nothing after another ~200 ms, switch to relay so
+        // gameplay can proceed regardless of NAT type. The user said
+        // "we never want burst punch to fail" — relay is that net.
+        if (!g_peer_authenticated.load() && g_relay_configured) {
+            Sleep(200);
+            if (!g_peer_authenticated.load()) {
+                g_relay_mode.store(true);
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "NAT: direct punch did not authenticate — relay mode ENGAGED");
+            }
+        } else if (!g_peer_authenticated.load()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "NAT: direct punch failed and no relay configured — peer "
+                "may stay unreachable");
+        }
     });
 }
 
@@ -245,6 +276,7 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
             // branch will keep tracking it across NAT remapping.
             ControlChannel_LatchPeerAddr(from);
             g_punching.store(false);
+            g_peer_authenticated.store(true);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
                 from_ip, (unsigned)ntohs(from.sin_port));
@@ -256,6 +288,105 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
                 (unsigned)tag, from_ip, (unsigned)ntohs(from.sin_port));
             return;
     }
+}
+
+// =============================================================================
+// Relay
+// =============================================================================
+
+bool ConfigureRelay() {
+    g_relay_configured = false;
+    g_relay_mode.store(false);
+
+    const char* addr_s    = std::getenv("FM2K_HUB_RELAY_ADDR");
+    const char* session_s = std::getenv("FM2K_HUB_RELAY_SESSION");
+    if (!addr_s || !session_s) return false;
+
+    std::string host;
+    uint16_t port = 0;
+    if (!ParseHostPort(addr_s, host, port)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: invalid FM2K_HUB_RELAY_ADDR='%s'", addr_s);
+        return false;
+    }
+
+    g_relay_addr = {};
+    g_relay_addr.sin_family = AF_INET;
+    g_relay_addr.sin_port   = htons(port);
+    if (inet_pton(AF_INET, host.c_str(), &g_relay_addr.sin_addr) != 1) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: relay inet_pton failed for '%s'", host.c_str());
+        return false;
+    }
+
+    // Session id is the same hex string as match token; decode 32 hex
+    // chars to 16 binary bytes (matches hub.py make_relay_session).
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+        return -1;
+    };
+    std::memset(g_relay_session, 0, sizeof(g_relay_session));
+    size_t hex_len = std::strlen(session_s);
+    if (hex_len > 32) hex_len = 32;
+    for (size_t i = 0; i + 1 < hex_len; i += 2) {
+        int hi = nibble(session_s[i]);
+        int lo = nibble(session_s[i + 1]);
+        if (hi < 0 || lo < 0) break;
+        g_relay_session[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+
+    g_relay_configured = true;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "NAT: relay configured -> %s:%u (session=%.32s)",
+        host.c_str(), (unsigned)port, session_s);
+    return true;
+}
+
+bool IsRelayMode() {
+    return g_relay_mode.load(std::memory_order_acquire);
+}
+
+void ForceRelayMode() {
+    if (!g_relay_configured) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: ForceRelayMode ignored — relay not configured");
+        return;
+    }
+    g_relay_mode.store(true);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+        "NAT: relay mode FORCED via diagnostic");
+}
+
+const sockaddr_in* GetRelayAddr() {
+    return g_relay_configured ? &g_relay_addr : nullptr;
+}
+
+const uint8_t* GetRelaySessionId() {
+    return g_relay_configured ? g_relay_session : nullptr;
+}
+
+size_t WrapForRelay(const uint8_t* in, size_t len, uint8_t* out, size_t out_cap) {
+    constexpr size_t HDR = 2 + 16;
+    if (out_cap < HDR + len) return 0;
+    out[0] = MAGIC_RELAY;
+    out[1] = TAG_RELAY_DATA;
+    std::memcpy(out + 2, g_relay_session, 16);
+    std::memcpy(out + HDR, in, len);
+    return HDR + len;
+}
+
+bool UnwrapFromRelay(const uint8_t* data, size_t len,
+                     const uint8_t** out_inner, size_t* out_inner_len) {
+    constexpr size_t HDR = 2 + 16;
+    if (!g_relay_configured) return false;
+    if (len < HDR + 1) return false;
+    if (data[0] != MAGIC_RELAY || data[1] != TAG_RELAY_DATA) return false;
+    if (std::memcmp(data + 2, g_relay_session, 16) != 0) return false;
+    *out_inner     = data + HDR;
+    *out_inner_len = len - HDR;
+    return true;
 }
 
 }  // namespace fm2k::nat

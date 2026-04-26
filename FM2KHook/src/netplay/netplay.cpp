@@ -312,6 +312,11 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
             ::fm2k::nat::SendStunProbe();
         }
 
+        // Read relay env vars early so the post-burst fallback in
+        // StartPunch's worker thread can engage relay mode the
+        // moment direct punch fails.
+        ::fm2k::nat::ConfigureRelay();
+
         if (match_tok && remote_addr && *remote_addr) {
             // Decode the 32-hex-char match token into 16 binary bytes.
             uint8_t token_bytes[16] = {};

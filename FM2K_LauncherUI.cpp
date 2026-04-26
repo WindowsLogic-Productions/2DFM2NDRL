@@ -893,6 +893,16 @@ void LauncherUI::RenderHubPanel() {
                     ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   "127.0.0.1:7711");
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
+                    if (!ev.match.relay_ip.empty() && ev.match.relay_port > 0) {
+                        std::string relay_addr = ev.match.relay_ip + ":" +
+                                                 std::to_string(ev.match.relay_port);
+                        ::SetEnvironmentVariableA("FM2K_HUB_RELAY_ADDR",    relay_addr.c_str());
+                        ::SetEnvironmentVariableA("FM2K_HUB_RELAY_SESSION",
+                                                  ev.match.relay_session_id.c_str());
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_HUB_RELAY_ADDR",    nullptr);
+                        ::SetEnvironmentVariableA("FM2K_HUB_RELAY_SESSION", nullptr);
+                    }
 
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
