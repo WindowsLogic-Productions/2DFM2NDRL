@@ -220,14 +220,15 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
             await send(user, {"type": "challenge_failed", "reason": "expired"})
             return
         token = uuid.uuid4().hex
+        make_relay_session(token)
         # Each side gets the OTHER side's addresses + a shared token.
         # IP comes from the WebSocket TCP source, NOT the client-supplied
         # value. Clients can lie about their IP, and the WS source is
         # accurate for the 95% case (cone NATs map UDP+TCP to the same
         # external IP). Port still comes from the client because UDP NAT
         # mapping is per-port and the launcher knows which one its game
-        # will bind. The Phase-2 STUN responder will refine the port
-        # for symmetric NAT cases.
+        # will bind. STUN-learned port (set on user.udp_addr by the UDP
+        # responder when the game probes) is preferred when present.
         def peer_dict(u: "User") -> dict[str, Any]:
             ws_ip = u.peer_addr[0]
             udp_port = u.udp_addr[1] if u.udp_addr else 7000
@@ -235,17 +236,20 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
                 "udp_addr": [ws_ip, udp_port],
                 "ws_addr":  list(u.peer_addr),
             }
+        relay_addr = list(RELAY_LISTEN)  # ["host", port]
         await send(user, {
             "type": "match_start",
             "token": token,
             "role": "guest",  # accepting side is the guest by convention
             "peer": peer_dict(challenger),
+            "relay": {"addr": relay_addr, "session_id": token},
         })
         await send(challenger, {
             "type": "match_start",
             "token": token,
             "role": "host",   # original challenger hosts
             "peer": peer_dict(user),
+            "relay": {"addr": relay_addr, "session_id": token},
         })
         await set_status_and_broadcast(user, "in_match", challenger.id)
         await set_status_and_broadcast(challenger, "in_match", user.id)
@@ -329,6 +333,107 @@ async def start_stun_responder(host: str, port: int) -> None:
     print(f"FM2K Hub STUN responder listening on udp://{host}:{port}")
 
 
+# =============================================================================
+# UDP relay — symmetric-NAT fallback
+# =============================================================================
+# When direct hole-punch fails (typically symmetric NAT on either side),
+# both peers can fall back to sending all UDP through the hub. Wire format:
+#
+#   Relay packet (peer -> hub or hub -> peer):
+#     0xCF 0x01 [16-byte session_id] [original UDP payload bytes...]
+#
+# Sessions are created when a match_start fires. The session_id is the
+# binary form of match_start.token (uuid4().hex -> 16 bytes). On each
+# inbound 0xCF packet:
+#   - look up the session by session_id
+#   - if the source endpoint is one of the two slots (or fills an empty
+#     slot), forward the inner payload to the OTHER slot
+#   - first packet from each peer fills its slot, learning the relay
+#     endpoint that peer's NAT actually uses (which may differ from the
+#     STUN-learned one for symmetric NAT)
+#
+# Hook side (FM2KHook/src/netplay/nat_traversal.cpp) is not yet wired to
+# this — that's the IPC-from-hook-back-to-launcher gap noted in
+# docs/FM2K_Matchmaking_Design.md. The hub-side scaffold is ready so the
+# protocol freezes now and the client side slots in cleanly later.
+
+RELAY_MAGIC      = 0xCF
+RELAY_TAG_DATA   = 0x01
+RELAY_SESSION_ID_LEN = 16
+
+class RelaySession:
+    def __init__(self) -> None:
+        # Two slots; either may be filled first. Each is the most recent
+        # source endpoint we've seen for that peer (for sym-NAT this is
+        # the peer-specific external mapping, not the STUN-learned one).
+        self.slot_a: Optional[tuple[str, int]] = None
+        self.slot_b: Optional[tuple[str, int]] = None
+
+    def route(self, src: tuple[str, int]) -> Optional[tuple[str, int]]:
+        # Returns the destination endpoint to forward to, or None if
+        # we don't have the other peer yet.
+        if self.slot_a == src:
+            return self.slot_b
+        if self.slot_b == src:
+            return self.slot_a
+        # New source — slot it. Fill A first, then B. Third+ unique
+        # sources for the same session are dropped (likely an attacker
+        # or stale packet from a different match).
+        if self.slot_a is None:
+            self.slot_a = src
+            return self.slot_b
+        if self.slot_b is None:
+            self.slot_b = src
+            return self.slot_a
+        return None
+
+
+RELAY_SESSIONS: dict[bytes, RelaySession] = {}
+
+# Address advertised to clients in match_start. Hub listens on this
+# port; clients put it as the destination when wrapping packets in
+# the 0xCF relay envelope.
+RELAY_LISTEN: tuple[str, int] = ("0.0.0.0", 7712)
+
+class _RelayProto(asyncio.DatagramProtocol):
+    def __init__(self) -> None:
+        self.transport: Optional[asyncio.DatagramTransport] = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < 2 + RELAY_SESSION_ID_LEN: return
+        if data[0] != RELAY_MAGIC or data[1] != RELAY_TAG_DATA: return
+        session_id = data[2:2 + RELAY_SESSION_ID_LEN]
+        payload    = data[2 + RELAY_SESSION_ID_LEN:]
+        sess = RELAY_SESSIONS.get(session_id)
+        if sess is None: return
+        dst = sess.route(addr)
+        if dst is None or self.transport is None: return
+        # Forward as-is — peer expects to see [0xCF 0x01 session_id payload]
+        # and strip the envelope before processing.
+        self.transport.sendto(data, dst)
+
+
+async def start_relay_responder(host: str, port: int) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(
+        _RelayProto, local_addr=(host, port), reuse_port=False)
+    print(f"FM2K Hub relay listening on udp://{host}:{port}")
+
+
+def make_relay_session(match_token_hex: str) -> bytes:
+    """Allocate a relay session keyed by the match token. Returns the
+    16-byte session id (the same bytes the client should put in the
+    relay envelope)."""
+    sid = bytes.fromhex(match_token_hex)[:RELAY_SESSION_ID_LEN]
+    if len(sid) < RELAY_SESSION_ID_LEN:
+        sid = sid.ljust(RELAY_SESSION_ID_LEN, b"\x00")
+    RELAY_SESSIONS[sid] = RelaySession()
+    return sid
+
+
 async def ping_loop() -> None:
     """Server pings each user every 5s. Two clients in the same room can
     estimate their pairwise RTT as ~ rtt_a + rtt_b (rough but cheap).
@@ -395,6 +500,11 @@ async def main() -> None:
         ROOMS[game_id] = Room(game_id, display_name, seeded=True)
     asyncio.create_task(ping_loop())
     await start_stun_responder(args.host, args.port)
+    # Relay listens on a dedicated UDP port so its envelope (0xCF) is
+    # never confused with STUN/control traffic on the lobby port.
+    global RELAY_LISTEN
+    RELAY_LISTEN = (args.host, args.port + 1)
+    await start_relay_responder(*RELAY_LISTEN)
     async with serve(handler, args.host, args.port):
         print(f"FM2K Hub listening on tcp://{args.host}:{args.port} (WebSocket)")
         print(f"  seeded rooms: {[r.id for r in ROOMS.values()]}")
