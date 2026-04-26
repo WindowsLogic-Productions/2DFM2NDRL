@@ -771,6 +771,13 @@ private:
     void RenderConsoleLog();
     void RenderObjectAnalysis();        // Stub
     void RenderSlotInspectionWindow();  // Stub
+    void RenderHubPanel();              // Fightcade-style lobby (placeholder)
+
+    // Developer mode toggle. End-user UI hides the offline-bisect
+    // checkboxes, dual-client launcher, stress test, and spectator
+    // chain test. Enabled via FM2K_DEV_MODE=1 env var on launch or
+    // via View → Developer Mode in the menu bar.
+    bool developer_mode_ = false;
 
     // Helper methods
     void ShowGameValidationStatus(const FM2K::FM2KGameInfo& game);

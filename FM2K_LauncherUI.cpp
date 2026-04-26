@@ -14,6 +14,8 @@
 #include <chrono>
 #include <ctime>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 // LauncherUI Implementation
 LauncherUI::LauncherUI() 
@@ -31,6 +33,14 @@ LauncherUI::LauncherUI()
     , original_log_function_(nullptr)
     , original_log_userdata_(nullptr)
 {
+    // Developer mode: opt-in via env var. End users see a simplified
+    // panel with just Online (Hub) / Offline / Replay; developers see
+    // the full battery of bisect checkboxes, stress, dual-client, etc.
+    if (const char* env_dev = std::getenv("FM2K_DEV_MODE");
+        env_dev && std::strcmp(env_dev, "1") == 0) {
+        developer_mode_ = true;
+    }
+
     // Initialize callbacks to null
     on_game_selected = nullptr;
     on_offline_session_start = nullptr;
@@ -170,16 +180,27 @@ void LauncherUI::Render() {
     if (ImGui::Begin("Games & Configuration", nullptr, panel_flags)) {
         RenderGameSelection();
         ImGui::Separator();
-        RenderNetworkConfig();
-        ImGui::Separator();
+        // Network-config panel is dev-mode only — end users use the Hub
+        // panel for matchmaking and don't manually configure ports/IPs.
+        if (developer_mode_) {
+            RenderNetworkConfig();
+            ImGui::Separator();
+        }
         RenderSessionControls();
     }
     ImGui::End();
-    
-    if (ImGui::Begin("Debug & Diagnostics", nullptr, panel_flags)) {
-        RenderDebugTools();
+
+    if (ImGui::Begin("Hub", nullptr, panel_flags)) {
+        RenderHubPanel();
     }
     ImGui::End();
+
+    if (developer_mode_) {
+        if (ImGui::Begin("Debug & Diagnostics", nullptr, panel_flags)) {
+            RenderDebugTools();
+        }
+        ImGui::End();
+    }
     
     ImGui::End(); // End DockSpace
 
@@ -208,7 +229,12 @@ void LauncherUI::RenderMenuBar() {
             }
             ImGui::EndMenu();
         }
-        // View menu removed - using standard Dark theme only
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Developer Mode", nullptr, developer_mode_)) {
+                developer_mode_ = !developer_mode_;
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
 }
@@ -485,58 +511,29 @@ void LauncherUI::RenderSessionControls() {
             ImGui::BeginDisabled();
         }
 
-        ImGui::Text("Single Player Sessions:");
-        ImGui::Separator();
-        
-        // Boot strategy + diagnostics
-        static int  s_boot_strategy     = 0;     // 0=safe (title→auto-mash), 1=fast (CSS direct)
-        static bool s_auto_title_skip   = true;  // auto-mash button A through title menu
+        // Boot/auto-mash defaults — applied to every offline launch, both
+        // dev and end-user paths. End users never see these toggles.
+        static int  s_boot_strategy     = 0;     // 0=safe, 1=fast
+        static bool s_auto_title_skip   = true;
         static bool s_bypass_trampoline = false;
         static bool s_force_t4_patch    = false;
         static bool s_skip_vs_mode_patch= false;
         static bool s_t4_probe          = false;
 
-        ImGui::Text("Boot strategy:");
-        ImGui::RadioButton("Safe — boot to title, auto-mash to CSS (universal)", &s_boot_strategy, 0);
-        ImGui::SetItemTooltip(
-            "Boots to title_screen_manager (skips intro cutscene). The "
-            "hook auto-mashes button A with cursor pre-set to VS Player. "
-            "Works on every game — adds ~10 frames to boot.");
-        ImGui::RadioButton("Fast — boot directly to CSS (verified games only)", &s_boot_strategy, 1);
-        ImGui::SetItemTooltip(
-            "Skips title screen entirely. WORKS on WW. BREAKS StudioS "
-            "Fighters / Strip Fighter Zero — characters self-damage on "
-            "frame 0. Only enable per-game once verified safe.");
-
-        ImGui::Checkbox("Auto-mash title → CSS", &s_auto_title_skip);
-        ImGui::SetItemTooltip(
-            "Default ON. Disable to walk title screen manually with your "
-            "own inputs (useful if a game has options you want to set).");
-
+        // ---------- USER-FACING SECTION ----------
+        ImGui::Text("Play:");
         ImGui::Separator();
-        ImGui::Text("Diagnostics (StudioS bisect):");
 
-        ImGui::Checkbox("Bypass trampoline (vanilla main_game_loop)", &s_bypass_trampoline);
-        ImGui::SetItemTooltip(
-            "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
-            "Offline only — netplay/spectator require the trampoline.");
+        if (ImGui::Button("Online (Hub)", ImVec2(-1, 0))) {
+            // Hub flow not yet wired to backend — placeholder routes
+            // through Online Session for now until HubClient lands.
+            if (on_online_session_start) {
+                on_online_session_start(network_config_);
+            }
+        }
+        ImGui::SetItemTooltip("Connect to the FM2K hub to find players (placeholder — opens room list).");
 
-        ImGui::Checkbox("Skip VS-player-mode force-set", &s_skip_vs_mode_patch);
-        ImGui::SetItemTooltip(
-            "Don't force g_game_mode_flag=1 at boot.");
-
-        ImGui::Checkbox("Force t4-walk patch (masks the real bug)", &s_force_t4_patch);
-        ImGui::SetItemTooltip(
-            "Re-enables the case-200 t4-walk neuter patch (0x408EC5). "
-            "Off by default since it hides the underlying script-damage "
-            "issue rather than fixing it.");
-
-        ImGui::Checkbox("T4 probe (log fighter pool conditions)", &s_t4_probe);
-        ImGui::SetItemTooltip(
-            "Pre-update pool walk matching case-200's filter. Logs when "
-            "count<2 with the failing condition.");
-
-        if (ImGui::Button("True Offline (Local Only)", ImVec2(-1, 0))) {
+        if (ImGui::Button("Offline (Single Player)", ImVec2(-1, 0))) {
             ::SetEnvironmentVariableA("FM2K_BOOT_TO_CSS_DIRECT",
                                       s_boot_strategy == 1 ? "1" : nullptr);
             ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP",
@@ -553,29 +550,68 @@ void LauncherUI::RenderSessionControls() {
                 on_offline_session_start();
             }
         }
-        ImGui::SetItemTooltip("Pure offline play - both players controlled locally, no networking");
+        ImGui::SetItemTooltip("Local-only — both players controlled at the same machine.");
 
-        if (ImGui::Button("Online Session", ImVec2(-1, 0))) {
-            if (on_online_session_start) {
-                on_online_session_start(network_config_);
+        // ---------- DEVELOPER SECTION ----------
+        if (developer_mode_) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Developer mode");
+            ImGui::Separator();
+
+            ImGui::Text("Boot strategy:");
+            ImGui::RadioButton("Safe — boot to title, auto-mash to CSS (universal)", &s_boot_strategy, 0);
+            ImGui::SetItemTooltip(
+                "Boots to title_screen_manager (skips intro cutscene). The "
+                "hook auto-mashes button A with cursor pre-set to VS Player. "
+                "Works on every game — adds ~10 frames to boot.");
+            ImGui::RadioButton("Fast — boot directly to CSS (verified games only)", &s_boot_strategy, 1);
+            ImGui::SetItemTooltip(
+                "Skips title screen entirely. WORKS on WW. BREAKS StudioS "
+                "Fighters / Strip Fighter Zero — characters self-damage on "
+                "frame 0. Only enable per-game once verified safe.");
+
+            ImGui::Checkbox("Auto-mash title → CSS", &s_auto_title_skip);
+            ImGui::SetItemTooltip(
+                "Default ON. Disable to walk title screen manually with your "
+                "own inputs.");
+
+            ImGui::Spacing();
+            ImGui::Text("Diagnostics:");
+            ImGui::Checkbox("Bypass trampoline (vanilla main_game_loop)", &s_bypass_trampoline);
+            ImGui::SetItemTooltip(
+                "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
+                "Offline only — netplay/spectator require the trampoline.");
+
+            ImGui::Checkbox("Skip VS-player-mode force-set", &s_skip_vs_mode_patch);
+            ImGui::SetItemTooltip("Don't force g_game_mode_flag=1 at boot.");
+
+            ImGui::Checkbox("Force t4-walk patch (masks the real bug)", &s_force_t4_patch);
+            ImGui::SetItemTooltip(
+                "Re-enables the case-200 t4-walk neuter patch (0x408EC5).");
+
+            ImGui::Checkbox("T4 probe (log fighter pool conditions)", &s_t4_probe);
+            ImGui::SetItemTooltip("Pre-update pool walk; logs when count<2.");
+
+            ImGui::Spacing();
+            if (ImGui::Button("Online Session (legacy)", ImVec2(-1, 0))) {
+                if (on_online_session_start) {
+                    on_online_session_start(network_config_);
+                }
             }
-        }
-        ImGui::SetItemTooltip("Network play using the configuration below");
+            ImGui::SetItemTooltip("Network play using the network-config panel below (pre-hub direct P2P).");
 
-        if (ImGui::Button("Stress Test (Determinism Check)", ImVec2(-1, 0))) {
-            if (on_stress_session_start) {
-                on_stress_session_start();
+            if (ImGui::Button("Stress Test (Determinism Check)", ImVec2(-1, 0))) {
+                if (on_stress_session_start) {
+                    on_stress_session_start();
+                }
             }
-        }
-        ImGui::SetItemTooltip(
-            "Single-instance GekkoStressSession. No network. GekkoNet artificially rolls back "
-            "every 10 frames and compares checksums. If the sim is deterministic the session "
-            "runs silently; if not, DESYNC fires with full diagnostic - exact repro of any "
-            "nondeterminism bug in save/load/tick without needing a second peer.");
+            ImGui::SetItemTooltip(
+                "GekkoStressSession with a single instance. Forces rollback every 10 frames "
+                "and compares save hashes — any DESYNC = local determinism bug.");
 
-        ImGui::Spacing();
-        ImGui::Text("Local Testing:");
-        ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::Text("Local Testing:");
+            ImGui::Separator();
         
         // Get client status for dual client button
         uint32_t client1_pid = 0, client2_pid = 0;
@@ -659,10 +695,11 @@ void LauncherUI::RenderSessionControls() {
                 }
             }
         }
-        
+        }  // end if (developer_mode_)
+
         ImGui::Spacing();
         ImGui::Separator();
-        
+
         if (ImGui::Button("Stop Session", ImVec2(-1, 0))) {
             if (on_session_stop) {
                 on_session_stop();
@@ -673,8 +710,110 @@ void LauncherUI::RenderSessionControls() {
         if (!game_selected) {
             ImGui::EndDisabled();
         }
-        
+
         ImGui::Unindent();
+    }
+}
+
+void LauncherUI::RenderHubPanel() {
+    // Phase-1 placeholder UI for the Fightcade-style hub. Real
+    // wire-level WebSocket client (HubClient) lands in a follow-up
+    // commit. Until then this panel is purely cosmetic — connect
+    // button is a no-op, room/user lists show synthetic data so the
+    // layout can be iterated against without the backend.
+
+    static char  s_server[128] = "ws://127.0.0.1:7711";
+    static char  s_nick[32]    = "player";
+    static bool  s_connected   = false;
+
+    ImGui::SeparatorText("Hub");
+    ImGui::PushItemWidth(-120);
+    ImGui::InputText("Server", s_server, sizeof(s_server));
+    ImGui::InputText("Nick",   s_nick,   sizeof(s_nick));
+    ImGui::PopItemWidth();
+    if (!s_connected) {
+        if (ImGui::Button(s_nick[0] ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
+            if (s_nick[0]) {
+                // TODO(hubclient): HubClient::Connect(s_server, s_nick).
+                // For now, fake a connection so the UI shape can be
+                // tested. Disconnect resets.
+                s_connected = true;
+            }
+        }
+    } else {
+        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "Connected as %s", s_nick);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Disconnect")) {
+            // TODO(hubclient): HubClient::Disconnect().
+            s_connected = false;
+        }
+    }
+
+    if (!s_connected) return;
+
+    ImGui::SeparatorText("Rooms");
+    if (ImGui::BeginTable("##rooms", 3,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Game");
+        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableHeadersRow();
+
+        // Synthetic rows. HubClient will replace with the real
+        // room_list payload from the server.
+        static const char* mock_rooms[][2] = {
+            {"WonderfulWorld",          "3"},
+            {"Strip Fighter Zero",      "1"},
+            {"StudioS Fighters",        "2"},
+        };
+        for (auto& r : mock_rooms) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r[0]);
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r[1]);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushID(r[0]);
+            if (ImGui::SmallButton("Join")) {
+                // TODO(hubclient): HubClient::JoinRoom(r[0]).
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Players in current room");
+    if (ImGui::BeginTable("##users", 4,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Nick");
+        ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Ping",     ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("",         ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableHeadersRow();
+
+        // Synthetic data — Fightcade-style: green/yellow/red status,
+        // ping column, challenge button per row.
+        struct Mock { const char* nick; const char* status; int rtt; ImVec4 color; };
+        static const Mock mock_users[] = {
+            {"alice",   "idle",       28, ImVec4(0.3f, 0.9f, 0.4f, 1.0f)},
+            {"bob",     "in match",   45, ImVec4(0.95f, 0.7f, 0.2f, 1.0f)},
+            {"carol",   "idle",      120, ImVec4(0.3f, 0.9f, 0.4f, 1.0f)},
+            {"dave",    "challenging",90, ImVec4(0.95f, 0.7f, 0.2f, 1.0f)},
+        };
+        for (auto& u : mock_users) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(u.nick);
+            ImGui::TableSetColumnIndex(1); ImGui::TextColored(u.color, "%s", u.status);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%dms", u.rtt);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::PushID(u.nick);
+            const bool can_challenge = std::strcmp(u.status, "idle") == 0;
+            if (!can_challenge) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Challenge")) {
+                // TODO(hubclient): HubClient::Challenge(user_id).
+            }
+            if (!can_challenge) ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
 }
 
