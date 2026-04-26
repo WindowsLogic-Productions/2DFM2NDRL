@@ -22,6 +22,8 @@ Deps:   pip install websockets
 import argparse
 import asyncio
 import json
+import socket
+import struct
 import time
 import uuid
 from typing import Any, Optional
@@ -219,25 +221,31 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
             return
         token = uuid.uuid4().hex
         # Each side gets the OTHER side's addresses + a shared token.
-        # Both should attempt UDP punch to peer.udp_addr if set, else fall
-        # back to the websocket-observed peer_addr as a hint.
+        # IP comes from the WebSocket TCP source, NOT the client-supplied
+        # value. Clients can lie about their IP, and the WS source is
+        # accurate for the 95% case (cone NATs map UDP+TCP to the same
+        # external IP). Port still comes from the client because UDP NAT
+        # mapping is per-port and the launcher knows which one its game
+        # will bind. The Phase-2 STUN responder will refine the port
+        # for symmetric NAT cases.
+        def peer_dict(u: "User") -> dict[str, Any]:
+            ws_ip = u.peer_addr[0]
+            udp_port = u.udp_addr[1] if u.udp_addr else 7000
+            return u.to_dict() | {
+                "udp_addr": [ws_ip, udp_port],
+                "ws_addr":  list(u.peer_addr),
+            }
         await send(user, {
             "type": "match_start",
             "token": token,
             "role": "guest",  # accepting side is the guest by convention
-            "peer": challenger.to_dict() | {
-                "udp_addr": challenger.udp_addr,
-                "ws_addr": list(challenger.peer_addr),
-            },
+            "peer": peer_dict(challenger),
         })
         await send(challenger, {
             "type": "match_start",
             "token": token,
             "role": "host",   # original challenger hosts
-            "peer": user.to_dict() | {
-                "udp_addr": user.udp_addr,
-                "ws_addr": list(user.peer_addr),
-            },
+            "peer": peer_dict(user),
         })
         await set_status_and_broadcast(user, "in_match", challenger.id)
         await set_status_and_broadcast(challenger, "in_match", user.id)
@@ -256,6 +264,69 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
             if user.room_id and user.room_id in ROOMS:
                 await broadcast_room(ROOMS[user.room_id],
                                      {"type": "user_rtt", "user_id": user.id, "rtt_ms": user.rtt_ms})
+
+
+# =============================================================================
+# UDP STUN responder
+# =============================================================================
+# The hub binds a UDP socket on the same port as the WebSocket (TCP and UDP
+# share namespaces independently — no conflict). It serves two purposes:
+#
+#   1. Reflexive-address discovery: a client sends a probe; we reply with the
+#      (ip, port) we observed. This is the client's actual external UDP
+#      mapping — the only correct value for cross-NAT play.
+#   2. Implicit udp_addr learning: the probe carries the client's user_id
+#      token; we update USERS[token].udp_addr from the source address. No
+#      separate `udp_addr` WS message needed once STUN is wired everywhere.
+#
+# Wire format (1 message-type today, more later):
+#
+#   STUN probe (client -> hub):
+#     0xCD 0x01 [16-byte hex user_id, padded right with NUL]
+#
+#   STUN ack (hub -> client):
+#     0xCD 0x02 [4-byte ip_be] [2-byte port_be]
+#
+# Magic byte 0xCD is reserved for NAT-layer packets in the master design
+# (see docs/FM2K_Matchmaking_Design.md §15.4). 0xCC is launcher control
+# channel; 0xCE is spectator-tree datagrams.
+
+STUN_MAGIC      = 0xCD
+STUN_PROBE_TAG  = 0x01
+STUN_ACK_TAG    = 0x02
+STUN_USER_ID_LEN = 12  # matches User.id length (uuid4().hex[:12])
+
+class _StunProto(asyncio.DatagramProtocol):
+    def __init__(self) -> None:
+        self.transport: Optional[asyncio.DatagramTransport] = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < 2 or data[0] != STUN_MAGIC:
+            return
+        if data[1] == STUN_PROBE_TAG:
+            uid = data[2:2 + STUN_USER_ID_LEN].rstrip(b"\x00").decode("ascii", errors="ignore")
+            user = USERS.get(uid)
+            if user is not None:
+                user.udp_addr = addr
+                print(f"[STUN] {user.nick} ({uid}) -> {addr[0]}:{addr[1]}")
+            try:
+                ip_bytes = socket.inet_aton(addr[0])
+                port_bytes = struct.pack("!H", addr[1])
+                ack = bytes([STUN_MAGIC, STUN_ACK_TAG]) + ip_bytes + port_bytes
+                if self.transport:
+                    self.transport.sendto(ack, addr)
+            except OSError:
+                pass
+
+
+async def start_stun_responder(host: str, port: int) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(
+        _StunProto, local_addr=(host, port), reuse_port=False)
+    print(f"FM2K Hub STUN responder listening on udp://{host}:{port}")
 
 
 async def ping_loop() -> None:
@@ -323,8 +394,9 @@ async def main() -> None:
     for game_id, display_name in SEED_ROOMS:
         ROOMS[game_id] = Room(game_id, display_name, seeded=True)
     asyncio.create_task(ping_loop())
+    await start_stun_responder(args.host, args.port)
     async with serve(handler, args.host, args.port):
-        print(f"FM2K Hub listening on {args.host}:{args.port}")
+        print(f"FM2K Hub listening on tcp://{args.host}:{args.port} (WebSocket)")
         print(f"  seeded rooms: {[r.id for r in ROOMS.values()]}")
         await asyncio.Future()
 

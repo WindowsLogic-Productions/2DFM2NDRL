@@ -40,6 +40,11 @@ const sockaddr_in* NetSocket_GetRemoteAddr();
 // Updates CSS state, handles connection keepalive
 void ControlChannel_Poll();
 
+// Borrow the underlying UDP SOCKET for nat_traversal/STUN. Returns
+// INVALID_SOCKET if the channel hasn't been initialized. Caller must
+// not closesocket() — the socket is owned by control_channel.
+SOCKET ControlChannel_GetSocket();
+
 // Send a control packet to remote peer
 void ControlChannel_Send(const CtrlPacket& packet);
 

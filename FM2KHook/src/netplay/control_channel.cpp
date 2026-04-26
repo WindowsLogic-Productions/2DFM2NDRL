@@ -3,6 +3,7 @@
 #include "globals.h"
 #include "gekkonet.h"
 #include "spectator_node.h"
+#include "nat_traversal.h"
 #include <SDL3/SDL_log.h>
 #include <vector>
 #include <cstring>
@@ -275,6 +276,15 @@ static void RawReceive() {
                 }
             }
         } else if (recv_len >= 1 &&
+                   static_cast<uint8_t>(g_recv_buffer[0]) == 0xCD) {
+            // NAT-layer datagram (0xCD) — STUN ack or peer punch probe.
+            // Defined in nat_traversal.h. Returning here keeps the byte
+            // out of GekkoNet's queue and the spectator path.
+            ::fm2k::nat::HandleDatagram(
+                reinterpret_cast<const uint8_t*>(g_recv_buffer),
+                static_cast<size_t>(recv_len),
+                from_addr);
+        } else if (recv_len >= 1 &&
                    static_cast<uint8_t>(g_recv_buffer[0]) == SPEC_DATA_MAGIC) {
             // Spectator-tree datagram (0xCE) — variable-length payload.
             // Cast explicitly to uint8_t: g_recv_buffer is `char` and on
@@ -295,6 +305,10 @@ static void RawReceive() {
 // =============================================================================
 // CONTROL CHANNEL
 // =============================================================================
+
+SOCKET ControlChannel_GetSocket() {
+    return g_socket;
+}
 
 void ControlChannel_Poll() {
     if (!g_socket_initialized) return;
