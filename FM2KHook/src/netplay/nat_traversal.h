@@ -50,4 +50,37 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
 // peer address when the packet authenticates via match_token.
 void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from);
 
+// =============================================================================
+// Relay fallback
+// =============================================================================
+// Read FM2K_HUB_RELAY_ADDR + FM2K_HUB_RELAY_SESSION env vars; configures
+// the relay envelope used when direct punch fails. Idempotent — safe to
+// call from Netplay_Init regardless of whether relay info is present.
+// Returns true if both env vars are set and parsed cleanly.
+bool ConfigureRelay();
+
+// True once we've decided to fall back to relaying — set after
+// StartPunch's burst completes without a peer-latch, OR explicitly
+// via ForceRelayMode() (test hook). Once true, RawSend wraps every
+// gameplay packet in a 0xCF envelope and sends to the relay; RawReceive
+// unwraps inbound 0xCF packets and re-dispatches the inner payload.
+bool IsRelayMode();
+void ForceRelayMode();   // test/diagnostic only
+
+// Borrowed pointers — caller must not free or modify. Valid for the
+// lifetime of the process once ConfigureRelay() returned true.
+const sockaddr_in* GetRelayAddr();
+const uint8_t*     GetRelaySessionId();   // 16 bytes
+
+// Wrap raw outbound payload bytes in the 0xCF envelope. `out` must
+// have room for `len + 18` bytes. Returns the total wrapped length.
+size_t WrapForRelay(const uint8_t* in, size_t len, uint8_t* out, size_t out_cap);
+
+// Strip the 0xCF envelope from an inbound packet. Returns true if the
+// packet was a valid relay envelope for our session and writes the
+// inner payload pointer/length via `out_inner`/`out_inner_len`. The
+// returned pointer aliases into `data`, no copy.
+bool UnwrapFromRelay(const uint8_t* data, size_t len,
+                     const uint8_t** out_inner, size_t* out_inner_len);
+
 }  // namespace fm2k::nat

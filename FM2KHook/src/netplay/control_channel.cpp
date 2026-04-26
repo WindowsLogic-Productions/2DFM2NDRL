@@ -193,6 +193,37 @@ const sockaddr_in* NetSocket_GetRemoteAddr() {
 
 static void RawSend(const void* data, size_t len) {
     if (g_socket == INVALID_SOCKET) return;
+
+    // Relay mode: wrap every gameplay byte in a 0xCF envelope and ship
+    // to the hub-supplied relay endpoint. The relay forwards by
+    // session_id to the other peer, who unwraps in their own
+    // RawReceive. Direct g_remote_sockaddr is bypassed entirely.
+    if (::fm2k::nat::IsRelayMode()) {
+        const sockaddr_in* relay = ::fm2k::nat::GetRelayAddr();
+        if (!relay) return;
+        // 18-byte header (0xCF 0x01 + 16-byte session_id) + payload.
+        // Most FM2K control / GekkoNet packets are well under 1500B so
+        // a 2KB stack buffer is plenty.
+        uint8_t wrapped[2048];
+        size_t wrapped_len = ::fm2k::nat::WrapForRelay(
+            reinterpret_cast<const uint8_t*>(data), len,
+            wrapped, sizeof(wrapped));
+        if (wrapped_len == 0) return;  // payload too large
+        int result = sendto(g_socket,
+                            reinterpret_cast<const char*>(wrapped),
+                            (int)wrapped_len, 0,
+                            reinterpret_cast<const sockaddr*>(relay),
+                            sizeof(*relay));
+        if (result == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "NetSocket: relay sendto failed: %d", err);
+            }
+        }
+        return;
+    }
+
     if (g_remote_sockaddr.sin_port == 0) return;  // peer address not known yet (host waiting for client)
 
     int result = sendto(g_socket, (const char*)data, (int)len, 0,
@@ -230,13 +261,36 @@ static void RawReceive() {
 
         g_last_recv_time = GetTimeMs();
 
+        // Relay-envelope unwrap. If this is a 0xCF packet for our
+        // configured relay session, strip the 18-byte header and treat
+        // the inner bytes as if they arrived directly from the peer.
+        // Skip peer-address learning for the inner packet — the actual
+        // sockaddr is the relay, which we don't want latched as peer.
+        bool from_relay = false;
+        const uint8_t* eff_data = reinterpret_cast<const uint8_t*>(g_recv_buffer);
+        size_t eff_len = static_cast<size_t>(recv_len);
+        const uint8_t* inner = nullptr;
+        size_t inner_len = 0;
+        if (recv_len >= 1 && static_cast<uint8_t>(g_recv_buffer[0]) == 0xCF) {
+            if (::fm2k::nat::UnwrapFromRelay(eff_data, eff_len, &inner, &inner_len)) {
+                eff_data = inner;
+                eff_len  = inner_len;
+                from_relay = true;
+            } else {
+                continue;  // bad envelope or wrong session — drop
+            }
+        }
+        const uint8_t first = eff_len ? eff_data[0] : 0;
+
         // Check if this is a control packet (magic byte 0xCC)
-        if (recv_len >= 1 && static_cast<uint8_t>(g_recv_buffer[0]) == CTRL_MAGIC) {
-            // Learn the peer's actual source address from the first authenticated
-            // packet. The host's configured remote is only a best-guess default
-            // (e.g. "127.0.0.1:7001"); the client may be bound on any port.
-            // Updating here makes HELLO_ACK / subsequent traffic reach the real peer.
-            if (!g_connected &&
+        if (eff_len >= 1 && first == CTRL_MAGIC) {
+            // Peer-address learning. Skip when the packet came in via
+            // the relay envelope — the actual sockaddr is the relay,
+            // and latching the relay as g_remote_sockaddr would later
+            // cause RawSend (in non-relay mode) to send to the relay
+            // instead of the peer. In relay mode we don't need a
+            // peer addr at all (RawSend's relay branch ignores it).
+            if (!from_relay && !g_connected &&
                 (g_remote_sockaddr.sin_addr.s_addr != from_addr.sin_addr.s_addr ||
                  g_remote_sockaddr.sin_port != from_addr.sin_port)) {
                 char ip_buf[INET_ADDRSTRLEN] = {};
@@ -249,8 +303,8 @@ static void RawReceive() {
             }
 
             // Control packet - process immediately
-            if (recv_len >= sizeof(CtrlPacketHeader)) {
-                const CtrlPacket* packet = reinterpret_cast<const CtrlPacket*>(g_recv_buffer);
+            if (eff_len >= sizeof(CtrlPacketHeader)) {
+                const CtrlPacket* packet = reinterpret_cast<const CtrlPacket*>(eff_data);
 
                 // Update ack
                 if (packet->header.seq > g_recv_seq) {
@@ -275,28 +329,19 @@ static void RawReceive() {
                     g_msg_callback(packet, from_addr);
                 }
             }
-        } else if (recv_len >= 1 &&
-                   static_cast<uint8_t>(g_recv_buffer[0]) == 0xCD) {
+        } else if (eff_len >= 1 && first == 0xCD) {
             // NAT-layer datagram (0xCD) — STUN ack or peer punch probe.
             // Defined in nat_traversal.h. Returning here keeps the byte
             // out of GekkoNet's queue and the spectator path.
-            ::fm2k::nat::HandleDatagram(
-                reinterpret_cast<const uint8_t*>(g_recv_buffer),
-                static_cast<size_t>(recv_len),
-                from_addr);
-        } else if (recv_len >= 1 &&
-                   static_cast<uint8_t>(g_recv_buffer[0]) == SPEC_DATA_MAGIC) {
+            ::fm2k::nat::HandleDatagram(eff_data, eff_len, from_addr);
+        } else if (eff_len >= 1 && first == SPEC_DATA_MAGIC) {
             // Spectator-tree datagram (0xCE) — variable-length payload.
-            // Cast explicitly to uint8_t: g_recv_buffer is `char` and on
-            // MinGW that's signed, so a raw `g_recv_buffer[0] == 0xCE`
-            // compare runs as signed-int (-50 vs 206) and never matches.
-            SpectatorNode_HandleSpecData(
-                reinterpret_cast<const uint8_t*>(g_recv_buffer),
-                static_cast<size_t>(recv_len),
-                from_addr);
+            SpectatorNode_HandleSpecData(eff_data, eff_len, from_addr);
         } else {
             // GekkoNet packet - queue for adapter
-            std::vector<char> pkt_data(g_recv_buffer, g_recv_buffer + recv_len);
+            std::vector<char> pkt_data(
+                reinterpret_cast<const char*>(eff_data),
+                reinterpret_cast<const char*>(eff_data) + eff_len);
             g_gekko_packet_queue.push_back({std::move(pkt_data), from_addr});
         }
     }

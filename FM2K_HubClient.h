@@ -89,6 +89,12 @@ struct HubEvent {
         std::string peer_udp_ip;
         int peer_udp_port = 0;
         std::string peer_ws_addr;
+        // Relay fallback. Hub fills these on match_start so the hook
+        // can switch to relay mode if direct punch fails. Empty/zero
+        // means hub didn't advertise a relay (older hub or disabled).
+        std::string relay_ip;
+        int         relay_port = 0;
+        std::string relay_session_id;   // 32-hex-char string (= match token bytes)
     } match;
 };
 

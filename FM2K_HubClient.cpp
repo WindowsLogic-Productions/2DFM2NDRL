@@ -567,6 +567,24 @@ void HubClient::OnMessage(const std::string& msg) {
         }
         std::string ws_addr = GetSub(peer_obj, "ws_addr");
         ev.match.peer_ws_addr = ws_addr;
+
+        // Optional relay fallback advertised by the hub.
+        std::string relay_obj = GetSub(msg, "relay");
+        if (!relay_obj.empty()) {
+            std::string addr_arr = GetSub(relay_obj, "addr");
+            if (!addr_arr.empty()) {
+                size_t a = addr_arr.find('"');
+                size_t b = (a == std::string::npos) ? a : addr_arr.find('"', a + 1);
+                if (a != std::string::npos && b != std::string::npos) {
+                    ev.match.relay_ip = addr_arr.substr(a + 1, b - a - 1);
+                }
+                size_t c = addr_arr.find(',');
+                if (c != std::string::npos) {
+                    ev.match.relay_port = std::atoi(addr_arr.c_str() + c + 1);
+                }
+            }
+            ev.match.relay_session_id = GetStr(relay_obj, "session_id");
+        }
         EmitEvent(std::move(ev));
         return;
     }
