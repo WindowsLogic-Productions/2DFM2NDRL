@@ -716,30 +716,29 @@ void LauncherUI::RenderSessionControls() {
 }
 
 void LauncherUI::RenderHubPanel() {
-    // Phase-1 placeholder UI for the Fightcade-style hub. Real
-    // wire-level WebSocket client (HubClient) lands in a follow-up
-    // commit. Until then this panel is purely cosmetic — connect
-    // button is a no-op, room/user lists show synthetic data so the
-    // layout can be iterated against without the backend.
+    // Phase-1 lobby UI scaffold. HubClient (C++ WebSocket transport)
+    // not yet wired — Connect/Join/Challenge are TODO markers. The
+    // hub server URL belongs in a Settings panel later; for now the
+    // launcher will hardcode `ws://127.0.0.1:7711` when HubClient
+    // lands. UI shows empty states so it's clear nothing is fake.
 
-    static char  s_server[128] = "ws://127.0.0.1:7711";
-    static char  s_nick[32]    = "player";
-    static bool  s_connected   = false;
+    static char s_nick[32]    = "";
+    static bool s_connected   = false;
 
     ImGui::SeparatorText("Hub");
     ImGui::PushItemWidth(-120);
-    ImGui::InputText("Server", s_server, sizeof(s_server));
-    ImGui::InputText("Nick",   s_nick,   sizeof(s_nick));
+    ImGui::InputText("Nick", s_nick, sizeof(s_nick));
     ImGui::PopItemWidth();
+
     if (!s_connected) {
-        if (ImGui::Button(s_nick[0] ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
-            if (s_nick[0]) {
-                // TODO(hubclient): HubClient::Connect(s_server, s_nick).
-                // For now, fake a connection so the UI shape can be
-                // tested. Disconnect resets.
-                s_connected = true;
-            }
+        const bool can_connect = s_nick[0] != '\0';
+        if (!can_connect) ImGui::BeginDisabled();
+        if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
+            // TODO(hubclient): HubClient::Connect(<configured server>, s_nick).
+            // s_connected only flips on actual hello_ack from server.
+            s_connected = true;
         }
+        if (!can_connect) ImGui::EndDisabled();
     } else {
         ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "Connected as %s", s_nick);
         ImGui::SameLine();
@@ -752,69 +751,18 @@ void LauncherUI::RenderHubPanel() {
     if (!s_connected) return;
 
     ImGui::SeparatorText("Rooms");
-    if (ImGui::BeginTable("##rooms", 3,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Game");
-        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableHeadersRow();
-
-        // Synthetic rows. HubClient will replace with the real
-        // room_list payload from the server.
-        static const char* mock_rooms[][2] = {
-            {"WonderfulWorld",          "3"},
-            {"Strip Fighter Zero",      "1"},
-            {"StudioS Fighters",        "2"},
-        };
-        for (auto& r : mock_rooms) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r[0]);
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r[1]);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::PushID(r[0]);
-            if (ImGui::SmallButton("Join")) {
-                // TODO(hubclient): HubClient::JoinRoom(r[0]).
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
+    // TODO(hubclient): replace empty state with real room_list payload.
+    // Rows will be populated from HubClient::GetRooms() once a hello_ack
+    // arrives. Future: room games map to entries from the upcoming
+    // master game list (exe-name → game metadata + title screen).
+    ImGui::TextDisabled("No rooms loaded.");
 
     ImGui::SeparatorText("Players in current room");
-    if (ImGui::BeginTable("##users", 4,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Nick");
-        ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn("Ping",     ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("",         ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableHeadersRow();
-
-        // Synthetic data — Fightcade-style: green/yellow/red status,
-        // ping column, challenge button per row.
-        struct Mock { const char* nick; const char* status; int rtt; ImVec4 color; };
-        static const Mock mock_users[] = {
-            {"alice",   "idle",       28, ImVec4(0.3f, 0.9f, 0.4f, 1.0f)},
-            {"bob",     "in match",   45, ImVec4(0.95f, 0.7f, 0.2f, 1.0f)},
-            {"carol",   "idle",      120, ImVec4(0.3f, 0.9f, 0.4f, 1.0f)},
-            {"dave",    "challenging",90, ImVec4(0.95f, 0.7f, 0.2f, 1.0f)},
-        };
-        for (auto& u : mock_users) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(u.nick);
-            ImGui::TableSetColumnIndex(1); ImGui::TextColored(u.color, "%s", u.status);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%dms", u.rtt);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::PushID(u.nick);
-            const bool can_challenge = std::strcmp(u.status, "idle") == 0;
-            if (!can_challenge) ImGui::BeginDisabled();
-            if (ImGui::SmallButton("Challenge")) {
-                // TODO(hubclient): HubClient::Challenge(user_id).
-            }
-            if (!can_challenge) ImGui::EndDisabled();
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
+    // TODO(hubclient): replace with HubClient::GetUsers(current_room_).
+    // Each row will show nick / status (idle | challenging | in_match) /
+    // ping (server-relayed RTT for now, peer-direct probe Phase 2) /
+    // challenge button.
+    ImGui::TextDisabled("Join a room to see players.");
 }
 
 void LauncherUI::RenderDebugTools() {
