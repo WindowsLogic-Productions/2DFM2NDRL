@@ -882,6 +882,18 @@ void LauncherUI::RenderHubPanel() {
                     // discovery completed.
                     if (on_game_selected) on_game_selected(games_[idx]);
 
+                    // Plumb hub coordinates through the spawned game's
+                    // env so FM2KHook's nat_traversal can fire a STUN
+                    // probe and authenticated punch on Netplay_Init.
+                    // Inherited via CreateProcess in
+                    // FM2KGameInstance::Launch.
+                    // TODO(settings): hub URL is hardcoded here as it
+                    // is in HubClient — both move to a Settings panel
+                    // together later.
+                    ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   "127.0.0.1:7711");
+                    ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
+                    ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
+
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");
