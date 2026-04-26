@@ -100,6 +100,27 @@ async def broadcast_room(room: Room, msg: dict[str, Any], exclude: Optional[str]
             pass
 
 
+async def broadcast_all(msg: dict[str, Any], exclude: Optional[str] = None) -> None:
+    """Send a message to every connected user."""
+    payload = json.dumps(msg)
+    for uid, u in list(USERS.items()):
+        if uid == exclude:
+            continue
+        try:
+            await u.ws.send(payload)
+        except ConnectionClosed:
+            pass
+
+
+async def broadcast_room_list() -> None:
+    """Push the current room list to every connected user. Used after
+    any membership change so non-members of the room see the user_count
+    update — and after seeded rooms gain/lose users — without needing
+    to poll list_rooms."""
+    msg = {"type": "room_list", "rooms": [r.to_dict() for r in ROOMS.values()]}
+    await broadcast_all(msg)
+
+
 async def leave_room(user: User) -> None:
     if user.room_id is None:
         return
@@ -109,6 +130,9 @@ async def leave_room(user: User) -> None:
         await broadcast_room(room, {"type": "user_left", "room_id": room.id, "user_id": user.id})
         if not room.user_ids and not room.seeded:
             ROOMS.pop(room.id, None)
+        # Push refreshed room list to everyone — user_count changed,
+        # and an unseeded room may have just been deleted.
+        await broadcast_room_list()
     user.room_id = None
 
 
@@ -152,6 +176,10 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
         })
         await broadcast_room(room, {"type": "user_joined", "room_id": gid, "user": user.to_dict()},
                              exclude=user.id)
+        # Refresh room list for everyone — user_count went up, and
+        # a freshly user-created room (non-seeded) needs to appear in
+        # the lobby browser of users not in any room.
+        await broadcast_room_list()
 
     elif t == "leave_room":
         await leave_room(user)
