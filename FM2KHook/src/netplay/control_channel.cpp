@@ -87,13 +87,28 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
         return false;
     }
 
+    // SO_REUSEADDR — allows rebinding to a port still in TIME_WAIT
+    // from a previous run. Without this, restarting the launcher
+    // within ~30s of a previous session hits WSAEADDRINUSE (10048).
+    BOOL reuse = TRUE;
+    setsockopt(g_socket, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
     // Bind to local port
     g_local_sockaddr.sin_family = AF_INET;
     g_local_sockaddr.sin_addr.s_addr = INADDR_ANY;
     g_local_sockaddr.sin_port = htons(local_port);
 
     if (bind(g_socket, (sockaddr*)&g_local_sockaddr, sizeof(g_local_sockaddr)) == SOCKET_ERROR) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: bind() failed: %d", WSAGetLastError());
+        int err = WSAGetLastError();
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "NetSocket: bind() failed on port %d (err=%d). %s",
+            (int)local_port, err,
+            err == WSAEADDRINUSE
+                ? "Port already in use — another launcher instance is on this port. "
+                  "If running two launchers on the same machine, configure each "
+                  "with a different FM2K_LOCAL_PORT (e.g. 7000 and 7001)."
+                : "");
         closesocket(g_socket);
         g_socket = INVALID_SOCKET;
         WSACleanup();

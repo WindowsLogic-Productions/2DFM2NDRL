@@ -917,6 +917,14 @@ void LauncherUI::RenderHubPanel() {
     if (!hs.client.IsConnected()) {
         ImGui::PushItemWidth(-120);
         ImGui::InputText("Nick", s_nick, sizeof(s_nick));
+        // Local UDP port — the socket the hook binds for game traffic.
+        // Same-machine testing requires distinct ports per launcher,
+        // otherwise the second one hits WSAEADDRINUSE on bind. Real
+        // network play: any single port works since each box is its
+        // own bind namespace.
+        ImGui::InputInt("Port", &network_config_.local_port);
+        if (network_config_.local_port < 1024)  network_config_.local_port = 7000;
+        if (network_config_.local_port > 65535) network_config_.local_port = 7000;
         ImGui::PopItemWidth();
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
