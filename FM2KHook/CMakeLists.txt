@@ -24,11 +24,15 @@ add_library(FM2KHook SHARED
     src/netplay/netplay.cpp
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
+    src/netplay/replay.cpp
+    src/netplay/spectator_node.cpp
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI
     src/ui/imgui_overlay.cpp
     src/ui/shared_mem.cpp
+    # Parity — kgtengine cross-engine ground-truth recorder
+    src/parity/parity_recorder.cpp
 )
 
 # Export symbols for DLL
@@ -67,6 +71,10 @@ target_include_directories(FM2KHook PRIVATE
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/include
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/GekkoLib/include
     ${CMAKE_SOURCE_DIR}/vendored/imgui
+    # kgtengine parity-snapshot header (sibling repo at /mnt/c/dev/kgtengine).
+    # FM2KHook/CMakeLists.txt is at /mnt/c/dev/wanwan/FM2KHook/, so go up two
+    # levels (../..) to reach /mnt/c/dev/, then into kgtengine/include.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../kgtengine/include
 )
 
 # Set output directories

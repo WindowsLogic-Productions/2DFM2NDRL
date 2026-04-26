@@ -788,6 +788,17 @@ bool FM2KLauncher::Initialize() {
     ui_->on_launch_local_client2 = [this](const std::string& game_path) -> bool {
         return LaunchLocalClient(game_path, false, 7001);  // Guest on port 7001
     };
+
+    ui_->on_launch_local_spectator = [this](const std::string& game_path) -> bool {
+        // Spectator subscribes to client1 (host on 7000), itself bound on 7002.
+        return LaunchLocalSpectator(game_path, /*spectator_port=*/7002, /*host_port=*/7000);
+    };
+
+    ui_->on_launch_local_spectator2 = [this](const std::string& game_path) -> bool {
+        // Daisy-chain: spectator 2 subscribes to spectator 1 (port 7002),
+        // bound on 7003. Validates the relay-forward path.
+        return LaunchLocalSpectator2(game_path, /*spectator_port=*/7003, /*upstream_port=*/7002);
+    };
     
     ui_->on_terminate_all_clients = [this]() -> bool {
         bool success = TerminateAllClients();
@@ -1099,10 +1110,69 @@ void FM2KLauncher::StartAsyncDiscovery() {
     }
 }
 
+// Max depth from games_root to descend looking for .kgt files. Real-world
+// libraries are organized publisher/game/[version/], so 6 covers everything
+// while preventing pathological symlink loops or scanning the whole drive.
+static constexpr int DISCOVERY_MAX_DEPTH = 6;
+
+// Walk state passed via SDL_EnumerateDirectory's userdata.
+struct DiscoveryWalkCtx {
+    std::vector<FM2K::FM2KGameInfo>* games;
+    int depth_remaining;
+};
+
+static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name);
+
+static void ScanDirForGames(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games,
+                            int depth_remaining)
+{
+    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Scanning '%s' (depth_left=%d)",
+                 dir.c_str(), depth_remaining);
+
+    // 1) Check this directory itself for *.kgt + matching *.exe.
+    int count = 0;
+    char** list = SDL_GlobDirectory(dir.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
+    if (list) {
+        for (int i = 0; i < count; ++i) {
+            if (!list[i]) continue;
+
+            const char* kgt_name = SDL_strrchr(list[i], '/');
+            if (!kgt_name) kgt_name = SDL_strrchr(list[i], '\\');
+            kgt_name = kgt_name ? kgt_name + 1 : list[i];
+
+            char* exe_name = nullptr;
+            if (SDL_asprintf(&exe_name, "%.*s.exe",
+                             (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
+                continue;
+            }
+            std::string exe_path = dir + "/" + exe_name;
+            std::string kgt_path = dir + "/" + kgt_name;
+            SDL_free(exe_name);
+
+            if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Found game pair: EXE='%s', KGT='%s'",
+                            exe_path.c_str(), kgt_path.c_str());
+                games.emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
+            }
+        }
+        SDL_free(list);
+    }
+
+    // 2) Recurse into subdirectories, decrementing depth budget.
+    if (depth_remaining > 0) {
+        DiscoveryWalkCtx ctx{&games, depth_remaining - 1};
+        SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
+    }
+}
+
 static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name) {
-    auto* games = static_cast<std::vector<FM2K::FM2KGameInfo>*>(userdata);
-    
-    // Build path using forward slashes to avoid double backslash issues
+    auto* ctx = static_cast<DiscoveryWalkCtx*>(userdata);
+
+    if (SDL_strcmp(name, ".") == 0 || SDL_strcmp(name, "..") == 0) {
+        return SDL_ENUM_CONTINUE;
+    }
+
     std::string dir_str = origdir;
     if (!dir_str.empty() && dir_str.back() != '/' && dir_str.back() != '\\') {
         dir_str += '/';
@@ -1111,53 +1181,19 @@ static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* ori
 
     SDL_PathInfo info;
     if (!SDL_GetPathInfo(full_path.c_str(), &info)) {
-        return SDL_ENUM_CONTINUE; // Cannot stat, but continue to next.
+        return SDL_ENUM_CONTINUE;
+    }
+    if (info.type != SDL_PATHTYPE_DIRECTORY) {
+        return SDL_ENUM_CONTINUE;
     }
 
-    if (info.type == SDL_PATHTYPE_DIRECTORY) {
-        if (SDL_strcmp(name, ".") != 0 && SDL_strcmp(name, "..") != 0) {
-            // For directories, look for KGT files directly inside
-            int count = 0;
-            char **list = SDL_GlobDirectory(full_path.c_str(), "*.kgt", /*flags=*/0, &count);
-            
-            if (list) {
-                for (int i = 0; i < count; ++i) {
-                    if (!list[i]) continue;
-                    
-                    const char* kgt_name = SDL_strrchr(list[i], '/');
-                    if (!kgt_name) kgt_name = SDL_strrchr(list[i], '\\');
-                    kgt_name = kgt_name ? kgt_name + 1 : list[i];  // Skip the slash
-                    
-                    // Build paths using string concatenation with forward slashes
-                    char* exe_name = nullptr;
-                    if (SDL_asprintf(&exe_name, "%.*s.exe", (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
-                        continue;
-                    }
-                    
-                    std::string exe_path = full_path + "/" + exe_name;
-                    std::string kgt_path = full_path + "/" + kgt_name;
-                    SDL_free(exe_name);
-
-                    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Found KGT in '%s': '%s', checking for EXE: '%s'", 
-                                name, kgt_path.c_str(), exe_path.c_str());
-
-                    if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Found valid game pair in '%s': EXE='%s', KGT='%s'", 
-                                  name, exe_path.c_str(), kgt_path.c_str());
-                        games->emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
-                    }
-                }
-                SDL_free(list);
-            }
-        }
-    }
-
-    return SDL_ENUM_CONTINUE; // Continue enumeration
+    ScanDirForGames(full_path, *ctx->games, ctx->depth_remaining);
+    return SDL_ENUM_CONTINUE;
 }
 
 static void DiscoverGamesRecursive(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games) {
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Scanning directory: '%s'", dir.c_str());
-    SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &games);
+    DiscoveryWalkCtx ctx{&games, DISCOVERY_MAX_DEPTH - 1};
+    SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
 }
 
 std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
@@ -1173,7 +1209,7 @@ std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
 
     // First, check for KGT files in the root directory itself
     int count = 0;
-    char **list = SDL_GlobDirectory(games_root.c_str(), "*.kgt", /*flags=*/0, &count);
+    char **list = SDL_GlobDirectory(games_root.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
     
     if (list) {
         for (int i = 0; i < count; ++i) {
@@ -1519,6 +1555,103 @@ bool FM2KLauncher::LaunchLocalClient(const std::string& game_path, bool is_host,
     return true;
 }
 
+bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
+                                        int spectator_port,
+                                        int host_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching local spectator: %s (port=%d -> host_port=%d)",
+                game_path.c_str(), spectator_port, host_port);
+
+    if (spectator_instance_ && spectator_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
+        return false;
+    }
+
+    spectator_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator_instance_.get());
+
+    // Spectator-mode env vars. The hook reads FM2K_SPECTATOR_MODE=1 to skip
+    // the normal HELLO/HELLO_ACK flow and instead send SPEC_JOIN_REQ to
+    // FM2K_REMOTE_ADDR after the socket is up. Player index 2 is just a
+    // sentinel — spectators don't claim a player slot.
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",   "2");
+    spectator_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",     std::to_string(spectator_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",    "127.0.0.1:" + std::to_string(host_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE", "1");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+
+    if (!spectator_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch spectator: %s", game_path.c_str());
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Spectator process terminated immediately!");
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectator launched successfully (PID: %u, port=%d -> host=127.0.0.1:%d)",
+                spectator_instance_->GetProcessId(), spectator_port, host_port);
+    return true;
+}
+
+bool FM2KLauncher::LaunchLocalSpectator2(const std::string& game_path,
+                                         int spectator_port,
+                                         int upstream_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching local spectator 2 (chain): %s (port=%d -> upstream_port=%d)",
+                game_path.c_str(), spectator_port, upstream_port);
+
+    if (spectator2_instance_ && spectator2_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator 2 already running");
+        return false;
+    }
+
+    spectator2_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator2_instance_.get());
+
+    // Same env-var shape as the first spectator. The only difference is
+    // FM2K_REMOTE_ADDR points at spectator 1's port (7002) instead of the
+    // host's (7000). Spectator 1 acts as upstream; on JOIN_REQ it accepts
+    // and starts shipping its session_history (which it has been
+    // accumulating from its OWN relay path) to spectator 2.
+    spectator2_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",   "3");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",     std::to_string(spectator_port));
+    spectator2_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",    "127.0.0.1:" + std::to_string(upstream_port));
+    spectator2_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE", "1");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+
+    if (!spectator2_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Failed to launch spectator 2: %s", game_path.c_str());
+        spectator2_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator2_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Spectator 2 process terminated immediately!");
+        spectator2_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectator 2 launched (PID: %u, port=%d -> upstream=127.0.0.1:%d)",
+                spectator2_instance_->GetProcessId(), spectator_port, upstream_port);
+    return true;
+}
+
 bool FM2KLauncher::TerminateAllClients() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating all local clients");
     
@@ -1539,7 +1672,21 @@ bool FM2KLauncher::TerminateAllClients() {
         client2_instance_.reset();
         client2_process_id_ = 0;
     }
-    
+
+    // Terminate spectator
+    if (spectator_instance_) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating Spectator (PID: %u)", spectator_instance_->GetProcessId());
+        spectator_instance_->Terminate();
+        spectator_instance_.reset();
+    }
+
+    // Terminate spectator 2 (daisy-chain)
+    if (spectator2_instance_) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating Spectator 2 (PID: %u)", spectator2_instance_->GetProcessId());
+        spectator2_instance_->Terminate();
+        spectator2_instance_.reset();
+    }
+
     return success;
 }
 

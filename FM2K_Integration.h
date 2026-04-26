@@ -538,6 +538,16 @@ private:
     // Multi-client testing instances
     std::unique_ptr<FM2KGameInstance> client1_instance_;
     std::unique_ptr<FM2KGameInstance> client2_instance_;
+    // Local spectator instance — subscribes to client1 (host) on its
+    // multiplexed UDP port and replays the input stream. Used by the
+    // launcher's "Launch Spectator" button so we can validate the
+    // spectator pipeline against a live local dual-client session.
+    std::unique_ptr<FM2KGameInstance> spectator_instance_;
+    // Second local spectator that subscribes to spectator_instance_ rather
+    // than the host — exercises the daisy-chain relay (host → spec1 → spec2).
+    // Validates that a relay node correctly forwards confirmed-input frames
+    // it received from upstream to its own subscribers.
+    std::unique_ptr<FM2KGameInstance> spectator2_instance_;
     FM2K::FM2KGameInfo selected_game_;
     NetworkConfig network_config_;
     LauncherState current_state_;
@@ -552,6 +562,17 @@ private:
     
     // Multi-client testing helpers
     bool LaunchLocalClient(const std::string& game_path, bool is_host, int port);
+    // Launch a local spectator pointing at the host (client1) on host_port.
+    // Spectator-mode hook will SPEC_JOIN_REQ the host and start replaying
+    // the streamed input history (CSS + battle).
+    bool LaunchLocalSpectator(const std::string& game_path,
+                              int spectator_port,
+                              int host_port);
+    // Daisy-chain test: launches a second spectator that subscribes to the
+    // first spectator instead of the host. Verifies relay-node forwarding.
+    bool LaunchLocalSpectator2(const std::string& game_path,
+                               int spectator_port,
+                               int upstream_port);
     bool TerminateAllClients();
     
     
@@ -694,6 +715,8 @@ public:
     // Multi-client process management  
     std::function<bool(const std::string&)> on_launch_local_client1;     // Launch first client as host
     std::function<bool(const std::string&)> on_launch_local_client2;     // Launch second client as guest
+    std::function<bool(const std::string&)> on_launch_local_spectator;   // Launch spectator subscribing to client1
+    std::function<bool(const std::string&)> on_launch_local_spectator2;  // Launch second spectator subscribing to first (daisy-chain test)
     std::function<bool()> on_terminate_all_clients;                      // Kill all launched clients
     std::function<bool(uint32_t&, uint32_t&)> on_get_client_status;      // Get client process IDs (client1_pid, client2_pid)
     

@@ -43,6 +43,13 @@ void ControlChannel_Poll();
 // Send a control packet to remote peer
 void ControlChannel_Send(const CtrlPacket& packet);
 
+// Send a control packet to a specific address, bypassing the latched
+// remote-peer slot. Required for spectator-tree replies (SPEC_JOIN_ACK,
+// SPEC_JOIN_REDIRECT) where the destination is a subscriber that isn't
+// the gameplay opposite-peer; using ControlChannel_Send for those would
+// route the ACK to the wrong client and put it in an unintended state.
+void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest);
+
 // Check if control channel is connected (received HELLO_ACK)
 bool ControlChannel_IsConnected();
 
@@ -83,11 +90,11 @@ void ControlChannel_SendCharUnlock();
 // Send CSS start signal (both players synced, start counting frames NOW)
 void ControlChannel_SendCSSStart();
 
-// Send battle ready signal (for CSS sync). Carries the sender's proposed
-// local input delay so both peers can agree on max() before starting the
-// GekkoNet session — otherwise mismatched RTT samples produce asymmetric
-// per-peer local delay and one side feels more input lag than the other.
-void ControlChannel_SendBattleReady(uint8_t proposed_local_delay);
+// Send battle ready signal (for CSS sync). GekkoNet supports per-player local
+// input delay natively — each peer sets its own value via gekko_set_local_delay,
+// so no cross-peer negotiation is needed here. This packet is just a CSS-sync
+// signal with no payload.
+void ControlChannel_SendBattleReady();
 
 // Send battle acknowledgment
 void ControlChannel_SendBattleAck();
@@ -103,6 +110,12 @@ void ControlChannel_SendBattleEnd();
 
 // Send clean disconnect
 void ControlChannel_SendDisconnect();
+
+// Send a short chat message to the remote peer (truncated to 23 chars + NUL).
+// Peer-to-peer, low-latency — intended for in-match quick chat only.
+// Full chat (history, lobby-scoped) goes over the lobby TCP channel when
+// the matchmaking server lands.
+void ControlChannel_SendChat(const char* text);
 
 // =============================================================================
 // GEKKONET CUSTOM ADAPTER
@@ -121,8 +134,11 @@ void DestroyMultiplexAdapter();
 // CALLBACKS - Set by netplay.cpp to handle received control messages
 // =============================================================================
 
-// Callback function type for control messages
-typedef void (*ControlMsgCallback)(const CtrlPacket* packet);
+// Callback function type for control messages. Source address is included so
+// spectator-tree join paths (SPEC_JOIN_REQ from unknown peers, SPEC_JOIN_ACK
+// from upstream) can identify the peer without relying on the latched
+// remote_sockaddr used for gameplay.
+typedef void (*ControlMsgCallback)(const CtrlPacket* packet, const sockaddr_in& from);
 
 // Set callback for when control messages are received
 void ControlChannel_SetCallback(ControlMsgCallback callback);

@@ -16,9 +16,10 @@
 #include <cstdint>
 
 enum class LoopPhase {
-    NATIVE,           // Menu / intro / results — full original flow reproduced
-    CSS,              // Character select — control-channel-lockstep, no GekkoNet
-    TRAMPOLINE_BATTLE // GekkoNet drives sim + save + load + advance
+    NATIVE,             // Menu / intro / results — full original flow reproduced
+    CSS,                // Character select — control-channel-lockstep, no GekkoNet
+    TRAMPOLINE_BATTLE,  // GekkoNet drives sim + save + load + advance
+    SPECTATOR_PLAYBACK  // Inputs sourced from spectator stream queue, no GekkoNet
 };
 
 // Entry point replacing main_game_loop wholesale. Returns the same BOOL the

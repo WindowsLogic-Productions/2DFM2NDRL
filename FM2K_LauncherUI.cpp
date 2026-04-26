@@ -59,6 +59,8 @@ LauncherUI::LauncherUI()
     // Initialize multi-client testing callbacks
     on_launch_local_client1 = nullptr;
     on_launch_local_client2 = nullptr;
+    on_launch_local_spectator = nullptr;
+    on_launch_local_spectator2 = nullptr;
     on_terminate_all_clients = nullptr;
     on_get_client_status = nullptr;
     // Network simulation callbacks removed - not connected to LocalNetworkAdapter
@@ -486,7 +488,67 @@ void LauncherUI::RenderSessionControls() {
         ImGui::Text("Single Player Sessions:");
         ImGui::Separator();
         
+        // Boot strategy + diagnostics
+        static int  s_boot_strategy     = 0;     // 0=safe (title→auto-mash), 1=fast (CSS direct)
+        static bool s_auto_title_skip   = true;  // auto-mash button A through title menu
+        static bool s_bypass_trampoline = false;
+        static bool s_force_t4_patch    = false;
+        static bool s_skip_vs_mode_patch= false;
+        static bool s_t4_probe          = false;
+
+        ImGui::Text("Boot strategy:");
+        ImGui::RadioButton("Safe — boot to title, auto-mash to CSS (universal)", &s_boot_strategy, 0);
+        ImGui::SetItemTooltip(
+            "Boots to title_screen_manager (skips intro cutscene). The "
+            "hook auto-mashes button A with cursor pre-set to VS Player. "
+            "Works on every game — adds ~10 frames to boot.");
+        ImGui::RadioButton("Fast — boot directly to CSS (verified games only)", &s_boot_strategy, 1);
+        ImGui::SetItemTooltip(
+            "Skips title screen entirely. WORKS on WW. BREAKS StudioS "
+            "Fighters / Strip Fighter Zero — characters self-damage on "
+            "frame 0. Only enable per-game once verified safe.");
+
+        ImGui::Checkbox("Auto-mash title → CSS", &s_auto_title_skip);
+        ImGui::SetItemTooltip(
+            "Default ON. Disable to walk title screen manually with your "
+            "own inputs (useful if a game has options you want to set).");
+
+        ImGui::Separator();
+        ImGui::Text("Diagnostics (StudioS bisect):");
+
+        ImGui::Checkbox("Bypass trampoline (vanilla main_game_loop)", &s_bypass_trampoline);
+        ImGui::SetItemTooltip(
+            "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
+            "Offline only — netplay/spectator require the trampoline.");
+
+        ImGui::Checkbox("Skip VS-player-mode force-set", &s_skip_vs_mode_patch);
+        ImGui::SetItemTooltip(
+            "Don't force g_game_mode_flag=1 at boot.");
+
+        ImGui::Checkbox("Force t4-walk patch (masks the real bug)", &s_force_t4_patch);
+        ImGui::SetItemTooltip(
+            "Re-enables the case-200 t4-walk neuter patch (0x408EC5). "
+            "Off by default since it hides the underlying script-damage "
+            "issue rather than fixing it.");
+
+        ImGui::Checkbox("T4 probe (log fighter pool conditions)", &s_t4_probe);
+        ImGui::SetItemTooltip(
+            "Pre-update pool walk matching case-200's filter. Logs when "
+            "count<2 with the failing condition.");
+
         if (ImGui::Button("True Offline (Local Only)", ImVec2(-1, 0))) {
+            ::SetEnvironmentVariableA("FM2K_BOOT_TO_CSS_DIRECT",
+                                      s_boot_strategy == 1 ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP",
+                                      s_auto_title_skip ? nullptr : "0");
+            ::SetEnvironmentVariableA("FM2K_BYPASS_TRAMPOLINE",
+                                      s_bypass_trampoline ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_FORCE_T4_PATCH",
+                                      s_force_t4_patch ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_SKIP_VS_MODE_PATCH",
+                                      s_skip_vs_mode_patch ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_T4_PROBE",
+                                      s_t4_probe ? "1" : nullptr);
             if (on_offline_session_start) {
                 on_offline_session_start();
             }
@@ -529,29 +591,17 @@ void LauncherUI::RenderSessionControls() {
         if (ImGui::Button("Launch Dual Clients (Localhost)", ImVec2(-1, 0))) {
             if (on_launch_local_client1 && on_launch_local_client2 && game_selected) {
                 const auto& selected_game = games_[selected_game_index_];
-                
-                // Create client 2 path by replacing directory name with "2" suffix
-                std::filesystem::path original_path(selected_game.exe_path);
-                std::filesystem::path original_dir = original_path.parent_path();
-                std::filesystem::path exe_name = original_path.filename();
-                
-                std::string new_dir_name = original_dir.filename().string() + "2";
-                std::filesystem::path parent_dir = original_dir.parent_path();
-                std::filesystem::path client2_dir = parent_dir / new_dir_name;
-                std::filesystem::path client2_path = client2_dir / exe_name;
-                
-                // Check if client2 directory exists
-                if (!std::filesystem::exists(client2_dir)) {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Client 2 directory not found: %s", client2_dir.string().c_str());
-                    return;
-                }
-                
-                // Launch both clients
+
+                // Both clients launch from the same folder. The hook's
+                // BypassMultiInstanceCheck patch disables FM2K's own
+                // FindWindow("KGT2KGAME") guard, and shared memory is
+                // PID-namespaced. Mutable file collisions (.ini, save data)
+                // are tolerable for testing; if they become a problem,
+                // revisit with per-instance shadow folders.
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Starting dual clients...");
                 bool success1 = on_launch_local_client1(selected_game.exe_path);
-                
                 if (success1) {
-                    bool success2 = on_launch_local_client2(client2_path.string());
+                    bool success2 = on_launch_local_client2(selected_game.exe_path);
                     if (!success2) {
                         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch Client 2");
                     }
@@ -562,9 +612,45 @@ void LauncherUI::RenderSessionControls() {
         if (clients_running) {
             ImGui::EndDisabled();
         }
-        
+
         ImGui::SetItemTooltip("Launch two separate game instances connected via localhost for network testing");
-        
+
+        // "Launch Spectator" — spawns a third local instance that subscribes
+        // to client1 (host on 7000) for replay-streamed spectating. Only
+        // makes sense after Launch Dual Clients has the host running.
+        bool can_spectate = on_launch_local_spectator && game_selected && client1_pid != 0;
+        if (!can_spectate) ImGui::BeginDisabled();
+        if (ImGui::Button("Launch Spectator (subscribes to host)", ImVec2(-1, 0))) {
+            if (can_spectate) {
+                const auto& selected_game = games_[selected_game_index_];
+                bool ok = on_launch_local_spectator(selected_game.exe_path);
+                if (!ok) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch spectator");
+                }
+            }
+        }
+        if (!can_spectate) ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Launch a third local instance that subscribes to client1 (host on port 7000) and replays the input stream");
+
+        // "Launch Spectator 2 (chain)" — daisy-chain test. Subscribes to
+        // spectator 1 (port 7002) instead of the host. Validates that
+        // spectator 1 correctly relays its received frames to its own
+        // subscribers. Disabled until both dual clients + spectator 1 are
+        // running.
+        bool can_spectate2 = on_launch_local_spectator2 && game_selected && client1_pid != 0;
+        if (!can_spectate2) ImGui::BeginDisabled();
+        if (ImGui::Button("Launch Spectator 2 (chain to spec 1)", ImVec2(-1, 0))) {
+            if (can_spectate2) {
+                const auto& selected_game = games_[selected_game_index_];
+                bool ok = on_launch_local_spectator2(selected_game.exe_path);
+                if (!ok) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch spectator 2");
+                }
+            }
+        }
+        if (!can_spectate2) ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Launch a fourth local instance bound on 7003 that subscribes to spectator 1 on 7002 (daisy-chain validation). Spectator 1 must be running.");
+
         if (clients_running) {
             ImGui::Text("Clients running (PID: %u, %u)", client1_pid, client2_pid);
             if (ImGui::Button("Terminate All Clients", ImVec2(-1, 0))) {
@@ -672,39 +758,16 @@ void LauncherUI::RenderMultiClientTools() {
         if (ImGui::Button("Launch Dual Clients", ImVec2(200, 30))) {
             if (on_launch_local_client1 && on_launch_local_client2 && can_launch) {
                 const auto& selected_game = games_[selected_game_index_];
-                
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Launching dual clients for: %s", selected_game.exe_path.c_str());
-                
-                // Create client 2 path by replacing directory name with "2" suffix
-                std::filesystem::path original_path(selected_game.exe_path);
-                std::filesystem::path original_dir = original_path.parent_path();
-                std::filesystem::path exe_name = original_path.filename();
-                
-                // Create new directory path: wanwan -> wanwan2
-                std::string new_dir_name = original_dir.filename().string() + "2";
-                std::filesystem::path parent_dir = original_dir.parent_path();
-                std::filesystem::path client2_dir = parent_dir / new_dir_name;
-                std::filesystem::path client2_path = client2_dir / exe_name;
-                
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Client 1 path: %s", selected_game.exe_path.c_str());
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Client 2 path: %s", client2_path.string().c_str());
-                
-                // Verify client 2 path exists
-                if (!std::filesystem::exists(client2_path)) {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Client 2 executable not found: %s", client2_path.string().c_str());
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Please manually create %s directory with game files", client2_dir.string().c_str());
-                    return;
-                }
-                
-                // Launch both clients quickly (OnlineSession style)
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Starting client 1 (Host)...");
-                bool success1 = on_launch_local_client1(selected_game.exe_path);  // wanwan/game.exe
-                
+
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Launching dual clients for: %s", selected_game.exe_path.c_str());
+
+                // Both clients launch from the same folder — multi-instance
+                // window check is patched and shared memory is PID-namespaced.
+                bool success1 = on_launch_local_client1(selected_game.exe_path);
                 if (success1) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Client 1 launched, starting client 2...");
-                    
-                    // Launch client 2 from the "2" directory
-                    bool success2 = on_launch_local_client2(client2_path.string());  // wanwan2/game.exe
+                    bool success2 = on_launch_local_client2(selected_game.exe_path);
                     if (success2) {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Client 2 (Guest) launched successfully");
                     } else {
@@ -729,10 +792,27 @@ void LauncherUI::RenderMultiClientTools() {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminate all clients: %s", success ? "success" : "failed");
             }
         }
-        
+
         if (!clients_running) {
             ImGui::EndDisabled();
         }
+
+        // "Launch Spectator" — third local instance subscribing to client1
+        // (host on 7000) for replay-streamed spectator validation. Only
+        // enabled once Launch Dual Clients has the host alive.
+        ImGui::SameLine();
+        bool can_spectate2 = on_launch_local_spectator && can_launch && client1_pid != 0;
+        if (!can_spectate2) ImGui::BeginDisabled();
+        if (ImGui::Button("Launch Spectator", ImVec2(160, 30))) {
+            if (can_spectate2) {
+                const auto& selected_game = games_[selected_game_index_];
+                bool ok = on_launch_local_spectator(selected_game.exe_path);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Launch spectator: %s", ok ? "success" : "failed");
+            }
+        }
+        if (!can_spectate2) ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Spawn a third local instance bound on 7002 that subscribes to host on 7000 (replay-streamed spectating). Requires Launch Dual Clients first.");
         
         if (!can_launch) {
             ImGui::EndDisabled();
