@@ -38,6 +38,27 @@ struct LauncherUI::HubState {
     bool show_challenge_modal = false;
 };
 
+// Case-insensitive match against installed games. Returns the index
+// in `games_` whose exe filename stem equals `room_id`, or -1 if the
+// user doesn't have the game installed. Hub room ids today come from
+// the seed list in hub.py and the "Join room for" shortcut, both of
+// which use the exe stem. Phase 2 master list will introduce a
+// canonical id mapped via metadata, dropping the stem assumption.
+static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games,
+                                    const std::string& room_id) {
+    if (room_id.empty()) return -1;
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    const std::string target = lower(room_id);
+    for (size_t i = 0; i < games.size(); ++i) {
+        std::filesystem::path exe(games[i].exe_path);
+        if (lower(exe.stem().string()) == target) return (int)i;
+    }
+    return -1;
+}
+
 // LauncherUI Implementation
 LauncherUI::LauncherUI() 
     : games_{}
@@ -765,11 +786,26 @@ void LauncherUI::RenderHubPanel() {
             case K::RoomList:
                 hs.rooms = ev.rooms;
                 break;
-            case K::RoomJoined:
+            case K::RoomJoined: {
                 if (!ev.rooms.empty()) hs.current_room_id = ev.rooms.front().id;
                 hs.users.clear();
                 for (auto& u : ev.users) hs.users[u.id] = u;
+                // Auto-select the installed game matching this room.
+                // If the user has SCWU installed and joins room "SCWU",
+                // there's no reason to make them click it in the games
+                // list separately — fix the "no game selected" stumble
+                // that currently blocks match_start from launching.
+                int idx = FindInstalledGameForRoom(games_, hs.current_room_id);
+                if (idx >= 0) {
+                    selected_game_index_ = idx;
+                    hs.status_line = "auto-selected installed game: "
+                        + std::filesystem::path(games_[idx].exe_path).stem().string();
+                } else {
+                    hs.status_line = "joined room '" + hs.current_room_id +
+                        "' — game not in your library, install it before challenging";
+                }
                 break;
+            }
             case K::RoomLeft:
                 hs.current_room_id.clear();
                 hs.users.clear();
@@ -878,17 +914,25 @@ void LauncherUI::RenderHubPanel() {
     if (hs.rooms.empty()) {
         ImGui::TextDisabled("No rooms yet — join one with the selected game below.");
     }
-    if (ImGui::BeginTable("##rooms", 3,
+    if (ImGui::BeginTable("##rooms", 4,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Game");
-        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Players",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Installed", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("",          ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
         for (auto& r : hs.rooms) {
+            int installed_idx = FindInstalledGameForRoom(games_, r.id);
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r.name.c_str());
             ImGui::TableSetColumnIndex(1); ImGui::Text("%d", r.user_count);
             ImGui::TableSetColumnIndex(2);
+            if (installed_idx >= 0) {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "yes");
+            } else {
+                ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.4f, 1.0f), "no");
+            }
+            ImGui::TableSetColumnIndex(3);
             ImGui::PushID(r.id.c_str());
             if (r.id == hs.current_room_id) {
                 ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "joined");
