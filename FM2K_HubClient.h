@@ -1,11 +1,21 @@
 #pragma once
 
-// FM2K Hub client — WinHTTP WebSocket transport for hub.py.
+// FM2K Hub client — WebSocket transport for hub.py.
 // Phase-1 scaffold; talks the JSON protocol documented in
 // docs/FM2K_Matchmaking_Design.md §15.2. No persistence, no auth.
+//
+// TODO(cross-platform): the implementation in FM2K_HubClient.cpp uses
+// WinHTTP (Windows-only). The public API in this header is platform-
+// agnostic. When we go Linux, swap the .cpp out for a libcurl /
+// libwebsockets / asio-beast backend; the launcher UI and integration
+// surface won't need to change.
 
 #include <windows.h>
-#include <winhttp.h>
+// NOTE: <winhttp.h> is NOT included here. It conflicts with <wininet.h>
+// which is pulled in by FM2K_LauncherUI.cpp (both define INTERNET_SCHEME,
+// URL_COMPONENTS, etc.). The public API only needs HINTERNET, which is
+// already defined in <windows.h>. WinHTTP-specific use is contained in
+// FM2K_HubClient.cpp.
 
 #include <atomic>
 #include <condition_variable>
@@ -123,10 +133,13 @@ private:
 
     void CleanupHandles();
 
-    HINTERNET session_ = nullptr;
-    HINTERNET conn_    = nullptr;
-    HINTERNET req_     = nullptr;
-    HINTERNET ws_      = nullptr;
+    // HINTERNET is a typedef in <winhttp.h>/<wininet.h>, neither of
+    // which we want to expose. Store as opaque void* and cast at the
+    // use sites in FM2K_HubClient.cpp.
+    void* session_ = nullptr;
+    void* conn_    = nullptr;
+    void* req_     = nullptr;
+    void* ws_      = nullptr;
 
     std::thread io_;
     std::atomic<bool> running_{false};

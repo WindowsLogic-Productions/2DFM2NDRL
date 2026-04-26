@@ -749,6 +749,12 @@ void LauncherUI::RenderHubPanel() {
                 hs.my_id = ev.user_id;
                 hs.rooms = ev.rooms;
                 hs.status_line = "connected";
+                // Tell the hub our planned UDP listen so it can relay
+                // it to a peer in match_start. Both launchers register
+                // their already-configured network_config_.local_port.
+                // For LAN/internet, replace "127.0.0.1" with the hub-
+                // observed reflexive IP (Phase 2 — STUN responder).
+                hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port);
                 break;
             case K::Disconnected:
                 hs.users.clear();
@@ -798,16 +804,35 @@ void LauncherUI::RenderHubPanel() {
             case K::ChallengeDeclined:
                 hs.status_line = "challenge declined";
                 break;
-            case K::MatchStart:
-                // TODO(nat-traversal): wire ev.match.peer_udp_ip/port into
-                // ControlChannel + start the punch. For now just log.
+            case K::MatchStart: {
                 hs.status_line = "match_start: " + ev.match.role +
                     " peer=" + ev.match.peer.nick +
                     " udp=" + ev.match.peer_udp_ip + ":" +
                     std::to_string(ev.match.peer_udp_port);
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Hub: %s", hs.status_line.c_str());
+
+                // Build a NetworkConfig from the hub-supplied peer
+                // info and trigger the existing online-session start.
+                // The hook side (FM2KHook) reads FM2K_PLAYER_INDEX,
+                // FM2K_LOCAL_PORT, FM2K_REMOTE_ADDR from env. Phase 2:
+                // also pass FM2K_HUB_MATCH_TOKEN so hook-level punch
+                // probes can authenticate.
+                if (ev.match.peer_udp_port > 0 && on_online_session_start) {
+                    NetworkConfig cfg = network_config_;
+                    cfg.session_mode = SessionMode::ONLINE;
+                    cfg.is_host = (ev.match.role == "host");
+                    cfg.remote_address =
+                        ev.match.peer_udp_ip + ":" +
+                        std::to_string(ev.match.peer_udp_port);
+                    on_online_session_start(cfg);
+                } else {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: match_start without peer udp_addr — peer never "
+                        "sent udp_addr, skipping session launch");
+                }
                 break;
+            }
             case K::PeerDisconnected:
                 hs.status_line = "peer disconnected";
                 break;
