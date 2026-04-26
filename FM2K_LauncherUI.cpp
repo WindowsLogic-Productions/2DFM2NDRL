@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <unordered_map>
 
 // Local-only state owned by LauncherUI for the Hub panel. Defined here
@@ -38,12 +39,18 @@ struct LauncherUI::HubState {
     bool show_challenge_modal = false;
 };
 
-// Case-insensitive match against installed games. Returns the index
-// in `games_` whose exe filename stem equals `room_id`, or -1 if the
-// user doesn't have the game installed. Hub room ids today come from
-// the seed list in hub.py and the "Join room for" shortcut, both of
-// which use the exe stem. Phase 2 master list will introduce a
-// canonical id mapped via metadata, dropping the stem assumption.
+// Case-insensitive match of `room_id` against installed games. A
+// match is either an exact stem hit (room "SCWU" -> "SCWU.exe") or
+// the room id followed by a non-letter on the stem
+// (room "WonderfulWorld" -> "WonderfulWorld_ver_0946.exe", with '_'
+// being non-alpha). The non-letter gate avoids overmatching on
+// unrelated games whose stems happen to start with the same word
+// ("Strip" -> "StripFighter5CE" vs "StripFighter_Zero" both pass
+// when 'F' is non-alpha — but "Strip" wouldn't be a real room id).
+//
+// Phase-2 master game list will replace this heuristic with a
+// canonical-id → exe-aliases table. Until then this gets us through
+// versioned exes without a manual selection step.
 static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games,
                                     const std::string& room_id) {
     if (room_id.empty()) return -1;
@@ -54,7 +61,12 @@ static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games
     const std::string target = lower(room_id);
     for (size_t i = 0; i < games.size(); ++i) {
         std::filesystem::path exe(games[i].exe_path);
-        if (lower(exe.stem().string()) == target) return (int)i;
+        const std::string stem = lower(exe.stem().string());
+        if (stem == target) return (int)i;
+        if (stem.size() > target.size() && stem.compare(0, target.size(), target) == 0) {
+            unsigned char next = static_cast<unsigned char>(stem[target.size()]);
+            if (!std::isalpha(next)) return (int)i;
+        }
     }
     return -1;
 }
@@ -790,14 +802,17 @@ void LauncherUI::RenderHubPanel() {
                 if (!ev.rooms.empty()) hs.current_room_id = ev.rooms.front().id;
                 hs.users.clear();
                 for (auto& u : ev.users) hs.users[u.id] = u;
-                // Auto-select the installed game matching this room.
-                // If the user has SCWU installed and joins room "SCWU",
-                // there's no reason to make them click it in the games
-                // list separately — fix the "no game selected" stumble
-                // that currently blocks match_start from launching.
+                // Auto-select the installed game matching this room and
+                // ALSO fire on_game_selected so the launcher's
+                // FM2KLauncher::selected_game_ record is populated —
+                // not just our local UI mirror selected_game_index_.
+                // Without this, StartOnlineSession bails on
+                // selected_game_.exe_path.empty() even though the UI
+                // showed a selection.
                 int idx = FindInstalledGameForRoom(games_, hs.current_room_id);
                 if (idx >= 0) {
                     selected_game_index_ = idx;
+                    if (on_game_selected) on_game_selected(games_[idx]);
                     hs.status_line = "auto-selected installed game: "
                         + std::filesystem::path(games_[idx].exe_path).stem().string();
                 } else {
@@ -848,13 +863,25 @@ void LauncherUI::RenderHubPanel() {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Hub: %s", hs.status_line.c_str());
 
-                // Build a NetworkConfig from the hub-supplied peer
-                // info and trigger the existing online-session start.
-                // The hook side (FM2KHook) reads FM2K_PLAYER_INDEX,
-                // FM2K_LOCAL_PORT, FM2K_REMOTE_ADDR from env. Phase 2:
-                // also pass FM2K_HUB_MATCH_TOKEN so hook-level punch
-                // probes can authenticate.
-                if (ev.match.peer_udp_port > 0 && on_online_session_start) {
+                // Three preconditions must hold to actually launch:
+                //   (1) peer reported a non-zero UDP port
+                //   (2) we have the room's game installed
+                //   (3) the launcher exposes on_online_session_start
+                // Failing any of these, tell the hub the "match" is over
+                // immediately so both peers go back to idle — otherwise
+                // the lobby reads "in_match" forever and they can't
+                // re-challenge or pick a new game.
+                int idx = FindInstalledGameForRoom(games_, hs.current_room_id);
+                bool ok = (ev.match.peer_udp_port > 0)
+                       && (idx >= 0)
+                       && (on_online_session_start != nullptr);
+
+                if (ok) {
+                    // Make sure the launcher's selected_game_ record is
+                    // up to date even if RoomJoined fired before games
+                    // discovery completed.
+                    if (on_game_selected) on_game_selected(games_[idx]);
+
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");
@@ -863,9 +890,14 @@ void LauncherUI::RenderHubPanel() {
                         std::to_string(ev.match.peer_udp_port);
                     on_online_session_start(cfg);
                 } else {
+                    const char* reason =
+                        (ev.match.peer_udp_port == 0) ? "peer never sent udp_addr" :
+                        (idx < 0)                     ? "game not in your library" :
+                                                        "launcher missing online callback";
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Hub: match_start without peer udp_addr — peer never "
-                        "sent udp_addr, skipping session launch");
+                        "Hub: match_start aborted (%s) — sending match_ended", reason);
+                    hs.status_line = std::string("match aborted: ") + reason;
+                    hs.client.MatchEnded();
                 }
                 break;
             }
