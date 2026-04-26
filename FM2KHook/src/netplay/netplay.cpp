@@ -6,6 +6,8 @@
 #include "control_channel.h"
 #include "input.h"
 #include "savestate.h"
+#include "replay.h"
+#include "spectator_node.h"
 #include "globals.h"
 #include "gekkonet.h"
 #include "../audio/sound_rollback.h"
@@ -109,23 +111,13 @@ static uint32_t g_last_rollback_frame = 0;
 static uint32_t g_desync_count = 0;
 static uint32_t g_last_desync_log_tick = 0;
 static int g_local_delay = 1;  // Computed from RTT at battle start
-// Local delay proposed by the REMOTE peer (received in BATTLE_READY). Both
-// peers send their own RTT-derived proposal; Netplay_StartBattle takes
-// max(local, remote) so both use the same value and input lag is symmetric.
-static uint8_t g_remote_proposed_delay = 0;
 
-// Compute the local-side proposed input delay from current RTT. Single
-// source of truth used by every BATTLE_READY sender and by the final
-// Netplay_StartBattle symmetrisation.
-static uint8_t ComputeLocalProposedDelay() {
-    uint32_t rtt_ms = ControlChannel_GetRttMs();
-    uint32_t one_way_ms = rtt_ms / 2;
-    if (one_way_ms < 10) one_way_ms = 10;
-    int d = (int)((one_way_ms + 9) / 10) + 1;
-    if (d < 2)  d = 2;
-    if (d > 15) d = 15;
-    return (uint8_t)d;
-}
+// Highest frame number we've ever recorded into the replay/spectator stream.
+// Reset on each Netplay_StartBattle (g_netplay_frame also resets to 0).
+// Gates the GekkoAdvance recording path against runahead duplicates — each
+// frame is advanced multiple times under runahead, but only the first
+// monotonic forward crossing is "the" confirmed advance.
+static uint32_t g_highest_recorded_frame = 0;
 
 // Battle entry sync barrier - ensures both clients enter battle at same time
 static bool g_local_battle_entered = false;   // We've detected battle mode
@@ -161,7 +153,7 @@ static void CheckFullyConnected() {
     }
 }
 
-static void OnControlMessage(const CtrlPacket* packet) {
+static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) {
     switch (packet->header.type) {
         case CtrlMsg::HELLO:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -189,17 +181,8 @@ static void OnControlMessage(const CtrlPacket* packet) {
         }
 
         case CtrlMsg::BATTLE_READY: {
-            // BATTLE_READY now carries the remote peer's proposed local delay
-            // in sync.frame's low byte. Track the max across all BATTLE_READY
-            // packets received so startup-jitter RTT samples can't make the
-            // two peers disagree on the final delay.
-            uint8_t proposed = (uint8_t)(packet->data.sync.frame & 0xFF);
-            if (proposed > g_remote_proposed_delay) {
-                g_remote_proposed_delay = proposed;
-            }
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received BATTLE_READY from remote (proposed_delay=%u, tracked_max=%u)",
-                (unsigned)proposed, (unsigned)g_remote_proposed_delay);
+                "Netplay: Received BATTLE_READY from remote");
             g_remote_css_ready = true;
             break;
         }
@@ -215,6 +198,39 @@ static void OnControlMessage(const CtrlPacket* packet) {
                 "Netplay: Remote disconnected");
             ControlChannel_SetConnected(false);
             g_simple_state = SimpleState::DISCONNECTED;
+            break;
+
+        case CtrlMsg::CHAT: {
+            // Inbound peer chat. Append to the chat log ring; launcher UI
+            // reads via Netplay_PopChatMessage on its own cadence.
+            const char* text = packet->data.chat.text;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: CHAT from remote: \"%s\"", text);
+            Netplay_PushChatMessage(/*from_remote*/ true, text);
+            break;
+        }
+
+        case CtrlMsg::SPEC_JOIN_REQ:
+            SpectatorNode_HandleJoinReq(from);
+            break;
+
+        case CtrlMsg::SPEC_JOIN_ACK:
+            SpectatorNode_HandleJoinAck(from);
+            break;
+
+        case CtrlMsg::SPEC_JOIN_REDIRECT:
+            SpectatorNode_HandleJoinRedirect(
+                from,
+                packet->data.spec_redirect.redirect_ip,
+                packet->data.spec_redirect.redirect_port);
+            break;
+
+        case CtrlMsg::SPEC_HEARTBEAT:
+            SpectatorNode_HandleHeartbeat(from);
+            break;
+
+        case CtrlMsg::SPEC_LEAVE:
+            SpectatorNode_HandleLeave(from);
             break;
 
         default:
@@ -259,6 +275,10 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     g_received_hello = false;
     g_received_hello_ack = false;
 
+    // Initialize spectator tree node — accepts subscribers on the same
+    // multiplexed UDP socket. Does not open a separate listen socket.
+    SpectatorNode_Init();
+
     // Store network config
     g_local_port = local_port;
     strncpy(g_remote_addr, remote_addr, sizeof(g_remote_addr) - 1);
@@ -277,6 +297,53 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     ControlChannel_SendHello(static_cast<uint8_t>(player_index), 0);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Initialized, connecting...");
+    return true;
+}
+
+bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay (spectator): Init port=%u host=%s", local_port, host_addr ? host_addr : "(null)");
+
+    g_player_index = 2;  // sentinel — not a player slot
+    g_simple_state = SimpleState::CONNECTED;  // skip handshake; spectators don't HELLO
+    g_session = nullptr;
+    g_session_ready = false;
+    g_netplay_frame = 0;
+
+    // Wire up the control-channel callback. OnControlMessage already
+    // dispatches SPEC_JOIN_ACK / SPEC_JOIN_REDIRECT / SPEC_HEARTBEAT / SPEC_LEAVE
+    // into SpectatorNode_*, so the same handler covers spectator inbound packets.
+    ControlChannel_SetCallback(OnControlMessage);
+
+    if (!NetSocket_IsInitialized()) {
+        if (!NetSocket_Init(local_port, host_addr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Netplay (spectator): socket init failed");
+            return false;
+        }
+    }
+
+    // Stand up the spectator node (initializes its state) and request to join
+    // the host. The 0xCE INPUT_BATCH datagrams will start flowing back once
+    // the host accepts.
+    SpectatorNode_Init();
+
+    const sockaddr_in* upstream = NetSocket_GetRemoteAddr();
+    if (!upstream || upstream->sin_port == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Netplay (spectator): no upstream addr latched");
+        return false;
+    }
+    // Stash the original upstream as the fallback root. If our current
+    // upstream later goes silent (e.g. an overflow-redirect relay died),
+    // SpectatorNode_TickHealth will reconnect us here. The host always
+    // serves as the root and is the always-on failback target.
+    extern void SpectatorNode_SetRootAddr(const sockaddr_in& root);
+    SpectatorNode_SetRootAddr(*upstream);
+
+    SpectatorNode_RequestJoin(*upstream);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay (spectator): SPEC_JOIN_REQ sent to host");
     return true;
 }
 
@@ -373,7 +440,7 @@ bool Netplay_ProcessCSS() {
     if (!g_css_active) {
         g_css_active = true;
         g_local_css_ready = true;
-        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
+        ControlChannel_SendBattleReady();
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
     }
 
@@ -383,7 +450,7 @@ bool Netplay_ProcessCSS() {
     static uint32_t last_ready_send = 0;
     bool remote_has_css_data = g_remote_inputs.GetEndFrame() > 0;
     if ((!g_remote_css_ready || !remote_has_css_data) && now - last_ready_send > 100) {
-        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
+        ControlChannel_SendBattleReady();
         last_ready_send = now;
     }
 
@@ -426,6 +493,20 @@ bool Netplay_ProcessCSS() {
     // Both sides have input -- advance
     g_css_current_read_frame = g_css_frame;
     g_css_frame++;
+
+    // Forward this CSS-confirmed input pair to spectator subscribers. Same
+    // pipe as battle inputs (INPUT_BATCH); spectator's local FM2K processes
+    // it as a CSS frame, walks through CSS in lockstep with this host. We
+    // need slot order (p1, p2), not local/remote order — translate based on
+    // which player slot we are.
+    {
+        uint16_t local_in  = g_local_inputs.Get(g_css_current_read_frame);
+        uint16_t remote_in = g_remote_inputs.Get(g_css_current_read_frame);
+        uint16_t p1, p2;
+        if (g_player_index == 0) { p1 = local_in;  p2 = remote_in; }
+        else                     { p1 = remote_in; p2 = local_in;  }
+        SpectatorNode_OnFrameConfirmed(p1, p2);
+    }
 
     // Log occasionally
     if ((g_css_frame - 1) % 100 == 0) {
@@ -525,30 +606,23 @@ bool Netplay_StartBattle() {
     g_local_css_ready = false;
     g_remote_css_ready = false;
 
-    // Calculate delay from RTT (CCCaster formula adapted for 100fps).
-    //   local_proposed = ceil(one_way_ms / 10) + 1
-    // Each peer computes this independently. Without synchronising, peer A's
-    // RTT sample at startup can differ from peer B's (one peer's first PONG
-    // might not have arrived yet), giving different local_delay values and
-    // ASYMMETRIC input lag — each peer's own inputs delayed by a different
-    // amount. Fix: BATTLE_READY now carries each peer's proposed_delay; we
-    // take max(local, remote) so both use the same value.
+    // Per-player local delay via GekkoNet's native API. Each peer picks its
+    // own value from its own RTT sample — no cross-peer negotiation. A laggy
+    // player can add delay to smooth their experience without forcing it on
+    // the opponent, which is the entire point of per-player delay.
+    //   local_delay = ceil(one_way_ms / 10) + 1
     uint32_t rtt_ms = ControlChannel_GetRttMs();
     uint32_t one_way_ms = rtt_ms / 2;
     if (one_way_ms < 10) one_way_ms = 10;
-    int local_proposed = (int)((one_way_ms + 9) / 10) + 1;
-    if (local_proposed < 2)  local_proposed = 2;
-    if (local_proposed > 15) local_proposed = 15;
-
-    int remote_proposed = (int)g_remote_proposed_delay;
-    int local_delay = (local_proposed > remote_proposed) ? local_proposed : remote_proposed;
-    if (local_delay < 2) local_delay = 2;
+    int local_delay = (int)((one_way_ms + 9) / 10) + 1;
+    if (local_delay < 2)  local_delay = 2;
+    if (local_delay > 15) local_delay = 15;
 
     int prediction_window = 8;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: RTT=%ums one_way=%ums | local_proposed=%d remote_proposed=%d -> agreed_delay=%d, prediction_window=%d",
-        rtt_ms, one_way_ms, local_proposed, remote_proposed, local_delay, prediction_window);
+        "Netplay: RTT=%ums one_way=%ums -> local_delay=%d, prediction_window=%d",
+        rtt_ms, one_way_ms, local_delay, prediction_window);
 
     GekkoConfig config = {};
     config.num_players = 2;
@@ -596,19 +670,50 @@ bool Netplay_StartBattle() {
         }
     }
 
+    // Runahead: speculatively advance local frames past confirmed input to
+    // hide input delay. GekkoNet rewinds runahead frames each tick and replays
+    // them — free latency reduction at the cost of extra sim work. 4 is a safe
+    // default; tune via UI once exposed. Zero disables.
+    gekko_set_runahead(g_session, 4);
+
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
     SaveState_Init();
     SoundRollback::Init();
 
+    // Start recording a replay of this match. Captures initial RNG +
+    // char selects + per-frame inputs; on battle end we flush to disk and
+    // cache for spectator streaming. Character slots / colors are read from
+    // CSS state — TODO once CSS exposes them; pass 0s for now so replays
+    // still work, just without char metadata.
+    const uint32_t initial_seed = 0x12345678;
+    const uint32_t initial_state_hash =
+        SaveState_GetRegionChecksums().gameplay_fingerprint;
+    Replay::Replay_BeginRecording(
+        /*game_hash*/         0,  // TODO: plumb FM2K variant hash
+        /*initial_rng_seed*/  initial_seed,
+        /*initial_state_hash*/initial_state_hash,
+        /*p1_char*/           0, /*p1_color*/ 0, /*p1_name*/ nullptr,
+        /*p2_char*/           0, /*p2_color*/ 0, /*p2_name*/ nullptr);
+
+    // Notify the spectator tree: start of a new match, push INITIAL_MATCH to
+    // any currently-subscribed viewers so they reset and follow this match.
+    SpectatorNode_OnMatchStart(
+        /*game_hash*/         0,
+        /*initial_rng_seed*/  initial_seed,
+        /*initial_state_hash*/initial_state_hash,
+        /*p1_char*/0, /*p1_color*/0,
+        /*p2_char*/0, /*p2_color*/0);
+
     g_simple_state = SimpleState::BATTLE;
     g_session_ready = false;
     g_netplay_frame = 0;
+    g_highest_recorded_frame = 0;  // monotonic dedup gate, reset per battle
     g_rollback_count = 0;
     g_last_rollback_frame = 0;
     g_desync_count = 0;
     g_last_desync_log_tick = 0;
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created (runahead=4)");
     return true;
 }
 
@@ -655,6 +760,7 @@ bool Netplay_StartStressBattle() {
     g_simple_state = SimpleState::BATTLE;
     g_session_ready = true;   // no handshake needed for stress
     g_netplay_frame = 0;
+    g_highest_recorded_frame = 0;
     g_rollback_count = 0;
     g_last_rollback_frame = 0;
     g_desync_count = 0;
@@ -672,6 +778,14 @@ void Netplay_EndBattle() {
         gekko_destroy(&g_session);
         g_session = nullptr;
     }
+
+    // Finalize replay file for this match and cache the in-memory copy for
+    // spectator streaming. No-op if recording wasn't active.
+    Replay::Replay_EndRecording();
+
+    // Tell the spectator tree the match is over — subscribers receive
+    // MATCH_END and go idle until the next SpectatorNode_OnMatchStart.
+    SpectatorNode_OnMatchEnd();
 
     // Stop any pending SFX "desired" entries and clear the channel map so
     // the next battle rescans the channel table (handles character-load
@@ -958,26 +1072,16 @@ bool Netplay_ProcessBattleInputPhase() {
                 // be updated on the authoritative (non-rollback) frame.
                 g_is_rolling_back = update->data.adv.rolling_back;
 
-                // ----------------------------------------------------------------
-                // Per-slot buf-idx fan-out must run BEFORE the sim so input
-                // processing sees the correct slot indices. g_last_frame_time
-                // is written AFTER the sim / virtual-time increment below —
-                // otherwise it reflects the pre-advance frame and replay lags
-                // forward by one (main_game_loop runs a post-advance iteration
-                // on forward that replay doesn't, ending on N*10 vs (N-1)*10).
-                // ----------------------------------------------------------------
-                {
-                    // main_game_loop @ 0x405BC7 walks character slots writing:
-                    //   slot[+0xDF75] = 0   (g_net_sync_frame_counter)
-                    //   slot[+0xDF79] = g_input_buffer_index
-                    // across all 8 slots (base 0x4D1D90, stride 57407).
-                    const uint32_t buf_idx = *(uint32_t*)0x447EE0;
-                    for (size_t s = 0; s < 8; s++) {
-                        uintptr_t slot_base = 0x4D1D90 + s * 57407;
-                        *(uint32_t*)(slot_base + 0xDF75) = 0;
-                        *(uint32_t*)(slot_base + 0xDF79) = buf_idx;
-                    }
-                }
+                // [REMOVED] per-slot fan-out at slot+0xDF79 / slot+0xDF7D.
+                // main_game_loop's prologue writes these every iteration,
+                // but IDA xref of g_p1_input_buffer_index_field (0x4DFD0D)
+                // shows the only reader is check_game_continue, which is
+                // a no-op when g_directplay_interface == NULL — and we
+                // never initialize DirectPlay. KGT scripts and
+                // update_game/process_game_inputs do not read these
+                // fields. The writes were just trampling adjacent slot
+                // memory the StudioS chars happen to use, breaking
+                // their scripts.
 
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
@@ -991,6 +1095,34 @@ bool Netplay_ProcessBattleInputPhase() {
                 g_is_rolling_back = false;
                 g_netplay_frame++;
                 has_advance = true;
+
+                // Replay recording + spectator stream. Gate on TRUE
+                // confirmed advances only:
+                //
+                //   running_ahead=true → speculative runahead with
+                //     PREDICTED inputs. We must NOT record these — when
+                //     the prediction turns out wrong, GekkoNet rolls back
+                //     and replays with the real input, but our recorded
+                //     session_history would already contain the wrong
+                //     prediction → spectator processes wrong inputs →
+                //     desync. (This was the running-ahead-after-resync
+                //     bug.)
+                //   rolling_back=true → mid-rollback replay. Inputs are
+                //     correct (post-confirmation) but we already recorded
+                //     this frame on its first forward pass.
+                //   monotonic gate → belt-and-suspenders against any
+                //     other re-advance pattern.
+                //
+                // Only !rolling_back && !running_ahead && new-frame ever
+                // hits session_history.
+                if (!update->data.adv.rolling_back &&
+                    !update->data.adv.running_ahead &&
+                    g_netplay_frame > g_highest_recorded_frame)
+                {
+                    g_highest_recorded_frame = g_netplay_frame;
+                    Replay::Replay_RecordFrame(g_p1_input, g_p2_input);
+                    SpectatorNode_OnFrameConfirmed(g_p1_input, g_p2_input);
+                }
 
                 // Shake safety cap removed — the real fix is letting the
                 // render-path timer decrement persist (see carve-out in
@@ -1132,7 +1264,7 @@ bool Netplay_IsCSSFullySynced() {
 void Netplay_SetLocalCSSReady(bool ready) {
     g_local_css_ready = ready;
     if (ready) {
-        ControlChannel_SendBattleReady(ComputeLocalProposedDelay());
+        ControlChannel_SendBattleReady();
     }
 }
 
@@ -1155,6 +1287,49 @@ uint32_t Netplay_GetPingMs() {
 
 int Netplay_GetLocalDelay() {
     return g_local_delay;
+}
+
+// -----------------------------------------------------------------------------
+// Chat ring. Small fixed-size SPSC-ish ring since both push and pop run on
+// the launcher-UI side; the only cross-thread producer is OnControlMessage
+// via the control-channel poller. Size 64 is plenty for a single match's
+// worth of unread messages.
+// -----------------------------------------------------------------------------
+static constexpr size_t CHAT_RING_CAP = 64;
+static ChatEntry g_chat_ring[CHAT_RING_CAP];
+static size_t    g_chat_head = 0;
+static size_t    g_chat_tail = 0;
+
+void Netplay_PushChatMessage(bool from_remote, const char* text) {
+    if (!text) return;
+    ChatEntry e = {};
+    e.from_remote  = from_remote;
+    e.timestamp_ms = (uint64_t)GetTickCount64();
+    std::strncpy(e.text, text, sizeof(e.text) - 1);
+    e.text[sizeof(e.text) - 1] = '\0';
+
+    size_t next = (g_chat_head + 1) % CHAT_RING_CAP;
+    if (next == g_chat_tail) {
+        // Ring full — drop oldest to keep the newest message visible.
+        g_chat_tail = (g_chat_tail + 1) % CHAT_RING_CAP;
+    }
+    g_chat_ring[g_chat_head] = e;
+    g_chat_head = next;
+}
+
+bool Netplay_PopChatMessage(ChatEntry* out) {
+    if (g_chat_tail == g_chat_head) return false;
+    if (out) *out = g_chat_ring[g_chat_tail];
+    g_chat_tail = (g_chat_tail + 1) % CHAT_RING_CAP;
+    return true;
+}
+
+void Netplay_SendChatMessage(const char* text) {
+    if (!text) return;
+    if (!Netplay_IsConnected()) return;
+    ControlChannel_SendChat(text);
+    // Echo into local ring so the sender sees their own message in the UI.
+    Netplay_PushChatMessage(/*from_remote*/ false, text);
 }
 
 GekkoNetworkStats Netplay_GetNetworkStats() {

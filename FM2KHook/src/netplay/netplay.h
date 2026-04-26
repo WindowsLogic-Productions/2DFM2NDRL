@@ -18,6 +18,13 @@
 // Returns true on success
 bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr);
 
+// Spectator-mode init. No HELLO/HELLO_ACK handshake — we're a viewer, not a
+// player. Sets up the multiplexed UDP socket bound to local_port with
+// host_addr ("ip:port") as the latched remote, registers OnControlMessage
+// for SPEC_JOIN_ACK / SPEC_JOIN_REDIRECT dispatch, and sends SPEC_JOIN_REQ
+// to start the subscription.
+bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr);
+
 // Shutdown everything (control channel + GekkoNet if active)
 void Netplay_Shutdown();
 
@@ -113,6 +120,28 @@ bool Netplay_IsSessionReady();
 
 // Poll GekkoNet for events without advancing game
 void Netplay_PollGekkoNet();
+
+// =============================================================================
+// CHAT (peer-to-peer over control channel)
+// =============================================================================
+
+// Send a chat message from the local player to the remote peer. Truncated
+// to 23 chars + NUL. Safe to call when disconnected (dropped silently).
+void Netplay_SendChatMessage(const char* text);
+
+// Push a received/sent chat message into the local ring. Called by
+// OnControlMessage (from_remote=true) and Netplay_SendChatMessage
+// (from_remote=false) so the local UI sees both sides of the conversation.
+void Netplay_PushChatMessage(bool from_remote, const char* text);
+
+struct ChatEntry {
+    bool     from_remote;
+    uint64_t timestamp_ms;      // GetTickCount64()
+    char     text[24];
+};
+
+// Pop the oldest unread chat entry. Returns false if the ring is empty.
+bool Netplay_PopChatMessage(ChatEntry* out);
 
 // =============================================================================
 // INPUT

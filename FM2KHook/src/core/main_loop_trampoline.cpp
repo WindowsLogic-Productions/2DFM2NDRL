@@ -19,7 +19,9 @@
 #include "../hooks/hooks.h"
 #include "../netplay/netplay.h"
 #include "../netplay/control_channel.h"
+#include "../netplay/spectator_node.h"
 #include "../ui/shared_mem.h"
+#include "../parity/parity_recorder.h"
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
 #include <cstring>
@@ -37,6 +39,7 @@ extern bool g_frame_pending_render;
 // here; declared with a public shim.
 extern "C" void Hook_CheckGameModeTransition_Public();
 extern "C" void Hook_RenderDiagnostics_Tick();
+extern "C" void Hook_BattleDiag_TickIfActive();
 
 // ============================================================================
 // RENDER SNAPSHOT/RESTORE
@@ -72,7 +75,18 @@ static void RenderFrameWithSnapshot() {
     // to do this; in trampoline mode render goes through here instead.
     Hook_RenderDiagnostics_Tick();
 
-    const bool protect = Netplay_IsActive();
+    // Per-frame state dump during battle-transition windows. Cheap (single
+    // counter check per frame); only emits log lines for ~3 sec around
+    // every CSS↔battle boundary.
+    Hook_BattleDiag_TickIfActive();
+
+    // Render isolates sim state when we're driving the simulation
+    // deterministically — either as a player under GekkoNet (host) or as
+    // a spectator replaying confirmed inputs. Without protection, render's
+    // mutations to RNG / object pool / afterimage / input tracking leak into
+    // sim memory, and the spectator's evolution diverges from the host's
+    // (which IS protected). One frame is enough to desync RNG.
+    const bool protect = Netplay_IsActive() || SpectatorNode_IsPlayingBack();
     uint32_t saved_rng = 0;
     if (protect) {
         saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
@@ -113,6 +127,15 @@ static void RenderFrameWithSnapshot() {
 // ============================================================================
 
 static LoopPhase ClassifyPhase() {
+    // Spectator mode pins the phase: regardless of game_mode or whether the
+    // upstream JOIN_ACK has arrived yet, run RunSpectatorTick. Pre-ACK the
+    // queue is empty so the trampoline holds the boot frame; once inputs
+    // start flowing the sim animates through CSS, locks chars, transitions
+    // to battle, etc. — all driven by the streamed input pipe.
+    if (g_spectator_mode || SpectatorNode_IsPlayingBack()) {
+        return LoopPhase::SPECTATOR_PLAYBACK;
+    }
+
     uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
     if (mode >= 3000 && mode < 4000) return LoopPhase::TRAMPOLINE_BATTLE;
     if (mode == 2000)                return LoopPhase::CSS;
@@ -125,6 +148,22 @@ static bool PumpMessages() {
     MSG msg;
     while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return false;
+        // Diagnostic: dump every key/cheat-relevant message coming through.
+        // FM2K's WindowProc maps F1-F12 to debug cheats (F1 hit-boxes, F5/F6
+        // instant-KO, F12 force round-end). StudioS games are mysteriously
+        // receiving F12 events the user isn't actually pressing. Need to see
+        // what the OS / synthesizer is queuing. Filter is gone for now —
+        // we want to *see* the F12s before deciding how to handle.
+        if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP
+            || msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP
+            || msg.message == WM_CHAR)
+        {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[MSG] msg=0x%04X wParam=0x%02X (%u) lParam=0x%08lX hwnd=%p",
+                        (unsigned)msg.message, (unsigned)msg.wParam,
+                        (unsigned)msg.wParam, (unsigned long)msg.lParam,
+                        msg.hwnd);
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
@@ -193,9 +232,130 @@ static void RunBattleTick() {
     // 3000. Sound rollback / GekkoNet-driven state machine are inert here;
     // the hook gates on Netplay_IsActive() which stays false.
     if (g_offline_mode) {
+        // [REMOVED] per-slot fan-out at slot+0xDF79 / slot+0xDF7D.
+        // Originally added to mimic main_game_loop's prologue, but IDA
+        // xref scan reveals those fields are DirectPlay-specific:
+        //   slot+0xDF7D = g_p1_input_buffer_index_field — read only by
+        //     check_game_continue (DirectPlay packet handler, no-op
+        //     when g_directplay_interface == NULL, which is always the
+        //     case for us)
+        //   slot+0xDF79 = g_net_sync_frame_counter — written/read only
+        //     by check_game_continue
+        // Neither KGT scripts nor update_game/process_game_inputs read
+        // these fields. Writing them every frame did nothing useful and
+        // interfered with adjacent memory the StudioS chars apparently
+        // touch. Per-slot fan-out also removed from spectator + GekkoNet
+        // paths (same reason — DirectPlay isn't used anywhere).
+
+        // Round-end-flag tripwire — leave in place to confirm the writer.
+        constexpr uintptr_t REF_ADDR = 0x424718;
+        uint32_t ref_before = *(volatile uint32_t*)REF_ADDR;
+
+        // Pre-update snapshot of the case-200 exit conditions in
+        // vs_round_function. Case 200 transitions to state 300 (round
+        // end) on:
+        //   (1) g_score_value crosses below 0 in the same frame
+        //   (2) active type-4 fighter count < 2 in story/team mode
+        //   (3) g_round_end_flag != 0
+        // Render-time logs show -1 / 2 / 0 — none should trigger. But
+        // the bail still happens, so one of these MUST be firing during
+        // update_game (the per-frame snapshot at render time misses
+        // transient values). Log the fields right before update_game so
+        // we capture the value the game's case-200 walk actually sees.
+        int32_t  pre_score = *(int32_t*)0x470050;
+        uint32_t pre_ref   = *(uint32_t*)0x424718;
+        // Recount t4 with the same exact walk vs_round_function uses.
+        // Pool @ 0x4701E0, stride 382, type uint32 == 4, alive @ +346
+        // == 0, hp[entry+342] != 0.
+        constexpr uintptr_t HP_BASE_LOCAL = 0x4DFC85;
+        constexpr uintptr_t HP_STRIDE_L   = 57407;
+        int pre_t4 = 0;
+        {
+            const uint8_t* pool = (const uint8_t*)0x4701E0;
+            for (int i = 0; i < 1024; i++) {
+                const uint8_t* e = pool + i * 382;
+                if (*(const uint32_t*)(e + 0) != 4) continue;
+                if (*(const uint32_t*)(e + 346) != 0) continue;
+                uint32_t s = *(const uint32_t*)(e + 342);
+                if (s >= 8) continue;
+                if (*(const uint32_t*)(HP_BASE_LOCAL + s * HP_STRIDE_L) == 0)
+                    continue;
+                pre_t4++;
+            }
+        }
+        uint32_t pre_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+
         if (original_process_game_inputs) original_process_game_inputs();
-        if (original_update_game)         original_update_game();
+        uint32_t ref_after_pgi = *(volatile uint32_t*)REF_ADDR;
+        if (ref_after_pgi != ref_before && ref_after_pgi != 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[REF-TRIP] round_end_flag flipped %u->%u during "
+                        "original_process_game_inputs",
+                        ref_before, ref_after_pgi);
+        }
+
+        if (original_update_game) original_update_game();
+        uint32_t ref_after_ug = *(volatile uint32_t*)REF_ADDR;
+        if (ref_after_ug != ref_after_pgi && ref_after_ug != 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[REF-TRIP] round_end_flag flipped %u->%u during "
+                        "original_update_game",
+                        ref_after_pgi, ref_after_ug);
+        }
+
+        // Post-update bracket of case-200 exit conditions. If pre/post
+        // differ on score from non-negative to negative, score path
+        // fired. If pre_t4 was < 2, t4 path fired. If pre_ref was non-0,
+        // round_end_flag path fired (already covered by REF-TRIP above
+        // if it persisted). Log only when game_mode is battle and
+        // anything actionable changed — avoid log spam.
+        int32_t  post_score = *(int32_t*)0x470050;
+        int post_t4 = 0;
+        {
+            const uint8_t* pool = (const uint8_t*)0x4701E0;
+            for (int i = 0; i < 1024; i++) {
+                const uint8_t* e = pool + i * 382;
+                if (*(const uint32_t*)(e + 0) != 4) continue;
+                if (*(const uint32_t*)(e + 346) != 0) continue;
+                uint32_t s = *(const uint32_t*)(e + 342);
+                if (s >= 8) continue;
+                if (*(const uint32_t*)(HP_BASE_LOCAL + s * HP_STRIDE_L) == 0)
+                    continue;
+                post_t4++;
+            }
+        }
+        if (pre_mode >= 3000 && pre_mode < 4000) {
+            // Score-cross trigger: pre_score >= 0 AND post_score < pre
+            if (pre_score >= 0 && post_score < pre_score) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "[CASE200-TRIP] score path fired: %d -> %d (case 200 "
+                    "decremented past 0 → state 300)",
+                    pre_score, post_score);
+            }
+            // t4 trigger: at the moment case 200 walked, t4 was < 2
+            if (pre_t4 < 2) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "[CASE200-TRIP] t4 path candidate: pre_t4=%d (post=%d) "
+                    "— if case 200 saw <2, transitioned to state 300",
+                    pre_t4, post_t4);
+            }
+            // round_end_flag trigger: pre_ref was non-zero
+            if (pre_ref != 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "[CASE200-TRIP] round_end_flag path fired: pre_ref=%u",
+                    pre_ref);
+            }
+        }
+
+        ParityRecorder::Capture();
         RenderFrameWithSnapshot();
+        uint32_t ref_after_render = *(volatile uint32_t*)REF_ADDR;
+        if (ref_after_render != ref_after_ug && ref_after_render != 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[REF-TRIP] round_end_flag flipped %u->%u during "
+                        "RenderFrameWithSnapshot",
+                        ref_after_ug, ref_after_render);
+        }
         return;
     }
 
@@ -260,6 +420,7 @@ static void RunCssTick() {
     // Run the native CSS tick.
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+    ParityRecorder::Capture();  // post-update snapshot for parity .pty
     RenderFrameWithSnapshot();
 }
 
@@ -276,6 +437,137 @@ static void RunNativeTick() {
 
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+    ParityRecorder::Capture();  // post-update snapshot for parity .pty
+    RenderFrameWithSnapshot();
+}
+
+// Spectator playback. Three regimes by current queue depth:
+//
+//   queue < SPECTATOR_LIVE_TARGET    → STALL  (re-render, no sim advance)
+//                                       Always lag the host by N frames so
+//                                       jitter / batch arrivals (8-frame
+//                                       INPUT_BATCH bursts) never starve us.
+//                                       Without this gate the spectator
+//                                       drains to zero between bursts and
+//                                       runs micro-ahead inside each burst,
+//                                       which is what produced the
+//                                       "spectator running ahead of host
+//                                       in battle" symptom — same root
+//                                       cause as audio jitter buffer.
+//   queue in [LIVE_TARGET, FF_THRESHOLD]
+//                                    → ADVANCE at 100 Hz (10 ms target)
+//   queue > FF_THRESHOLD             → ADVANCE at ~1000 Hz (1 ms target,
+//                                       set in the outer loop) to drain the
+//                                       backfill from a late join.
+//
+// We deliberately don't go through GekkoNet here — there's no rollback path,
+// no inputs to predict, no remote peer in our session. The replay engine
+// is local-only and deterministic so long as the host's RNG seed pin held.
+constexpr size_t SPECTATOR_LIVE_TARGET   = 8;   // jitter buffer floor: never
+                                                // advance with fewer queued
+                                                // frames than this. Pins
+                                                // spectator at >=8 frames
+                                                // behind the host at all
+                                                // times so we can't render
+                                                // a frame the host hasn't
+                                                // confirmed yet.
+
+// Hysteresis. Fast-forward is for late-joiner backfill ONLY — not for
+// absorbing routine jitter. Without hysteresis, host's 8-frame INPUT_BATCH
+// bursts make the queue swing 8..40+ each cycle, FF kicks in at 30, drains
+// to 30, batch arrives, queue 38, FF again. Net result: spectator runs at
+// 1 ms sleep continuously and arrives at the live edge way ahead of host.
+//   queue > FF_ENTER  → enter fast-forward (sleep ~1 ms)
+//   queue < FF_EXIT   → leave fast-forward (sleep 10 ms = 100 Hz)
+// In between: stay in current mode.
+constexpr size_t SPECTATOR_FF_ENTER = 100;  // ~1 second of host-queued frames
+constexpr size_t SPECTATOR_FF_EXIT  = 16;   // 2x live target — stable hysteresis
+
+static void RunSpectatorTick() {
+    Hook_CheckGameModeTransition_Public();
+
+    // Drain inbound UDP every iteration. SPEC_JOIN_ACK arrives as a
+    // CtrlPacket (0xCC), INITIAL_MATCH / INPUT_BATCH / MATCH_END arrive as
+    // 0xCE datagrams; both paths run inside ControlChannel_Poll →
+    // RawReceive → callback or SpectatorNode_HandleSpecData.
+    ControlChannel_Poll();
+
+    // Health tick: heartbeat send, silence-failover detection, expire
+    // silent subscribers. Internally rate-limited so cheap to call every
+    // iter.
+    SpectatorNode_TickHealth();
+
+    // Three modes by queue depth and stream state:
+    //
+    //  1. ACTIVE STREAMING (queue >= LIVE_TARGET):
+    //     pop a frame, advance sim with the streamed inputs. Normal path.
+    //
+    //  2. JITTER STALL (queue < LIVE_TARGET, still subscribed playing_back):
+    //     hold the current frame so we stay 8+ frames behind the host's
+    //     live edge. We're between INPUT_BATCH bursts; do nothing.
+    //
+    //  3. POST-MATCH IDLE (queue empty, playing_back=false after MATCH_END):
+    //     advance sim with ZERO inputs so the virtual clock keeps ticking
+    //     and the local FM2K can play out its results screen / intermission.
+    //     Without this, virtual time stops, results never times out, the
+    //     game freezes on battle-end. Host's intermission runs natively
+    //     (no INPUT_BATCH stream during it), so we just match its
+    //     "no-input auto-advance" behavior locally. When the host enters
+    //     CSS for the next match, INPUT_BATCH frames flow again and we
+    //     return to ACTIVE STREAMING.
+    //
+    // Note: zero-input intermission advance assumes neither player is
+    // pressing buttons during results — TRUE for our local test setup,
+    // FALSE in a real match where someone might mash to skip. Real-fix
+    // is to stream all confirmed frames regardless of game_mode (TBD).
+    const size_t qd = SpectatorNode_PendingFrameCount();
+    const bool active_stream = qd >= SPECTATOR_LIVE_TARGET;
+    const bool post_match    = qd == 0 && !SpectatorNode_IsPlayingBack();
+
+    if (!active_stream && !post_match) {
+        // JITTER STALL — between bursts, hold current frame.
+        RenderFrameWithSnapshot();
+        return;
+    }
+
+    uint16_t p1 = 0, p2 = 0;
+    if (active_stream) {
+        bool have_frame = SpectatorNode_PopFrameInputs(&p1, &p2);
+        if (!have_frame) {
+            RenderFrameWithSnapshot();
+            return;
+        }
+    } else {
+        // POST-MATCH IDLE — zero inputs, advance sim so virtual clock ticks
+        // and intermission auto-advances to next CSS. Force the spectator-
+        // cached values to 0 so Hook_GetPlayerInput returns neutral input
+        // to the sim instead of re-using last-streamed values.
+        SpectatorNode_ResetCurrentInputs();
+        p1 = p2 = 0;
+    }
+
+    // [REMOVED] per-slot fan-out at slot+0xDF79 / slot+0xDF7D.
+    // Same DirectPlay-only fields as the offline branch — see the
+    // RunBattleTick comment. KGT scripts and update_game don't read
+    // them; only check_game_continue does, and that's a no-op when
+    // g_directplay_interface == NULL (always our case). The writes
+    // were stomping memory the StudioS chars touch and breaking
+    // their scripts.
+
+    // PopFrameInputs cached the values into spectator-node current_p1/_p2
+    // globals; Hook_GetPlayerInput reads them when IsPlayingBack() is true.
+    if (original_process_game_inputs) original_process_game_inputs();
+    if (original_update_game)         original_update_game();
+    ParityRecorder::Capture();  // post-update snapshot for parity .pty
+
+    // Advance the deterministic virtual clock that Hook_timeGetTime returns.
+    // Host bumps this in its GekkoAdvanceEvent handler; spectator has no
+    // GekkoNet session, so we bump it here per successful sim tick. Without
+    // this, timeGetTime returns wall clock and any game code reading it
+    // diverges from the host's frame schedule.
+    extern uint32_t g_virtual_time_ms;
+    g_virtual_time_ms += 10;
+
     RenderFrameWithSnapshot();
 }
 
@@ -294,6 +586,17 @@ BOOL TrampolineMainLoop() {
     // misbehave. Set it to the expected 100-fps target on trampoline entry.
     *(uint32_t*)0x41E2F0 = 10;
 
+    // Parity recorder: if FM2K_PARITY_RECORD_PATH is set, open the .pty file
+    // here (DllMain runs too early — the game globals aren't initialized yet,
+    // and we want to record AFTER the warmup ticks below). MaybeAutoOpen
+    // is a no-op if the env var isn't set, so this costs nothing in normal
+    // play. Pairs with kgtengine's recorder for byte-level cross-engine
+    // parity gates via tools/kgt_diff_pty.
+    if (ParityRecorder::MaybeAutoOpen()) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "ParityRecorder: opened .pty output (FM2K_PARITY_RECORD_PATH)");
+    }
+
     // One-time warmup — matches main_game_loop's 8× update_game_state at
     // 0x405AF3. Required to initialize game subsystems before any input.
     if (original_update_game) {
@@ -311,6 +614,10 @@ BOOL TrampolineMainLoop() {
 
         if (!PumpMessages()) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Trampoline: WM_QUIT — exiting");
+            // Patch the .pty header's frame_count and close the file before
+            // process teardown. DllMain's DLL_PROCESS_DETACH runs at a point
+            // where CRT FILE* state may already be torn down, so close here.
+            ParityRecorder::Close();
             return TRUE;
         }
 
@@ -336,6 +643,22 @@ BOOL TrampolineMainLoop() {
                 RunNativeTick();
                 SleepToTarget(tick_start, 10);
                 break;
+
+            case LoopPhase::SPECTATOR_PLAYBACK: {
+                RunSpectatorTick();
+                // Fast-forward with hysteresis — see SPECTATOR_FF_ENTER/EXIT
+                // comments above. Without hysteresis the natural queue swing
+                // around live (host's 8-frame bursts) crosses a single
+                // threshold every batch and we end up at 1 ms sleep
+                // continuously, racing past the host. Sticky FF mode only
+                // engages for genuine backfill catch-up.
+                static bool s_fast_fwd = false;
+                size_t qd = SpectatorNode_PendingFrameCount();
+                if      (qd > SPECTATOR_FF_ENTER) s_fast_fwd = true;
+                else if (qd < SPECTATOR_FF_EXIT)  s_fast_fwd = false;
+                SleepToTarget(tick_start, s_fast_fwd ? 1 : 10);
+                break;
+            }
         }
     }
 }

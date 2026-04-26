@@ -106,4 +106,12 @@ extern char g_remote_addr[64];
 // GekkoNet active to drive save/load/advance events) but skips socket setup.
 extern bool g_stress_mode;
 
+// Spectator mode: this instance is a passive viewer, not a player. Skips
+// the HELLO/HELLO_ACK netplay handshake and instead sends SPEC_JOIN_REQ to
+// the configured remote (the host) at startup. The trampoline pins the
+// phase to SPECTATOR_PLAYBACK regardless of game_mode so the local FM2K's
+// CSS doesn't run native lockstep code while waiting for upstream.
+// Set via FM2K_SPECTATOR_MODE=1 env var.
+extern bool g_spectator_mode;
+
 #endif // GLOBALS_H

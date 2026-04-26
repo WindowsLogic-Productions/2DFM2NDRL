@@ -2,6 +2,7 @@
 #include "control_channel.h"
 #include "globals.h"
 #include "gekkonet.h"
+#include "spectator_node.h"
 #include <SDL3/SDL_log.h>
 #include <vector>
 #include <cstring>
@@ -255,9 +256,19 @@ static void RawReceive() {
 
                 // Forward all messages to callback (including PING/PONG for logging)
                 if (g_msg_callback) {
-                    g_msg_callback(packet);
+                    g_msg_callback(packet, from_addr);
                 }
             }
+        } else if (recv_len >= 1 &&
+                   static_cast<uint8_t>(g_recv_buffer[0]) == SPEC_DATA_MAGIC) {
+            // Spectator-tree datagram (0xCE) — variable-length payload.
+            // Cast explicitly to uint8_t: g_recv_buffer is `char` and on
+            // MinGW that's signed, so a raw `g_recv_buffer[0] == 0xCE`
+            // compare runs as signed-int (-50 vs 206) and never matches.
+            SpectatorNode_HandleSpecData(
+                reinterpret_cast<const uint8_t*>(g_recv_buffer),
+                static_cast<size_t>(recv_len),
+                from_addr);
         } else {
             // GekkoNet packet - queue for adapter
             std::vector<char> pkt_data(g_recv_buffer, g_recv_buffer + recv_len);
@@ -301,6 +312,21 @@ void ControlChannel_Send(const CtrlPacket& packet) {
     pkt.header.player_id = g_local_player_id;
 
     RawSend(&pkt, sizeof(pkt));
+}
+
+void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest) {
+    if (!g_socket_initialized) return;
+    if (g_socket == INVALID_SOCKET) return;
+    if (dest.sin_port == 0) return;
+
+    CtrlPacket pkt = packet;
+    pkt.header.magic     = CTRL_MAGIC;
+    pkt.header.seq       = ++g_send_seq;
+    pkt.header.ack       = g_recv_seq;
+    pkt.header.player_id = g_local_player_id;
+
+    sendto(g_socket, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
+           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
 }
 
 bool ControlChannel_IsConnected() {
@@ -405,17 +431,25 @@ void ControlChannel_SendCSSStart() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent CSS_START");
 }
 
-void ControlChannel_SendBattleReady(uint8_t proposed_local_delay) {
+void ControlChannel_SendBattleReady() {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_READY;
-    // Reuse the sync.frame field as a generic u32 payload to carry our
-    // proposed local delay. Low byte = delay; other bytes reserved.
-    pkt.data.sync.frame = (uint32_t)proposed_local_delay;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_READY");
+}
+
+void ControlChannel_SendChat(const char* text) {
+    if (!text) return;
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::CHAT;
+    // Truncate to 23 chars + guaranteed NUL terminator.
+    std::strncpy(pkt.data.chat.text, text, sizeof(pkt.data.chat.text) - 1);
+    pkt.data.chat.text[sizeof(pkt.data.chat.text) - 1] = '\0';
     ControlChannel_Send(pkt);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "ControlChannel: Sent BATTLE_READY (proposed_local_delay=%u)",
-                (unsigned)proposed_local_delay);
+                "ControlChannel: Sent CHAT \"%s\"", pkt.data.chat.text);
 }
 
 void ControlChannel_SendBattleAck() {
