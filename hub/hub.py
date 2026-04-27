@@ -480,6 +480,12 @@ async def handler(ws: ServerConnection) -> None:
                 print(f"[+] {user.nick} ({user.id}) from {user.peer_addr}")
             else:
                 await handle_message(user, msg)
+    except ConnectionClosed:
+        # Normal disconnect path — client closed the socket (with or
+        # without a close frame). The websockets library raises this
+        # out of `async for raw in ws` if the peer drops abruptly.
+        # Treat as cleanup, not as a server bug.
+        pass
     finally:
         if user is not None:
             await leave_room(user)
