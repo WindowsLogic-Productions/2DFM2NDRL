@@ -892,6 +892,14 @@ void LauncherUI::RenderSessionControls() {
     }
 }
 
+void LauncherUI::NotifyHubMatchEnded() {
+    if (!hub_state_) return;
+    if (!hub_state_->client.IsConnected()) return;
+    hub_state_->client.MatchEnded();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: signaled match_ended (game terminated)");
+}
+
 void LauncherUI::RenderHubPanel() {
     auto& hs = *hub_state_;
 
