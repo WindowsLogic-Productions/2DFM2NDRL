@@ -360,6 +360,12 @@ namespace Utils {
 extern "C" {
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    // Rename the console window we get for the console-subsystem EXE.
+    // Default title is the full EXE path or, on some launches, the
+    // MinGW-w64 toolchain string ("POSIX WinThreads") inherited from
+    // the runtime. Override with something meaningful.
+    SetConsoleTitleA("FM2K Rollback Launcher");
+
     std::cout << "=== FM2K Rollback Launcher ===\n";
     std::cout << "Initializing with SDL callbacks...\n\n";
     
