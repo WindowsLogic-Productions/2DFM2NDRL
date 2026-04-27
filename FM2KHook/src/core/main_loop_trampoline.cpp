@@ -431,7 +431,30 @@ static void RunCssTick() {
 static void RunNativeTick() {
     Hook_CheckGameModeTransition_Public();
 
-    if (!g_offline_mode && !g_stress_mode) {
+    const bool skip_netplay = g_offline_mode || g_stress_mode;
+
+    // Connection gate — networked mode only. Don't tick the game (no
+    // process_game_inputs, no update_game, no render-snapshot mutation)
+    // until both peers have HELLO/HELLO_ACK'd. Without this, both games
+    // launch freely, the auto-mash drives them through title → CSS, and
+    // the existing CSS-phase barrier ends up the fallback — which the
+    // user sees as "stays in Connecting until CSS, then snaps."
+    //
+    // Mirror of RunCssTick's barrier. Both phases (NATIVE = title,
+    // CSS = char select) block on Netplay_IsConnected. Battle mode has
+    // its own BATTLE_READY barrier downstream.
+    if (!skip_netplay && !Netplay_IsConnected()) {
+        ControlChannel_Poll();
+        static uint32_t last_poll = 0;
+        uint32_t now = GetTickCount();
+        if (now - last_poll > 500) {
+            ControlChannel_SendHello((uint8_t)g_player_index, 0);
+            last_poll = now;
+        }
+        return;
+    }
+
+    if (!skip_netplay) {
         Netplay_ProcessMenu();
     }
 
