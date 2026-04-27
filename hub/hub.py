@@ -493,8 +493,14 @@ async def handler(ws: ServerConnection) -> None:
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=7711)
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address (0.0.0.0 = all interfaces)")
+    ap.add_argument("--port", type=int, default=7711,
+                    help="WebSocket lobby port; relay UDP uses port+1")
+    ap.add_argument("--advertise-host", default=None,
+                    help="hostname/IP to advertise to clients for STUN/relay. "
+                         "Defaults to 127.0.0.1 when host is 0.0.0.0; set to "
+                         "your public IP for internet deployments.")
     args = ap.parse_args()
     for game_id, display_name in SEED_ROOMS:
         ROOMS[game_id] = Room(game_id, display_name, seeded=True)
@@ -503,8 +509,18 @@ async def main() -> None:
     # Relay listens on a dedicated UDP port so its envelope (0xCF) is
     # never confused with STUN/control traffic on the lobby port.
     global RELAY_LISTEN
-    RELAY_LISTEN = (args.host, args.port + 1)
-    await start_relay_responder(*RELAY_LISTEN)
+    # Bind on whatever the operator set (0.0.0.0 by default for "all
+    # interfaces"), but advertise a sendable address. 0.0.0.0 is a
+    # listen wildcard, not a destination — clients sending to it get
+    # WSAEADDRNOTAVAIL. Default the advertised host to 127.0.0.1 when
+    # the operator hasn't supplied --advertise-host; production deploys
+    # should pass the public IP/DNS the clients will reach.
+    advertise_host = args.advertise_host or (
+        "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host)
+    bind_addr = (args.host, args.port + 1)
+    RELAY_LISTEN = (advertise_host, args.port + 1)
+    await start_relay_responder(*bind_addr)
+    print(f"  relay advertised to clients as udp://{RELAY_LISTEN[0]}:{RELAY_LISTEN[1]}")
     async with serve(handler, args.host, args.port):
         print(f"FM2K Hub listening on tcp://{args.host}:{args.port} (WebSocket)")
         print(f"  seeded rooms: {[r.id for r in ROOMS.values()]}")
