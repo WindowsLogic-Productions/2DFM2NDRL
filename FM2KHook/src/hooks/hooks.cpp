@@ -953,9 +953,30 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                 }
             } else if (connected) {
                 uint32_t ping = Netplay_GetPingMs();
+                // Label the actual phase from g_game_mode, not just
+                // "CSS". The title bar previously stuck on "CSS" the
+                // moment handshake completed even though the game was
+                // still in the title state machine.
+                //   0       boot/early init
+                //   1000    title — splash + demo loop + main menu
+                //   2000    CSS (character select)
+                //   3000-3999 battle (handled by `active` branch above)
+                //   anything else → fall through to the numeric value
+                uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+                const char* phase = nullptr;
+                char phase_buf[16] = {};
+                if      (mode == 0)               phase = "BOOT";
+                else if (mode == 1000)            phase = "TITLE";
+                else if (mode == 2000)            phase = "CSS";
+                else if (mode >= 3000 && mode < 4000) phase = "BATTLE";
+                else {
+                    std::snprintf(phase_buf, sizeof(phase_buf), "MODE %u",
+                                  (unsigned)mode);
+                    phase = phase_buf;
+                }
                 snprintf(title, sizeof(title),
-                    "FM2K [%s] CSS | FPS:%d | RTT:%ums",
-                    role, g_current_fps, ping);
+                    "FM2K [%s] %s | FPS:%d | RTT:%ums",
+                    role, phase, g_current_fps, ping);
             } else if (!g_offline_mode) {
                 snprintf(title, sizeof(title),
                     "FM2K [%s] Connecting... | FPS:%d",
