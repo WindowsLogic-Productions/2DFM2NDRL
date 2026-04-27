@@ -786,6 +786,14 @@ private:
     struct HubState;
     std::unique_ptr<HubState> hub_state_;
 
+public:
+    // Tell the hub the current match (if any) has ended. Called by
+    // FM2KLauncher::StopSession on both the user-initiated stop and
+    // the game-process-died path. No-op when not in a hub-driven
+    // session (the hub will silently treat the match_ended for an
+    // already-idle user as a noop).
+    void NotifyHubMatchEnded();
+
     // Helper methods
     void ShowGameValidationStatus(const FM2K::FM2KGameInfo& game);
     void ShowNetworkDiagnostics();      // Stub

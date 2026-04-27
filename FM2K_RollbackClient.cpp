@@ -1463,6 +1463,14 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
 void FM2KLauncher::StopSession() {
     // DLL handles GekkoNet directly - no launcher-side session needed
     std::cout << "? Session stopped\n";
+    // Tell the hub the match ended BEFORE we tear the local instance
+    // down. Hub flips both peers' status back to "idle" and
+    // broadcasts user_status to the rest of the room — without this
+    // the lobby sticks at "in_match" and Challenge stays disabled
+    // until the user reconnects.
+    if (ui_) {
+        ui_->NotifyHubMatchEnded();
+    }
     if (game_instance_) {
         game_instance_->Terminate();
         game_instance_.reset();
