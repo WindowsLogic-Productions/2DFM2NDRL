@@ -218,6 +218,13 @@ HubClient::~HubClient() {
 bool HubClient::Connect(const std::string& host, uint16_t port,
                         const std::string& path, const std::string& nick) {
     if (running_.load()) return false;  // already connecting / connected
+    // A previous failed Connect leaves io_ in a finished-but-joinable
+    // state — IoThread returned, but std::thread doesn't auto-detach.
+    // Reassigning over a joinable thread calls std::terminate(); join
+    // first to clean up. The thread is already done so this is instant.
+    if (io_.joinable()) {
+        io_.join();
+    }
     running_.store(true);
     io_ = std::thread(&HubClient::IoThread, this, host, port, path, nick);
     return true;
