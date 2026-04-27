@@ -1043,6 +1043,16 @@ bool Netplay_ProcessBattleInputPhase() {
     // batches have earliest == latest; rollback batches span the rewind range.
     uint32_t earliest_advance = UINT32_MAX;
     uint32_t latest_advance = g_netplay_frame;
+    // Per-batch LoadEvent counter. GekkoNet's update sequence is:
+    //   RewindRunahead -> [maybe HandleRollback] -> Advance -> Save
+    //   -> [HandleRunahead emits Save + N speculative Advances]
+    // RewindRunahead unconditionally emits a LoadEvent once runahead has
+    // run at least once (to undo last tick's speculative advances). It
+    // is NOT a real rollback. Real rollbacks emit a SECOND LoadEvent in
+    // the same batch from HandleRollback. The first LoadEvent of every
+    // batch is therefore the runahead rewind; only the 2nd+ should be
+    // counted as user-visible rollbacks.
+    int load_events_in_batch = 0;
     for (int i = 0; i < update_count; i++) {
         auto update = updates[i];
         switch (update->type) {
@@ -1064,7 +1074,11 @@ bool Netplay_ProcessBattleInputPhase() {
 
             case GekkoLoadEvent: {
                 int frame = update->data.load.frame;
-                g_rollback_count++;
+                load_events_in_batch++;
+                const bool is_runahead_rewind = (load_events_in_batch == 1);
+                if (!is_runahead_rewind) {
+                    g_rollback_count++;
+                }
                 g_last_rollback_frame = g_netplay_frame;
                 // Rolling stats only — per-rollback SDL_LogInfo at 100 fps
                 // chewed framerate under stress. Ring buffer + summary every
