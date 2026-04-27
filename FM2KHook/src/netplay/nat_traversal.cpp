@@ -203,18 +203,24 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         SetThreadPriority(th, prev_pri);
         g_punching.store(false);
 
-        // Final fallback gate: give the peer a few more frames to
-        // hit us back via direct UDP (their burst may be slightly
-        // staggered relative to ours due to launcher-spawn timing).
-        // If still nothing after another ~200 ms, switch to relay so
-        // gameplay can proceed regardless of NAT type. The user said
-        // "we never want burst punch to fail" — relay is that net.
-        if (!g_peer_authenticated.load() && g_relay_configured) {
-            Sleep(200);
+        // Final fallback gate: give the peer a much longer window to
+        // hit us back via direct UDP. The 200 ms we used originally
+        // was too short — Netplay_Init runs early in DllMain, before
+        // the game's main loop and ControlChannel_Poll start, so
+        // inbound CTRL_PUNCH packets can sit in the kernel buffer
+        // for several hundred ms before we ever drain them. Use 2 s
+        // to cover that startup latency. The user said "we never
+        // want burst punch to fail" — relay is the safety net but
+        // direct should always get the chance to win first.
+        if (g_relay_configured) {
+            for (int i = 0; i < 200 && !g_peer_authenticated.load(); ++i) {
+                Sleep(10);
+            }
             if (!g_peer_authenticated.load()) {
                 g_relay_mode.store(true);
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "NAT: direct punch did not authenticate — relay mode ENGAGED");
+                    "NAT: direct punch did not authenticate after 2s — "
+                    "relay mode ENGAGED");
             }
         } else if (!g_peer_authenticated.load()) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -282,6 +288,15 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
             if (first_auth) {
                 ControlChannel_LatchPeerAddr(from);
                 g_punching.store(false);
+                // If relay engaged before this auth landed (CTRL_PUNCH
+                // can arrive after the burst grace expires because the
+                // game's ControlChannel_Poll loop hadn't started yet),
+                // turn relay back off — direct path now works and is
+                // strictly cheaper.
+                if (g_relay_mode.exchange(false)) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "NAT: relay disengaged — direct punch landed late");
+                }
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
                     from_ip, (unsigned)ntohs(from.sin_port));
