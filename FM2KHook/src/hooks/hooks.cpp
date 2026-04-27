@@ -1119,12 +1119,12 @@ void __cdecl Hook_RenderGame() {
     // Update shared memory with current stats for launcher
     SharedMem_Update();
 
-    // GekkoNet frame pacing - called after render, matching GekkoNet examples.
-    // Uses precise QPC timing to hit 10ms target (100fps).
-    // When ahead of remote, slows down by 1.6% to prevent rollback cascade.
-    if (Netplay_IsActive()) {
-        Netplay_HandleFrameTime();
-    }
+    // GekkoNet frame-pacing drift correction now lives in the
+    // trampoline's SleepToTarget — that function applies the 1.6%
+    // slowdown when ahead of peer. The Sleep(extra_ms) trick that
+    // used to be in Netplay_HandleFrameTime was unreliable (Sleep
+    // granularity, fights with QPC-based outer loop) and didn't
+    // actually converge frames_ahead.
 }
 
 // Hook: RunGameLoop
