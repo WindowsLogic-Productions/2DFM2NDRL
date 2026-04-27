@@ -177,9 +177,22 @@ static bool PumpMessages() {
 // deadline, then busy-wait the remainder using QueryPerformanceCounter.
 // Burns a fraction of a millisecond of CPU at the tail of each frame in
 // exchange for actual-100-FPS pacing.
-static void SleepToTarget(uint64_t start_qpc, uint32_t target_ms) {
+static void SleepToTarget(uint64_t start_qpc, uint32_t target_ms,
+                          float frames_ahead = 0.0f) {
     const uint64_t freq = SDL_GetPerformanceFrequency();
-    const uint64_t target_ticks = start_qpc + (freq * target_ms) / 1000;
+    uint64_t target_ticks_count = (freq * target_ms) / 1000;
+    // GekkoNet drift correction. When we're more than half a frame
+    // ahead of the peer's confirmed input, lengthen this frame's
+    // target by 1.6%. Over time the local sim slows just enough for
+    // the lagging peer to catch up. Matches the canonical pattern
+    // in vendored/GekkoNet/Examples/OnlineSession/OnlineSession.cpp.
+    // Without this the host's frame loop holds rigid 10 ms while the
+    // client falls 7-8 frames behind permanently — the symptom of
+    // "host says rb=300, client says rb=0, ahead pinned at ±8.5".
+    if (frames_ahead > 0.5f) {
+        target_ticks_count = (target_ticks_count * 1016) / 1000;
+    }
+    const uint64_t target_ticks = start_qpc + target_ticks_count;
     for (;;) {
         uint64_t now = SDL_GetPerformanceCounter();
         if (now >= target_ticks) return;
@@ -220,7 +233,10 @@ static void RunBattleTick() {
             RenderFrameWithSnapshot();
             g_frame_pending_render = false;
         }
-        Netplay_HandleFrameTime();
+        // Drift adjustment is now handled by SleepToTarget at the
+        // outer loop call site, which applies the 1.6% slowdown when
+        // ahead. Sleep(0)/Sleep(extra_ms) trick that lived in
+        // Netplay_HandleFrameTime was unreliable and never converged.
         return;
     }
 
@@ -381,7 +397,8 @@ static void RunBattleTick() {
             RenderFrameWithSnapshot();
             g_frame_pending_render = false;
         }
-        Netplay_HandleFrameTime();
+        // Drift adjustment now lives in SleepToTarget at the outer
+        // loop (see RunBattleTick comment in TRAMPOLINE_BATTLE case).
     }
 }
 
@@ -647,14 +664,15 @@ BOOL TrampolineMainLoop() {
         switch (ClassifyPhase()) {
             case LoopPhase::TRAMPOLINE_BATTLE:
                 RunBattleTick();
-                // Netplay_HandleFrameTime only slows when AHEAD of peer; with
-                // two localhost instances nobody is ever ahead so it becomes a
-                // no-op and the loop spins at ~260 FPS (observed). Stress
-                // mode has no peer at all. A hard 10 ms floor matches the
-                // original main_game_loop @0x405AD3 target (100 Hz) and
-                // doesn't fight the GekkoNet catch-up logic because that
-                // only kicks in when the delta is POSITIVE.
-                SleepToTarget(tick_start, 10);
+                // Pass the live frames_ahead so SleepToTarget applies the
+                // 1.6% slowdown when the host is ahead of the client (or
+                // vice versa). Without this the host runs rigid 10 ms
+                // forever, the client trails by 7-8 frames permanently,
+                // and FA stays pinned at ±8.5 — exactly the symptom we
+                // saw. Stress / offline / pre-session paths all return
+                // 0.0 from Netplay_GetFramesAhead so the slowdown is a
+                // no-op there.
+                SleepToTarget(tick_start, 10, Netplay_GetFramesAhead());
                 break;
 
             case LoopPhase::CSS:
