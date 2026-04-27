@@ -51,6 +51,127 @@ struct LauncherUI::HubState {
 // Phase-2 master game list will replace this heuristic with a
 // canonical-id → exe-aliases table. Until then this gets us through
 // versioned exes without a manual selection step.
+// Launcher-side preflight: bidirectional 0xCD CTRL_PUNCH on the same
+// UDP port the spawned game's hook will bind. Confirms peer reachability
+// AND opens the NAT pinhole before launch — the hook's own punch is then
+// redundant in the happy path but stays as a safety net. Closes the socket
+// on return so the game DLL can re-bind via SO_REUSEADDR.
+//
+// Returns true if at least one authentic peer punch was observed.
+// Synchronous and bounded by `timeout_ms`; UI freezes briefly while it
+// runs (≤ ~50 ms on loopback, <1 s typical LAN/Internet).
+static bool HubPreflightPunch(uint16_t local_port,
+                              const std::string& peer_ip,
+                              uint16_t peer_port,
+                              const std::string& match_token_hex,
+                              int timeout_ms)
+{
+    WSADATA wsa{};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return false;
+
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+    sockaddr_in laddr{};
+    laddr.sin_family = AF_INET;
+    laddr.sin_port   = htons(local_port);
+    laddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(s, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr)) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Preflight: bind() to %d failed err=%d", (int)local_port,
+            WSAGetLastError());
+        closesocket(s);
+        return false;
+    }
+
+    DWORD recv_timeout = 100;  // 100ms recvfrom poll
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
+
+    sockaddr_in paddr{};
+    paddr.sin_family = AF_INET;
+    paddr.sin_port   = htons(peer_port);
+    if (inet_pton(AF_INET, peer_ip.c_str(), &paddr.sin_addr) != 1) {
+        closesocket(s);
+        return false;
+    }
+
+    // Decode 32-hex match token to 16 binary bytes (matches hub.py + nat_traversal).
+    uint8_t token[16] = {};
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+        return -1;
+    };
+    for (size_t i = 0; i + 1 < match_token_hex.size() && i / 2 < 16; i += 2) {
+        int hi = nib(match_token_hex[i]);
+        int lo = nib(match_token_hex[i + 1]);
+        if (hi < 0 || lo < 0) break;
+        token[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+
+    // CTRL_PUNCH packet: 0xCD 0x10 [16-byte token] — matches
+    // FM2KHook/src/netplay/nat_traversal.cpp wire format.
+    uint8_t pkt[2 + 16];
+    pkt[0] = 0xCD;
+    pkt[1] = 0x10;
+    std::memcpy(pkt + 2, token, 16);
+
+    const auto start    = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(timeout_ms);
+    auto next_send      = start;
+    int  sends_done     = 0;
+    bool peer_seen      = false;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto now = std::chrono::steady_clock::now();
+        if (!peer_seen && now >= next_send && sends_done < 30) {
+            sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                   reinterpret_cast<const sockaddr*>(&paddr), sizeof(paddr));
+            sends_done++;
+            next_send = now + std::chrono::milliseconds(10);
+        }
+
+        uint8_t buf[1024];
+        sockaddr_in from{};
+        int from_len = sizeof(from);
+        int n = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n >= 18 && buf[0] == 0xCD && buf[1] == 0x10 &&
+            std::memcmp(buf + 2, token, 16) == 0) {
+            peer_seen = true;
+            // Send a few more punches so the peer also confirms us
+            // before we drop the socket. NAT mapping persists through
+            // close on cone NATs, but the peer needs one good packet
+            // arriving from us to flip its own preflight to "done".
+            for (int i = 0; i < 3; ++i) {
+                sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                       reinterpret_cast<const sockaddr*>(&paddr), sizeof(paddr));
+                Sleep(5);
+            }
+            break;
+        }
+        // recvfrom returned WSAETIMEDOUT or other err — loop and try
+        // again until deadline.
+    }
+
+    closesocket(s);
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Preflight: %s in %lldms (%d sends, peer %s:%u, port=%d)",
+        peer_seen ? "PEER REACHED" : "TIMED OUT",
+        (long long)elapsed, sends_done, peer_ip.c_str(),
+        (unsigned)peer_port, (int)local_port);
+    return peer_seen;
+}
+
 static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games,
                                     const std::string& room_id) {
     if (room_id.empty()) return -1;
@@ -877,6 +998,31 @@ void LauncherUI::RenderHubPanel() {
                        && (on_online_session_start != nullptr);
 
                 if (ok) {
+                    // Preflight punch — confirm peer reachability on
+                    // the same UDP port the game's hook will bind,
+                    // BEFORE spawning the game. If we can't reach
+                    // each other, neither side launches; the user
+                    // sees a clear "couldn't connect to peer" status
+                    // instead of two stalled CSS screens.
+                    hs.status_line = "preflight: punching peer...";
+                    bool reachable = HubPreflightPunch(
+                        static_cast<uint16_t>(network_config_.local_port),
+                        ev.match.peer_udp_ip,
+                        static_cast<uint16_t>(ev.match.peer_udp_port),
+                        ev.match.token,
+                        2000);
+                    if (!reachable) {
+                        // Could try relay here as a final fallback,
+                        // but for now we treat preflight failure as
+                        // hard-stop. Symmetric NAT story is Phase-3
+                        // relay-engaged-from-start; not yet wired.
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: preflight failed — aborting match (no game spawn)");
+                        hs.status_line = "preflight failed: peer unreachable";
+                        hs.client.MatchEnded();
+                        break;
+                    }
+
                     // Make sure the launcher's selected_game_ record is
                     // up to date even if RoomJoined fired before games
                     // discovery completed.
