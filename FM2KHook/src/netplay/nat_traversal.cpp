@@ -81,6 +81,24 @@ bool ParseHostPort(const std::string& s, std::string& host, uint16_t& port) {
     return true;
 }
 
+// Resolve a hostname (or literal IPv4 string) to in_addr. Returns
+// false on failure. Used so the launcher / dllmain can pass either
+// "127.0.0.1" or "2dfm.sytes.net" as the hub address — getaddrinfo
+// handles both cases. Only the FIRST A record is taken; sufficient
+// for our small hub deployments.
+bool ResolveHostA(const std::string& host, in_addr& out) {
+    if (inet_pton(AF_INET, host.c_str(), &out) == 1) return true;
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+        return false;
+    }
+    out = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return true;
+}
+
 }  // namespace
 
 bool SendStunProbe() {
@@ -101,9 +119,9 @@ bool SendStunProbe() {
     sockaddr_in hub{};
     hub.sin_family = AF_INET;
     hub.sin_port   = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &hub.sin_addr) != 1) {
+    if (!ResolveHostA(host, hub.sin_addr)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "NAT: inet_pton failed for hub host='%s'", host.c_str());
+            "NAT: failed to resolve hub host='%s'", host.c_str());
         return false;
     }
 
@@ -334,9 +352,9 @@ bool ConfigureRelay() {
     g_relay_addr = {};
     g_relay_addr.sin_family = AF_INET;
     g_relay_addr.sin_port   = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &g_relay_addr.sin_addr) != 1) {
+    if (!ResolveHostA(host, g_relay_addr.sin_addr)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "NAT: relay inet_pton failed for '%s'", host.c_str());
+            "NAT: failed to resolve relay host='%s'", host.c_str());
         return false;
     }
 

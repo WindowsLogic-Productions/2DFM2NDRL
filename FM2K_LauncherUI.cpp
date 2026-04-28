@@ -1041,10 +1041,17 @@ void LauncherUI::RenderHubPanel() {
                     // probe and authenticated punch on Netplay_Init.
                     // Inherited via CreateProcess in
                     // FM2KGameInstance::Launch.
-                    // TODO(settings): hub URL is hardcoded here as it
-                    // is in HubClient — both move to a Settings panel
-                    // together later.
-                    ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   "127.0.0.1:7711");
+                    //
+                    // Use the same FM2K_HUB_HOST override as the WS
+                    // Connect above. nat_traversal does its own DNS
+                    // resolve on this string — it's not required to be
+                    // a literal IP.
+                    const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
+                    const std::string hub_udp =
+                        std::string(hub_host_env && hub_host_env[0]
+                                    ? hub_host_env : "2dfm.sytes.net")
+                        + ":7711";
+                    ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   hub_udp.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
                     if (!ev.match.relay_ip.empty() && ev.match.relay_port > 0) {
@@ -1137,10 +1144,16 @@ void LauncherUI::RenderHubPanel() {
             network_config_.local_port = picked;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Hub: auto-picked UDP port %d for this session", picked);
-            // TODO(settings): hub address belongs in a Settings panel.
-            // Hardcoded to localhost for the demo.
-            hs.client.Connect("127.0.0.1", 7711, "/", hs.my_nick);
-            hs.status_line = "connecting...";
+            // Hub address. Override for local testing / dev work via
+            // FM2K_HUB_HOST env var; default points at our public hub.
+            // TODO(settings): expose this in a Settings panel; for now
+            // env var is good enough for me/dev and Just Works for end
+            // users on the default.
+            const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
+            const std::string hub_host = (hub_host_env && hub_host_env[0])
+                ? hub_host_env : "2dfm.sytes.net";
+            hs.client.Connect(hub_host, 7711, "/", hs.my_nick);
+            hs.status_line = "connecting to " + hub_host + " ...";
         }
         if (!can_connect) ImGui::EndDisabled();
     } else {
