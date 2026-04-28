@@ -316,11 +316,27 @@ void HubClient::IoThread(std::string host, uint16_t port,
                          std::string path, std::string nick) {
     auto fail = [&](const char* where) {
         DWORD err = GetLastError();
+        // Map the most common WinHTTP failure codes to text the user
+        // can act on. "WinHttpSendRequest failed (err=12029)" by
+        // itself is opaque — the user keeps hitting these and asking
+        // "what's going wrong?". Spelling out the cause + likely fix
+        // surfaces the answer in the UI status_line.
+        const char* hint = "";
+        switch (err) {
+            case 12002: hint = " (timeout — host unreachable or slow)"; break;
+            case 12007: hint = " (name not resolved — typo in Host field?)"; break;
+            case 12029: hint = " (cannot connect — host reached but TCP refused. "
+                               "If hub is local, set Host to 127.0.0.1.)"; break;
+            case 12030: hint = " (connection reset — hub closed unexpectedly)"; break;
+            case 12152: hint = " (invalid server response — wrong protocol on port?)"; break;
+            default: break;
+        }
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "HubClient: %s failed (err=%lu)", where, (unsigned long)err);
+                     "HubClient: %s failed (err=%lu)%s",
+                     where, (unsigned long)err, hint);
         HubEvent ev;
         ev.kind = HubEvent::Kind::Error;
-        ev.error = std::string(where) + " failed";
+        ev.error = std::string(where) + " (err=" + std::to_string(err) + ")" + hint;
         EmitEvent(std::move(ev));
         ev.kind = HubEvent::Kind::Disconnected;
         EmitEvent(std::move(ev));
