@@ -1012,13 +1012,45 @@ void LauncherUI::RenderHubPanel() {
                     // each other, neither side launches; the user
                     // sees a clear "couldn't connect to peer" status
                     // instead of two stalled CSS screens.
+                    // Candidate ladder for preflight:
+                    //   1. peer's public addr (hub-supplied) — works
+                    //      cross-internet for cone NATs.
+                    //   2. 127.0.0.1 — same-machine fallback. When
+                    //      both clients run behind the same NAT and
+                    //      the router doesn't hairpin (typical), each
+                    //      sending punches to its own public IP fails;
+                    //      loopback always works for same-box tests
+                    //      and is the right path. If loopback succeeds
+                    //      we override the peer addr so the spawned
+                    //      game's FM2K_REMOTE_ADDR is 127.0.0.1 too.
+                    // TODO: gather LAN candidates and try them between
+                    // public and loopback so same-LAN/different-box
+                    // setups also work without relay.
                     hs.status_line = "preflight: punching peer...";
+                    std::string peer_ip   = ev.match.peer_udp_ip;
+                    int         peer_port = ev.match.peer_udp_port;
                     bool reachable = HubPreflightPunch(
                         static_cast<uint16_t>(network_config_.local_port),
-                        ev.match.peer_udp_ip,
-                        static_cast<uint16_t>(ev.match.peer_udp_port),
+                        peer_ip,
+                        static_cast<uint16_t>(peer_port),
                         ev.match.token,
                         2000);
+                    if (!reachable && peer_ip != "127.0.0.1") {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: public preflight timed out, retrying via 127.0.0.1");
+                        hs.status_line = "preflight: trying 127.0.0.1...";
+                        if (HubPreflightPunch(
+                                static_cast<uint16_t>(network_config_.local_port),
+                                "127.0.0.1",
+                                static_cast<uint16_t>(peer_port),
+                                ev.match.token,
+                                1000)) {
+                            reachable = true;
+                            peer_ip = "127.0.0.1";
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Hub: loopback preflight succeeded — same-box match");
+                        }
+                    }
                     if (!reachable) {
                         // Could try relay here as a final fallback,
                         // but for now we treat preflight failure as
@@ -1068,9 +1100,13 @@ void LauncherUI::RenderHubPanel() {
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");
+                    // Use the peer addr the preflight actually
+                    // succeeded on (may have been swapped to
+                    // 127.0.0.1 above). The spawned game's
+                    // ControlChannel needs the same path the
+                    // pinhole opened on.
                     cfg.remote_address =
-                        ev.match.peer_udp_ip + ":" +
-                        std::to_string(ev.match.peer_udp_port);
+                        peer_ip + ":" + std::to_string(peer_port);
                     on_online_session_start(cfg);
                 } else {
                     const char* reason =
