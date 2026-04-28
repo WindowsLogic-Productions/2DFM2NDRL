@@ -666,22 +666,35 @@ bool Netplay_StartBattle() {
     g_remote_css_ready = false;
 
     // Per-player local delay via GekkoNet's native API. Each peer picks its
-    // own value from its own RTT sample — no cross-peer negotiation. A laggy
-    // player can add delay to smooth their experience without forcing it on
-    // the opponent, which is the entire point of per-player delay.
-    //   local_delay = ceil(one_way_ms / 10) + 1
+    // own value — no cross-peer negotiation. A laggy player can add delay
+    // to smooth their experience without forcing it on the opponent.
+    //
+    // Two paths:
+    //   (a) FM2K_LOCAL_DELAY env var set to 1..15: use that verbatim.
+    //       Honors the user's manual override from the launcher UI.
+    //   (b) Otherwise: compute from measured RTT.
+    //         local_delay = ceil(one_way_ms / 10) + 1, clamped [2, 15].
+    int local_delay = 0;
+    if (const char* env = std::getenv("FM2K_LOCAL_DELAY"); env && env[0]) {
+        int v = std::atoi(env);
+        if (v >= 1 && v <= 15) local_delay = v;
+    }
     uint32_t rtt_ms = ControlChannel_GetRttMs();
     uint32_t one_way_ms = rtt_ms / 2;
-    if (one_way_ms < 10) one_way_ms = 10;
-    int local_delay = (int)((one_way_ms + 9) / 10) + 1;
-    if (local_delay < 2)  local_delay = 2;
-    if (local_delay > 15) local_delay = 15;
+    if (local_delay == 0) {
+        if (one_way_ms < 10) one_way_ms = 10;
+        local_delay = (int)((one_way_ms + 9) / 10) + 1;
+        if (local_delay < 2)  local_delay = 2;
+        if (local_delay > 15) local_delay = 15;
+    }
 
     int prediction_window = 8;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: RTT=%ums one_way=%ums -> local_delay=%d, prediction_window=%d",
-        rtt_ms, one_way_ms, local_delay, prediction_window);
+        "Netplay: RTT=%ums one_way=%ums -> local_delay=%d (%s), prediction_window=%d",
+        rtt_ms, one_way_ms, local_delay,
+        std::getenv("FM2K_LOCAL_DELAY") ? "manual" : "auto",
+        prediction_window);
 
     GekkoConfig config = {};
     config.num_players = 2;
