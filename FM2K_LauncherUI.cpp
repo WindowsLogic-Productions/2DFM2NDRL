@@ -1151,6 +1151,38 @@ void LauncherUI::RenderHubPanel() {
             "your own hub.py on the same machine — NAT routers "
             "rarely hairpin so the public DNS won't loop back.");
         ImGui::PopItemWidth();
+
+        // Local delay override. 0 = auto (RTT-derived in netplay.cpp).
+        // Stored in the same scope as Nick/Host so it's stable across
+        // panel toggles. End-user value 0..8 maps to:
+        //   0  -> Auto (FM2K_LOCAL_DELAY env unset)
+        //   N  -> manual N frames
+        // Hook reads FM2K_LOCAL_DELAY at gekko_start time.
+        static int s_delay_override = 0;
+        const char* delay_items[] = {
+            "Auto", "1", "2", "3", "4", "5", "6", "7", "8"
+        };
+        ImGui::PushItemWidth(-120);
+        ImGui::Combo("Delay", &s_delay_override, delay_items,
+                     IM_ARRAYSIZE(delay_items));
+        ImGui::PopItemWidth();
+        ImGui::SetItemTooltip(
+            "Input delay in frames. Auto picks from measured RTT "
+            "(loopback 2, LAN 2-3, internet 4-6). Manual override "
+            "applies on the next match — useful when Auto picks too "
+            "low for your connection and you'd rather eat a fixed "
+            "delay than constant rollbacks.");
+
+        // Cache the choice into the env so it's inherited by the
+        // game process spawned via match_start. The hook reads it
+        // in Netplay_StartBattle.
+        if (s_delay_override > 0) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%d", s_delay_override);
+            ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", buf);
+        } else {
+            ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", nullptr);
+        }
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
         if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
