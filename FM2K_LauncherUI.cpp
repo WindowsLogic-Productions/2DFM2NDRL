@@ -1141,24 +1141,13 @@ void LauncherUI::RenderHubPanel() {
         const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
         std::snprintf(s_hub_host, sizeof(s_hub_host), "%s", def);
     }
-    if (!hs.client.IsConnected()) {
-        ImGui::PushItemWidth(-120);
-        ImGui::InputText("Nick", s_nick, sizeof(s_nick));
-        ImGui::InputText("Host", s_hub_host, sizeof(s_hub_host));
-        ImGui::SetItemTooltip(
-            "Hub server hostname or IP. Default 2dfm.sytes.net for "
-            "public play. Use 127.0.0.1 (or localhost) when running "
-            "your own hub.py on the same machine — NAT routers "
-            "rarely hairpin so the public DNS won't loop back.");
-        ImGui::PopItemWidth();
-
-        // Local delay override. 0 = auto (RTT-derived in netplay.cpp).
-        // Stored in the same scope as Nick/Host so it's stable across
-        // panel toggles. End-user value 0..8 maps to:
-        //   0  -> Auto (FM2K_LOCAL_DELAY env unset)
-        //   N  -> manual N frames
-        // Hook reads FM2K_LOCAL_DELAY at gekko_start time.
-        static int s_delay_override = 0;
+    // Delay override is panel-wide so the user can change it after
+    // connecting too — they often want to bump delay between matches
+    // without reconnecting. Sits above the rooms section regardless
+    // of connection state. Cached into FM2K_LOCAL_DELAY every frame
+    // so the next match_start spawn inherits the latest value.
+    static int s_delay_override = 0;
+    {
         const char* delay_items[] = {
             "Auto", "1", "2", "3", "4", "5", "6", "7", "8"
         };
@@ -1171,11 +1160,8 @@ void LauncherUI::RenderHubPanel() {
             "(loopback 2, LAN 2-3, internet 4-6). Manual override "
             "applies on the next match — useful when Auto picks too "
             "low for your connection and you'd rather eat a fixed "
-            "delay than constant rollbacks.");
-
-        // Cache the choice into the env so it's inherited by the
-        // game process spawned via match_start. The hook reads it
-        // in Netplay_StartBattle.
+            "delay than constant rollbacks. Changing this between "
+            "matches takes effect on the next challenge accept.");
         if (s_delay_override > 0) {
             char buf[8];
             std::snprintf(buf, sizeof(buf), "%d", s_delay_override);
@@ -1183,6 +1169,18 @@ void LauncherUI::RenderHubPanel() {
         } else {
             ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", nullptr);
         }
+    }
+
+    if (!hs.client.IsConnected()) {
+        ImGui::PushItemWidth(-120);
+        ImGui::InputText("Nick", s_nick, sizeof(s_nick));
+        ImGui::InputText("Host", s_hub_host, sizeof(s_hub_host));
+        ImGui::SetItemTooltip(
+            "Hub server hostname or IP. Default 2dfm.sytes.net for "
+            "public play. Use 127.0.0.1 (or localhost) when running "
+            "your own hub.py on the same machine — NAT routers "
+            "rarely hairpin so the public DNS won't loop back.");
+        ImGui::PopItemWidth();
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
         if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
