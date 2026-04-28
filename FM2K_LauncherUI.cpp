@@ -1097,9 +1097,23 @@ void LauncherUI::RenderHubPanel() {
     ImGui::SeparatorText("Hub");
 
     static char s_nick[32] = "";
+    static char s_hub_host[128] = "";
+    static bool s_hub_host_initialized = false;
+    if (!s_hub_host_initialized) {
+        s_hub_host_initialized = true;
+        const char* env_h = std::getenv("FM2K_HUB_HOST");
+        const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
+        std::snprintf(s_hub_host, sizeof(s_hub_host), "%s", def);
+    }
     if (!hs.client.IsConnected()) {
         ImGui::PushItemWidth(-120);
         ImGui::InputText("Nick", s_nick, sizeof(s_nick));
+        ImGui::InputText("Host", s_hub_host, sizeof(s_hub_host));
+        ImGui::SetItemTooltip(
+            "Hub server hostname or IP. Default 2dfm.sytes.net for "
+            "public play. Use 127.0.0.1 (or localhost) when running "
+            "your own hub.py on the same machine — NAT routers "
+            "rarely hairpin so the public DNS won't loop back.");
         ImGui::PopItemWidth();
         const bool can_connect = s_nick[0] != '\0';
         if (!can_connect) ImGui::BeginDisabled();
@@ -1144,14 +1158,14 @@ void LauncherUI::RenderHubPanel() {
             network_config_.local_port = picked;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Hub: auto-picked UDP port %d for this session", picked);
-            // Hub address. Override for local testing / dev work via
-            // FM2K_HUB_HOST env var; default points at our public hub.
-            // TODO(settings): expose this in a Settings panel; for now
-            // env var is good enough for me/dev and Just Works for end
-            // users on the default.
-            const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
-            const std::string hub_host = (hub_host_env && hub_host_env[0])
-                ? hub_host_env : "2dfm.sytes.net";
+            // Hub address from the Host field above. The same string
+            // gets persisted into the FM2K_HUB_HOST env so the spawned
+            // game's nat_traversal STUN probe / relay endpoint uses
+            // the same host.
+            const std::string hub_host = (s_hub_host[0] != '\0') ? s_hub_host : "2dfm.sytes.net";
+            ::SetEnvironmentVariableA("FM2K_HUB_HOST", hub_host.c_str());
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: connecting to %s:7711 (WS)", hub_host.c_str());
             hs.client.Connect(hub_host, 7711, "/", hs.my_nick);
             hs.status_line = "connecting to " + hub_host + " ...";
         }
