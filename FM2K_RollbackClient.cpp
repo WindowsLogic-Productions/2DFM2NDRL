@@ -573,6 +573,22 @@ bool FM2KLauncher::Initialize() {
     ui_->on_session_stop = [this]() {
         StopSession();
     };
+    ui_->on_spectate_match = [this](const std::string& host_ip, int host_port) {
+        // Need an installed game to point the spectator at; reuse whatever
+        // the launcher currently has selected.
+        if (selected_game_.exe_path.empty()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectate: no game selected — pick one before clicking Spectate");
+            return;
+        }
+        // Pick a free local UDP port for the spectator's bind. 7002 by
+        // convention (above the host's 7000 and the client's 7001).
+        // If a spectator is already running, LaunchRemoteSpectator returns
+        // false; user can stop it from the multi-client tools first.
+        constexpr int SPEC_LOCAL_PORT = 7002;
+        LaunchRemoteSpectator(selected_game_.exe_path, SPEC_LOCAL_PORT,
+                              host_ip, host_port);
+    };
     ui_->on_exit = [this]() {
         running_ = false;
     };
@@ -1618,6 +1634,52 @@ bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Spectator launched successfully (PID: %u, port=%d -> host=127.0.0.1:%d)",
                 spectator_instance_->GetProcessId(), spectator_port, host_port);
+    return true;
+}
+
+bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
+                                         int spectator_port,
+                                         const std::string& host_ip,
+                                         int host_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching remote spectator: %s (port=%d -> %s:%d)",
+                game_path.c_str(), spectator_port, host_ip.c_str(), host_port);
+
+    if (spectator_instance_ && spectator_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
+        return false;
+    }
+
+    spectator_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator_instance_.get());
+
+    const std::string remote_addr = host_ip + ":" + std::to_string(host_port);
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",    "2");
+    spectator_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",      std::to_string(spectator_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",     remote_addr);
+    spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE",  "1");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+
+    if (!spectator_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch remote spectator: %s",
+                     game_path.c_str());
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Remote spectator process terminated immediately!");
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Remote spectator launched (PID: %u, port=%d -> host=%s)",
+                spectator_instance_->GetProcessId(), spectator_port, remote_addr.c_str());
     return true;
 }
 

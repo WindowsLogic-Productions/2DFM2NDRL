@@ -573,6 +573,15 @@ private:
     bool LaunchLocalSpectator2(const std::string& game_path,
                                int spectator_port,
                                int upstream_port);
+    // Launch a spectator pointing at an arbitrary remote host (typically
+    // received via hub spectate_grant). Used by the lobby UI's "click an
+    // active match to watch it" path. spectator_port is local UDP bind;
+    // host_ip:host_port is where the spectator's FM2K_REMOTE_ADDR points
+    // and the SpectatorNode JOIN_REQ is sent.
+    bool LaunchRemoteSpectator(const std::string& game_path,
+                               int spectator_port,
+                               const std::string& host_ip,
+                               int host_port);
     bool TerminateAllClients();
     
     
@@ -620,6 +629,10 @@ public:
     std::function<void()> on_offline_session_start;
     std::function<void(const NetworkConfig&)> on_online_session_start;
     std::function<void()> on_stress_session_start;  // Single-instance GekkoStressSession determinism test
+    // Click-to-spectate. host_ip:host_port comes from the hub's
+    // spectate_grant. Launcher should boot a local FM2K spectator instance
+    // pointing at that addr (LaunchRemoteSpectator).
+    std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     std::function<void(const std::string&)> on_games_folder_set;

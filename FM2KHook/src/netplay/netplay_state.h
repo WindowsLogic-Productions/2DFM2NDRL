@@ -183,6 +183,15 @@ struct CtrlPacket {
             uint16_t redirect_port;  // host byte order
         } spec_redirect;
 
+        // SPEC_JOIN_ACK — host tells joining spectator which session kind to
+        // create for its GekkoSpectateSession. Values: 0 = unknown / between
+        // matches (spectator should wait for next BATTLE_ENTERING),
+        // 1 = CSS lockstep, 2 = battle rollback. Receivers from older peers
+        // (zero-initialised CtrlPacket data) read 0 → safe default.
+        struct {
+            uint8_t host_session_kind;
+        } spec_join_ack;
+
         // Raw bytes for unknown/future use
         uint8_t raw[24];
     } data;

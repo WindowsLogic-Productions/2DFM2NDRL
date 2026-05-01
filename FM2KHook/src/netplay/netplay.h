@@ -79,16 +79,44 @@ void Netplay_ProcessMenu();
 // BATTLE MODE SYNC BARRIER
 // =============================================================================
 
-// Signal that we're entering battle mode (game_mode changed to 3000+)
-// Sends BATTLE_ENTERING to remote, returns immediately
+// Signal that we're entering battle mode (game_mode changed to 3000+).
+// Sends BATTLE_ENTERING with a proposed swap_frame = current CSS frame +
+// SWAP_FRAME_BUFFER; resender keeps the latest agreed (max(local, remote))
+// value flowing until both sides converge. Returns immediately.
 void Netplay_SignalBattleEntry();
 
-// Check if both clients have entered battle mode
-// Returns true when both have signaled battle entry
+// Check if the CSS->battle swap is ready to fire: both peers have signaled
+// AND the active CSS-session frame has reached the agreed swap_frame.
+// Callers should perform gekko_destroy(css) -> gekko_create(battle) once
+// this returns true.
 bool Netplay_IsBattleSynced();
 
-// Poll for battle sync messages (call while waiting for sync)
+// Returns the agreed swap_frame for the CSS->battle direction (max of local
+// and remote proposals). Valid once g_local_battle_entered is true.
+uint32_t Netplay_GetBattleEntrySwapFrame();
+
+// Poll for battle entry sync messages (call while waiting for sync).
+// Resends BATTLE_ENTERING with the latest agreed swap_frame until remote
+// acknowledges via its own BATTLE_ENTERING.
 void Netplay_PollBattleSync();
+
+// Signal that we're leaving battle mode (game_mode changed out of [3000,4000)).
+// Sends BATTLE_END with a proposed swap_frame = current battle frame +
+// SWAP_FRAME_BUFFER; convergence is the same max(local, remote) protocol.
+void Netplay_SignalBattleEnd();
+
+// Check if the battle->CSS swap is ready to fire: both peers have signaled
+// AND the active battle-session frame has reached the agreed swap_frame.
+// Callers should perform gekko_destroy(battle) -> gekko_create(css) once
+// this returns true.
+bool Netplay_IsBattleEndSynced();
+
+// Returns the agreed swap_frame for the battle->CSS direction.
+// Valid once g_local_battle_end_signaled is true.
+uint32_t Netplay_GetBattleEndSwapFrame();
+
+// Poll for battle-end sync messages (call while waiting for sync).
+void Netplay_PollBattleEndSync();
 
 // =============================================================================
 // GEKKONET SESSION LIFECYCLE
@@ -110,6 +138,54 @@ bool Netplay_StartStressBattle();
 // End GekkoNet session when leaving battle mode
 // Keeps control channel connected for rematch
 void Netplay_EndBattle();
+
+// =============================================================================
+// SPECTATOR SESSION LIFECYCLE
+// =============================================================================
+
+// SessionKind enum is internal to netplay.cpp; re-declared here for the
+// spectator-facing API. Values must match netplay.cpp's enum class.
+enum class NetplaySessionKind : uint8_t {
+    NONE     = 0,
+    CSS      = 1,
+    BATTLE   = 2,
+    STRESS   = 3,
+    SPECTATE = 4,
+};
+
+// Create a GekkoSpectateSession matching the host's current session phase.
+// Called from SpectatorNode_HandleJoinAck after the host accepts our
+// SPEC_JOIN_REQ. host_kind comes from the JOIN_ACK payload (1=CSS, 2=BATTLE);
+// host_addr is the formatted "ip:port" string.
+bool Netplay_StartSpectateSession(NetplaySessionKind host_kind, const char* host_addr);
+
+// Tear down the spectator session. Called when the host signals phase change
+// (BATTLE_ENTERING / BATTLE_END) or when the spectator disconnects.
+void Netplay_EndSpectateSession();
+
+// Spectator-side phase-flip handlers. Called from OnControlMessage when the
+// receiver is currently a spectator and the host announced a swap.
+void Netplay_OnHostBattleEntering(uint32_t swap_frame);
+void Netplay_OnHostBattleEnd(uint32_t swap_frame);
+
+// Returns true if this peer is currently running a GekkoSpectateSession.
+bool Netplay_IsSpectatorSession();
+
+// Drive the spectator's GekkoSpectateSession for one tick: poll network,
+// drain session events, drain Save/Load/Advance events. On AdvanceEvent
+// the input cache (g_p1_input / g_p2_input) is updated and the game's
+// process_game_inputs + update_game functions run — same as the host's
+// path. Returns true if the sim advanced this tick (caller renders);
+// false if the session is stalled waiting for confirmed inputs.
+bool Netplay_ProcessSpectatorPhase();
+
+// Returns the current session kind (for trampoline branching).
+NetplaySessionKind Netplay_GetSessionKind();
+
+// Returns the active GekkoNet session pointer (or nullptr). Used by
+// SpectatorNode_HandleJoinReq to add late joiners as GekkoSpectator actors.
+struct GekkoSession;
+GekkoSession* Netplay_GetActiveSession();
 
 // Legacy API (delegates to StartBattle/EndBattle)
 bool Netplay_StartGekkoSession();

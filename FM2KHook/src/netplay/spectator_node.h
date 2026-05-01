@@ -135,6 +135,12 @@ size_t SpectatorNode_GetSubscriberCount();
 // Is this node currently pushing a live match to subscribers?
 bool SpectatorNode_IsBroadcasting();
 
+// Snapshot of subscriber addresses, used by Netplay_Start{CSS,Battle}Session
+// to call gekko_add_actor(GekkoSpectator, &addr) for each. Returned by value
+// (copy) to avoid exposing the internal Subscriber struct.
+#include <vector>
+std::vector<sockaddr_in> SpectatorNode_GetSubscriberAddrs();
+
 // =============================================================================
 // VIEWER-SIDE (this node is a spectator subscribing upstream)
 // =============================================================================
@@ -149,9 +155,10 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream);
 // from Netplay_InitAsSpectator.
 void SpectatorNode_SetRootAddr(const sockaddr_in& root);
 
-// Handle inbound SPEC_JOIN_ACK — upstream accepted us; further 0xCE
-// datagrams on the same socket will populate our replay queue.
-void SpectatorNode_HandleJoinAck(const sockaddr_in& from);
+// Handle inbound SPEC_JOIN_ACK — upstream accepted us. host_session_kind
+// from the ACK payload (1=CSS, 2=BATTLE, 0=unknown/between-matches) is
+// used to create a matching GekkoSpectateSession.
+void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind);
 
 // Handle inbound SPEC_JOIN_REDIRECT — retry against redirect target.
 void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,

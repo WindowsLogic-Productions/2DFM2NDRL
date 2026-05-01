@@ -399,6 +399,19 @@ static void RunBattleTick() {
         }
         // Drift adjustment now lives in SleepToTarget at the outer
         // loop (see RunBattleTick comment in TRAMPOLINE_BATTLE case).
+
+        // Battle-exit swap-frame gate. Once CheckGameModeTransition has
+        // detected game_mode leaving battle range it called
+        // Netplay_SignalBattleEnd() which sent BATTLE_END(swap_frame).
+        // Both peers + any spectators wait until they reach that frame
+        // before tearing down the GekkoNet battle session, so the swap
+        // is observed at the same logical point on every node.
+        Netplay_PollBattleEndSync();
+        if (Netplay_IsBattleEndSynced()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Trampoline: battle-end swap_frame reached — destroying battle session");
+            Netplay_EndBattle();
+        }
     }
 }
 
@@ -526,85 +539,65 @@ constexpr size_t SPECTATOR_FF_EXIT  = 16;   // 2x live target — stable hystere
 static void RunSpectatorTick() {
     Hook_CheckGameModeTransition_Public();
 
-    // Drain inbound UDP every iteration. SPEC_JOIN_ACK arrives as a
-    // CtrlPacket (0xCC), INITIAL_MATCH / INPUT_BATCH / MATCH_END arrive as
-    // 0xCE datagrams; both paths run inside ControlChannel_Poll →
-    // RawReceive → callback or SpectatorNode_HandleSpecData.
+    // Drain inbound UDP. CtrlPackets (0xCC: SPEC_JOIN_ACK, HEARTBEAT, etc.)
+    // and 0xCE datagrams (INITIAL_MATCH / INPUT_BATCH / MATCH_END) both
+    // route through ControlChannel_Poll → SpectatorNode_HandleSpecData.
     ControlChannel_Poll();
 
-    // Health tick: heartbeat send, silence-failover detection, expire
-    // silent subscribers. Internally rate-limited so cheap to call every
-    // iter.
+    // Health tick: heartbeat send, silence-failover detection, daisy-chain
+    // self-heal. Internally rate-limited.
     SpectatorNode_TickHealth();
 
-    // Three modes by queue depth and stream state:
+    // Spectator pops one (p1, p2) pair per game-loop tick from the
+    // SpectatorNode pb_queue (populated by INPUT_BATCH datagrams from
+    // upstream + the historical backfill on JOIN_ACK). Forward-only sim;
+    // the input log spans the entire connection, so the spectator's local
+    // FM2K walks naturally through title→CSS→battle→CSS→battle in lockstep
+    // with the host. Late joiners FF through the backlog before reaching
+    // live frames.
     //
-    //  1. ACTIVE STREAMING (queue >= LIVE_TARGET):
-    //     pop a frame, advance sim with the streamed inputs. Normal path.
-    //
-    //  2. JITTER STALL (queue < LIVE_TARGET, still subscribed playing_back):
-    //     hold the current frame so we stay 8+ frames behind the host's
-    //     live edge. We're between INPUT_BATCH bursts; do nothing.
-    //
-    //  3. POST-MATCH IDLE (queue empty, playing_back=false after MATCH_END):
-    //     advance sim with ZERO inputs so the virtual clock keeps ticking
-    //     and the local FM2K can play out its results screen / intermission.
-    //     Without this, virtual time stops, results never times out, the
-    //     game freezes on battle-end. Host's intermission runs natively
-    //     (no INPUT_BATCH stream during it), so we just match its
-    //     "no-input auto-advance" behavior locally. When the host enters
-    //     CSS for the next match, INPUT_BATCH frames flow again and we
-    //     return to ACTIVE STREAMING.
-    //
-    // Note: zero-input intermission advance assumes neither player is
-    // pressing buttons during results — TRUE for our local test setup,
-    // FALSE in a real match where someone might mash to skip. Real-fix
-    // is to stream all confirmed frames regardless of game_mode (TBD).
+    // Three states by queue depth + stream state:
+    //   ACTIVE STREAMING (qd >= LIVE_TARGET): pop, advance sim.
+    //   JITTER STALL    (qd > 0 but < LIVE_TARGET, still subscribed): hold.
+    //   POST-MATCH IDLE (qd == 0, !playing_back, after MATCH_END): zero
+    //                    inputs, advance sim so virtual clock ticks
+    //                    through results / intermission.
     const size_t qd = SpectatorNode_PendingFrameCount();
     const bool active_stream = qd >= SPECTATOR_LIVE_TARGET;
-    const bool post_match    = qd == 0 && !SpectatorNode_IsPlayingBack();
+
+    // post_match: queue empty AND we WERE playing back (MATCH_END flipped
+    // playing_back→false). Distinct from pre-JOIN_ACK where playing_back
+    // has never been true. Track that distinction with a sticky bit so
+    // boot-time stall can hold the title screen until host inputs arrive.
+    static bool s_seen_playback = false;
+    if (SpectatorNode_IsPlayingBack()) s_seen_playback = true;
+    const bool post_match = qd == 0 && !SpectatorNode_IsPlayingBack() && s_seen_playback;
 
     if (!active_stream && !post_match) {
-        // JITTER STALL — between bursts, hold current frame.
-        RenderFrameWithSnapshot();
+        RenderFrameWithSnapshot();  // jitter stall — hold current frame
         return;
     }
 
     uint16_t p1 = 0, p2 = 0;
     if (active_stream) {
-        bool have_frame = SpectatorNode_PopFrameInputs(&p1, &p2);
-        if (!have_frame) {
+        if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
             RenderFrameWithSnapshot();
             return;
         }
     } else {
-        // POST-MATCH IDLE — zero inputs, advance sim so virtual clock ticks
-        // and intermission auto-advances to next CSS. Force the spectator-
-        // cached values to 0 so Hook_GetPlayerInput returns neutral input
-        // to the sim instead of re-using last-streamed values.
+        // Post-match: zero inputs into spec-cached globals so
+        // Hook_GetPlayerInput returns neutral, not last-streamed values.
         SpectatorNode_ResetCurrentInputs();
         p1 = p2 = 0;
     }
 
-    // [REMOVED] per-slot fan-out at slot+0xDF79 / slot+0xDF7D.
-    // Same DirectPlay-only fields as the offline branch — see the
-    // RunBattleTick comment. KGT scripts and update_game don't read
-    // them; only check_game_continue does, and that's a no-op when
-    // g_directplay_interface == NULL (always our case). The writes
-    // were stomping memory the StudioS chars touch and breaking
-    // their scripts.
-
-    // PopFrameInputs cached the values into spectator-node current_p1/_p2
-    // globals; Hook_GetPlayerInput reads them when IsPlayingBack() is true.
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
-    ParityRecorder::Capture();  // post-update snapshot for parity .pty
+    ParityRecorder::Capture();
 
-    // Advance the deterministic virtual clock that Hook_timeGetTime returns.
-    // Host bumps this in its GekkoAdvanceEvent handler; spectator has no
-    // GekkoNet session, so we bump it here per successful sim tick. Without
-    // this, timeGetTime returns wall clock and any game code reading it
-    // diverges from the host's frame schedule.
+    // Advance the deterministic virtual clock used by Hook_timeGetTime.
+    // Player path bumps inside GekkoAdvance; spectator has no GekkoNet
+    // session here, so bump per-tick to track host's frame schedule.
     extern uint32_t g_virtual_time_ms;
     g_virtual_time_ms += 10;
 

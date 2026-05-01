@@ -44,65 +44,45 @@ static NetplayState MapToLegacyState(SimpleState s) {
 }
 
 // =============================================================================
-// CCCASTER-STYLE INPUT DELAY SYSTEM
-// Inputs stored at (frame + delay), read at (frame)
-// Both clients always advance - delay ensures inputs arrive in time
+// SESSION TRACKING
 // =============================================================================
+//
+// What kind of GekkoNet session g_session currently points at. We run two
+// distinct sessions back-to-back for a single match: a CSS lockstep session
+// (input_prediction_window=0, no rollback) and a battle rollback session
+// (prediction_window=8 + runahead). The kind determines the per-tick driver
+// and the swap-frame protocol direction. SessionKind is an alias for the
+// public NetplaySessionKind enum exported from netplay.h so external callers
+// (spectator_node, hub_client) can compare against the same values.
 
-static constexpr int CSS_INPUT_DELAY = 6;           // 6 frames delay like CCCaster - never stall
-static constexpr int CSS_INPUT_BUFFER_SIZE = 256;   // Ring buffer size
+using SessionKind = NetplaySessionKind;
+static SessionKind g_session_kind = SessionKind::NONE;
+
+// CSS lockstep parameters (ported from the legacy CCCaster-style ring-buffer
+// implementation). With GekkoNet's prediction=0 mode, local_delay is the
+// per-player input commitment delay — peer A's input committed at frame F
+// becomes the input applied at frame F+local_delay, identical semantics to
+// the previous "store at frame+delay, read at frame" model.
+static constexpr int CSS_LOCAL_DELAY = 6;
 static constexpr int CSS_CONFIRM_LOCKOUT = 150;     // Block confirm for first N frames (moon selector workaround)
 
-// Ring buffer for inputs indexed by frame
-struct InputRingBuffer {
-    uint16_t inputs[CSS_INPUT_BUFFER_SIZE];
-    uint32_t end_frame;  // Highest frame we have input for + 1
+// CSS state — input transport now lives inside the CSS GekkoSession
+static bool g_css_active        = false;  // Currently in CSS mode (game-side detection)
+static bool g_css_synced        = false;  // Both peers BATTLE_READY, CSS GekkoSession ready
+static bool g_remote_css_ready  = false;  // Remote has entered CSS
+static bool g_local_css_ready   = false;  // We've entered CSS
+static uint32_t g_css_frame     = 0;      // Last confirmed CSS AdvanceEvent frame (+1)
 
-    void Clear() {
-        memset(inputs, 0, sizeof(inputs));
-        end_frame = 0;
-    }
+// Per-poll AdvanceEvent input cache. Netplay_ProcessCSS drives gekko_update_session,
+// which fires AdvanceEvent only when both peers have inputs for the current frame
+// (lockstep guarantee). The cached inputs are read by Hook_GetPlayerInput via
+// Netplay_GetCSSInput.
+static uint16_t g_css_advance_p1     = 0;
+static uint16_t g_css_advance_p2     = 0;
+static bool     g_css_advance_ready  = false;
 
-    void Set(uint32_t frame, uint16_t input) {
-        int slot = frame % CSS_INPUT_BUFFER_SIZE;
-        inputs[slot] = input;
-        if (frame >= end_frame) {
-            end_frame = frame + 1;
-        }
-    }
-
-    uint16_t Get(uint32_t frame) const {
-        // Return 0 (neutral) if we don't have this frame yet
-        if (frame >= end_frame) {
-            return 0;
-        }
-        int slot = frame % CSS_INPUT_BUFFER_SIZE;
-        return inputs[slot];
-    }
-
-    bool HasFrame(uint32_t frame) const {
-        return frame < end_frame;
-    }
-
-    uint32_t GetEndFrame() const {
-        return end_frame;
-    }
-};
-
-// CSS state
-static InputRingBuffer g_local_inputs;
-static InputRingBuffer g_remote_inputs;
-static uint32_t g_css_start_timer = 0;  // Value of game timer when BOTH clients ready
-static uint32_t g_css_frame = 0;        // Current CSS frame (relative to start)
-static bool g_css_active = false;       // Currently in CSS mode
-static bool g_css_synced = false;       // BOTH clients ready, timer started
-static bool g_remote_css_ready = false; // Remote has entered CSS
-static bool g_local_css_ready = false;  // We've entered CSS
-
-// Explicit read frame - the frame the game is currently processing
-static uint32_t g_css_current_read_frame = 0;
-
-// GekkoNet session
+// GekkoNet session pointer + readiness flag (shared by CSS and battle —
+// only one is alive at a time, distinguished by g_session_kind).
 static GekkoSession* g_session = nullptr;
 static bool g_session_ready = false;
 static uint16_t g_p1_input = 0;
@@ -123,10 +103,29 @@ static int g_local_delay = 1;  // Computed from RTT at battle start
 // monotonic forward crossing is "the" confirmed advance.
 static uint32_t g_highest_recorded_frame = 0;
 
-// Battle entry sync barrier - ensures both clients enter battle at same time
-static bool g_local_battle_entered = false;   // We've detected battle mode
-static bool g_remote_battle_entered = false;  // Remote has detected battle mode
-static bool g_battle_synced = false;          // Both have entered, GekkoNet can start
+// Battle entry sync barrier - ensures both clients enter battle at same time.
+// Also carries swap_frame negotiation for the CSS-session->battle-session swap:
+// both peers propose g_css_frame + SWAP_FRAME_BUFFER on detection, exchange via
+// BATTLE_ENTERING.data.sync.frame, and the agreed value is max(local, remote).
+// The actual gekko_destroy(css)/gekko_create(battle) deferred until the active
+// CSS session reaches g_battle_entry_swap_frame.
+static bool     g_local_battle_entered    = false;
+static bool     g_remote_battle_entered   = false;
+static bool     g_battle_synced           = false;
+static uint32_t g_battle_entry_swap_frame = 0;     // Latest agreed swap frame.
+
+// Battle exit sync barrier (battle-session -> CSS-session swap, for rematch
+// or return-to-menu). Mirrors the entry barrier but reads g_netplay_frame
+// instead of g_css_frame and is driven by BATTLE_END instead of BATTLE_ENTERING.
+static bool     g_local_battle_end_signaled  = false;
+static bool     g_remote_battle_end_signaled = false;
+static bool     g_battle_end_synced          = false;
+static uint32_t g_battle_end_swap_frame      = 0;
+
+// Frames of slack added to the proposed swap_frame so both peers have time
+// to drain in-flight inputs and converge their proposals before reaching it.
+// 8 @ 100 FPS = 80ms — comfortably above typical RTT. Tunable.
+constexpr uint32_t SWAP_FRAME_BUFFER = 8;
 
 // Handshake state
 static bool g_received_hello = false;
@@ -175,14 +174,13 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             CheckFullyConnected();
             break;
 
-        case CtrlMsg::CSS_INPUT: {
-            // Store remote input at the specified frame
-            uint32_t frame = packet->data.css_input.frame;
-            uint16_t input = packet->data.css_input.input;
-            g_remote_inputs.Set(frame, input);
-            // No logging - too spammy
+        case CtrlMsg::CSS_INPUT:
+            // CSS_INPUT is dead code post-redesign — CSS lockstep now lives
+            // inside a GekkoGameSession with prediction_window=0, so inputs
+            // flow through GekkoNet's transport. The enum value + this case
+            // are kept as a no-op for backward compatibility with peers that
+            // still send the old packet (they'll be silently ignored).
             break;
-        }
 
         case CtrlMsg::BATTLE_READY: {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -191,11 +189,44 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             break;
         }
 
-        case CtrlMsg::BATTLE_ENTERING:
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received BATTLE_ENTERING from remote - they're in battle mode");
+        case CtrlMsg::BATTLE_ENTERING: {
+            const uint32_t remote_proposal = packet->data.sync.frame;
+            // Spectator-side handling: this is host telling us about the
+            // upcoming CSS->battle swap. Flip our SpectateSession to battle
+            // config. (Spectators don't participate in proposal convergence —
+            // they passively follow whatever the host announces.)
+            if (g_session_kind == SessionKind::SPECTATE) {
+                Netplay_OnHostBattleEntering(remote_proposal);
+                break;
+            }
+            // Player-side handling: convergence on max(local, remote) swap.
+            const uint32_t prev_agreed = g_battle_entry_swap_frame;
+            if (remote_proposal > g_battle_entry_swap_frame) {
+                g_battle_entry_swap_frame = remote_proposal;
+            }
             g_remote_battle_entered = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Received BATTLE_ENTERING (remote_swap=%u, prev_agreed=%u, agreed=%u)",
+                remote_proposal, prev_agreed, g_battle_entry_swap_frame);
             break;
+        }
+
+        case CtrlMsg::BATTLE_END: {
+            const uint32_t remote_proposal = packet->data.sync.frame;
+            if (g_session_kind == SessionKind::SPECTATE) {
+                Netplay_OnHostBattleEnd(remote_proposal);
+                break;
+            }
+            const uint32_t prev_agreed = g_battle_end_swap_frame;
+            if (remote_proposal > g_battle_end_swap_frame) {
+                g_battle_end_swap_frame = remote_proposal;
+            }
+            g_remote_battle_end_signaled = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Received BATTLE_END (remote_swap=%u, prev_agreed=%u, agreed=%u)",
+                remote_proposal, prev_agreed, g_battle_end_swap_frame);
+            break;
+        }
 
         case CtrlMsg::DISCONNECT:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -219,7 +250,7 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             break;
 
         case CtrlMsg::SPEC_JOIN_ACK:
-            SpectatorNode_HandleJoinAck(from);
+            SpectatorNode_HandleJoinAck(from, packet->data.spec_join_ack.host_session_kind);
             break;
 
         case CtrlMsg::SPEC_JOIN_REDIRECT:
@@ -259,21 +290,30 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     g_p1_input = 0;
     g_p2_input = 0;
 
-    // Reset CSS state
-    g_local_inputs.Clear();
-    g_remote_inputs.Clear();
-    g_css_start_timer = 0;
-    g_css_frame = 0;
-    g_css_current_read_frame = 0;
+    // Reset CSS state — input transport now lives in the CSS GekkoSession,
+    // so the legacy ring-buffer fields are gone. The session itself is
+    // created on first BATTLE_READY rendezvous and torn down on battle entry.
+    g_session_kind      = SessionKind::NONE;
+    g_css_frame         = 0;
+    g_css_advance_p1    = 0;
+    g_css_advance_p2    = 0;
+    g_css_advance_ready = false;
     g_css_active = false;
     g_css_synced = false;
     g_remote_css_ready = false;
     g_local_css_ready = false;
 
-    // Reset battle sync state
-    g_local_battle_entered = false;
-    g_remote_battle_entered = false;
-    g_battle_synced = false;
+    // Reset battle sync state (entry direction)
+    g_local_battle_entered    = false;
+    g_remote_battle_entered   = false;
+    g_battle_synced           = false;
+    g_battle_entry_swap_frame = 0;
+
+    // Reset battle sync state (exit direction, for next return-to-CSS)
+    g_local_battle_end_signaled  = false;
+    g_remote_battle_end_signaled = false;
+    g_battle_end_synced          = false;
+    g_battle_end_swap_frame      = 0;
 
     // Reset handshake
     g_received_hello = false;
@@ -448,47 +488,53 @@ bool Netplay_IsSessionReady() {
 }
 
 // =============================================================================
-// CSS PROCESSING - CCCaster-Style Input Delay
+// CSS PROCESSING — GekkoNet lockstep (input_prediction_window = 0)
 //
-// Key insight: NEVER BLOCK THE GAME
-// - Capture input every frame, store at frame + DELAY
-// - Read input from frame (which we stored DELAY frames ago)
-// - Send inputs to remote as fast as possible
-// - Both clients advance at same rate, delay ensures sync
+// CSS used to ride a custom CCCaster-style ring buffer over CtrlMsg::CSS_INPUT.
+// It's now a GekkoGameSession with prediction_window=0, which gives true
+// lockstep: gekko_update_session emits AdvanceEvent only when both peers'
+// inputs for the current frame have arrived. Save/Load events are suppressed
+// in lockstep mode (game_session.cpp:226-228, 365-367, 537), so CSS state is
+// derived purely from the shared seed (0x12345678 reseeded on sync) +
+// identical confirmed inputs — same determinism as today, but riding a
+// well-tested transport.
 // =============================================================================
 
-// Send last N CSS inputs as a batch for redundancy against packet loss.
-// CCCaster-style: every packet carries recent history so dropped packets
-// are recovered automatically from subsequent packets.
-static void SendCSSInputBatch() {
-    // Send last (DELAY + 2) frames of inputs to cover any gaps
-    constexpr int BATCH_SIZE = CSS_INPUT_DELAY + 2;
-    uint32_t end = g_local_inputs.GetEndFrame();
-    uint32_t start = (end > BATCH_SIZE) ? end - BATCH_SIZE : 0;
+// Forward decl — defined after Netplay_StartBattle (shares the actor-add
+// pattern). Returns true if the CSS session is ready to drive.
+static bool Netplay_StartCSSSession();
+static void Netplay_EndCSSSession();
 
-    for (uint32_t f = start; f < end; f++) {
-        ControlChannel_SendCSSInput(g_local_inputs.Get(f), f);
-    }
-}
+// Iterate currently-subscribed spectators (from SpectatorNode's address list)
+// and call gekko_add_actor(GekkoSpectator, &addr) for each on the active
+// g_session. Called after the player actors are added in StartCSS/StartBattle.
+// Late joiners (after session creation) are added directly in
+// SpectatorNode_HandleJoinReq.
+static void AddSubscribedSpectatorsToSession();
 
 void Netplay_PollCSS() {
     ControlChannel_Poll();
+    if (g_session && g_session_kind == SessionKind::CSS) {
+        gekko_network_poll(g_session);
+    }
 }
 
 bool Netplay_CanAdvanceCSS() {
-    // Not synced yet - let game run freely (pre-CSS or waiting for remote)
+    // Not synced yet — let game run freely (pre-CSS or waiting for remote)
     if (!g_css_synced) {
         return true;
     }
-    // Check if we have remote input for the frame we're about to process
-    return g_remote_inputs.HasFrame(g_css_frame);
+    // Once the CSS session is up, advance is gated on the AdvanceEvent
+    // having fired during the most recent Netplay_ProcessCSS call.
+    return g_css_advance_ready;
 }
 
 bool Netplay_ProcessCSS() {
-    // Poll for incoming messages
+    // Poll for incoming control-channel messages (BATTLE_READY rendezvous,
+    // BATTLE_ENTERING, etc.) — independent of GekkoNet's transport.
     ControlChannel_Poll();
 
-    // Not connected yet - let game run with local input
+    // Not connected yet — let game run with local input
     if (g_simple_state < SimpleState::CONNECTED) {
         return true;
     }
@@ -503,106 +549,138 @@ bool Netplay_ProcessCSS() {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
     }
 
-    // Keep resending BATTLE_READY until remote is synced AND sending CSS inputs.
-    // Without this, if P1 syncs first and sends only one BATTLE_READY that gets
-    // lost, P2 never syncs and gets stuck forever.
+    // Keep resending BATTLE_READY until remote acknowledges. Without this,
+    // if P1 syncs first and sends only one BATTLE_READY that gets lost,
+    // P2 never syncs and gets stuck forever.
     static uint32_t last_ready_send = 0;
-    bool remote_has_css_data = g_remote_inputs.GetEndFrame() > 0;
-    if ((!g_remote_css_ready || !remote_has_css_data) && now - last_ready_send > 100) {
+    if (!g_remote_css_ready && now - last_ready_send > 100) {
         ControlChannel_SendBattleReady();
         last_ready_send = now;
     }
 
-    // Wait for both clients to be in CSS before starting frame count
+    // Wait for both clients to be in CSS before bringing up the GekkoNet
+    // CSS session. Pre-rendezvous frames run unsynchronized (identical to
+    // today's pre-g_css_synced behavior).
     if (!g_remote_css_ready) {
-        return true;  // Let game run but don't count CSS frames yet
+        return true;  // Let game run but don't drive the session yet
     }
 
-    // Initialize on first synced frame
+    // First frame after rendezvous: reseed RNG and stand up the CSS session.
     if (!g_css_synced) {
-        g_css_synced = true;
-        g_css_frame = 0;
-        g_css_current_read_frame = 0;
-        g_local_inputs.Clear();
-        g_remote_inputs.Clear();
-
-        // CRITICAL: Re-seed RNG now that both clients are synced.
-        // Pre-CSS frames ran unsynchronized and diverged the RNG.
-        // Stage selection uses RNG during CSS->battle transition,
-        // so it MUST be identical from this point forward.
+        // CRITICAL: Re-seed RNG now that both clients are synced. Pre-CSS
+        // frames ran unsynchronized and diverged the RNG. Stage selection
+        // uses RNG during CSS->battle transition, so it MUST be identical
+        // from this point forward.
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
 
+        if (!Netplay_StartCSSSession()) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "CSS: Netplay_StartCSSSession failed");
+            return false;
+        }
+        g_css_synced = true;
+        g_css_frame  = 0;
+
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "CSS SYNCED: Both ready, delay=%d, RNG reseeded", CSS_INPUT_DELAY);
+            "CSS SYNCED: Both ready, GekkoNet CSS session up, RNG reseeded");
     }
 
-    // ALWAYS capture local input and send to remote -- even during stalls.
-    // This prevents deadlock where both sides wait for each other.
+    // Drive the GekkoNet CSS session for this tick.
+    g_css_advance_ready = false;
+    if (!g_session || g_session_kind != SessionKind::CSS) {
+        // Session torn down (e.g., we just swapped to battle); nothing to do.
+        return true;
+    }
+
+    gekko_network_poll(g_session);
+
+    // Submit local input. With prediction=0, this commits at frame
+    // local_frame + CSS_LOCAL_DELAY; AdvanceEvent fires later for the
+    // committed frame once the remote's input for that frame arrives.
     uint16_t local_raw = Input_CaptureLocal();
-    uint32_t store_frame = g_css_frame + CSS_INPUT_DELAY;
-    g_local_inputs.Set(store_frame, local_raw);
-    SendCSSInputBatch();  // Send batch for redundancy against packet loss
+    gekko_add_local_input(g_session, g_player_index, &local_raw);
 
-    // CCCaster-style stall: if remote input isn't ready, DON'T advance the game.
-    // Our inputs are already sent above, so remote will eventually receive them.
-    if (!g_remote_inputs.HasFrame(g_css_frame)) {
-        return false;  // Stall - don't advance game
-    }
-
-    // Both sides have input -- advance
-    g_css_current_read_frame = g_css_frame;
-    g_css_frame++;
-
-    // Forward this CSS-confirmed input pair to spectator subscribers. Same
-    // pipe as battle inputs (INPUT_BATCH); spectator's local FM2K processes
-    // it as a CSS frame, walks through CSS in lockstep with this host. We
-    // need slot order (p1, p2), not local/remote order — translate based on
-    // which player slot we are.
-    {
-        uint16_t local_in  = g_local_inputs.Get(g_css_current_read_frame);
-        uint16_t remote_in = g_remote_inputs.Get(g_css_current_read_frame);
-        uint16_t p1, p2;
-        if (g_player_index == 0) { p1 = local_in;  p2 = remote_in; }
-        else                     { p1 = remote_in; p2 = local_in;  }
-        SpectatorNode_OnFrameConfirmed(p1, p2);
-    }
-
-    // Log occasionally
-    if ((g_css_frame - 1) % 100 == 0) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "CSS: frame=%u local_end=%u remote_end=%u",
-            g_css_frame - 1, g_local_inputs.GetEndFrame(), g_remote_inputs.GetEndFrame());
-    }
-
-    return true;
-}
-
-uint16_t Netplay_GetCSSInput(int player_id) {
-    uint32_t read_frame = g_css_current_read_frame;
-
-    uint16_t input;
-    if (player_id == g_player_index) {
-        input = g_local_inputs.Get(read_frame);
-    } else {
-        input = g_remote_inputs.Get(read_frame);
-
-        // Warn if remote data is missing (shouldn't happen with delay=6 on localhost)
-        static uint32_t miss_count = 0;
-        if (!g_remote_inputs.HasFrame(read_frame) && miss_count < 5) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "CSS: Missing remote frame %u (remote_end=%u) - returning neutral",
-                read_frame, g_remote_inputs.GetEndFrame());
-            miss_count++;
+    // Drain session events (Connected/Syncing/Disconnected/Desync).
+    int event_count = 0;
+    auto events = gekko_session_events(g_session, &event_count);
+    for (int i = 0; i < event_count; i++) {
+        auto event = events[i];
+        switch (event->type) {
+            case GekkoSessionStarted:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "CSS: GekkoNet CSS session started");
+                g_session_ready = true;
+                break;
+            case GekkoPlayerConnected:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "CSS: GekkoNet player %d connected", event->data.connected.handle);
+                g_session_ready = true;
+                break;
+            case GekkoPlayerSyncing:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "CSS: GekkoNet syncing %u/%u",
+                    event->data.syncing.current, event->data.syncing.max);
+                break;
+            case GekkoDesyncDetected:
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "CSS DESYNC f=%d local=0x%08X remote=0x%08X",
+                    event->data.desynced.frame,
+                    event->data.desynced.local_checksum,
+                    event->data.desynced.remote_checksum);
+                break;
+            default:
+                break;
         }
     }
 
-    // CCCaster-style: Block confirm/cancel for first 150 frames (moon selector workaround)
-    if (read_frame < CSS_CONFIRM_LOCKOUT) {
-        // Mask out confirm (bit 8 = 0x100) and cancel (bit 9 = 0x200)
-        // Note: FM2K uses different bit layout than MBAACC
-        // Check what bits are confirm/cancel in FM2K and mask appropriately
-        // For now, just mask bits 8-10 which are typically button presses
-        input &= 0x0FF;  // Keep only direction bits
+    // Drain update events. With prediction=0 + limited_saving=false, only
+    // AdvanceEvent fires (lockstep mode skips Save/Load — see
+    // game_session.cpp:226 / :365 / :537).
+    int update_count = 0;
+    auto updates = gekko_update_session(g_session, &update_count);
+    for (int i = 0; i < update_count; i++) {
+        auto update = updates[i];
+        if (update->type != GekkoAdvanceEvent) {
+            continue;  // Save/Load shouldn't fire under lockstep, but ignore if they do.
+        }
+        // Inputs are packed in slot order (p1 at index 0, p2 at index 1).
+        const uint16_t* in = (const uint16_t*)update->data.adv.inputs;
+        g_css_advance_p1    = in[0];
+        g_css_advance_p2    = in[1];
+        g_css_advance_ready = true;
+        g_css_frame         = (uint32_t)update->data.adv.frame + 1;
+
+        // session_history recording moved to Hook_GetPlayerInput where
+        // the actual returned input values pass through. That captures
+        // pre-rendezvous title-screen / auto-mash inputs too, which this
+        // post-AdvanceEvent point misses (no AdvanceEvents fire pre-
+        // rendezvous). One canonical log spanning FM2K boot to disconnect.
+
+        if ((g_css_frame - 1) % 100 == 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "CSS: advance frame=%d p1=0x%04X p2=0x%04X",
+                update->data.adv.frame, g_css_advance_p1, g_css_advance_p2);
+        }
+    }
+
+    // No AdvanceEvent this tick → lockstep is waiting on remote → stall.
+    return g_css_advance_ready;
+}
+
+uint16_t Netplay_GetCSSInput(int player_id) {
+    uint16_t input;
+    if (player_id == 0) {
+        input = g_css_advance_p1;
+    } else {
+        input = g_css_advance_p2;
+    }
+
+    // CCCaster-style: block confirm/cancel for the first CSS_CONFIRM_LOCKOUT
+    // frames (moon selector workaround). g_css_frame is one past the last
+    // confirmed AdvanceEvent, so the "current" read frame is g_css_frame - 1.
+    const uint32_t read_frame = (g_css_frame > 0) ? g_css_frame - 1 : 0;
+    if (read_frame < (uint32_t)CSS_CONFIRM_LOCKOUT) {
+        input &= 0x0FF;  // Mask button presses, keep direction bits.
     }
 
     return input;
@@ -613,57 +691,453 @@ uint16_t Netplay_GetCSSInput(int player_id) {
 // Ensures both clients enter battle mode at the same time
 // =============================================================================
 
+// Helper: send a BATTLE_ENTERING / BATTLE_END payload to every currently
+// subscribed spectator so they can mirror the swap. Called alongside the
+// usual unicast-to-remote-peer send.
+static void BroadcastSwapToSubscribers(CtrlMsg type, uint32_t swap_frame) {
+    auto subs = SpectatorNode_GetSubscriberAddrs();
+    for (const auto& addr : subs) {
+        CtrlPacket pkt = {};
+        pkt.header.type     = type;
+        pkt.data.sync.frame = swap_frame;
+        ControlChannel_SendTo(pkt, addr);
+    }
+}
+
 void Netplay_SignalBattleEntry() {
     if (g_local_battle_entered) {
         return;  // Already signaled
     }
 
+    // Compute our proposed swap frame on the active CSS session. Remote may
+    // already have proposed a higher value (we adopt it via the receive
+    // handler); take max so we never go backwards.
+    const uint32_t local_proposal = g_css_frame + SWAP_FRAME_BUFFER;
+    if (local_proposal > g_battle_entry_swap_frame) {
+        g_battle_entry_swap_frame = local_proposal;
+    }
     g_local_battle_entered = true;
-    ControlChannel_SendBattleEntering();
+    ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+    BroadcastSwapToSubscribers(CtrlMsg::BATTLE_ENTERING, g_battle_entry_swap_frame);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "BATTLE SYNC: Local entered battle mode, signaling remote...");
+        "BATTLE SYNC: Local entered battle mode (css_frame=%u, swap_frame=%u)",
+        g_css_frame, g_battle_entry_swap_frame);
 }
 
 bool Netplay_IsBattleSynced() {
-    // Check if sync just completed
-    if (!g_battle_synced && g_local_battle_entered && g_remote_battle_entered) {
+    // Once the game's CSS detects the battle transition (game_mode -> 3000),
+    // the trampoline phase classifier flips us into TRAMPOLINE_BATTLE and we
+    // stop driving Netplay_ProcessCSS — so g_css_frame stops advancing. The
+    // swap_frame value (g_css_frame + SWAP_FRAME_BUFFER) is therefore
+    // unreachable from the CSS session itself. Lockstep already guarantees
+    // both peers detect the transition at the same logical frame (the same
+    // shared CSS input stream produced the same selected character + lock-in
+    // events), so the agreed-on-both-sides BATTLE_ENTERING is enough — no
+    // need to also gate on css_frame parity. swap_frame stays in the message
+    // for diagnostic logging and future battle-side gating.
+    if (!g_battle_synced &&
+        g_local_battle_entered &&
+        g_remote_battle_entered) {
         g_battle_synced = true;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "BATTLE SYNC: Both clients in battle mode - sync complete!");
+            "BATTLE SYNC: both peers signaled (css_frame=%u, swap_frame=%u) - swap CSS->battle now",
+            g_css_frame, g_battle_entry_swap_frame);
     }
     return g_battle_synced;
+}
+
+uint32_t Netplay_GetBattleEntrySwapFrame() {
+    return g_battle_entry_swap_frame;
 }
 
 void Netplay_PollBattleSync() {
     // Poll control channel to receive BATTLE_ENTERING from remote
     ControlChannel_Poll();
 
-    // Resend BATTLE_ENTERING until remote acknowledges
+    // Resend BATTLE_ENTERING until remote acknowledges, carrying the latest
+    // agreed swap_frame each time. If remote's proposal arrived higher than
+    // ours, the agreed value bumped — keep both sides in sync via resend.
     static uint32_t last_send = 0;
     uint32_t now = GetTickCount();
     if (g_local_battle_entered && !g_remote_battle_entered && now - last_send > 50) {
-        ControlChannel_SendBattleEntering();
+        ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
         last_send = now;
     }
 }
 
 // =============================================================================
-// GEKKONET SESSION - Battle Mode
+// BATTLE EXIT SYNC BARRIER
+// Mirrors the entry barrier; gates battle->CSS swap on agreed swap_frame.
+// =============================================================================
+
+void Netplay_SignalBattleEnd() {
+    if (g_local_battle_end_signaled) {
+        return;
+    }
+
+    const uint32_t local_proposal = g_netplay_frame + SWAP_FRAME_BUFFER;
+    if (local_proposal > g_battle_end_swap_frame) {
+        g_battle_end_swap_frame = local_proposal;
+    }
+    g_local_battle_end_signaled = true;
+    ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+    BroadcastSwapToSubscribers(CtrlMsg::BATTLE_END, g_battle_end_swap_frame);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "BATTLE END SYNC: Local left battle mode (battle_frame=%u, swap_frame=%u)",
+        g_netplay_frame, g_battle_end_swap_frame);
+}
+
+bool Netplay_IsBattleEndSynced() {
+    // Same chicken-and-egg as the entry direction: once game_mode leaves
+    // the [3000,4000) battle range, the phase classifier flips to CSS and
+    // RunBattleTick stops driving the battle session — so g_netplay_frame
+    // stops, the swap_frame target is unreachable. Both peers' confirmed
+    // exit detection happens at the same logical battle frame (deterministic
+    // from shared inputs), so the both-signaled gate is sufficient.
+    if (!g_battle_end_synced &&
+        g_local_battle_end_signaled &&
+        g_remote_battle_end_signaled) {
+        g_battle_end_synced = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "BATTLE END SYNC: both peers signaled (battle_frame=%u, swap_frame=%u) - swap battle->CSS now",
+            g_netplay_frame, g_battle_end_swap_frame);
+    }
+    return g_battle_end_synced;
+}
+
+uint32_t Netplay_GetBattleEndSwapFrame() {
+    return g_battle_end_swap_frame;
+}
+
+void Netplay_PollBattleEndSync() {
+    ControlChannel_Poll();
+
+    static uint32_t last_send = 0;
+    uint32_t now = GetTickCount();
+    if (g_local_battle_end_signaled && !g_remote_battle_end_signaled && now - last_send > 50) {
+        ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+        last_send = now;
+    }
+}
+
+static void AddSubscribedSpectatorsToSession() {
+    // No-op. Spectators are NOT added as GekkoSpectator actors on the
+    // host's GekkoSession — that approach broke late-join across phase
+    // boundaries (CSS session destroyed on battle entry, no input history
+    // for late joiner). Spectators ride SpectatorNode::session_history
+    // exclusively: every confirmed input from CSS and BATTLE GekkoSessions
+    // is appended to one persistent log spanning the entire connection,
+    // backfilled to late joiners via SendSessionBackfillTo, and live-
+    // streamed via INPUT_BATCH. GekkoNet's spectator-actor mechanism is
+    // unused on this side.
+    //
+    // Kept as a stub (still called from StartCSSSession / StartBattle) so
+    // future spectator-related session-create logic has a hook point.
+}
+
+// =============================================================================
+// GEKKONET SESSION - CSS Lockstep (input_prediction_window = 0)
+// =============================================================================
+
+static bool Netplay_StartCSSSession() {
+    if (g_session) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay_StartCSSSession: session already exists (kind=%d)",
+            (int)g_session_kind);
+        return g_session_kind == SessionKind::CSS;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: Creating CSS GekkoSession (lockstep, prediction=0, delay=%d)",
+        CSS_LOCAL_DELAY);
+
+    GekkoConfig config = {};
+    config.num_players              = 2;
+    // Allow up to 4 spectators per session; spectator_delay sized for full
+    // CSS catch-up. CSS sessions are short (a few hundred frames at most
+    // before battle entry), so default is plenty.
+    config.max_spectators           = 4;
+    config.spectator_delay          = 0;    // see battle-session comment — disables pause-buffer
+    // input_history_size: host keeps every confirmed CSS input frame in
+    // _net_spectator_queue, capped at this many. Late-joining spectators
+    // (last_acked_frame == NULL_FRAME) get the entire history streamed
+    // on connect. 60000 frames = 10 min @ 100 FPS — plenty for a CSS
+    // lobby session that ran for an unusually long pre-match wait.
+    // See vendored/GekkoNet patch + README.md:36.
+    config.input_history_size       = 60000;
+    config.input_prediction_window  = 0;    // lockstep — IsLockstepActive() in game_session.cpp:520
+    config.input_size               = sizeof(uint16_t);
+    config.state_size               = sizeof(uint32_t);
+    config.desync_detection         = true;
+    config.limited_saving           = false;  // No effect in lockstep — Save events suppressed
+
+    gekko_create(&g_session, GekkoGameSession);
+    gekko_start(g_session, &config);
+
+    auto adapter = CreateMultiplexAdapter();
+    gekko_net_adapter_set(g_session, adapter);
+
+    // Refresh remote address string from learned sockaddr (post-HELLO_ACK).
+    if (const sockaddr_in* learned = NetSocket_GetRemoteAddr()) {
+        if (learned->sin_port != 0) {
+            char ip_buf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, (void*)&learned->sin_addr, ip_buf, sizeof(ip_buf));
+            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s:%u",
+                     ip_buf, ntohs(learned->sin_port));
+        }
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (i == g_player_index) {
+            gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
+            gekko_set_local_delay(g_session, i, CSS_LOCAL_DELAY);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "CSS: Added local player at slot %d (delay=%d)", i, CSS_LOCAL_DELAY);
+        } else {
+            GekkoNetAddress addr = {};
+            addr.data = (void*)g_remote_addr;
+            addr.size = (int)strlen(g_remote_addr);
+            gekko_add_actor(g_session, GekkoRemotePlayer, &addr);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "CSS: Added remote player at slot %d -> %s", i, g_remote_addr);
+        }
+    }
+
+    // No runahead in lockstep mode (suppressed by IsLockstepActive at
+    // game_session.cpp:537 even if requested).
+
+    // Set kind BEFORE the spectator add — AddSubscribedSpectatorsToSession
+    // re-broadcasts SPEC_JOIN_ACK carrying g_session_kind, which spectators
+    // use to swap their SpectateSession config to match.
+    g_session_kind      = SessionKind::CSS;
+    g_session_ready     = false;
+    g_css_advance_ready = false;
+    g_css_advance_p1    = 0;
+    g_css_advance_p2    = 0;
+    g_css_frame         = 0;
+    g_local_delay       = CSS_LOCAL_DELAY;
+
+    AddSubscribedSpectatorsToSession();
+
+    return true;
+}
+
+static void Netplay_EndCSSSession() {
+    if (g_session && g_session_kind == SessionKind::CSS) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Destroying CSS GekkoSession");
+        gekko_destroy(&g_session);
+        g_session       = nullptr;
+        g_session_kind  = SessionKind::NONE;
+        g_session_ready = false;
+    }
+    g_css_advance_ready = false;
+}
+
+// =============================================================================
+// GEKKONET SESSION - Spectate (passive observer of a remote host)
+// =============================================================================
+
+// Build the GekkoConfig for a spectator session, mirroring the host's config
+// for the given phase. Spectators only need session_type, input_size,
+// state_size, and spectator_delay — num_players + prediction_window are
+// informational but kept consistent with host for clarity.
+static GekkoConfig MakeSpectateConfig(SessionKind host_kind) {
+    GekkoConfig config = {};
+    config.num_players      = 2;
+    config.max_spectators   = 0;     // Spectator doesn't accept further spectators via gekko
+    config.input_size       = sizeof(uint16_t);
+    config.state_size       = sizeof(uint32_t);
+    config.desync_detection = true;
+    config.limited_saving   = false;
+    // spectator_delay = 0: disable GekkoNet's spectator pause-buffer.
+    // With > 0, SpectatorSession::ShouldDelaySpectator gates AdvanceEvent
+    // emission until min_received - current >= delay frames, which can
+    // never converge on low-latency connections (current advances each
+    // tick once unpaused; min only advances on incoming packets, so the
+    // diff stays ~stable). 0 == always advance as fast as inputs arrive.
+    config.spectator_delay     = 0;
+    // Late-joiner backfill: receive buffer holds up to ~10 minutes of
+    // confirmed inputs (60000 frames @ 100 FPS, 4B each = ~240 KB). Lets
+    // the spectator's local sim FF through the host's full session
+    // history on connect. See vendored/GekkoNet patch for README.md:36.
+    config.input_history_size  = 60000;
+    if (host_kind == SessionKind::BATTLE) {
+        config.input_prediction_window = 8;
+    } else {
+        // CSS or anything else → lockstep config
+        config.input_prediction_window = 0;
+    }
+    return config;
+}
+
+bool Netplay_IsSpectatorSession() {
+    return g_session_kind == SessionKind::SPECTATE;
+}
+
+NetplaySessionKind Netplay_GetSessionKind() {
+    return g_session_kind;
+}
+
+GekkoSession* Netplay_GetActiveSession() {
+    return g_session;
+}
+
+bool Netplay_StartSpectateSession(NetplaySessionKind host_kind, const char* host_addr) {
+    // Idempotent: if a SpectateSession is already alive against the same
+    // host with the same kind, don't tear it down. SpectatorNode's silence-
+    // failover currently fires on legacy 0xCE quiet (input streaming dead)
+    // and re-runs JOIN_REQ → JOIN_ACK → here. Without this guard we'd
+    // destroy a healthy session every 5 seconds and re-handshake.
+    if (g_session && g_session_kind == SessionKind::SPECTATE &&
+        host_addr && host_addr[0] && std::strcmp(g_remote_addr, host_addr) == 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay_StartSpectateSession: session already alive for %s — keeping",
+            host_addr);
+        return true;
+    }
+    if (g_session) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay_StartSpectateSession: session already exists (kind=%d) — destroying first",
+            (int)g_session_kind);
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+        g_session_kind = SessionKind::NONE;
+    }
+
+    if (!host_addr || !host_addr[0]) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay_StartSpectateSession: empty host_addr");
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: Creating SpectateSession (host_kind=%d, host=%s)",
+        (int)host_kind, host_addr);
+
+    GekkoConfig config = MakeSpectateConfig(host_kind);
+
+    gekko_create(&g_session, GekkoSpectateSession);
+    gekko_start(g_session, &config);
+    g_session_kind = SessionKind::SPECTATE;
+
+    auto adapter = CreateMultiplexAdapter();
+    gekko_net_adapter_set(g_session, adapter);
+
+    // Add host as the (single) remote actor we receive input forwards from.
+    GekkoNetAddress addr = {};
+    addr.data = (void*)host_addr;
+    addr.size = (int)strlen(host_addr);
+    gekko_add_actor(g_session, GekkoRemotePlayer, &addr);
+
+    g_session_ready     = false;
+    g_p1_input          = 0;
+    g_p2_input          = 0;
+    g_netplay_frame     = 0;
+    g_css_advance_ready = false;
+
+    return true;
+}
+
+void Netplay_EndSpectateSession() {
+    if (g_session && g_session_kind == SessionKind::SPECTATE) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Destroying SpectateSession");
+        gekko_destroy(&g_session);
+        g_session       = nullptr;
+        g_session_kind  = SessionKind::NONE;
+        g_session_ready = false;
+    }
+}
+
+// Spectator-side phase-flip handlers. Called from the BATTLE_ENTERING /
+// BATTLE_END control-channel handlers when g_session_kind == SPECTATE.
+// The spectator is passive: it observes the host's announced swap_frame
+// and executes destroy/create at that frame.
+//
+// NOTE: For now we don't gate on swap_frame on the spectator side — the host's
+// session destroy at swap_frame causes magic-mismatch silence to land at the
+// same logical point on the wire, and the spectator's session sync re-handshake
+// with the new session naturally aligns. swap_frame gating on the spectator
+// side is a refinement; keep simple for first cut.
+// Spectator-side pending swap: when the host announces a phase change,
+// the spectator may still be FFing through backfilled inputs to catch up
+// to live. Recording the target swap_frame lets ProcessSpectatorPhase
+// finish draining AdvanceEvents up to that frame BEFORE tearing the
+// session down — otherwise we'd lose the tail of CSS / battle inputs.
+// Drained per-tick from Netplay_ProcessSpectatorPhase.
+//
+// pending_kind == NONE means no swap pending. Set by On* handlers, cleared
+// when the swap actually fires (or on EndSpectateSession reset).
+static NetplaySessionKind g_pending_swap_kind  = NetplaySessionKind::NONE;
+static uint32_t           g_pending_swap_frame = 0;
+
+void Netplay_OnHostBattleEntering(uint32_t swap_frame) {
+    if (g_session_kind != SessionKind::SPECTATE) return;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Spectator: host entering battle (swap_frame=%u) — pending CSS->battle swap",
+        swap_frame);
+    g_pending_swap_kind  = SessionKind::BATTLE;
+    g_pending_swap_frame = swap_frame;
+}
+
+void Netplay_OnHostBattleEnd(uint32_t swap_frame) {
+    if (g_session_kind != SessionKind::SPECTATE) return;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Spectator: host ending battle (swap_frame=%u) — pending battle->CSS swap",
+        swap_frame);
+    g_pending_swap_kind  = SessionKind::CSS;
+    g_pending_swap_frame = swap_frame;
+}
+
+// Called from Netplay_ProcessSpectatorPhase after each AdvanceEvent.
+// Returns true if a swap fired this tick (caller should stop draining
+// further events from the now-destroyed session).
+static bool MaybeSwapPendingSpectator(uint32_t advanced_frame) {
+    if (g_pending_swap_kind == SessionKind::NONE)        return false;
+    if (g_session_kind     != SessionKind::SPECTATE)     return false;
+    if (advanced_frame      < g_pending_swap_frame)      return false;
+
+    const NetplaySessionKind next_kind = g_pending_swap_kind;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Spectator: caught up to swap_frame=%u — swapping to %s SpectateSession",
+        g_pending_swap_frame,
+        next_kind == SessionKind::BATTLE ? "battle" : "CSS");
+
+    char host_addr[64];
+    snprintf(host_addr, sizeof(host_addr), "%s", g_remote_addr);
+    Netplay_EndSpectateSession();
+    Netplay_StartSpectateSession(next_kind, host_addr);
+
+    g_pending_swap_kind  = SessionKind::NONE;
+    g_pending_swap_frame = 0;
+    return true;
+}
+
+// =============================================================================
+// GEKKONET SESSION - Battle Mode (rollback)
 // =============================================================================
 
 bool Netplay_StartBattle() {
+    // Tear down the CSS lockstep session before standing up the battle
+    // session. Sequenced so g_session is null between the two — the
+    // multiplex adapter is shared (session_magic demuxes), but only one
+    // session is alive at a time.
+    if (g_session && g_session_kind == SessionKind::CSS) {
+        Netplay_EndCSSSession();
+    }
     if (g_session) {
-        return true;
+        return true;  // Already in some other session (battle or stress).
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Starting GekkoNet session");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Starting battle GekkoSession");
 
     // Reset CSS state when entering battle
-    g_css_active = false;
-    g_css_synced = false;
-    g_local_css_ready = false;
-    g_remote_css_ready = false;
+    g_css_active        = false;
+    g_css_synced        = false;
+    g_local_css_ready   = false;
+    g_remote_css_ready  = false;
+    g_css_advance_ready = false;
 
     // Per-player local delay via GekkoNet's native API. Each peer picks its
     // own value — no cross-peer negotiation. A laggy player can add delay
@@ -698,8 +1172,19 @@ bool Netplay_StartBattle() {
 
     GekkoConfig config = {};
     config.num_players = 2;
-    config.max_spectators = 0;
-    config.input_prediction_window = prediction_window;
+    // Up to 4 spectators per battle session. spectator_delay = 0 disables
+    // GekkoNet's spectator pause-buffer (spectator_session.cpp:216-218
+    // short-circuits ShouldDelaySpectator). With > 0 the spectator's
+    // local sim stays paused until min_received - current >= delay, but
+    // current also advances each tick post-unpause — for low-latency
+    // LAN/localhost setups the buffer never converges and spectator stays
+    // paused forever. Re-enable jitter buffering once we have measured
+    // cross-internet ping data.
+    config.max_spectators           = 4;
+    config.spectator_delay          = 0;
+    // Late-joiner backfill — see CSS-session comment + README.md:36.
+    config.input_history_size       = 60000;
+    config.input_prediction_window  = prediction_window;
     config.input_size = sizeof(uint16_t);
     config.state_size = sizeof(uint32_t);
     config.desync_detection = true;
@@ -707,6 +1192,7 @@ bool Netplay_StartBattle() {
 
     gekko_create(&g_session, GekkoGameSession);
     gekko_start(g_session, &config);
+    g_session_kind = SessionKind::BATTLE;
 
     auto adapter = CreateMultiplexAdapter();
     gekko_net_adapter_set(g_session, adapter);
@@ -741,6 +1227,8 @@ bool Netplay_StartBattle() {
                 "Netplay: Added remote player at slot %d -> %s", i, g_remote_addr);
         }
     }
+
+    AddSubscribedSpectatorsToSession();
 
     // Runahead: speculatively advance local frames past confirmed input to
     // hide input delay. GekkoNet rewinds runahead frames each tick and replays
@@ -816,6 +1304,7 @@ bool Netplay_StartStressBattle() {
     // StressSession mode: ignores network, forces rollbacks from a single instance.
     gekko_create(&g_session, GekkoStressSession);
     gekko_start(g_session, &config);
+    g_session_kind = SessionKind::STRESS;
 
     // Both actors local. No adapter set -> no network calls.
     for (int i = 0; i < 2; i++) {
@@ -846,9 +1335,11 @@ bool Netplay_StartStressBattle() {
 
 void Netplay_EndBattle() {
     if (g_session) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Ending GekkoNet session");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay: Ending GekkoNet session (kind=%d)", (int)g_session_kind);
         gekko_destroy(&g_session);
-        g_session = nullptr;
+        g_session       = nullptr;
+        g_session_kind  = SessionKind::NONE;
     }
 
     // Finalize replay file for this match and cache the in-memory copy for
@@ -877,10 +1368,17 @@ void Netplay_EndBattle() {
     g_local_css_ready = false;
     g_remote_css_ready = false;
 
-    // Reset battle sync state for next battle
-    g_local_battle_entered = false;
-    g_remote_battle_entered = false;
-    g_battle_synced = false;
+    // Reset battle sync state for next battle (entry direction)
+    g_local_battle_entered    = false;
+    g_remote_battle_entered   = false;
+    g_battle_synced           = false;
+    g_battle_entry_swap_frame = 0;
+
+    // Reset battle-end sync state — fresh for the rematch's next return.
+    g_local_battle_end_signaled  = false;
+    g_remote_battle_end_signaled = false;
+    g_battle_end_synced          = false;
+    g_battle_end_swap_frame      = 0;
 }
 
 // =============================================================================
@@ -1207,6 +1705,14 @@ bool Netplay_ProcessBattleInputPhase() {
                 {
                     g_highest_recorded_frame = g_netplay_frame;
                     Replay::Replay_RecordFrame(g_p1_input, g_p2_input);
+                    // Battle-side session_history capture lives HERE (not
+                    // in Hook_GetPlayerInput's capture_and_return) because
+                    // this site is already gated on !rolling_back &&
+                    // !running_ahead && new_frame — exactly the dedup we
+                    // need to avoid runahead/rollback multi-recording the
+                    // same frame. Pre-battle frames (title screen, CSS)
+                    // are captured at Hook_GetPlayerInput which is correct
+                    // for those phases (no rollback there).
                     SpectatorNode_OnFrameConfirmed(g_p1_input, g_p2_input);
                 }
 
@@ -1300,6 +1806,127 @@ uint16_t Netplay_GetInput(int player_id) {
     return (player_id == 0) ? g_p1_input : g_p2_input;
 }
 
+// Spectator-side per-tick driver. Mirrors Netplay_ProcessBattleInputPhase
+// minus the gekko_add_local_input call (spectators have no local input).
+// Save/Load events fire only when host's session is in BATTLE config
+// (rollback-capable); CSS spectate sessions are pure forward AdvanceEvent.
+//
+// Returns true if the sim advanced this tick (caller renders); false on
+// stall (waiting for confirmed inputs from host).
+bool Netplay_ProcessSpectatorPhase() {
+    if (!g_session || g_session_kind != SessionKind::SPECTATE) return false;
+
+    gekko_network_poll(g_session);
+
+    // No local input add — spectator is passive.
+
+    // Drain session events.
+    int event_count = 0;
+    auto events = gekko_session_events(g_session, &event_count);
+    for (int i = 0; i < event_count; i++) {
+        auto event = events[i];
+        switch (event->type) {
+            case GekkoSessionStarted:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: GekkoSpectateSession started");
+                g_session_ready = true;
+                break;
+            case GekkoPlayerConnected:
+                g_session_ready = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: handle %d connected",
+                    event->data.connected.handle);
+                break;
+            case GekkoPlayerSyncing:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: syncing %u/%u",
+                    event->data.syncing.current, event->data.syncing.max);
+                break;
+            case GekkoPlayerDisconnected:
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: host disconnected (handle=%d)",
+                    event->data.disconnected.handle);
+                break;
+            case GekkoSpectatorPaused:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: paused — buffering");
+                break;
+            case GekkoSpectatorUnpaused:
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: unpaused — playback resumed");
+                break;
+            case GekkoDesyncDetected:
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Spectator: DESYNC f=%d local=0x%08X remote=0x%08X",
+                    event->data.desynced.frame,
+                    event->data.desynced.local_checksum,
+                    event->data.desynced.remote_checksum);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Drain Save/Load/Advance events — same handlers as the host's battle
+    // path, ensuring the spectator's render-side mutations and virtual
+    // clock stay locked to the host's confirmed state.
+    int update_count = 0;
+    auto updates = gekko_update_session(g_session, &update_count);
+
+    bool advanced = false;
+    for (int i = 0; i < update_count; i++) {
+        auto update = updates[i];
+        switch (update->type) {
+            case GekkoSaveEvent: {
+                int frame = update->data.save.frame;
+                SaveState_Save(frame);
+                (void)SaveState_GetLastChecksum(frame);
+                uint32_t checksum = SaveState_GetRegionChecksums().gameplay_fingerprint;
+                *update->data.save.state_len = sizeof(uint32_t);
+                *update->data.save.checksum  = checksum;
+                memcpy(update->data.save.state, &frame, sizeof(uint32_t));
+                break;
+            }
+            case GekkoLoadEvent: {
+                int frame = update->data.load.frame;
+                SaveState_Load(frame);
+                break;
+            }
+            case GekkoAdvanceEvent: {
+                const uint16_t* in = (const uint16_t*)update->data.adv.inputs;
+                g_p1_input = in[0];
+                g_p2_input = in[1];
+                g_netplay_frame = (uint32_t)update->data.adv.frame;
+                // Lock virtual clock to host's frame schedule — same contract
+                // as the host's GekkoAdvance handler. This is what closes H3
+                // (g_virtual_time_ms skew vs host's rollback-rewinds).
+                extern uint32_t g_virtual_time_ms;
+                g_virtual_time_ms = g_netplay_frame * 10;
+
+                if (original_process_game_inputs) original_process_game_inputs();
+                if (original_update_game)         original_update_game();
+                // ParityRecorder::Capture() runs from the trampoline post-tick
+                // (mirrors the offline + battle paths) — keeps the parity
+                // header dependency out of netplay.cpp.
+                advanced = true;
+
+                // Pending CSS<->battle phase swap: now that the local sim
+                // has caught up to the host's announced swap_frame, tear
+                // down this session and bring up the next-kind one. Stop
+                // draining further events from the now-destroyed session.
+                if (MaybeSwapPendingSpectator(g_netplay_frame)) {
+                    return advanced;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    return advanced;
+}
+
 // =============================================================================
 // LEGACY API
 // =============================================================================
@@ -1327,15 +1954,19 @@ void Netplay_PollGekkoNet() {
 }
 
 void Netplay_ResetCSSState() {
-    g_local_inputs.Clear();
-    g_remote_inputs.Clear();
-    g_css_start_timer = 0;
-    g_css_frame = 0;
-    g_css_current_read_frame = 0;
-    g_css_active = false;
-    g_css_synced = false;
-    g_remote_css_ready = false;
-    g_local_css_ready = false;
+    // Tear down the CSS GekkoSession if it's still alive — happens when this
+    // is called outside the normal battle-entry path (e.g. peer disconnect).
+    if (g_session && g_session_kind == SessionKind::CSS) {
+        Netplay_EndCSSSession();
+    }
+    g_css_frame         = 0;
+    g_css_advance_p1    = 0;
+    g_css_advance_p2    = 0;
+    g_css_advance_ready = false;
+    g_css_active        = false;
+    g_css_synced        = false;
+    g_remote_css_ready  = false;
+    g_local_css_ready   = false;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Reset state for new sync");
 }
 
