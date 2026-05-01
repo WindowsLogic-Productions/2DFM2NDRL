@@ -217,6 +217,7 @@ namespace ParityRecorder {
 struct Recorder {
     std::FILE* fp;
     uint32_t   frames_written;
+    bool       seed_captured;
 };
 
 static Recorder* g_active_recorder = nullptr;
@@ -234,6 +235,12 @@ bool Open(const char* path) {
     hdr.snapshot_size = static_cast<uint32_t>(sizeof(KgtParitySnapshot));
     hdr.flags         = KGT_PARITY_FLAG_FROM_FM2K;
     hdr.frame_count   = 0u;
+    /* initial_seed is patched on the first Capture() call — at Open()
+     * time (DLL attach) FM2K hasn't yet executed srand(time(NULL)) so
+     * g_rand_seed reads as the C-runtime default (1). The first frame
+     * we capture is post-init, so g_rand_seed is the real time-based
+     * seed there. Header field stays zero until we patch it. */
+    hdr.initial_seed  = 0u;
 
     if (std::fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
         std::fclose(fp);
@@ -243,12 +250,38 @@ bool Open(const char* path) {
     auto* rec = new Recorder{};
     rec->fp = fp;
     rec->frames_written = 0u;
+    rec->seed_captured = false;
     g_active_recorder = rec;
     return true;
 }
 
 void Capture() {
     if (!g_active_recorder || !g_active_recorder->fp) return;
+
+    /* Patch initial_seed into the header on the first frame where FM2K
+     * is in battle phase (g_game_mode == 3000). srand(time(NULL)) runs
+     * during the title-to-CSS transition, well before battle. Capturing
+     * here means kgt boots with the same seed FM2K's vs_round_function
+     * has at battle start — frame-0-of-battle rng matches by construction.
+     *
+     * Reading at Open() (DLL attach) catches g_rand_seed == 1 (CRT
+     * default), and even reading on the very first capture catches the
+     * pre-srand value since the recorder fires from process attach. */
+    if (!g_active_recorder->seed_captured) {
+        const uint32_t mode = Read32(ADDR_MATCH_PHASE);
+        if (mode >= 3000u) {
+            const uint32_t seed = Read32(ADDR_RNG);
+            const long here = std::ftell(g_active_recorder->fp);
+            if (here >= 0) {
+                std::fseek(g_active_recorder->fp,
+                           offsetof(KgtParitySnapshotHeader, initial_seed),
+                           SEEK_SET);
+                std::fwrite(&seed, sizeof(seed), 1, g_active_recorder->fp);
+                std::fseek(g_active_recorder->fp, here, SEEK_SET);
+            }
+            g_active_recorder->seed_captured = true;
+        }
+    }
 
     /* Capture every post-update frame. Alignment with kgt's .pty (which
      * starts already-in-battle from kgt_engine_create) happens at the

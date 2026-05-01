@@ -71,7 +71,11 @@
       "mcp__ida__lookup_funcs",
       "mcp__ida__decompile",
       "mcp__ida__xrefs_to",
-      "Bash(git config:*)"
+      "Bash(git config:*)",
+      "Read(//mnt/c/Program Files/Python313/**)",
+      "Read(//mnt/c/Users/teo/AppData/Roaming/Python/Python313/site-packages/ida_pro_mcp/**)",
+      "Bash(\"/mnt/c/Program Files/Python313/python.exe\" -c \"import sys; print\\(sys.executable\\); print\\(sys.platform\\)\")",
+      "mcp__ida-pro-mcp__list_instances"
     ],
     "deny": []
   }
