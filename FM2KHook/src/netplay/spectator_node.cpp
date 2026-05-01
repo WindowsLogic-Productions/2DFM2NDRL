@@ -1,7 +1,9 @@
 #include "spectator_node.h"
 #include "control_channel.h"
+#include "netplay.h"
 #include "replay.h"
 #include "netplay_state.h"
+#include "gekkonet.h"
 
 #include <SDL3/SDL_log.h>
 #include <winsock2.h>
@@ -364,14 +366,46 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
+    // Helper: build SPEC_JOIN_ACK with the host's current session kind so
+    // the spectator knows which GekkoSpectateSession config to create.
+    auto BuildJoinAck = []() {
+        CtrlPacket ack = {};
+        ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
+        ack.data.spec_join_ack.host_session_kind =
+            static_cast<uint8_t>(Netplay_GetSessionKind());
+        return ack;
+    };
+
+    // Helper: if there's a live GekkoNet session on this node (player slot),
+    // add the joining spectator as a GekkoSpectator actor so input/state
+    // forwards reach them. Called once per accepted JOIN_REQ.
+    auto AddSpectatorToSession = [](const sockaddr_in& spec_from) {
+        const NetplaySessionKind k = Netplay_GetSessionKind();
+        if (k != NetplaySessionKind::CSS && k != NetplaySessionKind::BATTLE) {
+            return;
+        }
+        char ip_str[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, (void*)&spec_from.sin_addr, ip_str, sizeof(ip_str));
+        char addr_str[64];
+        snprintf(addr_str, sizeof(addr_str), "%s:%u",
+                 ip_str, ntohs(spec_from.sin_port));
+        GekkoSession* sess = Netplay_GetActiveSession();
+        if (!sess) return;
+        GekkoNetAddress addr = {};
+        addr.data = (void*)addr_str;
+        addr.size = (int)strlen(addr_str);
+        gekko_add_actor(sess, GekkoSpectator, &addr);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: Late-joiner added as GekkoSpectator -> %s", addr_str);
+    };
+
     // Already subscribed? Idempotent ACK.
     for (const auto& sub : g_state.subscribers) {
         if (AddrEqual(sub.addr, from)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: JOIN_REQ from existing subscriber %s — re-ACKing",
                         addr_buf);
-            CtrlPacket ack = {};
-            ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
+            CtrlPacket ack = BuildJoinAck();
             ControlChannel_SendTo(ack, from);
             SendInitialMatchTo(from);
             return;
@@ -388,10 +422,13 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
                     "SpectatorNode: Accepted subscriber %s (%zu/%zu)",
                     addr_buf, g_state.subscribers.size(), g_state.capacity);
 
-        CtrlPacket ack = {};
-        ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
+        CtrlPacket ack = BuildJoinAck();
         ControlChannel_SendTo(ack, from);
         SendInitialMatchTo(from);
+
+        // If we already have a live GekkoNet session, add this late joiner
+        // as a GekkoSpectator actor so the input stream reaches them.
+        AddSpectatorToSession(from);
 
         // Fast-forward backfill: ship the entire session input history so the
         // late joiner can drain it locally at >100 Hz and catch up to live.
@@ -470,6 +507,15 @@ void SpectatorNode_HandleHeartbeat(const sockaddr_in& from) {
 size_t SpectatorNode_GetSubscriberCount() { return g_state.subscribers.size(); }
 bool   SpectatorNode_IsBroadcasting()     { return g_state.broadcasting;      }
 
+std::vector<sockaddr_in> SpectatorNode_GetSubscriberAddrs() {
+    std::vector<sockaddr_in> out;
+    out.reserve(g_state.subscribers.size());
+    for (const auto& sub : g_state.subscribers) {
+        out.push_back(sub.addr);
+    }
+    return out;
+}
+
 // -----------------------------------------------------------------------------
 // VIEWER-SIDE
 // -----------------------------------------------------------------------------
@@ -487,16 +533,27 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream) {
     return true;
 }
 
-void SpectatorNode_HandleJoinAck(const sockaddr_in& from) {
-    if (!g_state.join_req_pending) {
-        // We never sent a JOIN_REQ — this ACK was misrouted (e.g. host's
-        // ack to a different subscriber arrived here because we share the
-        // socket). Ignore it entirely; flipping playing_back here would
-        // freeze a player client into spectator mode.
+void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind) {
+    // SPEC_JOIN_ACK is dual-purpose:
+    //   1. First-time arrival (initial subscribe): completes the JOIN_REQ
+    //      handshake, pins RNG, marks subscribed_upstream.
+    //   2. Re-broadcast on host session-kind change (host crosses a
+    //      session boundary like CSS->battle or first-CSS-create): the
+    //      payload's host_session_kind tells the spectator which kind to
+    //      mirror. Treated as authoritative current-host-kind.
+    //
+    // Both paths funnel through the same handler so the spectator can
+    // recover cleanly if the host transitions before the JOIN_REQ ack
+    // round-trip lands. Stray ACKs from non-upstream peers are still
+    // dropped (sender addr check below).
+    const bool first_time = g_state.join_req_pending;
+
+    if (!first_time && !AddrEqual(g_state.upstream_addr, from)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: ignoring stray SPEC_JOIN_ACK (no pending JOIN_REQ)");
+                    "SpectatorNode: ignoring SPEC_JOIN_ACK from non-upstream peer");
         return;
     }
+
     g_state.join_req_pending      = false;
     g_state.upstream_addr         = from;
     g_state.subscribed_upstream   = true;
@@ -510,11 +567,9 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from) {
     // INITIAL_MATCH packets also write this seed — idempotent.
     *(uint32_t*)0x41FB1C = 0x12345678;
 
-    // Flip into playback mode immediately. No initial match metadata yet, so
-    // queue starts empty — trampoline holds the current frame until the host
-    // ships the first INPUT_BATCH. Once frames flow, the local FM2K (booted
-    // to CSS via game_patches) walks the same CSS path the host's two
-    // players walked, locks the same chars, transitions to battle, etc.
+    // playing_back stays as a metadata flag (drives RunSpectatorTick fallback
+    // when the GekkoSpectateSession isn't alive yet) but the actual input
+    // stream now flows through the GekkoSpectateSession we create here.
     g_state.playing_back = true;
     g_state.pb_queue.clear();
     g_state.pb_current_p1 = 0;
@@ -522,8 +577,49 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from) {
 
     char buf[48] = {}; FormatAddr(from, buf, sizeof(buf));
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: JOIN_ACK from %s — subscribed, RNG pinned to 0x12345678",
-                buf);
+                "SpectatorNode: JOIN_ACK from %s (host_kind=%u) — subscribed, RNG pinned",
+                buf, (unsigned)host_session_kind);
+
+    // host_session_kind == 0 (NONE): host has no session active yet
+    // (e.g. JOIN_REQ landed during host's title-skip phase before its
+    // first CSS session was created). DO NOT create a SpectateSession
+    // with a guessed config — that caused config mismatch deadlocks
+    // before. Wait for host's follow-up SPEC_JOIN_ACK after session create.
+    if (host_session_kind == 0) {
+        char buf2[48] = {}; FormatAddr(from, buf2, sizeof(buf2));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: host has no session yet — waiting (from=%s)", buf2);
+        return;
+    }
+
+    NetplaySessionKind kind = (host_session_kind == 1)
+        ? NetplaySessionKind::CSS
+        : NetplaySessionKind::BATTLE;
+
+    char host_addr_str[64];
+    snprintf(host_addr_str, sizeof(host_addr_str), "%s:%u",
+             inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+
+    // If a SpectateSession is already alive, only act on a kind CHANGE.
+    // Same-kind re-broadcasts (host re-acks for liveness / new spectator
+    // joining the same session) are no-ops via Netplay_StartSpectateSession's
+    // own idempotency guard.
+    const NetplaySessionKind current = Netplay_GetSessionKind();
+    if (current == NetplaySessionKind::SPECTATE) {
+        // Wrong-kind alive — treat as a phase swap. swap_frame=0 fires
+        // immediately on the next AdvanceEvent.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: host kind changed mid-session, requesting swap to kind=%d",
+                    (int)kind);
+        if (kind == NetplaySessionKind::BATTLE) {
+            Netplay_OnHostBattleEntering(0);
+        } else {
+            Netplay_OnHostBattleEnd(0);
+        }
+        return;
+    }
+
+    Netplay_StartSpectateSession(kind, host_addr_str);
 }
 
 void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,
@@ -738,17 +834,22 @@ void SpectatorNode_TickHealth() {
             g_state.last_heartbeat_send_ms = now;
         }
 
-        if (g_state.last_upstream_recv_ms > 0 &&
+        // Silence-based failover. Liveness signal used to be the 0xCE
+        // INPUT_BATCH stream, but that's gone — input forwarding moved
+        // to GekkoSpectateSession. When the spectator session is alive,
+        // skip the silence check entirely (GekkoNet is the liveness
+        // signal). Otherwise fall back to the legacy timer for the
+        // brief window between JOIN_ACK and SpectateSession creation.
+        const bool gekko_spec_alive = (Netplay_GetSessionKind() == NetplaySessionKind::SPECTATE);
+        if (!gekko_spec_alive &&
+            g_state.last_upstream_recv_ms > 0 &&
             now - g_state.last_upstream_recv_ms >= SPECTATOR_SILENCE_FAILOVER_MS)
         {
-            // Upstream died. Mark unsubscribed; the not-subscribed branch
-            // below will trigger reconnect-to-root on next tick.
             char buf[48] = {}; FormatAddr(g_state.upstream_addr, buf, sizeof(buf));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: upstream %s silent for %llu ms — failing over",
                         buf,
                         (unsigned long long)(now - g_state.last_upstream_recv_ms));
-            // Best-effort SPEC_LEAVE to the dead upstream (might no-op).
             CtrlPacket leave = {};
             leave.header.type = CtrlMsg::SPEC_LEAVE;
             ControlChannel_SendTo(leave, g_state.upstream_addr);

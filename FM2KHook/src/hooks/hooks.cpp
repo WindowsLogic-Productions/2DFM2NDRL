@@ -358,13 +358,21 @@ static void CheckGameModeTransition() {
                 // after both clients have entered battle mode
             }
         } else if (was_battle && !is_battle) {
-            // LEAVING BATTLE MODE - Stop GekkoNet
+            // LEAVING BATTLE MODE - Signal exit; trampoline tears down the
+            // GekkoNet session at the agreed swap_frame so both peers
+            // (and any spectators) destroy in lockstep. Synchronous
+            // teardown here would leave a few frames of mismatched session
+            // state on the wire and risk spectator desync at the boundary.
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "<<< LEAVING BATTLE MODE - Stopping GekkoNet session");
-            if (Netplay_IsActive()) {
+                "<<< LEAVING BATTLE MODE - Signaling swap_frame exit");
+            if (!g_offline_mode && Netplay_IsActive()) {
+                Netplay_SignalBattleEnd();
+            } else if (Netplay_IsActive()) {
+                // Offline / stress paths still tear down synchronously —
+                // there's no remote peer to negotiate with.
                 Netplay_EndBattle();
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "GekkoNet session stopped, back to control channel");
+                    "GekkoNet session stopped (offline path)");
             }
             g_battle_entry_signaled = false;
         }
@@ -382,6 +390,102 @@ static void CheckGameModeTransition() {
 // Battle: return synchronized input from GekkoNet with facing adjustment
 int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+
+    // Single capture-and-return funnel. EVERY return path goes through
+    // this lambda so we record the (p1, p2) input pair into the host's
+    // session_history every time the input-buffer-index ticks (= one
+    // full FM2K frame). Recording starts at FM2K boot — captures title-
+    // screen no-ops, auto-mash, pre-rendezvous CSS, post-rendezvous
+    // GekkoNet-merged inputs, battle frames — one canonical log spanning
+    // the entire connection. Late-joining spectators get this whole log
+    // via SendSessionBackfillTo and replay deterministically from frame 0.
+    //
+    // Spectators (g_spectator_mode) DO NOT record — they consume from
+    // pb_queue, not produce. Stress / offline DO record but the log is
+    // never sent (no subscribers).
+    auto capture_and_return = [player_id](int result) -> int {
+        if (g_spectator_mode) return result;
+        // During battle, GekkoNet's runahead + rollback fires
+        // process_game_inputs (and thus this hook) up to ~5 times per real
+        // frame: 1 confirmed advance + 4 speculative runahead + N rewind
+        // replays. Capturing here would multi-record each frame and inflate
+        // session_history at ~5x real rate. Battle confirmed-frame capture
+        // happens in netplay.cpp's AdvanceEvent handler with the proper
+        // rolling_back/running_ahead gate. Skip during battle.
+        if (Netplay_IsActive()) return result;
+        static uint16_t s_p[2] = {0, 0};
+        static uint32_t s_recorded_idx = UINT32_MAX;
+        const uint32_t cur_idx = *(uint32_t*)0x447EE0;
+        // Order matters: record the PREVIOUS frame's full (p0, p1) pair
+        // BEFORE overwriting either slot with this call's value. The
+        // first call of a new frame is the first place we detect the
+        // boundary — at that moment s_p[0..1] still holds the COMPLETED
+        // previous frame's pair. Updating s_p first would Frankenstein
+        // (this-frame slot, previous-frame other-slot).
+        if (cur_idx != s_recorded_idx) {
+            if (s_recorded_idx != UINT32_MAX) {
+                SpectatorNode_OnFrameConfirmed(s_p[0], s_p[1]);
+            }
+            s_recorded_idx = cur_idx;
+        }
+        s_p[player_id & 1] = (uint16_t)result;
+        return result;
+    };
+
+    // Title-screen menu-cursor write. Must fire on BOTH host AND spectator —
+    // it's a state side-effect of the auto-title-skip protocol, not an
+    // input. session_history only records returned input values, so a
+    // spectator replaying host's recorded auto-mash button-A pulses would
+    // navigate from g_menu_selection=0 (default = "VS CPU"/first option)
+    // and end up in the wrong scene tree. We force g_menu_selection=1
+    // ("VS Player") on every node so the same recorded input pattern
+    // resolves to the same menu transitions everywhere.
+    {
+        static const char* env_skip = std::getenv("FM2K_AUTO_TITLE_SKIP");
+        const bool auto_skip = !(env_skip && std::strcmp(env_skip, "0") == 0);
+        static bool s_cursor_set_global = false;
+        if (auto_skip && !s_cursor_set_global && game_mode == 1000) {
+            *(uint32_t*)0x424780 = 1;  // g_menu_selection = VS Player
+            s_cursor_set_global = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "TitleMenuCursor: pre-set g_menu_selection=1 (host or spectator)");
+        }
+    }
+
+    // Spectator process — gated on the PROCESS-LEVEL flag g_spectator_mode,
+    // NOT on SpectatorNode_IsPlayingBack(). The latter only flips true after
+    // JOIN_ACK arrives, leaving a brief boot window where the spectator
+    // would otherwise fall through to the auto-mash block below and generate
+    // local title-screen pulses. Those pulses would walk the spectator's
+    // FM2K into CSS BEFORE host's recorded input stream began, producing a
+    // sub-state mismatch (spectator in CSS while host's first inputs are
+    // title-screen frames). Always-return-from-spectator path means sim
+    // freezes in title until host's recorded inputs flow.
+    if (g_spectator_mode) {
+        uint16_t input = SpectatorNode_IsPlayingBack()
+            ? ((player_id == 0)
+                ? SpectatorNode_GetCurrentP1Input()
+                : SpectatorNode_GetCurrentP2Input())
+            : (uint16_t)0;
+
+        constexpr size_t CHAR_ACTIVE_FLAG_OFFSET = 0xDF41;
+        constexpr size_t CHAR_STATE_FLAGS_OFFSET = 0x7CA6;
+        bool facing_reversed = true;
+        if (game_mode >= 3000 && game_mode < 4000) {
+            uintptr_t slot_base = CHAR_SLOT_BASE + (size_t)input_type * CHAR_SLOT_SIZE;
+            uint8_t char_active = *(uint8_t*)(slot_base + CHAR_ACTIVE_FLAG_OFFSET);
+            if (char_active != 0) {
+                uint8_t char_flags = *(uint8_t*)(slot_base + CHAR_STATE_FLAGS_OFFSET);
+                if ((char_flags & 8) == 0) facing_reversed = false;
+            }
+        }
+        if (!facing_reversed) {
+            uint16_t left_bit  = (input & 0x001);
+            uint16_t right_bit = (input & 0x002);
+            input = (input & ~0x003) | (left_bit << 1) | (right_bit >> 1);
+        }
+        return (int)input;  // spectator path doesn't record
+    }
 
     // Auto-mash through title screen → menu → CSS. Default ON unless
     // FM2K_AUTO_TITLE_SKIP=0. With the boot-to-title patch (push 0x0C)
@@ -413,12 +517,15 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                     game_mode, now - s_started_frame);
             } else if (game_mode == 1000) {
                 if (!s_cursor_set) {
-                    *(uint32_t*)0x424780 = 1;  // g_menu_selection = VS Player
+                    // Menu cursor itself is now written in the hoisted
+                    // block at the top of this function (runs on host AND
+                    // spectator). Here we just record the start-frame for
+                    // the auto-mash duration log and flip s_cursor_set.
                     s_cursor_set = true;
                     s_started_frame = *(uint32_t*)0x447EE0;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "AutoTitleSkip: pre-set g_menu_selection=1 (VS Player), "
-                        "input_buf=%u — mashing button A", s_started_frame);
+                        "AutoTitleSkip: starting button-A mash from input_buf=%u",
+                        s_started_frame);
                 }
                 // 4-tick pattern (0x010, 0x010, 0, 0) ensures a rising
                 // edge every 4 frames: prev=0 → cur=0x010 fires the
@@ -429,7 +536,7 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 // in ~16 frames, slow enough not to skip past states
                 // the menu hasn't latched yet.
                 uint32_t buf_idx = *(uint32_t*)0x447EE0;
-                return ((buf_idx >> 1) & 1) ? 0 : 0x010;
+                return capture_and_return(((buf_idx >> 1) & 1) ? 0 : 0x010);
             }
         }
     }
@@ -508,38 +615,13 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 s_last_logged_mode = game_mode;
                 if (periodic) s_last_periodic = frame;
             }
-            return (int)out;
+            return capture_and_return((int)out);
         }
     }
 
-    // Spectator playback: inputs come from the streamed batch queue, not from
-    // local devices and not from GekkoNet. The trampoline pops one (p1, p2)
-    // pair per sim tick via SpectatorNode_PopFrameInputs and stashes it; we
-    // just return the cached value here. Same facing-swap logic as the
-    // GekkoNet path, since the on-wire input is in unswapped form.
-    if (SpectatorNode_IsPlayingBack()) {
-        uint16_t input = (player_id == 0)
-            ? SpectatorNode_GetCurrentP1Input()
-            : SpectatorNode_GetCurrentP2Input();
-
-        constexpr size_t CHAR_ACTIVE_FLAG_OFFSET = 0xDF41;
-        constexpr size_t CHAR_STATE_FLAGS_OFFSET = 0x7CA6;
-        bool facing_reversed = true;
-        if (game_mode >= 3000 && game_mode < 4000) {
-            uintptr_t slot_base = CHAR_SLOT_BASE + (size_t)input_type * CHAR_SLOT_SIZE;
-            uint8_t char_active = *(uint8_t*)(slot_base + CHAR_ACTIVE_FLAG_OFFSET);
-            if (char_active != 0) {
-                uint8_t char_flags = *(uint8_t*)(slot_base + CHAR_STATE_FLAGS_OFFSET);
-                if ((char_flags & 8) == 0) facing_reversed = false;
-            }
-        }
-        if (!facing_reversed) {
-            uint16_t left_bit  = (input & 0x001);
-            uint16_t right_bit = (input & 0x002);
-            input = (input & ~0x003) | (left_bit << 1) | (right_bit >> 1);
-        }
-        return (int)input;
-    }
+    // (Spectator branch lifted to the top of the function — runs before
+    // auto-mash so spectator's local FM2K replays host's recorded inputs
+    // instead of generating its own auto-mash sequence.)
 
     // Battle mode with GekkoNet active - return synced input with facing fix
     if (Netplay_IsActive()) {
@@ -599,17 +681,20 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
         }
         battle_log_count++;
 
-        return input;
+        return capture_and_return((int)input);
     }
 
     // CSS mode with connection - return CSS input from control channel
     if (IsCSSMode(game_mode) && Netplay_IsConnected()) {
         uint16_t input = Netplay_GetCSSInput(player_id);
-        return input;
+        return capture_and_return((int)input);
     }
 
     // Offline or menu: use original function
-    return original_get_player_input ? original_get_player_input(player_id, input_type) : 0;
+    int orig = original_get_player_input
+        ? original_get_player_input(player_id, input_type)
+        : 0;
+    return capture_and_return(orig);
 }
 
 // Hook: UpdateGameState

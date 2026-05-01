@@ -62,6 +62,8 @@ struct HubEvent {
         ChallengeDeclined,     // target declined
         MatchStart,            // both sides go into punch + GekkoNet
         PeerDisconnected,
+        SpectateGranted,       // hub returned host addr for our spectate request
+        SpectateDenied,        // hub rejected spectate (target not in_match etc)
         Error,
     };
 
@@ -96,6 +98,18 @@ struct HubEvent {
         int         relay_port = 0;
         std::string relay_session_id;   // 32-hex-char string (= match token bytes)
     } match;
+
+    // Spectate-grant payload. host_ip / host_port are where the spectator
+    // FM2K should aim its FM2K_REMOTE_ADDR; target_nick / opponent_nick
+    // are advisory for UI labelling ("Watching A vs B").
+    struct {
+        std::string target_id;
+        std::string target_nick;
+        std::string opponent_id;
+        std::string opponent_nick;
+        std::string host_ip;
+        int         host_port = 0;
+    } spectate;
 };
 
 class HubClient {
@@ -130,6 +144,11 @@ public:
     void AcceptChallenge(const std::string& challenger_id);
     void DeclineChallenge(const std::string& challenger_id);
     void MatchEnded();
+
+    // Ask hub to introduce us to the host of an in-progress match.
+    // target_id is the host user's id (the user we want to spectate).
+    // Hub responds with SpectateGranted / SpectateDenied.
+    void RequestSpectate(const std::string& target_id);
 
 private:
     void EnqueueOut(std::string msg);

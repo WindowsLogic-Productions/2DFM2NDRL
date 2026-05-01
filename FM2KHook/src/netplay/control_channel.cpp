@@ -467,14 +467,6 @@ void ControlChannel_SendPing() {
     g_ping_send_time = GetTimeMs();
 }
 
-void ControlChannel_SendCSSInput(uint16_t input, uint32_t frame) {
-    CtrlPacket pkt = {};
-    pkt.header.type = CtrlMsg::CSS_INPUT;
-    pkt.data.css_input.input = input;
-    pkt.data.css_input.frame = frame;
-    ControlChannel_Send(pkt);
-}
-
 void ControlChannel_SendCursor(uint8_t x, uint8_t y) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::CSS_CURSOR;
@@ -547,12 +539,14 @@ void ControlChannel_SendBattleAck() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ACK");
 }
 
-void ControlChannel_SendBattleEntering() {
+void ControlChannel_SendBattleEntering(uint32_t swap_frame) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_ENTERING;
+    pkt.data.sync.frame = swap_frame;
     ControlChannel_Send(pkt);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ENTERING");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent BATTLE_ENTERING (swap_frame=%u)", swap_frame);
 }
 
 void ControlChannel_SendBattleStart(uint32_t start_frame) {
@@ -565,12 +559,14 @@ void ControlChannel_SendBattleStart(uint32_t start_frame) {
                 start_frame);
 }
 
-void ControlChannel_SendBattleEnd() {
+void ControlChannel_SendBattleEnd(uint32_t swap_frame) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_END;
+    pkt.data.sync.frame = swap_frame;
     ControlChannel_Send(pkt);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_END");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent BATTLE_END (swap_frame=%u)", swap_frame);
 }
 
 void ControlChannel_SendDisconnect() {
@@ -587,13 +583,66 @@ void ControlChannel_SendDisconnect() {
 // Shares socket with control channel, filters control packets
 // =============================================================================
 
-// Adapter send function - sends directly via our socket
+// Adapter send function - sends directly via our socket.
+//
+// Pre-spectator era this ignored `addr` and sent to the single peer via
+// RawSend → g_remote_sockaddr. With spectator support GekkoNet now
+// addresses multiple destinations (player + spectators), so we honor the
+// supplied address. Format on the wire is "ip:port" (matches what
+// MultiplexAdapter_Receive constructs from inbound sockaddr_in via
+// inet_ntoa+ntohs). Falls back to RawSend(g_remote_sockaddr) when the
+// addr string can't be parsed (defensive).
 static void MultiplexAdapter_Send(GekkoNetAddress* addr, const char* data, int length) {
     if (g_socket == INVALID_SOCKET) return;
+    if (!addr || !addr->data || addr->size <= 0) {
+        RawSend(data, length);
+        return;
+    }
 
-    // GekkoNet packets go directly (no prefix needed)
-    // The address is ignored - we always send to g_remote_addr
-    RawSend(data, length);
+    // Parse "ip:port" — addr->data may not be null-terminated, copy out.
+    char addr_buf[64] = {};
+    int n = (addr->size < (int)sizeof(addr_buf) - 1) ? addr->size : (int)sizeof(addr_buf) - 1;
+    std::memcpy(addr_buf, addr->data, n);
+    char* colon = std::strrchr(addr_buf, ':');
+    if (!colon) {
+        RawSend(data, length);
+        return;
+    }
+    *colon = '\0';
+    const char* ip_str = addr_buf;
+    const int   port   = std::atoi(colon + 1);
+    if (port <= 0 || port > 65535) {
+        RawSend(data, length);
+        return;
+    }
+
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, ip_str, &dst.sin_addr) != 1) {
+        RawSend(data, length);
+        return;
+    }
+
+    // In relay mode all gameplay traffic must still go through the relay
+    // wrapper. RawSend handles that path internally; we keep the explicit
+    // peer address only for direct (non-relay) sends. TODO: spectators
+    // through a relay are a separate problem (the relay only knows about
+    // one session_id pair); for now spectators go direct only.
+    if (::fm2k::nat::IsRelayMode()) {
+        RawSend(data, length);
+        return;
+    }
+
+    int result = sendto(g_socket, data, length, 0,
+                        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+    if (result == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "MultiplexAdapter: sendto(%s:%d) failed: %d", ip_str, port, err);
+        }
+    }
 }
 
 // Adapter receive function - returns queued GekkoNet packets

@@ -1123,6 +1123,21 @@ void LauncherUI::RenderHubPanel() {
             case K::PeerDisconnected:
                 hs.status_line = "peer disconnected";
                 break;
+            case K::SpectateGranted: {
+                hs.status_line = "spectate: " + ev.spectate.target_nick +
+                                 " vs " + ev.spectate.opponent_nick +
+                                 " @ " + ev.spectate.host_ip + ":" +
+                                 std::to_string(ev.spectate.host_port);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
+                if (on_spectate_match) {
+                    on_spectate_match(ev.spectate.host_ip, ev.spectate.host_port);
+                }
+                break;
+            }
+            case K::SpectateDenied:
+                hs.status_line = "spectate denied: " + ev.error;
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
+                break;
             case K::Error:
                 hs.status_line = "error: " + ev.error;
                 break;
@@ -1298,6 +1313,57 @@ void LauncherUI::RenderHubPanel() {
         std::string label = "Join room for: " + game_id;
         if (ImGui::Button(label.c_str(), ImVec2(-1, 0))) {
             hs.client.JoinRoom(game_id, game_id);
+        }
+    }
+
+    // ---- Active Matches ----
+    // Walk the user list, group in_match pairs (each pair appears once,
+    // owned by the user with the lexicographically smaller id so we don't
+    // double-render). Click "Spectate" to ask the hub for the host's UDP
+    // addr; on grant a local FM2K spectator instance launches pointing at
+    // it and joins the host's GekkoSpectateSession via SpectatorNode JOIN_REQ.
+    if (!hs.users.empty()) {
+        std::vector<std::pair<const fm2k::HubUser*, const fm2k::HubUser*>> active_pairs;
+        for (auto& [uid, u] : hs.users) {
+            if (u.status != "in_match") continue;
+            if (u.opponent_id.empty())  continue;
+            if (uid >= u.opponent_id)   continue;  // dedupe — only the lower-id half
+            auto it = hs.users.find(u.opponent_id);
+            if (it == hs.users.end())   continue;
+            if (it->second.status != "in_match") continue;
+            active_pairs.emplace_back(&u, &it->second);
+        }
+
+        ImGui::SeparatorText("Active Matches");
+        if (active_pairs.empty()) {
+            ImGui::TextDisabled("(no matches in progress)");
+        } else if (ImGui::BeginTable("##active_matches", 3,
+                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Match");
+            ImGui::TableSetupColumn("Room", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("",     ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableHeadersRow();
+
+            for (auto& [a, b] : active_pairs) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%s vs %s", a->nick.c_str(), b->nick.c_str());
+
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(a->room_id.empty() ? "-" : a->room_id.c_str());
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushID(a->id.c_str());
+                if (ImGui::SmallButton("Spectate")) {
+                    // Always request against the lower-id half (a). Hub
+                    // returns that user's UDP addr; if both halves were
+                    // valid hosts the choice is arbitrary anyway.
+                    hs.client.RequestSpectate(a->id);
+                    hs.status_line = "spectate request sent for " + a->nick + " vs " + b->nick;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
         }
     }
 

@@ -53,6 +53,11 @@ class User:
         self.nick = nick
         self.peer_addr = peer_addr  # (ip, tcp_port_of_websocket)
         self.udp_addr: Optional[tuple[str, int]] = None  # learned later, when client tells us
+        # local_udp_port — what the launcher self-reports via udp_addr message
+        # before STUN overrides udp_addr to the public-mapped value. Kept as
+        # a separate field so we can hand it to same-NAT spectators (loopback
+        # fallback) without losing the STUN-learned external port.
+        self.local_udp_port: Optional[int] = None
         self.room_id: Optional[str] = None
         self.status = "idle"           # idle | challenging | in_match
         self.opponent_id: Optional[str] = None
@@ -155,6 +160,10 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
         ip = msg.get("ip"); port = msg.get("port")
         if isinstance(ip, str) and isinstance(port, int):
             user.udp_addr = (ip, port)
+            # Stash the launcher-reported local port — STUN overrides udp_addr
+            # to the public-mapped port, but we still want the local one for
+            # same-NAT spectators (loopback fallback).
+            user.local_udp_port = port
 
     elif t == "list_rooms":
         await send(user, {"type": "room_list", "rooms": [r.to_dict() for r in ROOMS.values()]})
@@ -260,6 +269,46 @@ async def handle_message(user: User, msg: dict[str, Any]) -> None:
         await set_status_and_broadcast(user, "idle", None)
         if opp is not None and opp.status == "in_match" and opp.opponent_id == user.id:
             await set_status_and_broadcast(opp, "idle", None)
+
+    elif t == "spectate_request":
+        # Spectator-side asks the hub to introduce them to the host of an
+        # active match. We hand back the host's UDP addr (preferred) or
+        # WebSocket-source IP + port 7000 fallback. The host's spectator
+        # subscription is established direct UDP after this — see
+        # SpectatorNode_RequestJoin in FM2KHook.
+        target_id = msg.get("target_id")
+        target = USERS.get(target_id) if isinstance(target_id, str) else None
+        if target is None or target.status != "in_match":
+            await send(user, {
+                "type": "spectate_denied",
+                "target_id": target_id,
+                "reason": "not_in_match",
+            })
+            return
+        # Same-NAT detection: if the spectator's WS source IP matches the
+        # target's, both are behind the same external mapping (or the same
+        # machine). Hairpin NAT is unreliable on consumer routers, so route
+        # the spectator to the host's loopback address + locally-bound UDP
+        # port instead. Only the launcher's local_udp_port (stashed pre-STUN)
+        # has the right value — udp_addr[1] would be the external-mapped port
+        # which doesn't reach a same-machine listener.
+        same_nat = (user.peer_addr[0] == target.peer_addr[0])
+        if same_nat and target.local_udp_port is not None:
+            host_ip = "127.0.0.1"
+            host_port = target.local_udp_port
+        else:
+            host_ip = target.peer_addr[0]
+            host_port = target.udp_addr[1] if target.udp_addr else 7000
+        opp = USERS.get(target.opponent_id) if isinstance(target.opponent_id, str) else None
+        await send(user, {
+            "type": "spectate_grant",
+            "target_id": target.id,
+            "target_nick": target.nick,
+            "opponent_id": target.opponent_id or "",
+            "opponent_nick": opp.nick if opp is not None else "",
+            "host_ip": host_ip,
+            "host_port": host_port,
+        })
 
     elif t == "pong":
         if user.pending_ping_ts > 0:

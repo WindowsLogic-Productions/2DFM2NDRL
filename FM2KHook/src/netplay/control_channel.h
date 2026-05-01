@@ -84,8 +84,10 @@ void ControlChannel_SendHelloAck(uint8_t player_id);
 // Send PING for keepalive
 void ControlChannel_SendPing();
 
-// Send CSS raw input with frame number for lockstep
-void ControlChannel_SendCSSInput(uint16_t input, uint32_t frame);
+// CSS raw inputs were sent via the control channel as a custom CCCaster-style
+// ring buffer. They now ride a dedicated GekkoNet CSS session (prediction=0
+// lockstep). The CtrlMsg::CSS_INPUT enum and the css_input payload struct are
+// kept as deprecated stubs for backward-compat with peers running older code.
 
 // Send CSS cursor position update [deprecated - use CSS input instead]
 void ControlChannel_SendCursor(uint8_t x, uint8_t y);
@@ -111,14 +113,20 @@ void ControlChannel_SendBattleReady();
 // Send battle acknowledgment
 void ControlChannel_SendBattleAck();
 
-// Send battle entering signal (game_mode changed to battle)
-void ControlChannel_SendBattleEntering();
+// Send battle entering signal (game_mode changed to battle).
+// swap_frame carries the proposed CSS-session frame at which to swap CSS
+// session for battle session. Both peers compute swap_frame = local_css_frame
+// + SWAP_FRAME_BUFFER and exchange; receiver takes max(local, remote).
+void ControlChannel_SendBattleEntering(uint32_t swap_frame);
 
 // Send battle start (both sides ready)
 void ControlChannel_SendBattleStart(uint32_t start_frame);
 
-// Send battle end
-void ControlChannel_SendBattleEnd();
+// Send battle end (game_mode left the [3000,4000) range).
+// swap_frame carries the proposed battle-session frame at which to destroy
+// the battle session and create a CSS session for the next match. Same
+// max(local, remote) convergence as BATTLE_ENTERING.
+void ControlChannel_SendBattleEnd(uint32_t swap_frame);
 
 // Send clean disconnect
 void ControlChannel_SendDisconnect();

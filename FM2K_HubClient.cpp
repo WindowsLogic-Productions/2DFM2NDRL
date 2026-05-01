@@ -310,6 +310,11 @@ void HubClient::MatchEnded() {
     EnqueueOut("{\"type\":\"match_ended\"}");
 }
 
+void HubClient::RequestSpectate(const std::string& target_id) {
+    EnqueueOut("{\"type\":\"spectate_request\",\"target_id\":\"" +
+               EscapeJsonString(target_id) + "\"}");
+}
+
 // ----- transport: I/O thread -----
 
 void HubClient::IoThread(std::string host, uint16_t port,
@@ -608,6 +613,26 @@ void HubClient::OnMessage(const std::string& msg) {
             }
             ev.match.relay_session_id = GetStr(relay_obj, "session_id");
         }
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "spectate_grant") {
+        ev.kind = HubEvent::Kind::SpectateGranted;
+        ev.spectate.target_id     = GetStr(msg, "target_id");
+        ev.spectate.target_nick   = GetStr(msg, "target_nick");
+        ev.spectate.opponent_id   = GetStr(msg, "opponent_id");
+        ev.spectate.opponent_nick = GetStr(msg, "opponent_nick");
+        ev.spectate.host_ip       = GetStr(msg, "host_ip");
+        ev.spectate.host_port     = GetInt(msg, "host_port", 0);
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "spectate_denied") {
+        ev.kind = HubEvent::Kind::SpectateDenied;
+        ev.spectate.target_id = GetStr(msg, "target_id");
+        ev.error              = GetStr(msg, "reason");
         EmitEvent(std::move(ev));
         return;
     }
