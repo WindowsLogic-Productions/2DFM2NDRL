@@ -1461,6 +1461,19 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
     game_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT", std::to_string(local_port));
     game_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR", remote_addr);
 
+    // Auto-enable parity recorder for spectator-desync diagnosis. Each
+    // process writes per-frame state snapshots (RNG, game_timer, render_fc,
+    // etc.) to a .pty file. Diff host vs spectator post-run with
+    // tools/kgt_diff_pty to find the first divergent frame. Skip the env
+    // override if the user already set one (manual diagnostic flow).
+    if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
+        const std::string pty_path = "c:/games/2dfm/wanwan/parity_p"
+            + std::to_string(player_index + 1) + ".pty";
+        game_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH", pty_path);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Online session: parity recorder -> %s", pty_path.c_str());
+    }
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Online session: P%d port=%d remote=%s",
         player_index + 1, local_port, remote_addr.c_str());
@@ -1617,6 +1630,10 @@ bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
     spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
+        spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
+            "c:/games/2dfm/wanwan/parity_p3.pty");
+    }
 
     if (!spectator_instance_->Launch(game_path)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch spectator: %s", game_path.c_str());
@@ -1662,6 +1679,8 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
     spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
+        "c:/games/2dfm/wanwan/parity_p3.pty");
 
     if (!spectator_instance_->Launch(game_path)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch remote spectator: %s",

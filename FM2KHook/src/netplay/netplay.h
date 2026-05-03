@@ -179,6 +179,11 @@ bool Netplay_IsSpectatorSession();
 // false if the session is stalled waiting for confirmed inputs.
 bool Netplay_ProcessSpectatorPhase();
 
+// (SpectatorSaveLoadMirror was tried + removed — GekkoNet's SpectatorSession
+// emits only AdvanceEvent, never Save/Load. See spectator_session.cpp
+// UpdateSession. The desync fix moved to INPUT_BATCH redundancy +
+// gap-detection on the spectator-node side instead.)
+
 // Returns the current session kind (for trampoline branching).
 NetplaySessionKind Netplay_GetSessionKind();
 

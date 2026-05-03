@@ -128,6 +128,16 @@ void ControlChannel_SendBattleStart(uint32_t start_frame);
 // max(local, remote) convergence as BATTLE_ENTERING.
 void ControlChannel_SendBattleEnd(uint32_t swap_frame);
 
+// Host pushes its current match settings (selected stage, round count, time
+// limit, game speed, SOCD mode) to client + spectators. Receiver mem-writes
+// the address-mapped fields and adopts SOCD mode locally. Use 0xFFFFFFFF /
+// 0 / 0xFF for "leave at default; don't write" on per-field basis.
+void ControlChannel_SendHostConfig(uint32_t selected_stage,
+                                   uint32_t round_count,
+                                   uint32_t round_time_sec,
+                                   uint32_t game_speed_pct,
+                                   uint8_t  socd_mode);
+
 // Send clean disconnect
 void ControlChannel_SendDisconnect();
 

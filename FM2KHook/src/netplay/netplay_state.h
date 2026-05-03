@@ -90,6 +90,14 @@ enum class CtrlMsg : uint8_t {
     SPEC_JOIN_REDIRECT, // Upstream at capacity, redirect to existing subscriber
     SPEC_HEARTBEAT,     // 1s keepalive both directions
     SPEC_LEAVE,         // Clean disconnect from subscriber tree
+
+    // Host config snapshot — host pushes its match-config (selected stage,
+    // round count, time limit, game speed, SOCD mode) to client so both
+    // peers run with identical settings without the user having to mirror
+    // them by hand. Sent at HELLO_ACK and again whenever the host UI
+    // changes a value or a new match starts. Client mem-writes the
+    // mapped fields and adopts the SOCD mode locally.
+    HOST_CONFIG,
 };
 
 // Convert message type to string for logging
@@ -117,6 +125,7 @@ inline const char* CtrlMsgToString(CtrlMsg msg) {
         case CtrlMsg::SPEC_JOIN_REDIRECT:return "SPEC_JOIN_REDIRECT";
         case CtrlMsg::SPEC_HEARTBEAT:    return "SPEC_HEARTBEAT";
         case CtrlMsg::SPEC_LEAVE:        return "SPEC_LEAVE";
+        case CtrlMsg::HOST_CONFIG:       return "HOST_CONFIG";
         default:                         return "UNKNOWN";
     }
 }
@@ -191,6 +200,20 @@ struct CtrlPacket {
         struct {
             uint8_t host_session_kind;
         } spec_join_ack;
+
+        // HOST_CONFIG — host's authoritative match settings, mirrored to
+        // client + spectators so everyone runs with identical rules. All
+        // fields are advisory: 0xFF / 0 means "leave at default; don't write."
+        // Address-mapped fields are written via direct memcpy to the
+        // documented FM2K addresses inside the receiver.
+        struct {
+            uint32_t selected_stage;    // → 0x470188 (u32). 0xFFFFFFFF = unset
+            uint32_t round_count;       // best-of-N (1/3/5). 0 = unset
+            uint32_t round_time_sec;    // per-round time limit. 0 = unset
+            uint32_t game_speed_pct;    // 100 = normal. 0 = unset
+            uint8_t  socd_mode;         // 0..5 per Hook_GetSOCDMode. 0xFF = unset
+            uint8_t  reserved[3];
+        } host_config;
 
         // Raw bytes for unknown/future use
         uint8_t raw[24];

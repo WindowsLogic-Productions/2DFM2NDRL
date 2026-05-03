@@ -38,6 +38,12 @@ enum class SpecDataType : uint8_t {
     INPUT_BATCH   = 2,  // Payload = ReplayFrame[frame_count], 4 B each.
                         // Used for ALL phases (CSS + battle).
     MATCH_END     = 3,  // No payload — informational, queue keeps draining.
+    INPUT_REQUEST = 4,  // Spectator → host: "send me frames from start_frame
+                        // onward." Payload empty; the request is encoded in
+                        // SpecDataHeader.start_frame. Host responds with an
+                        // INPUT_BATCH starting at that frame (or empty if
+                        // not yet recorded). Gives bulletproof delivery —
+                        // any persistent gap gets re-requested until filled.
 };
 
 #pragma pack(push, 1)

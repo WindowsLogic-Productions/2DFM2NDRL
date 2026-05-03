@@ -136,6 +136,17 @@ static LoopPhase ClassifyPhase() {
         return LoopPhase::SPECTATOR_PLAYBACK;
     }
 
+    // Battle session still alive (e.g. game_mode just flipped 3000→2000 inside
+    // the final battle UG, but the GekkoNet battle session hasn't been
+    // destroyed yet — it's waiting on Netplay_IsBattleEndSynced). Stay in the
+    // BATTLE phase so RunBattleTick keeps polling the swap-frame gate and
+    // calling Netplay_EndBattle. Without this, the battle session sticks
+    // forever and Netplay_StartCSSSession spins in a "session already exists"
+    // retry loop.
+    if (Netplay_GetSessionKind() == NetplaySessionKind::BATTLE) {
+        return LoopPhase::TRAMPOLINE_BATTLE;
+    }
+
     uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
     if (mode >= 3000 && mode < 4000) return LoopPhase::TRAMPOLINE_BATTLE;
     if (mode == 2000)                return LoopPhase::CSS;
@@ -451,6 +462,16 @@ static void RunCssTick() {
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
     ParityRecorder::Capture();  // post-update snapshot for parity .pty
+
+    // Advance virtual_time to match the spectator's per-pop bump cadence.
+    // Hook_timeGetTime returns g_virtual_time_ms whenever a session is
+    // active OR a spectator is subscribed; if host doesn't bump per CSS
+    // tick, host's timeGetTime stays at zero while spectator's accelerates
+    // by 10/pop, and any FM2K CSS code that reads timeGetTime (animation
+    // timers, fade counters) sees different deltas → desync.
+    extern uint32_t g_virtual_time_ms;
+    g_virtual_time_ms += 10;
+
     RenderFrameWithSnapshot();
 }
 
@@ -491,113 +512,154 @@ static void RunNativeTick() {
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
     ParityRecorder::Capture();  // post-update snapshot for parity .pty
+
+    // Same virtual-time alignment as RunCssTick — keep timeGetTime cadence
+    // 1:1 with the spectator's per-pop bump on title/menu frames so any
+    // FM2K menu animation code that reads timeGetTime sees identical deltas
+    // on both sides.
+    extern uint32_t g_virtual_time_ms;
+    g_virtual_time_ms += 10;
+
     RenderFrameWithSnapshot();
 }
 
-// Spectator playback. Three regimes by current queue depth:
+// Spectator playback — pure input-replay model.
 //
-//   queue < SPECTATOR_LIVE_TARGET    → STALL  (re-render, no sim advance)
-//                                       Always lag the host by N frames so
-//                                       jitter / batch arrivals (8-frame
-//                                       INPUT_BATCH bursts) never starve us.
-//                                       Without this gate the spectator
-//                                       drains to zero between bursts and
-//                                       runs micro-ahead inside each burst,
-//                                       which is what produced the
-//                                       "spectator running ahead of host
-//                                       in battle" symptom — same root
-//                                       cause as audio jitter buffer.
-//   queue in [LIVE_TARGET, FF_THRESHOLD]
-//                                    → ADVANCE at 100 Hz (10 ms target)
-//   queue > FF_THRESHOLD             → ADVANCE at ~1000 Hz (1 ms target,
-//                                       set in the outer loop) to drain the
-//                                       backfill from a late join.
+// CONTRACT: spectator's local FM2K only advances sim when it has a confirmed
+// (p1, p2) input pair from the host for the next frame. Pop one → run one
+// frame → render → wait for the next pair. That's it.
 //
-// We deliberately don't go through GekkoNet here — there's no rollback path,
-// no inputs to predict, no remote peer in our session. The replay engine
-// is local-only and deterministic so long as the host's RNG seed pin held.
-constexpr size_t SPECTATOR_LIVE_TARGET   = 8;   // jitter buffer floor: never
-                                                // advance with fewer queued
-                                                // frames than this. Pins
-                                                // spectator at >=8 frames
-                                                // behind the host at all
-                                                // times so we can't render
-                                                // a frame the host hasn't
-                                                // confirmed yet.
-
-// Hysteresis. Fast-forward is for late-joiner backfill ONLY — not for
-// absorbing routine jitter. Without hysteresis, host's 8-frame INPUT_BATCH
-// bursts make the queue swing 8..40+ each cycle, FF kicks in at 30, drains
-// to 30, batch arrives, queue 38, FF again. Net result: spectator runs at
-// 1 ms sleep continuously and arrives at the live edge way ahead of host.
-//   queue > FF_ENTER  → enter fast-forward (sleep ~1 ms)
-//   queue < FF_EXIT   → leave fast-forward (sleep 10 ms = 100 Hz)
-// In between: stay in current mode.
-constexpr size_t SPECTATOR_FF_ENTER = 100;  // ~1 second of host-queued frames
-constexpr size_t SPECTATOR_FF_EXIT  = 16;   // 2x live target — stable hysteresis
+// Why this works: every change to FM2K's state is input-driven from a
+// canonical default state at boot. Host records every confirmed (p1, p2)
+// it returns from Hook_GetPlayerInput (title-screen auto-mash, CSS cursor
+// moves, battle commands — the whole stream). Spectator drains the same
+// stream → identical state by construction.
+//
+// Three regimes by queue depth:
+//   QUEUE EMPTY                 → freeze, render last frame, wait
+//   QUEUE >= LIVE_TARGET        → pop one, run one, render (live edge)
+//   QUEUE > FF_ENTER (catch-up) → outer loop drops to 1 ms sleep so we
+//                                 burn through backfill at ~1000 Hz
+//
+// Pre-JOIN_ACK: queue is empty, no sim runs, screen holds the boot snapshot.
+// JOIN_ACK fires SendSessionBackfillTo from the host → queue fills with
+// every confirmed frame from session start → spectator drains those at
+// FF speed → catches up to live edge.
+constexpr size_t SPECTATOR_LIVE_TARGET = 8;   // jitter buffer floor
+constexpr size_t SPECTATOR_FF_ENTER    = 100; // ~1 sec of host frames queued
+constexpr size_t SPECTATOR_FF_EXIT     = 16;  // hysteresis: 2x live target
 
 static void RunSpectatorTick() {
     Hook_CheckGameModeTransition_Public();
 
-    // Drain inbound UDP. CtrlPackets (0xCC: SPEC_JOIN_ACK, HEARTBEAT, etc.)
-    // and 0xCE datagrams (INITIAL_MATCH / INPUT_BATCH / MATCH_END) both
-    // route through ControlChannel_Poll → SpectatorNode_HandleSpecData.
+    // Drain UDP — control channel (0xCC: SPEC_JOIN_ACK / HEARTBEAT) and
+    // 0xCE INPUT_BATCH datagrams land on the same multiplex socket.
     ControlChannel_Poll();
 
-    // Health tick: heartbeat send, silence-failover detection, daisy-chain
-    // self-heal. Internally rate-limited.
+    // Health: heartbeat send, silence-failover, daisy-chain reconnect.
     SpectatorNode_TickHealth();
 
-    // Spectator pops one (p1, p2) pair per game-loop tick from the
-    // SpectatorNode pb_queue (populated by INPUT_BATCH datagrams from
-    // upstream + the historical backfill on JOIN_ACK). Forward-only sim;
-    // the input log spans the entire connection, so the spectator's local
-    // FM2K walks naturally through title→CSS→battle→CSS→battle in lockstep
-    // with the host. Late joiners FF through the backlog before reaching
-    // live frames.
-    //
-    // Three states by queue depth + stream state:
-    //   ACTIVE STREAMING (qd >= LIVE_TARGET): pop, advance sim.
-    //   JITTER STALL    (qd > 0 but < LIVE_TARGET, still subscribed): hold.
-    //   POST-MATCH IDLE (qd == 0, !playing_back, after MATCH_END): zero
-    //                    inputs, advance sim so virtual clock ticks
-    //                    through results / intermission.
     const size_t qd = SpectatorNode_PendingFrameCount();
-    const bool active_stream = qd >= SPECTATOR_LIVE_TARGET;
-
-    // post_match: queue empty AND we WERE playing back (MATCH_END flipped
-    // playing_back→false). Distinct from pre-JOIN_ACK where playing_back
-    // has never been true. Track that distinction with a sticky bit so
-    // boot-time stall can hold the title screen until host inputs arrive.
-    static bool s_seen_playback = false;
-    if (SpectatorNode_IsPlayingBack()) s_seen_playback = true;
-    const bool post_match = qd == 0 && !SpectatorNode_IsPlayingBack() && s_seen_playback;
-
-    if (!active_stream && !post_match) {
-        RenderFrameWithSnapshot();  // jitter stall — hold current frame
+    if (qd < SPECTATOR_LIVE_TARGET) {
+        // Queue starved — hold the current rendered frame. Don't tick sim,
+        // don't read inputs, don't run process_game_inputs/update_game.
+        RenderFrameWithSnapshot();
         return;
     }
 
+    // Pop the next confirmed (p1, p2). PopFrameInputs caches them into
+    // pb_current_p1/p2 which Hook_GetPlayerInput reads as its single
+    // source of truth this tick.
     uint16_t p1 = 0, p2 = 0;
-    if (active_stream) {
-        if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
-            RenderFrameWithSnapshot();
-            return;
+    if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
+        RenderFrameWithSnapshot();
+        return;
+    }
+
+    // PER-FRAME alignment-trace log: capture RNG before PGI runs so we can
+    // pair with [HOST-TRACE] on the host. If host's bf=N rng_pre matches
+    // spectator's bf=N rng_pre, alignment is correct. If they diverge, the
+    // leak is between frame N-1 post-UG and frame N pre-PGI (inter-frame).
+    // If they match but rng_post diverges, leak is inside PGI+UG itself.
+    static uint32_t s_spec_trace_bf = 0;
+    static bool     s_spec_trace_in_battle = false;
+    const uint32_t mode_pre = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    const uint32_t rng_pre_pgi_spec = *(uint32_t*)0x41FB1C;
+    if (mode_pre >= 3000 && mode_pre < 4000) {
+        if (!s_spec_trace_in_battle) {
+            s_spec_trace_in_battle = true;
+            s_spec_trace_bf = 0;
         }
     } else {
-        // Post-match: zero inputs into spec-cached globals so
-        // Hook_GetPlayerInput returns neutral, not last-streamed values.
-        SpectatorNode_ResetCurrentInputs();
-        p1 = p2 = 0;
+        s_spec_trace_in_battle = false;
     }
 
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
     ParityRecorder::Capture();
 
-    // Advance the deterministic virtual clock used by Hook_timeGetTime.
-    // Player path bumps inside GekkoAdvance; spectator has no GekkoNet
-    // session here, so bump per-tick to track host's frame schedule.
+    if (s_spec_trace_in_battle && s_spec_trace_bf < 100) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[SPEC-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
+            "p1=0x%03X p2=0x%03X",
+            s_spec_trace_bf, rng_pre_pgi_spec,
+            *(uint32_t*)0x41FB1C, p1, p2);
+        s_spec_trace_bf++;
+    }
+
+    // Per-frame state fingerprint log for desync diagnosis. Counts pops
+    // (= sim frames executed) since spectator boot. Logs once we're in
+    // battle (mode 3000) at battle-frame multiples of 30 (~3x per sec).
+    // Pairs with the host's matching log at netplay.cpp's AdvanceEvent
+    // recording site so we can grep both .log files for the same
+    // sim_frame and find the first divergent state by hand.
+    {
+        static uint32_t s_pop_count = 0;
+        ++s_pop_count;
+        static uint32_t s_battle_frame_at_entry = 0;
+        static bool s_in_battle = false;
+        const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (mode_now >= 3000 && mode_now < 4000) {
+            if (!s_in_battle) {
+                s_in_battle = true;
+                s_battle_frame_at_entry = s_pop_count;
+            }
+            const uint32_t bf = s_pop_count - s_battle_frame_at_entry;
+            if ((bf % 30) == 0) {
+                const uint32_t rng     = *(uint32_t*)0x41FB1C;
+                const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
+                const uint32_t p2_hp   = *(uint32_t*)0x4EDCC4;
+                const uint32_t timer   = *(uint32_t*)0x470044;
+                // Real battle positions in object pool. (Earlier this read
+                // 0x470020 which is the CSS slot index — useless for
+                // detecting in-match drift.)
+                constexpr uintptr_t POOL = 0x4701E0;
+                constexpr size_t    SLOT = 382;
+                const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
+                const int32_t p1_y = *(int32_t*)(POOL + 0 * SLOT + 0x0C);
+                const int32_t p2_x = *(int32_t*)(POOL + 1 * SLOT + 0x08);
+                const int32_t p2_y = *(int32_t*)(POOL + 1 * SLOT + 0x0C);
+                const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
+                const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[SPEC-FP] bf=%u (pop=%u) rng=0x%08X buf=%u "
+                    "p1_hp=%u p2_hp=%u timer=%u "
+                    "p1_pos=(%d,%d) p2_pos=(%d,%d) "
+                    "p1_script=%d p2_script=%d "
+                    "p1_in=0x%03X p2_in=0x%03X",
+                    bf, s_pop_count, rng, buf_idx,
+                    p1_hp, p2_hp, timer,
+                    p1_x, p1_y, p2_x, p2_y,
+                    p1_script, p2_script,
+                    p1, p2);
+            }
+        } else {
+            s_in_battle = false;
+        }
+    }
+
+    // Advance the deterministic virtual clock (Hook_timeGetTime reads it).
     extern uint32_t g_virtual_time_ms;
     g_virtual_time_ms += 10;
 
@@ -680,12 +742,12 @@ BOOL TrampolineMainLoop() {
 
             case LoopPhase::SPECTATOR_PLAYBACK: {
                 RunSpectatorTick();
-                // Fast-forward with hysteresis — see SPECTATOR_FF_ENTER/EXIT
-                // comments above. Without hysteresis the natural queue swing
-                // around live (host's 8-frame bursts) crosses a single
-                // threshold every batch and we end up at 1 ms sleep
-                // continuously, racing past the host. Sticky FF mode only
-                // engages for genuine backfill catch-up.
+                // FF with hysteresis. Live edge: queue oscillates around
+                // LIVE_TARGET, sleep 10 ms (100 Hz). Backfill (>FF_ENTER):
+                // sleep 1 ms (~1000 Hz) to drain the catch-up window.
+                // Hysteresis: only EXIT fast-forward when queue drops
+                // below FF_EXIT, so routine batch-arrival jitter doesn't
+                // toggle pacing every burst.
                 static bool s_fast_fwd = false;
                 size_t qd = SpectatorNode_PendingFrameCount();
                 if      (qd > SPECTATOR_FF_ENTER) s_fast_fwd = true;

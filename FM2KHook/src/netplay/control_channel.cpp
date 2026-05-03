@@ -569,6 +569,27 @@ void ControlChannel_SendBattleEnd(uint32_t swap_frame) {
                 "ControlChannel: Sent BATTLE_END (swap_frame=%u)", swap_frame);
 }
 
+void ControlChannel_SendHostConfig(uint32_t selected_stage,
+                                   uint32_t round_count,
+                                   uint32_t round_time_sec,
+                                   uint32_t game_speed_pct,
+                                   uint8_t  socd_mode)
+{
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::HOST_CONFIG;
+    pkt.data.host_config.selected_stage  = selected_stage;
+    pkt.data.host_config.round_count     = round_count;
+    pkt.data.host_config.round_time_sec  = round_time_sec;
+    pkt.data.host_config.game_speed_pct  = game_speed_pct;
+    pkt.data.host_config.socd_mode       = socd_mode;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent HOST_CONFIG (stage=%u rounds=%u time=%u speed=%u socd=%u)",
+                selected_stage, round_count, round_time_sec, game_speed_pct,
+                (unsigned)socd_mode);
+}
+
 void ControlChannel_SendDisconnect() {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::DISCONNECT;

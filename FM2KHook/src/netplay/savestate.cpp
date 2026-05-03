@@ -542,25 +542,39 @@ bool SaveState_Save(int frame) {
     uint32_t checksum = state->checksum;
 
     // Build a fresh per-region CRC snapshot for THIS save (forward or replay).
+    //
+    // PERF: The cheap fingerprint fields (rng/game_state/object_pool/etc) are
+    // populated by SaveState_CalculateFingerprint above and just copied here.
+    // The EXPENSIVE Fletcher32 calls — afterimage_pool (~159 KB), list_heads
+    // (1 KB), node_pool (8 KB) — are gated on full_crcs_due so they only fire
+    // once per second instead of every save. During an 8-frame rollback the
+    // host fires up to 16 saves in a single outer iteration; without this gate
+    // those three hashes alone burned ~5.4ms of the 10ms frame budget,
+    // overflowing it and "eating" the local player's keystrokes that fell
+    // between Input_CaptureLocal samples. CRCs are diagnostic only (only used
+    // by the desync-dump path's per-region diff and the throttled replay-diff
+    // scan above) so once-per-second resolution is plenty.
     SaveStateData::SavedRegionCRCs this_save_crcs = {};
     {
         const auto& rc = g_region_checksums;
         this_save_crcs.rng                    = rc.rng;
-        this_save_crcs.game_state             = rc.game_state;
-        this_save_crcs.object_pool            = rc.object_pool;
-        this_save_crcs.char_dynamic           = rc.char_dynamic;
-        this_save_crcs.input_tracking         = rc.input_tracking;
-        this_save_crcs.effect_sys1            = rc.effect_sys1;
-        this_save_crcs.effect_sys2            = rc.effect_sys2;
-        this_save_crcs.shake_effects          = rc.shake_effects;
         this_save_crcs.gameplay_fingerprint   = rc.gameplay_fingerprint;
-        this_save_crcs.combined               = rc.combined;
-        // Hash the SAVED copy of afterimage_pool (with g_last_frame_time zeroed
-        // above), NOT live memory — this is what makes the exclusion work
-        // across forward- and replay-sim.
-        this_save_crcs.afterimage_pool        = Fletcher32(state->afterimage_pool,                     WaveCAddrs::AFTERIMAGE_POOL_SZ);
-        this_save_crcs.list_heads_tails       = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_LIST_HEADS,    WaveCAddrs::OBJECT_LIST_HEADS_SZ);
-        this_save_crcs.node_pool              = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_NODE_POOL,     WaveCAddrs::OBJECT_NODE_POOL_SZ);
+        if (full_crcs_due) {
+            this_save_crcs.game_state             = rc.game_state;
+            this_save_crcs.object_pool            = rc.object_pool;
+            this_save_crcs.char_dynamic           = rc.char_dynamic;
+            this_save_crcs.input_tracking         = rc.input_tracking;
+            this_save_crcs.effect_sys1            = rc.effect_sys1;
+            this_save_crcs.effect_sys2            = rc.effect_sys2;
+            this_save_crcs.shake_effects          = rc.shake_effects;
+            this_save_crcs.combined               = rc.combined;
+            // Hash the SAVED copy of afterimage_pool (with g_last_frame_time zeroed
+            // above), NOT live memory — this is what makes the exclusion work
+            // across forward- and replay-sim.
+            this_save_crcs.afterimage_pool        = Fletcher32(state->afterimage_pool,                     WaveCAddrs::AFTERIMAGE_POOL_SZ);
+            this_save_crcs.list_heads_tails       = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_LIST_HEADS,    WaveCAddrs::OBJECT_LIST_HEADS_SZ);
+            this_save_crcs.node_pool              = Fletcher32((uint8_t*)WaveCAddrs::OBJECT_NODE_POOL,     WaveCAddrs::OBJECT_NODE_POOL_SZ);
+        }
         this_save_crcs.current_object_ptr_val = *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR;
 
         // Per-object-slot CRCs: NOT computed here. ~400 KB of Fletcher32 per

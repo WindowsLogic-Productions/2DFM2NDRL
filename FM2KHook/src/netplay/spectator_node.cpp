@@ -19,9 +19,21 @@
 
 namespace {
 
-// Broadcast cadence: batch INPUT_BATCH every N confirmed frames. Tunable.
-// 8 means ~12.5 batches/sec at 100 FPS — ~40 B/batch → ~500 B/s per subscriber.
+// Broadcast cadence: emit a batch every N newly-confirmed frames.
 constexpr size_t BROADCAST_BATCH_FRAMES = 8;
+
+// Redundancy window: each batch carries the last N confirmed frames (not
+// just the BROADCAST_BATCH_FRAMES new ones). This means each frame appears
+// in floor(REDUNDANCY_WINDOW / BROADCAST_BATCH_FRAMES) consecutive batches,
+// so a single dropped UDP packet doesn't lose any inputs — the next batch
+// re-delivers them. With WINDOW=32 and BATCH=8, each frame ships in 4
+// batches: tolerates up to 3 consecutive packet losses before any data is
+// genuinely lost.
+//
+// Wire cost: ~128 B / batch payload (32 frames × 4 B) + 10 B header + UDP
+// overhead ≈ 180 B / packet. At 12.5 batches/sec that's ~2.3 KB/s per
+// subscriber — still nothing.
+constexpr size_t REDUNDANCY_WINDOW = 32;
 
 // Subscriber entry from the host's perspective.
 struct Subscriber {
@@ -84,6 +96,10 @@ struct State {
     // first batch received after JOIN_ACK; subsequent batches increment.
     bool                      have_frame_baseline = false;
     uint32_t                  next_expected_frame = 0;
+    // Pull-based gap recovery: periodic + on-demand INPUT_REQUEST
+    // (spectator → upstream) for the missing frame range. Closes any
+    // gap that the push-based redundancy window can't recover from.
+    uint64_t                  last_input_request_send_ms = 0;
 
     // Viewer-side playback driver state.
     // Populated by HandleSpecData (INITIAL_MATCH / INPUT_BATCH / MATCH_END);
@@ -130,45 +146,67 @@ void SendRaw(const void* buf, size_t len, const sockaddr_in& to) {
 // BROADCAST
 // =============================================================================
 
-// Emit the current pending batch as an INPUT_BATCH datagram to all subscribers.
+// Emit a redundancy-window INPUT_BATCH datagram to all subscribers.
+//
+// pending.p1_inputs / p2_inputs are the just-accumulated NEW frames since
+// the last flush. We don't send only those — we look up the LAST
+// REDUNDANCY_WINDOW frames in session_history and send all of them. Each
+// frame thus appears in (REDUNDANCY_WINDOW / BROADCAST_BATCH_FRAMES)
+// consecutive batches, so a dropped packet still delivers via the next
+// batch. Receiver dedups via per-frame next_expected_frame gate.
+//
+// pending.p1/p2_inputs are still tracked just to drive the
+// "every-N-new-frames trigger this flush" cadence — their actual contents
+// aren't read here (we read session_history directly). pending.start_frame
+// still advances by the new-frame count to keep the cadence trigger correct.
 void FlushBatch() {
     if (g_state.pending.p1_inputs.empty()) return;
-    if (g_state.subscribers.empty()) {
-        g_state.pending.p1_inputs.clear();
-        g_state.pending.p2_inputs.clear();
-        return;
-    }
+    const uint32_t new_frame_count = static_cast<uint32_t>(
+        g_state.pending.p1_inputs.size());
 
-    const uint16_t n = static_cast<uint16_t>(g_state.pending.p1_inputs.size());
-    const size_t   payload_bytes = n * 4;  // (p1 u16, p2 u16) per frame
-    const size_t   dgram_bytes   = sizeof(SpecDataHeader) + payload_bytes;
+    // Always advance start_frame, even with no subscribers. Otherwise a
+    // future late joiner backfilled to session_history.size() N would
+    // see live batches with frames < N (because pending.start_frame
+    // never advanced while host ran solo) and drop them all on the
+    // dedup gate, starving the queue.
+    g_state.pending.start_frame += new_frame_count;
+    g_state.pending.p1_inputs.clear();
+    g_state.pending.p2_inputs.clear();
+
+    if (g_state.subscribers.empty()) return;
+
+    // Slice the redundancy window from session_history. session_history
+    // last index = pending.start_frame - 1 (the just-pushed frames).
+    // Window covers [start, end) inclusive of the most recent frame.
+    const size_t total = g_state.session_history.size();
+    if (total == 0) return;
+    const size_t window_size = std::min<size_t>(REDUNDANCY_WINDOW, total);
+    const size_t window_end_idx = total;                 // exclusive
+    const size_t window_start_idx = total - window_size;
+    const uint32_t window_start_frame =
+        g_state.session_start_frame + (uint32_t)window_start_idx;
+
+    const size_t payload_bytes = window_size * 4;
+    const size_t dgram_bytes   = sizeof(SpecDataHeader) + payload_bytes;
 
     std::vector<uint8_t> buf(dgram_bytes);
     SpecDataHeader hdr = {};
     hdr.magic       = SPEC_DATA_MAGIC;
     hdr.type        = SpecDataType::INPUT_BATCH;
-    hdr.start_frame = g_state.pending.start_frame;
-    hdr.frame_count = n;
+    hdr.start_frame = window_start_frame;
+    hdr.frame_count = static_cast<uint16_t>(window_size);
     std::memcpy(buf.data(), &hdr, sizeof(hdr));
 
-    // Pack (p1, p2) interleaved — matches ReplayFrame layout exactly so
-    // the spectator side can memcpy directly into replay buffer.
     uint8_t* out = buf.data() + sizeof(hdr);
-    for (uint16_t i = 0; i < n; i++) {
-        uint16_t p1 = g_state.pending.p1_inputs[i];
-        uint16_t p2 = g_state.pending.p2_inputs[i];
-        std::memcpy(out + i * 4 + 0, &p1, 2);
-        std::memcpy(out + i * 4 + 2, &p2, 2);
+    for (size_t i = 0; i < window_size; i++) {
+        const PlaybackFrame& f = g_state.session_history[window_start_idx + i];
+        std::memcpy(out + i * 4 + 0, &f.p1_input, 2);
+        std::memcpy(out + i * 4 + 2, &f.p2_input, 2);
     }
 
     for (const auto& sub : g_state.subscribers) {
         SendRaw(buf.data(), buf.size(), sub.addr);
     }
-
-    // Advance start_frame for next batch; clear pending.
-    g_state.pending.start_frame += n;
-    g_state.pending.p1_inputs.clear();
-    g_state.pending.p2_inputs.clear();
 }
 
 void SendInitialMatchTo(const sockaddr_in& to) {
@@ -233,6 +271,75 @@ void SendMatchEndToAll() {
     for (const auto& sub : g_state.subscribers) {
         SendRaw(&hdr, sizeof(hdr), sub.addr);
     }
+}
+
+// Spectator-side: send INPUT_REQUEST to upstream asking for frames starting
+// at start_frame. Host replies with an INPUT_BATCH covering up to
+// REDUNDANCY_WINDOW frames from session_history.
+void SendInputRequest(uint32_t start_frame) {
+    if (!g_state.subscribed_upstream) return;
+    SpecDataHeader hdr = {};
+    hdr.magic       = SPEC_DATA_MAGIC;
+    hdr.type        = SpecDataType::INPUT_REQUEST;
+    hdr.start_frame = start_frame;
+    hdr.frame_count = 0;
+    hdr.flags       = 0;
+    SendRaw(&hdr, sizeof(hdr), g_state.upstream_addr);
+    g_state.last_input_request_send_ms = (uint64_t)GetTickCount64();
+}
+
+// Host-side: respond to a spectator's INPUT_REQUEST with an INPUT_BATCH
+// containing up to REDUNDANCY_WINDOW frames from session_history starting
+// at requested_frame. If session_history hasn't reached requested_frame
+// yet, send an empty batch (header only) so the spectator knows we got
+// the request but have nothing newer.
+void RespondToInputRequest(const sockaddr_in& from, uint32_t requested_frame) {
+    const size_t total = g_state.session_history.size();
+    const uint32_t hist_first = g_state.session_start_frame;
+    const uint32_t hist_end   = hist_first + (uint32_t)total;
+
+    // Spectator wants something we don't have yet (or never will). Reply
+    // with an empty batch from hist_end so the dedup gate ignores this
+    // round-trip cleanly.
+    if (requested_frame >= hist_end) {
+        SpecDataHeader hdr = {};
+        hdr.magic       = SPEC_DATA_MAGIC;
+        hdr.type        = SpecDataType::INPUT_BATCH;
+        hdr.start_frame = hist_end;
+        hdr.frame_count = 0;
+        SendRaw(&hdr, sizeof(hdr), from);
+        return;
+    }
+
+    // Clamp requested start to within session_history. If spectator asks
+    // for frames older than we still have (extreme catch-up after a long
+    // disconnection), bump up to the oldest available — they'll have to
+    // re-key from there.
+    const uint32_t req_clamped = (requested_frame < hist_first)
+        ? hist_first : requested_frame;
+    const uint32_t off    = req_clamped - hist_first;
+    const uint32_t avail  = (uint32_t)total - off;
+    const uint32_t count  = (avail < REDUNDANCY_WINDOW)
+        ? avail : (uint32_t)REDUNDANCY_WINDOW;
+
+    const size_t payload_bytes = count * 4;
+    const size_t dgram_bytes   = sizeof(SpecDataHeader) + payload_bytes;
+
+    std::vector<uint8_t> buf(dgram_bytes);
+    SpecDataHeader hdr = {};
+    hdr.magic       = SPEC_DATA_MAGIC;
+    hdr.type        = SpecDataType::INPUT_BATCH;
+    hdr.start_frame = req_clamped;
+    hdr.frame_count = (uint16_t)count;
+    std::memcpy(buf.data(), &hdr, sizeof(hdr));
+
+    uint8_t* out = buf.data() + sizeof(hdr);
+    for (uint32_t i = 0; i < count; i++) {
+        const PlaybackFrame& f = g_state.session_history[off + i];
+        std::memcpy(out + i * 4 + 0, &f.p1_input, 2);
+        std::memcpy(out + i * 4 + 2, &f.p2_input, 2);
+    }
+    SendRaw(buf.data(), buf.size(), from);
 }
 
 } // namespace
@@ -377,8 +484,12 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
     };
 
     // Helper: if there's a live GekkoNet session on this node (player slot),
-    // add the joining spectator as a GekkoSpectator actor so input/state
-    // forwards reach them. Called once per accepted JOIN_REQ.
+    // add the joining spectator as a GekkoSpectator actor so confirmed-input
+    // events and (battle) Save/Load events reach them natively. Both CSS
+    // and BATTLE sessions get spectators added — CSS doesn't emit Save/Load
+    // (lockstep suppresses them) but it does emit GekkoAdvanceEvent per
+    // confirmed frame, and that's the source of truth that drives the
+    // spectator's local sim 1:1 with the host.
     auto AddSpectatorToSession = [](const sockaddr_in& spec_from) {
         const NetplaySessionKind k = Netplay_GetSessionKind();
         if (k != NetplaySessionKind::CSS && k != NetplaySessionKind::BATTLE) {
@@ -396,7 +507,9 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
         addr.size = (int)strlen(addr_str);
         gekko_add_actor(sess, GekkoSpectator, &addr);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "SpectatorNode: Late-joiner added as GekkoSpectator -> %s", addr_str);
+            "SpectatorNode: Late-joiner added as GekkoSpectator on %s session -> %s",
+            k == NetplaySessionKind::CSS ? "CSS" : "BATTLE",
+            addr_str);
     };
 
     // Already subscribed? Idempotent ACK.
@@ -559,21 +672,23 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     g_state.subscribed_upstream   = true;
     g_state.last_upstream_recv_ms = (uint64_t)GetTickCount64();
 
-    // RNG sync: every netplay reset point on the host writes the same fixed
-    // seed (0x12345678) — see CheckFullyConnected, Netplay_StartBattle.
-    // Pin our seed to that value the moment we subscribe so the spectator's
-    // local CSS code (which makes its own RNG calls before any INITIAL_MATCH
-    // arrives) evolves the RNG state identically to the host. Subsequent
-    // INITIAL_MATCH packets also write this seed — idempotent.
-    *(uint32_t*)0x41FB1C = 0x12345678;
-
-    // playing_back stays as a metadata flag (drives RunSpectatorTick fallback
-    // when the GekkoSpectateSession isn't alive yet) but the actual input
-    // stream now flows through the GekkoSpectateSession we create here.
+    // RNG sync + queue clear: ONLY apply on FIRST-TIME subscribe (spectator
+    // is still at title/pre-CSS, no game state to lose). On reconnect-after-
+    // silence-failover or on re-broadcast ACK from
+    // AddSubscribedSpectatorsToSession, the spectator's local sim is
+    // mid-match — clobbering RNG to 0x12345678 and wiping pb_queue would
+    // ERASE the in-progress game state and any inputs already buffered for
+    // the next few frames. The user's "spectator desyncs under packet loss"
+    // symptom is exactly this: silence-failover fires under sustained loss,
+    // ACK arrives, RNG gets stomped to seed-pin, sim diverges from host
+    // permanently. Gate both behaviors on first-time only.
+    if (first_time) {
+        *(uint32_t*)0x41FB1C = 0x12345678;
+        g_state.pb_queue.clear();
+        g_state.pb_current_p1 = 0;
+        g_state.pb_current_p2 = 0;
+    }
     g_state.playing_back = true;
-    g_state.pb_queue.clear();
-    g_state.pb_current_p1 = 0;
-    g_state.pb_current_p2 = 0;
 
     char buf[48] = {}; FormatAddr(from, buf, sizeof(buf));
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -660,9 +775,14 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // 96-byte ReplayHeader payload. New-match metadata: stash char
             // selects + state-hash for UI / sanity, re-write seed (host
             // wrote 0x12345678 at battle start; we mirror to stay locked).
-            // We do NOT clear pb_queue or flip playing_back — subscription
-            // already turned playback on, and any in-flight CSS-end frames
-            // need to keep draining.
+            //
+            // playing_back gets re-enabled here. MATCH_END from a previous
+            // match flipped it false; without this re-enable, all
+            // INPUT_BATCH packets for the new match get dropped at the
+            // gate at line 810. Do NOT clear pb_queue — any in-flight
+            // CSS-end / between-match frames still need to drain so the
+            // spectator's sim walks naturally into the new match.
+            g_state.playing_back = true;
             if (payload_len < 96) return;
             uint32_t seed = 0, state_hash = 0;
             std::memcpy(&seed,       payload + 20, 4);
@@ -680,11 +800,20 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             std::memcpy(g_state.initial_match.header_bytes, payload, 96);
             g_state.initial_match.valid = true;
 
-            // Idempotent re-write — same value as JOIN_ACK wrote.
-            *(uint32_t*)0x41FB1C = seed;
+            // INITIAL_MATCH is metadata-only here — char/color/state-hash for
+            // replay headers and UI. We INTENTIONALLY do NOT write RNG.
+            // INITIAL_MATCH arrives on the wire when host calls
+            // SpectatorNode_OnMatchStart (= moment of host's Netplay_StartBattle),
+            // but the spectator's local sim is ~queue_depth frames behind host.
+            // Stomping ADDR_RANDOM_SEED at receipt-time corrupts RNG mid-CSS
+            // replay — every game_rand() call in the still-queued CSS frames
+            // would diverge from host. The actual seed pin happens
+            // deterministically inside CheckGameModeTransition's spectator
+            // branch when the spectator's local game_mode flips to battle,
+            // matching host's pin in Netplay_StartBattle.
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "SpectatorNode: INITIAL_MATCH seed=0x%08X state=0x%08X "
+                        "SpectatorNode: INITIAL_MATCH (metadata) seed=0x%08X state=0x%08X "
                         "p1=%u/%u p2=%u/%u",
                         seed, state_hash,
                         g_state.pb_p1_char, g_state.pb_p1_color,
@@ -701,20 +830,52 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // Refresh upstream liveness — any inbound 0xCE counts.
             g_state.last_upstream_recv_ms = (uint64_t)GetTickCount64();
 
+            // Gap-strict ingest. Each batch carries up to REDUNDANCY_WINDOW
+            // frames where most are re-sends of recent history; we use the
+            // redundancy to fill in for dropped packets. ONLY push frames
+            // contiguous with next_expected_frame; gaps stall the push and
+            // wait for the redundant copy in the next batch to deliver
+            // missing frames. Without this, a single packet loss permanently
+            // misaligns pb_queue from session_history (frames pushed in pop
+            // order against a spectator-local frame counter that no longer
+            // matches the input frame numbers).
             g_state.pb_queue.reserve(g_state.pb_queue.size() + hdr.frame_count);
+            const uint32_t expected_at_entry = g_state.have_frame_baseline
+                ? g_state.next_expected_frame : 0xFFFFFFFFu;
+            const size_t   queue_at_entry    = g_state.pb_queue.size();
+            uint32_t       gap_first_seen    = 0xFFFFFFFFu;
+            bool           gap_request_sent  = false;
+            uint32_t       pushed_this_batch = 0;
             for (uint16_t i = 0; i < hdr.frame_count; i++) {
                 const uint32_t global_frame = hdr.start_frame + (uint32_t)i;
-                // De-dup gate. On failover the new upstream (root) ships
-                // session_history from frame 0; any frame at or before the
-                // local sim's cursor was already played and would re-render
-                // the past if requeued. Skip silently.
-                if (g_state.have_frame_baseline &&
-                    global_frame < g_state.next_expected_frame) {
+
+                // First-ever frame: anchor the cursor here.
+                if (!g_state.have_frame_baseline) {
+                    g_state.have_frame_baseline = true;
+                    g_state.next_expected_frame = global_frame;
+                }
+
+                // Already consumed (or already queued): redundant re-send,
+                // skip.
+                if (global_frame < g_state.next_expected_frame) {
                     continue;
                 }
-                if (!g_state.have_frame_baseline) {
-                    g_state.have_frame_baseline  = true;
-                    g_state.next_expected_frame  = global_frame;
+
+                // Future-frame past the contiguous edge: gap detected.
+                // Don't push (would misalign pb_queue); instead fire ONE
+                // INPUT_REQUEST asking host to re-send from next_expected
+                // onward. Without this single-shot guard the same dropped
+                // packet would fire up to REDUNDANCY_WINDOW (=32) requests
+                // back-to-back as we see each gap-frame in the batch,
+                // hammering the host pointlessly. The 200 ms periodic poll
+                // in TickHealth covers persistent gaps.
+                if (global_frame > g_state.next_expected_frame) {
+                    if (gap_first_seen == 0xFFFFFFFFu) gap_first_seen = global_frame;
+                    if (!gap_request_sent) {
+                        SendInputRequest(g_state.next_expected_frame);
+                        gap_request_sent = true;
+                    }
+                    continue;
                 }
 
                 PlaybackFrame f;
@@ -722,6 +883,7 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 std::memcpy(&f.p2_input, payload + i * 4 + 2, 2);
                 g_state.pb_queue.push_back(f);
                 g_state.next_expected_frame = global_frame + 1;
+                ++pushed_this_batch;
 
                 // Hop-1 relay (rare overflow path): feed forward to any
                 // subscribers we have. Most spectators have zero subs, so
@@ -729,6 +891,14 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 // overflow relay, this populates its session_history +
                 // broadcast queue so its 1-hop downstreams keep streaming.
                 SpectatorNode_OnFrameConfirmed(f.p1_input, f.p2_input);
+            }
+            if (gap_request_sent) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: GAP at frame %u (batch start=%u count=%u, "
+                    "expected=%u at entry, pushed=%u, queue=%zu->%zu) — INPUT_REQUEST sent",
+                    gap_first_seen, hdr.start_frame, hdr.frame_count,
+                    expected_at_entry, pushed_this_batch,
+                    queue_at_entry, g_state.pb_queue.size());
             }
             // Quiet log — at K=8 frames/batch this fires ~12.5x/sec per batch.
             // Keep at INFO so it shows in file log but throttle to one per second.
@@ -751,6 +921,15 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // Don't clear the queue — let the trampoline drain whatever is
             // buffered so we see the final frames before idling. Next
             // INITIAL_MATCH will reset state.
+            break;
+        }
+        case SpecDataType::INPUT_REQUEST: {
+            // Host-side: a downstream subscriber is asking us to re-send
+            // frames from hdr.start_frame onward. Reply with up to one
+            // REDUNDANCY_WINDOW worth from session_history. This is the
+            // bulletproof recovery path — any packet loss leaves a gap
+            // the spectator detects and re-requests until filled.
+            RespondToInputRequest(from, hdr.start_frame);
             break;
         }
     }
@@ -832,6 +1011,19 @@ void SpectatorNode_TickHealth() {
             hb.header.type = CtrlMsg::SPEC_HEARTBEAT;
             ControlChannel_SendTo(hb, g_state.upstream_addr);
             g_state.last_heartbeat_send_ms = now;
+        }
+
+        // Bulletproof input delivery: every INPUT_REQUEST_POLL_MS, ask
+        // upstream to re-send from next_expected_frame. Even with no
+        // packet loss this is dedup'd cheaply on the receive side
+        // (frames < next_expected_frame are dropped). With loss, this
+        // guarantees eventual delivery — gap stalls cap at the poll
+        // interval. Combines with the on-gap-immediate request in the
+        // INPUT_BATCH receive handler for fast recovery.
+        constexpr uint64_t INPUT_REQUEST_POLL_MS = 200;
+        if (g_state.have_frame_baseline &&
+            now - g_state.last_input_request_send_ms >= INPUT_REQUEST_POLL_MS) {
+            SendInputRequest(g_state.next_expected_frame);
         }
 
         // Silence-based failover. Liveness signal used to be the 0xCE
