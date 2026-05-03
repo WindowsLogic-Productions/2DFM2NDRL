@@ -270,6 +270,9 @@ add_executable(FM2K_RollbackLauncher
     FM2K_HubClient.cpp
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
+    # ImGui-based input binder (shared with the hook overlay) — depends only
+    # on SDL3 + ImGui, no project-specific includes.
+    FM2KHook/src/ui/input_binder.cpp
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 
@@ -305,6 +308,10 @@ target_link_libraries(FM2K_RollbackLauncher PRIVATE
     oleaut32
     wininet
     winhttp
+    # XInput for input_binder's Sample_Win32 path. Compiled into the
+    # launcher EXE too even though SDL3-Sample() is the default there;
+    # unifying lets the launcher fall back if SDL3 events stop pumping.
+    xinput9_1_0
 )
 
 # Preprocessor definitions

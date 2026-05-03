@@ -1,5 +1,6 @@
 #include "FM2K_Integration.h"
 #include "FM2K_HubClient.h"
+#include "FM2KHook/src/ui/input_binder.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <wininet.h>
@@ -412,8 +413,110 @@ void LauncherUI::RenderMenuBar() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Settings")) {
+            if (ImGui::MenuItem("Input Bindings — P1", nullptr, show_input_binder_p1_)) {
+                show_input_binder_p1_ = !show_input_binder_p1_;
+                if (show_input_binder_p1_ && !input_binder_initialized_) {
+                    FM2KInputBinder::Init();
+                    input_binder_initialized_ = true;
+                }
+            }
+            if (ImGui::MenuItem("Input Bindings — P2", nullptr, show_input_binder_p2_)) {
+                show_input_binder_p2_ = !show_input_binder_p2_;
+                if (show_input_binder_p2_ && !input_binder_initialized_) {
+                    FM2KInputBinder::Init();
+                    input_binder_initialized_ = true;
+                }
+            }
+            if (ImGui::MenuItem("Host Config", nullptr, show_host_config_)) {
+                show_host_config_ = !show_host_config_;
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
+
+    // Input-binder windows. RenderWindow returns true on any change → autosave.
+    if (show_input_binder_p1_) {
+        if (FM2KInputBinder::RenderWindow(0, &show_input_binder_p1_)) {
+            FM2KInputBinder::Save();
+        }
+    }
+    if (show_input_binder_p2_) {
+        if (FM2KInputBinder::RenderWindow(1, &show_input_binder_p2_)) {
+            FM2KInputBinder::Save();
+        }
+    }
+    if (show_host_config_) {
+        RenderHostConfigWindow();
+    }
+}
+
+// Host-side match settings UI. SOCD mode + stage selection for now;
+// round count / time limit / game speed are forward-compat fields whose
+// addresses aren't mapped per-game yet. Settings are saved to fm2k_host.ini
+// next to the launcher and pushed over the control channel via the hook
+// DLL's Netplay_BroadcastHostConfig.
+void LauncherUI::RenderHostConfigWindow() {
+    if (!ImGui::Begin("Host Config", &show_host_config_, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::TextWrapped(
+        "These settings apply to YOUR game and (when you host) get pushed "
+        "to the connected client + spectators automatically.");
+    ImGui::Separator();
+
+    static const char* kSocdLabels[6] = {
+        "0 — Default        (R wins L+R, U wins U+D)",
+        "1 — Hitbox SOCD    (L+R neutral, U wins U+D)  [tournament default]",
+        "2 — U/D Cancel     (R wins L+R, U+D neutral)",
+        "3 — Both Cancel    (L+R neutral, U+D neutral)",
+        "4 — Up Bias        (R wins L+R, U wins U+D)",
+        "5 — Hitbox + UpBias",
+    };
+    ImGui::Text("SOCD Mode:");
+    if (ImGui::Combo("##socd", &host_config_socd_mode_, kSocdLabels, 6)) {
+        host_config_dirty_ = true;
+    }
+
+    ImGui::Spacing();
+    ImGui::Text("Selected Stage (0xFFFFFFFF = unset):");
+    int stage_int = (int)host_config_stage_;
+    if (ImGui::InputInt("##stage", &stage_int, 1, 1)) {
+        if (stage_int < 0) stage_int = -1;
+        host_config_stage_ = (uint32_t)stage_int;
+        host_config_dirty_ = true;
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled(
+        "Round count / time limit / game speed: not yet mapped to game memory.");
+    ImGui::TextDisabled(
+        "For now both peers must use the same install + game.ini.");
+
+    ImGui::Separator();
+    if (host_config_dirty_) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+            "Unsaved changes — apply before hosting.");
+    }
+    if (ImGui::Button("Apply (writes fm2k_host.ini, takes effect on next session)")) {
+        FILE* f = fopen("fm2k_host.ini", "w");
+        if (f) {
+            fprintf(f, "[Host]\nSocdMode=%d\nSelectedStage=%u\n",
+                    host_config_socd_mode_, host_config_stage_);
+            fclose(f);
+        }
+        // Set env vars so the freshly-spawned hook DLL picks these up at
+        // its first SOCD-mode read (Hook_GetSOCDMode caches on first call).
+        char socd_buf[8];
+        snprintf(socd_buf, sizeof(socd_buf), "%d", host_config_socd_mode_);
+        _putenv_s("FM2K_SOCD_MODE", socd_buf);
+        host_config_dirty_ = false;
+    }
+
+    ImGui::End();
 }
 
 void LauncherUI::RenderGameSelection() {

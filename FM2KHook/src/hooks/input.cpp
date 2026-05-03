@@ -16,7 +16,11 @@
 #include "input.h"
 #include "../core/globals.h"           // original_get_player_input, g_player_index
 #include "../netplay/savestate.h"      // CHAR_SLOT_BASE, CHAR_SLOT_SIZE
+#include "../ui/input_binder.h"        // FM2KInputBinder::Sample_Win32 + Init/Load
 #include <windows.h>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/stat.h>
 
 // Player index we're capturing for (set externally)
 extern int g_player_index;
@@ -67,6 +71,51 @@ uint16_t Input_CaptureLocal() {
     // This prevents cross-instance input bleeding
     if (!IsOurWindowFocused()) {
         return 0;  // Not focused, no input
+    }
+
+    // If the user has set up bindings via the launcher's Input Bindings UI,
+    // use those bindings as the local input source — that's what makes
+    // launcher binds actually drive gameplay. The path resolution lives in
+    // the binder so launcher and hook agree on it (currently
+    // %APPDATA%\FM2K_Rollback\fm2k_inputs.ini, with FM2K_INPUT_CONFIG_PATH
+    // env var override). Falls back to FM2K's own get_player_input below
+    // when no config file is present, so vanilla FM2K key bindings keep
+    // working out of the box.
+    //
+    // Re-checked on every call (cheap stat) instead of cached-on-first-call,
+    // because the user might Save bindings AFTER the game has started — we
+    // want the new binds to take effect without needing to relaunch.
+    {
+        static int  s_last_check_tick = 0;
+        static bool s_binder_active   = false;
+        const int now_tick = (int)GetTickCount();
+        if ((now_tick - s_last_check_tick) > 1000 || s_last_check_tick == 0) {
+            s_last_check_tick = now_tick;
+            // Init() is idempotent and resolves the same DefaultConfigPath()
+            // as the launcher. Calling it once attempts to Load(); if the
+            // file doesn't exist we fall through to the original game input.
+            FM2KInputBinder::Init();
+            // Detect "config file present and successfully loaded" by
+            // checking whether any binding has a non-NONE source. Defaults
+            // also have non-NONE bindings (P1 keyboard arrows + Z/X/C/V/A/S/D/Enter)
+            // so this effectively says "binder is initialized" — which is
+            // exactly when we want to use it.
+            const auto& pb = FM2KInputBinder::Bindings(0);
+            s_binder_active = false;
+            for (const auto& b : pb.bits) {
+                if (b.source != FM2KInputBinder::Binding::Source::NONE) {
+                    s_binder_active = true;
+                    break;
+                }
+            }
+        }
+        if (s_binder_active) {
+            // Local player always reads slot 0 of the binder config (the
+            // user only ever configures one profile; netplay routes it to
+            // the right remote slot). Same convention this file already
+            // uses for original_get_player_input(0, 0) below.
+            return FM2KInputBinder::Sample_Win32(0);
+        }
     }
 
     // Ask the game directly for P1's input. original_get_player_input is

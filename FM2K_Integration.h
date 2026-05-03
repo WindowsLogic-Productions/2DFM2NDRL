@@ -785,12 +785,26 @@ private:
     void RenderObjectAnalysis();        // Stub
     void RenderSlotInspectionWindow();  // Stub
     void RenderHubPanel();              // Fightcade-style lobby
+    void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
 
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
     // chain test. Enabled via FM2K_DEV_MODE=1 env var on launch or
     // via View → Developer Mode in the menu bar.
     bool developer_mode_ = false;
+
+    // Settings windows toggled from the menu bar. input_binder_initialized_
+    // gates Init() to a single call (gamepad subsystem startup) the first
+    // time the user opens either binder window.
+    bool show_input_binder_p1_ = false;
+    bool show_input_binder_p2_ = false;
+    bool show_host_config_     = false;
+    bool input_binder_initialized_ = false;
+
+    // Host-config staged values (committed on Apply → fm2k_host.ini + env var).
+    int      host_config_socd_mode_ = 1;          // tournament default
+    uint32_t host_config_stage_     = 0xFFFFFFFFu;// 0xFFFFFFFF = unset
+    bool     host_config_dirty_     = false;
 
     // Hub client + per-frame drained state. Owned by the launcher
     // (forward-declared in LauncherUI scope to avoid pulling

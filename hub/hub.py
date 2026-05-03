@@ -38,11 +38,15 @@ ROOMS: dict[str, "Room"] = {}
 # anyone joins. Keyed by canonical game id (later: master game list
 # will provide stable ids). Display name shown in the launcher UI.
 SEED_ROOMS: list[tuple[str, str]] = [
-    ("pkmncc",            "Pokemon: CardCaptor"),
+    ("pkmncc",            "Pokemon: Close Combat"),
     ("SCWU",              "SCWU Infinity"),
     ("WonderfulWorld",    "Wonderful World"),
     ("StudioS_Fighters",  "StudioS Fighters"),
     ("STRIPFIGHTER_ZERO", "Strip Fighter Zero"),
+    # game_id matches the EXE stem (ReSHUFFLE.exe → "ReSHUFFLE") so the
+    # launcher's auto-derived game_id from the discovered .exe lines up
+    # with this seeded room without needing a separate lookup table.
+    ("ReSHUFFLE",         "Emblem of Red: ReSHUFFLE"),
 ]
 
 

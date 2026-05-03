@@ -140,6 +140,45 @@ static bool g_received_hello_ack = false;
 // CONTROL MESSAGE HANDLER
 // =============================================================================
 
+// Forward decls for SOCD-mode helpers in hooks.cpp (file-scope so all
+// uses below — Netplay_BroadcastHostConfig + the HOST_CONFIG receiver —
+// can reach them).
+extern "C" int  Hook_GetSOCDModePublic();
+extern "C" void Hook_SetSOCDMode(int mode);
+
+// Snapshot host's current settings and ship them to the remote peer +
+// any subscribed spectators. Called from CheckFullyConnected (initial
+// rendezvous) and from Netplay_StartBattle (every new match) so settings
+// changes mid-session propagate. No-op when the local peer isn't host.
+static void Netplay_BroadcastHostConfig() {
+    if (g_player_index != 0) return;  // only host pushes config
+    const uint32_t stage = *(uint32_t*)0x470188;
+    const uint8_t  socd  = (uint8_t)Hook_GetSOCDModePublic();
+    ControlChannel_SendHostConfig(
+        /*selected_stage*/  stage,
+        /*round_count*/     0,        // forward-compat field; address unmapped
+        /*round_time_sec*/  0,        // forward-compat field; address unmapped
+        /*game_speed_pct*/  0,        // forward-compat field; address unmapped
+        /*socd_mode*/       socd);
+
+    // Also push to subscribed spectators on the same multiplex channel.
+    // BroadcastSwapToSubscribers is the existing helper that fans CtrlPacket
+    // to every subscriber addr; we reuse the same control packet.
+    {
+        CtrlPacket pkt = {};
+        pkt.header.type = CtrlMsg::HOST_CONFIG;
+        pkt.data.host_config.selected_stage  = stage;
+        pkt.data.host_config.socd_mode       = socd;
+        pkt.data.host_config.round_count     = 0;
+        pkt.data.host_config.round_time_sec  = 0;
+        pkt.data.host_config.game_speed_pct  = 0;
+        auto subs = SpectatorNode_GetSubscriberAddrs();
+        for (const auto& s : subs) {
+            ControlChannel_SendTo(pkt, s);
+        }
+    }
+}
+
 static void CheckFullyConnected() {
     if (g_received_hello && g_received_hello_ack) {
         if (g_simple_state != SimpleState::CONNECTED) {
@@ -152,6 +191,10 @@ static void CheckFullyConnected() {
             *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Synced RNG=0x12345678");
+
+            // Push host's authoritative match config so client adopts the
+            // same stage/SOCD/etc settings without manual mirroring.
+            Netplay_BroadcastHostConfig();
         }
     }
 }
@@ -186,6 +229,20 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Received BATTLE_READY from remote");
             g_remote_css_ready = true;
+
+            // Loss-tolerant echo — same pattern as BATTLE_ENTERING / BATTLE_END.
+            // When peers return to CSS at slightly different wall-clock times
+            // (one finishes battle-end-sync ~300 ms before the other), the
+            // ahead peer creates its CSS GekkoSession on the first BATTLE_READY
+            // it sees, then STOPS sending its own BATTLE_READY. The lagging
+            // peer's BATTLE_READYs after that point arrive here, set the flag
+            // (already true), and used to do nothing else — so the lagging
+            // peer never received the ahead peer's signal and stayed stuck
+            // resending BATTLE_READY forever. Echo back when we've already
+            // signaled locally so the lagging peer always sees our flag.
+            if (g_local_css_ready) {
+                ControlChannel_SendBattleReady();
+            }
             break;
         }
 
@@ -208,6 +265,19 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Received BATTLE_ENTERING (remote_swap=%u, prev_agreed=%u, agreed=%u)",
                 remote_proposal, prev_agreed, g_battle_entry_swap_frame);
+
+            // Echo our own BATTLE_ENTERING back if we've already signaled
+            // locally. Without this echo a single dropped packet causes
+            // deadlock: if remote received our signal but we never received
+            // theirs (or vice versa), the resender in PollBattleSync is
+            // gated on !g_remote_battle_entered which is now true, so it
+            // stops firing. Meanwhile remote keeps re-sending, and gets
+            // no reply. The echo guarantees both sides eventually see each
+            // other's signal regardless of which direction the loss was in.
+            // Idempotent on receiver: g_remote_battle_entered stays true.
+            if (g_local_battle_entered) {
+                ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+            }
             break;
         }
 
@@ -225,6 +295,11 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Received BATTLE_END (remote_swap=%u, prev_agreed=%u, agreed=%u)",
                 remote_proposal, prev_agreed, g_battle_end_swap_frame);
+
+            // Same loss-tolerant echo as BATTLE_ENTERING — see comment above.
+            if (g_local_battle_end_signaled) {
+                ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+            }
             break;
         }
 
@@ -234,6 +309,37 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             ControlChannel_SetConnected(false);
             g_simple_state = SimpleState::DISCONNECTED;
             break;
+
+        case CtrlMsg::HOST_CONFIG: {
+            // Host's authoritative match settings — adopt locally so this
+            // peer (client OR spectator) runs with identical rules.
+            // Per-field "unset" sentinels: 0xFFFFFFFF for selected_stage,
+            // 0 for the count/time/speed fields, 0xFF for socd_mode.
+            const auto& hc = packet->data.host_config;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: Received HOST_CONFIG (stage=%u rounds=%u time=%u speed=%u socd=%u)",
+                hc.selected_stage, hc.round_count, hc.round_time_sec,
+                hc.game_speed_pct, (unsigned)hc.socd_mode);
+
+            // Stage selection — direct memcpy to FM2K's selected-stage global.
+            // Address verified in FM2K_Integration.h:78. The host writes its
+            // pick here at battle entry; client mirrors before its own
+            // pre-battle code reads the field.
+            if (hc.selected_stage != 0xFFFFFFFF) {
+                *(uint32_t*)0x470188 = hc.selected_stage;
+            }
+
+            // SOCD mode — wire through the runtime setter. Persists for
+            // the rest of the session unless host changes it again.
+            if (hc.socd_mode != 0xFF) {
+                Hook_SetSOCDMode((int)hc.socd_mode);
+            }
+
+            // round_count / round_time_sec / game_speed_pct: forward-compat
+            // fields. Per-game addresses aren't mapped yet (would need IDA
+            // session per FM2K variant). Document on the wire for v1.1.
+            break;
+        }
 
         case CtrlMsg::CHAT: {
             // Inbound peer chat. Append to the chat log ring; launcher UI
@@ -823,18 +929,20 @@ void Netplay_PollBattleEndSync() {
 }
 
 static void AddSubscribedSpectatorsToSession() {
-    // No-op. Spectators are NOT added as GekkoSpectator actors on the
-    // host's GekkoSession — that approach broke late-join across phase
-    // boundaries (CSS session destroyed on battle entry, no input history
-    // for late joiner). Spectators ride SpectatorNode::session_history
-    // exclusively: every confirmed input from CSS and BATTLE GekkoSessions
-    // is appended to one persistent log spanning the entire connection,
-    // backfilled to late joiners via SendSessionBackfillTo, and live-
-    // streamed via INPUT_BATCH. GekkoNet's spectator-actor mechanism is
-    // unused on this side.
+    // Spectators are NOT GekkoSpectator actors. Input distribution to
+    // spectators flows over the SpectatorNode INPUT_BATCH path — every
+    // confirmed (p1, p2) frame is recorded into session_history at
+    // Hook_GetPlayerInput's capture_and_return and the host's
+    // FlushBatch broadcasts to every subscriber.
     //
-    // Kept as a stub (still called from StartCSSSession / StartBattle) so
-    // future spectator-related session-create logic has a hook point.
+    // Adding spectators to GekkoNet was the wrong architecture — it required
+    // host/spectator sub-state to match at session-create time, which is
+    // launch-timing dependent and a snapshot transfer to fix. Pure input
+    // replay sidesteps all of that: spectator boots → starts consuming
+    // host's recorded inputs from frame 0 → walks title→CSS→battle in
+    // lockstep with host's recorded execution.
+    (void)0;  // intentionally empty — kept as a hook for future per-session
+              // setup if needed.
 }
 
 // =============================================================================
@@ -1264,6 +1372,11 @@ bool Netplay_StartBattle() {
         /*p1_char*/0, /*p1_color*/0,
         /*p2_char*/0, /*p2_color*/0);
 
+    // Re-broadcast host config so any setting changes (host clicked a
+    // different stage between matches, switched SOCD mode, etc.) propagate
+    // to client + spectators before this match's first sim frame.
+    Netplay_BroadcastHostConfig();
+
     g_simple_state = SimpleState::BATTLE;
     g_session_ready = false;
     g_netplay_frame = 0;
@@ -1667,6 +1780,11 @@ bool Netplay_ProcessBattleInputPhase() {
                 // memory the StudioS chars happen to use, breaking
                 // their scripts.
 
+                // Snapshot RNG BEFORE PGI/UG run. Used by the [HOST-TRACE] log
+                // below — distinguishes "per-frame leak inside PGI/UG" from
+                // "inter-frame leak between confirmed advances."
+                const uint32_t rng_pre_advance = *(uint32_t*)0x41FB1C;
+
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
                 if (original_process_game_inputs) {
@@ -1704,16 +1822,92 @@ bool Netplay_ProcessBattleInputPhase() {
                     g_netplay_frame > g_highest_recorded_frame)
                 {
                     g_highest_recorded_frame = g_netplay_frame;
+
+                    // PER-FRAME alignment-trace log: every confirmed frame
+                    // for the first 100 frames of each battle. Pairs with the
+                    // identical [SPEC-TRACE] log on spectator. Comparing
+                    // (rng_pre, rng_post, p1_in, p2_in) at every battle frame
+                    // tells us:
+                    //   * inputs match every frame? → alignment correct
+                    //   * inputs differ at some bf? → alignment off / wrong
+                    //                                 input popped that frame
+                    //   * rng_pre matches but rng_post differs → PGI+UG itself
+                    //                                            calls game_rand
+                    //                                            different #
+                    //   * rng_pre differs → leak between confirmed advances
+                    //                       (something between this frame and
+                    //                       last frame mutated RNG)
+                    // Long trace: 5000 confirmed frames (~50 sec), so we
+                    // capture the wall-clock window where the user reports
+                    // visible desync. "bf-1" subtraction aligns this with
+                    // spec's bf=K labelling (spec starts at 0, host's
+                    // post-increment makes its first log bf=1).
+                    if (g_netplay_frame > 0 && g_netplay_frame <= 5000) {
+                        constexpr uintptr_t POOL = 0x4701E0;
+                        constexpr size_t    SLOT = 382;
+                        const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
+                        const int32_t p2_x = *(int32_t*)(POOL + 1 * SLOT + 0x08);
+                        const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
+                        const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
+                        const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
+                        const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "[HOST-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
+                            "p1=0x%03X p2=0x%03X p1_x=%d p2_x=%d "
+                            "p1_s=%d p2_s=%d hp=%u/%u",
+                            g_netplay_frame - 1u, rng_pre_advance,
+                            *(uint32_t*)0x41FB1C,
+                            g_p1_input, g_p2_input,
+                            p1_x, p2_x, p1_script, p2_script,
+                            p1_hp, p2_hp);
+                    }
+
                     Replay::Replay_RecordFrame(g_p1_input, g_p2_input);
-                    // Battle-side session_history capture lives HERE (not
-                    // in Hook_GetPlayerInput's capture_and_return) because
-                    // this site is already gated on !rolling_back &&
-                    // !running_ahead && new_frame — exactly the dedup we
-                    // need to avoid runahead/rollback multi-recording the
-                    // same frame. Pre-battle frames (title screen, CSS)
-                    // are captured at Hook_GetPlayerInput which is correct
-                    // for those phases (no rollback there).
+                    // Spectator input forwarding: gate is here because this
+                    // site is already !rolling_back && !running_ahead &&
+                    // new_frame — the dedup we need to avoid runahead /
+                    // rollback re-recording the same frame. Pre-battle
+                    // frames (title screen, CSS) are captured by
+                    // Hook_GetPlayerInput's capture_and_return, which is
+                    // correct for those phases (no rollback there).
                     SpectatorNode_OnFrameConfirmed(g_p1_input, g_p2_input);
+
+                    // Per-frame state fingerprint for spectator-desync
+                    // diagnosis — pairs with [SPEC-FP] log in
+                    // RunSpectatorTick. Same sample addresses; spectator's
+                    // bf counter is its own pop count post-battle-entry,
+                    // host's bf is g_netplay_frame. Match by bf to find
+                    // first divergent frame.
+                    if ((g_netplay_frame % 30) == 0) {
+                        const uint32_t rng     = *(uint32_t*)0x41FB1C;
+                        const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                        const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
+                        const uint32_t p2_hp   = *(uint32_t*)0x4EDCC4;
+                        const uint32_t timer   = *(uint32_t*)0x470044;
+                        // World positions live in the object pool: slot 0 +0x08
+                        // = pos_x, slot 1 = slot 0 + 382. (0x470020 was the
+                        // CSS character-slot index, not the in-battle x —
+                        // earlier logs were comparing useless data.)
+                        constexpr uintptr_t POOL = 0x4701E0;
+                        constexpr size_t    SLOT = 382;
+                        const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
+                        const int32_t p1_y = *(int32_t*)(POOL + 0 * SLOT + 0x0C);
+                        const int32_t p2_x = *(int32_t*)(POOL + 1 * SLOT + 0x08);
+                        const int32_t p2_y = *(int32_t*)(POOL + 1 * SLOT + 0x0C);
+                        const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
+                        const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "[HOST-FP] bf=%u rng=0x%08X buf=%u "
+                            "p1_hp=%u p2_hp=%u timer=%u "
+                            "p1_pos=(%d,%d) p2_pos=(%d,%d) "
+                            "p1_script=%d p2_script=%d "
+                            "p1_in=0x%03X p2_in=0x%03X",
+                            g_netplay_frame, rng, buf_idx,
+                            p1_hp, p2_hp, timer,
+                            p1_x, p1_y, p2_x, p2_y,
+                            p1_script, p2_script,
+                            g_p1_input, g_p2_input);
+                    }
                 }
 
                 // Shake safety cap removed — the real fix is letting the
@@ -1813,6 +2007,7 @@ uint16_t Netplay_GetInput(int player_id) {
 //
 // Returns true if the sim advanced this tick (caller renders); false on
 // stall (waiting for confirmed inputs from host).
+
 bool Netplay_ProcessSpectatorPhase() {
     if (!g_session || g_session_kind != SessionKind::SPECTATE) return false;
 

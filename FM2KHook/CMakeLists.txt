@@ -32,6 +32,7 @@ add_library(FM2KHook SHARED
     # UI
     src/ui/imgui_overlay.cpp
     src/ui/shared_mem.cpp
+    src/ui/input_binder.cpp
     # Parity — kgtengine cross-engine ground-truth recorder
     src/parity/parity_recorder.cpp
 )
@@ -55,6 +56,10 @@ target_link_libraries(FM2KHook PRIVATE
     ws2_32
     winmm
     d3d9
+    # XInput for the input binder's Win32 polling path. Use xinput9_1_0
+    # (ships with Win7+ in-box) to avoid the redist requirement of the
+    # current xinput1_4.
+    xinput9_1_0
 )
 
 # Include directories - add all src subdirectories so includes work
