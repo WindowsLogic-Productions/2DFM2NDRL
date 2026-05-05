@@ -12,7 +12,33 @@ vendored/SDL/
 *.txt
 
 CLAUDE.local.md
-CLAUDE.local.md
+
+# Per-developer tooling state (Cursor, Claude Code).
+.cursor/
+.claude/
+
+# IDA-generated databases littering the repo root.
+*.i64
+*.id0
+*.id1
+*.id2
+*.til
+*.nam
+*.sig
+
+# Game executables copied into root for IDA. The actual builds live
+# under build/ and get deployed to /mnt/c/games/.
+/KGT2nd_EDITOR.exe
+/WonderfulWorld_*.exe
+
+# Loose game install / config copies the editor leaves around.
+2D Fighter*Maker*.ini
+/2DFM_Player/
+/refgame/
+/editor/
+
+# Stray IDE / scratch files.
+FM2K::State::GameStateMachine
 /2dfm
 /Unity2dfmRuntime
 ExceptionAutoSave_FM-Variables.CT
