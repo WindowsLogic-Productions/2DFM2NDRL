@@ -54,3 +54,6 @@ FM-Variables.CT
 
 # Auto-generated at build time by scripts/make_version.sh.
 /version_local.h
+
+# Python bytecode caches in the stats site / hub side.
+__pycache__/
