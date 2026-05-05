@@ -28,6 +28,9 @@ bool NetSocket_IsInitialized();
 // Get the raw socket handle (for debugging)
 SOCKET NetSocket_GetHandle();
 
+// Get the bound local UDP port (host byte order). Returns 0 if not initialized.
+uint16_t NetSocket_GetLocalPort();
+
 // Get remote address info (for GekkoNet adapter)
 const sockaddr_in* NetSocket_GetRemoteAddr();
 
@@ -70,6 +73,14 @@ uint32_t ControlChannel_GetLastRecvMs();
 
 // Get round-trip time estimate (ping)
 uint32_t ControlChannel_GetRttMs();
+
+// Worst RTT observed since last ResetWorstRttMs() call. Used by
+// Netplay_StartBattleSession to compute CCCaster-style local delay
+// (delay covers the worst spike, not just the mean) at session
+// creation time.
+uint32_t ControlChannel_GetWorstRttMs();
+uint32_t ControlChannel_GetRttSampleCount();
+void     ControlChannel_ResetWorstRttMs();
 
 // =============================================================================
 // CONTROL CHANNEL - CONVENIENCE FUNCTIONS

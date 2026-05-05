@@ -192,13 +192,14 @@ struct CtrlPacket {
             uint16_t redirect_port;  // host byte order
         } spec_redirect;
 
-        // SPEC_JOIN_ACK — host tells joining spectator which session kind to
-        // create for its GekkoSpectateSession. Values: 0 = unknown / between
-        // matches (spectator should wait for next BATTLE_ENTERING),
-        // 1 = CSS lockstep, 2 = battle rollback. Receivers from older peers
-        // (zero-initialised CtrlPacket data) read 0 → safe default.
+        // SPEC_JOIN_ACK — host tells joining spectator which session kind
+        // to mirror (CSS=1, BATTLE=2, NONE=0=between-matches). Plus the
+        // host's TCP listener port — spectator MUST dial it to receive
+        // the INPUT_BATCH / INITIAL_MATCH / MATCH_END stream. UDP carries
+        // only handshake + heartbeat; TCP carries the bulk stream.
         struct {
-            uint8_t host_session_kind;
+            uint8_t  host_session_kind;
+            uint16_t host_tcp_port;
         } spec_join_ack;
 
         // HOST_CONFIG — host's authoritative match settings, mirrored to
