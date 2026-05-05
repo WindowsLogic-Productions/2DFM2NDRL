@@ -1,12 +1,14 @@
 #include "FM2K_Integration.h"
 #include "FM2K_HubClient.h"
 #include "FM2K_DiscordAuth.h"
+#include "FM2K_Locale.h"
 #include "FM2K_Updater.h"
 #include "version_local.h"
 #include "FM2KHook/src/ui/input_binder.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <wininet.h>
+#include <shellapi.h>  // Shell_NotifyIcon for challenge toast
 #include <iostream>
 #include <algorithm>
 #include <fstream>
@@ -300,7 +302,89 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
     ImGuiStyle& style = ImGui::GetStyle();
     style.ScaleAllSizes(main_scale);
     style.FontScaleDpi = main_scale;
-    
+
+    // Two-font atlas: a Latin-first font for ASCII / Latin-1 (so backslash
+    // stays a backslash and Spanish accented chars render natively), then
+    // MS Gothic / Meiryo merged on top for Japanese coverage.
+    //
+    // Why this matters: Japanese fonts follow JIS X 0201, which maps
+    // codepoint 0x5C to the yen sign (¥) instead of backslash. If we load
+    // a JP font first with `GetGlyphRangesJapanese()` (which includes
+    // ASCII), every backslash in the UI renders as ¥ — visible in file
+    // paths, escape characters in tooltips, etc. By loading Segoe UI (or
+    // any Latin font) first to claim ASCII slots, then merging the JP
+    // font with MergeMode=true, ImGui keeps the Latin font's glyph for
+    // any codepoint already in the atlas and only pulls JP glyphs from
+    // MS Gothic. Backslash stays a backslash, hiragana/kanji come from JP.
+    {
+        // Latin font candidates in priority order. Segoe UI is the modern
+        // Windows UI font (Vista+); Tahoma is a universal fallback that
+        // ships on every Windows install.
+        const char* latin_font_paths[] = {
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\tahoma.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        };
+        ImFontConfig latin_config;
+        latin_config.OversampleH = 2;
+        latin_config.OversampleV = 2;
+        latin_config.PixelSnapH = false;
+        ImFont* latin_font = nullptr;
+        for (const char* p : latin_font_paths) {
+            latin_font = io.Fonts->AddFontFromFileTTF(p, 16.0f, &latin_config,
+                                                     io.Fonts->GetGlyphRangesDefault());
+            if (latin_font) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Loaded Latin UI font: %s", p);
+                break;
+            }
+        }
+        if (!latin_font) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "No Latin system font loaded — falling back to "
+                        "ImGui default. Backslash and accented characters "
+                        "may render with the bundled bitmap font.");
+            io.Fonts->AddFontDefault();
+        }
+
+        // Japanese fonts merged on top. MergeMode=true means glyphs already
+        // claimed by the Latin font (ASCII / Latin-1 supplement) stay with
+        // the Latin font; only codepoints not yet in the atlas (kana,
+        // kanji, half-width katakana, etc) get pulled from MS Gothic.
+        ImFontConfig jp_config;
+        jp_config.MergeMode    = true;
+        jp_config.OversampleH  = 2;
+        jp_config.OversampleV  = 2;
+        jp_config.PixelSnapH   = true;
+        const char* jp_font_paths[] = {
+            "C:\\Windows\\Fonts\\msgothic.ttc",
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "C:\\Windows\\Fonts\\msgothic.ttf",
+            "C:\\Windows\\Fonts\\YuGothM.ttc",
+        };
+        bool jp_loaded = false;
+        for (const char* p : jp_font_paths) {
+            if (io.Fonts->AddFontFromFileTTF(p, 16.0f, &jp_config,
+                                             io.Fonts->GetGlyphRangesJapanese())) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Merged Japanese font: %s", p);
+                jp_loaded = true;
+                break;
+            }
+        }
+        if (!jp_loaded) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "No Japanese-capable system font found — Japanese "
+                        "text will render as '?'. Install East Asian "
+                        "language pack to fix.");
+        }
+    }
+
+    // Locale: load translation tables and pick the active language. Must
+    // happen AFTER the font is configured (so ImGui has glyphs ready when
+    // the first frame renders) but BEFORE any T() call.
+    fm2k::Locale::Init();
+
     // Setup Platform/Renderer backends
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
@@ -448,53 +532,53 @@ void LauncherUI::Render() {
 
 void LauncherUI::RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Select Games Folder...")) {
+        if (ImGui::BeginMenu(T("menu_file"))) {
+            if (ImGui::MenuItem(T("btn_select_games_folder"))) {
                 // ... folder selection logic ...
             }
-            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+            if (ImGui::MenuItem(T("menu_exit"), "Alt+F4")) {
                 if (on_exit) on_exit();
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Session")) {
+        if (ImGui::BeginMenu(T("menu_session"))) {
             if (launcher_state_ == LauncherState::InGame || launcher_state_ == LauncherState::Connecting) {
-                if (ImGui::MenuItem("Disconnect")) {
+                if (ImGui::MenuItem(T("hub_disconnect"))) {
                     if (on_session_stop) on_session_stop();
                 }
             } else {
-                ImGui::MenuItem("Disconnect", nullptr, false, false); // Disabled
+                ImGui::MenuItem(T("hub_disconnect"), nullptr, false, false); // Disabled
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("View")) {
-            if (ImGui::MenuItem("Developer Mode", nullptr, developer_mode_)) {
+        if (ImGui::BeginMenu(T("menu_view"))) {
+            if (ImGui::MenuItem(T("menu_developer_mode"), nullptr, developer_mode_)) {
                 developer_mode_ = !developer_mode_;
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Settings")) {
-            if (ImGui::MenuItem("Input Bindings — P1", nullptr, show_input_binder_p1_)) {
+        if (ImGui::BeginMenu(T("menu_settings"))) {
+            if (ImGui::MenuItem(T("input_bindings_p1"), nullptr, show_input_binder_p1_)) {
                 show_input_binder_p1_ = !show_input_binder_p1_;
                 if (show_input_binder_p1_ && !input_binder_initialized_) {
                     FM2KInputBinder::Init();
                     input_binder_initialized_ = true;
                 }
             }
-            if (ImGui::MenuItem("Input Bindings — P2", nullptr, show_input_binder_p2_)) {
+            if (ImGui::MenuItem(T("input_bindings_p2"), nullptr, show_input_binder_p2_)) {
                 show_input_binder_p2_ = !show_input_binder_p2_;
                 if (show_input_binder_p2_ && !input_binder_initialized_) {
                     FM2KInputBinder::Init();
                     input_binder_initialized_ = true;
                 }
             }
-            if (ImGui::MenuItem("Host Config", nullptr, show_host_config_)) {
+            if (ImGui::MenuItem(T("panel_host_config"), nullptr, show_host_config_)) {
                 show_host_config_ = !show_host_config_;
             }
-            if (ImGui::MenuItem("Hub Server...", nullptr, show_hub_server_)) {
+            if (ImGui::MenuItem(T("menu_hub_server"), nullptr, show_hub_server_)) {
                 show_hub_server_ = !show_hub_server_;
             }
-            if (ImGui::MenuItem("Sign in with Discord...", nullptr, show_discord_auth_)) {
+            if (ImGui::MenuItem(T("hub_signin_ellipsis"), nullptr, show_discord_auth_)) {
                 show_discord_auth_ = !show_discord_auth_;
             }
             ImGui::Separator();
@@ -506,19 +590,61 @@ void LauncherUI::RenderMenuBar() {
                 mute_state_loaded_ = true;
                 LoadAudioMuteState();
             }
-            if (ImGui::MenuItem("Mute Music", nullptr, mute_bgm_)) {
+            if (ImGui::MenuItem(T("audio_mute_music"), nullptr, mute_bgm_)) {
                 mute_bgm_ = !mute_bgm_;
                 SaveAudioMuteState();
             }
-            if (ImGui::MenuItem("Mute Sound Effects", nullptr, mute_se_)) {
+            if (ImGui::MenuItem(T("audio_mute_se"), nullptr, mute_se_)) {
                 mute_se_ = !mute_se_;
                 SaveAudioMuteState();
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Check for Updates")) {
+            // Notification toggles. Lazy-loaded once on first menu render
+            // so the read of settings.ini doesn't happen until the user
+            // actually opens the Settings menu.
+            if (!notify_state_loaded_) {
+                LoadNotifyState();
+                notify_state_loaded_ = true;
+            }
+            if (ImGui::BeginMenu(T("menu_notifications"))) {
+                if (ImGui::MenuItem(T("notify_taskbar_flash"), nullptr, notify_flash_)) {
+                    notify_flash_ = !notify_flash_;
+                    SaveNotifyState();
+                }
+                if (ImGui::MenuItem(T("notify_sound"), nullptr, notify_sound_)) {
+                    notify_sound_ = !notify_sound_;
+                    SaveNotifyState();
+                }
+                if (ImGui::MenuItem(T("notify_toast"), nullptr, notify_toast_)) {
+                    notify_toast_ = !notify_toast_;
+                    SaveNotifyState();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem(T("menu_check_for_updates"))) {
                 fm2k::updater::CheckForUpdates();
             }
-            ImGui::TextDisabled("  v%s (rev %s)", fm2k::kAppVersion, fm2k::kAppRevision);
+            ImGui::TextDisabled(T("label_version_rev"), fm2k::kAppVersion, fm2k::kAppRevision);
+            ImGui::EndMenu();
+        }
+
+        // Language menu — top-level so users don't have to dig into
+        // Settings to switch. Each entry labels itself in its own native
+        // script so anyone can recognize their language regardless of what
+        // the launcher is currently set to. Toggling persists the choice to
+        // %APPDATA%\FM2K_Rollback\settings.ini and applies on the next
+        // frame (no restart needed — the font atlas has every glyph range
+        // loaded once at boot).
+        if (ImGui::BeginMenu(T("menu_language"))) {
+            const fm2k::Lang current = fm2k::Locale::Current();
+            for (fm2k::Lang lang : fm2k::Locale::All()) {
+                bool selected = (lang == current);
+                if (ImGui::MenuItem(fm2k::Locale::DisplayNameForLang(lang),
+                                    nullptr, selected)) {
+                    fm2k::Locale::Set(lang);
+                }
+            }
             ImGui::EndMenu();
         }
 
@@ -710,7 +836,7 @@ void LauncherUI::RenderHubServerWindow() {
         return;
     }
     ImGui::PushItemWidth(280);
-    ImGui::InputText("Host", hub_host_, sizeof(hub_host_));
+    ImGui::InputText(T("netcfg_host"), hub_host_, sizeof(hub_host_));
     ImGui::PopItemWidth();
     ImGui::TextWrapped(
         "Hub server hostname or IP. Default 2dfm.sytes.net for public play. "
@@ -828,6 +954,166 @@ void LauncherUI::SaveAudioMuteState() {
     std::fclose(f);
 }
 
+// ---------------------------------------------------------------------------
+// Notification settings + delivery
+// ---------------------------------------------------------------------------
+// Persists three independent toggles to the launcher's settings.ini next to
+// the Locale module's `language` key. Defaults are all-on so users never miss
+// a challenge while tabbed out — they can dial it back per-channel from
+// Settings → Notifications.
+
+static std::string NotifySettingsPath() {
+    const char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    std::string dir = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\settings.ini";
+}
+
+static bool ReadBoolSetting(const std::string& path, const char* key, bool dflt) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return dflt;
+    char line[256];
+    bool out = dflt;
+    while (std::fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n') continue;
+        char* eq = std::strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* k = p;
+        size_t klen = std::strlen(k);
+        while (klen > 0 && (k[klen-1] == ' ' || k[klen-1] == '\t')) k[--klen] = '\0';
+        if (std::strcmp(k, key) != 0) continue;
+        char* v = eq + 1;
+        while (*v == ' ' || *v == '\t') ++v;
+        size_t vlen = std::strlen(v);
+        while (vlen > 0 && (v[vlen-1] == '\n' || v[vlen-1] == '\r' ||
+                            v[vlen-1] == ' '  || v[vlen-1] == '\t')) v[--vlen] = '\0';
+        out = (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0
+            || std::strcmp(v, "yes") == 0 || std::strcmp(v, "on") == 0);
+        break;
+    }
+    std::fclose(f);
+    return out;
+}
+
+static void WriteBoolSetting(const std::string& path, const char* key, bool value) {
+    // Read all keys, replace ours, rewrite. Tiny file, tiny number of keys —
+    // brute force is fine and keeps the format stable.
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            std::string s = line;
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
+            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+            const size_t eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
+        }
+        std::fclose(f);
+    }
+    bool found = false;
+    for (auto& p : kv) if (p.first == key) { p.second = (value ? "1" : "0"); found = true; }
+    if (!found) kv.emplace_back(key, value ? "1" : "0");
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
+        std::fclose(f);
+    }
+}
+
+void LauncherUI::LoadNotifyState() {
+    const std::string path = NotifySettingsPath();
+    if (path.empty()) return;
+    notify_flash_ = ReadBoolSetting(path, "notify_flash", true);
+    notify_sound_ = ReadBoolSetting(path, "notify_sound", true);
+    notify_toast_ = ReadBoolSetting(path, "notify_toast", true);
+}
+
+void LauncherUI::SaveNotifyState() {
+    const std::string path = NotifySettingsPath();
+    if (path.empty()) return;
+    WriteBoolSetting(path, "notify_flash", notify_flash_);
+    WriteBoolSetting(path, "notify_sound", notify_sound_);
+    WriteBoolSetting(path, "notify_toast", notify_toast_);
+}
+
+void LauncherUI::FireChallengeNotification(const std::string& from_nick) {
+    // Resolve the launcher's HWND once. SDL3 stores it on the window's
+    // properties under SDL_PROP_WINDOW_WIN32_HWND_POINTER. If we can't get
+    // it (e.g., SDL backend changed), every Win32-flavored notification
+    // silently no-ops — sound still works.
+    HWND hwnd = nullptr;
+    if (window_) {
+        hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window_),
+                                            SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                            nullptr);
+    }
+
+    // 1) Taskbar flash. Only if the launcher isn't currently the foreground
+    // window — flashing while focused is annoying. FLASHW_ALL flashes both
+    // window caption AND taskbar button. FLASHW_TIMERNOFG keeps flashing
+    // until the user focuses the window. Cancels automatically on focus.
+    if (notify_flash_ && hwnd && hwnd != GetForegroundWindow()) {
+        FLASHWINFO fi = { sizeof(fi), hwnd,
+                          FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0 };
+        FlashWindowEx(&fi);
+    }
+
+    // 2) Sound: MessageBeep is the cheapest "make a noise" path on Windows.
+    // No assets to ship; the Windows default-event sound is what users
+    // already recognize as a notification chirp. MB_ICONINFORMATION maps
+    // to SystemAsterisk — a short, non-jarring ding.
+    if (notify_sound_) {
+        MessageBeep(MB_ICONINFORMATION);
+    }
+
+    // 3) Windows toast / balloon notification via Shell_NotifyIconW
+    // (wide-string variant). Use the W version specifically so non-ASCII
+    // nicks (Armonté, テスト, español) render correctly. Shell_NotifyIconA
+    // would interpret our UTF-8 bytes as the system codepage (CP1252 on
+    // most US installs), so "é" (UTF-8 `C3 A9`) shows up as "Ã©" mangled.
+    // Wide-API call sites take UTF-16 throughout and the OS routes it to
+    // the Action Center toast on Windows 10/11. We don't keep a persistent
+    // tray icon; Add+Modify+Delete fires the balloon and cleans up.
+    if (notify_toast_ && hwnd) {
+        // Build the body string in UTF-8 first, then convert to UTF-16
+        // for the Win32 wide-string call. Body is "X wants to play." —
+        // we localize via T() so JP/ES users get translated text too.
+        char body_utf8[256];
+        std::snprintf(body_utf8, sizeof(body_utf8),
+                      T("modal_incoming_challenge_body"), from_nick.c_str());
+
+        NOTIFYICONDATAW nid{};
+        nid.cbSize           = sizeof(nid);
+        nid.hWnd             = hwnd;
+        nid.uID              = 1;
+        nid.uFlags           = NIF_INFO | NIF_ICON | NIF_TIP;
+        nid.hIcon            = LoadIcon(nullptr, IDI_APPLICATION);
+        nid.dwInfoFlags      = NIIF_INFO;
+
+        auto utf8_to_wide = [](const char* in, wchar_t* out, int out_len) {
+            if (!in || !out || out_len <= 0) return;
+            int n = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, out_len);
+            if (n <= 0) out[0] = L'\0';
+        };
+
+        utf8_to_wide("FM2K Rollback Launcher", nid.szTip,
+                     (int)(sizeof(nid.szTip)/sizeof(WCHAR)));
+        utf8_to_wide(T("modal_incoming_challenge_title"), nid.szInfoTitle,
+                     (int)(sizeof(nid.szInfoTitle)/sizeof(WCHAR)));
+        utf8_to_wide(body_utf8, nid.szInfo,
+                     (int)(sizeof(nid.szInfo)/sizeof(WCHAR)));
+
+        Shell_NotifyIconW(NIM_ADD,    &nid);
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
 // Settings → Sign in with Discord… window. Drives the OAuth pairing
 // flow in FM2K_DiscordAuth: kicks off /pair/begin, opens the browser,
 // polls /pair/<code> until success/fail. The hub_token is cached in
@@ -840,7 +1126,7 @@ void LauncherUI::RenderDiscordAuthWindow() {
     static std::string              s_status;
     static fm2k::discord_auth::CachedAuth s_cached = LoadCached();
 
-    if (!ImGui::Begin("Sign in with Discord", &show_discord_auth_,
+    if (!ImGui::Begin(T("hub_signin"), &show_discord_auth_,
                       ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::End();
         return;
@@ -849,8 +1135,8 @@ void LauncherUI::RenderDiscordAuthWindow() {
     if (s_cached.valid) {
         ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
                            "Signed in as %s", s_cached.nick.c_str());
-        ImGui::TextDisabled("discord id: %s", s_cached.discord_user_id.c_str());
-        if (ImGui::Button("Sign out")) {
+        ImGui::TextDisabled(T("label_discord_id"), s_cached.discord_user_id.c_str());
+        if (ImGui::Button(T("hub_signout"))) {
             ClearCached();
             s_cached = CachedAuth{};
             // Tell the menu-bar pill to flip back to the orange
@@ -863,7 +1149,7 @@ void LauncherUI::RenderDiscordAuthWindow() {
 
     const bool busy = s_pairing && s_pairing->status() == Pairing::Status::Pending;
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button(s_cached.valid ? "Re-sign in" : "Sign in with Discord")) {
+    if (ImGui::Button(s_cached.valid ? T("hub_resignin") : T("hub_signin"))) {
         // Build hub HTTP base URL from the configured Hub Server host.
         // Note: separate port from the WebSocket. The hub's HUB_HTTP_PORT
         // (default 7700) handles the OAuth callback; WS stays on 7711.
@@ -899,12 +1185,12 @@ void LauncherUI::RenderDiscordAuthWindow() {
             case Pairing::Status::Expired:
                 ImGui::TextColored(ImVec4(0.85f, 0.6f, 0.3f, 1.0f),
                                    "%s", s_pairing->error_detail().c_str());
-                if (ImGui::Button("Dismiss")) s_pairing.reset();
+                if (ImGui::Button(T("btn_dismiss"))) s_pairing.reset();
                 break;
             case Pairing::Status::Error:
                 ImGui::TextColored(ImVec4(0.95f, 0.32f, 0.32f, 1.0f),
                                    "%s", s_pairing->error_detail().c_str());
-                if (ImGui::Button("Dismiss")) s_pairing.reset();
+                if (ImGui::Button(T("btn_dismiss"))) s_pairing.reset();
                 break;
         }
     }
@@ -942,13 +1228,13 @@ void LauncherUI::RenderHostConfigWindow() {
         "4 — Up Bias        (R wins L+R, U wins U+D)",
         "5 — Hitbox + UpBias",
     };
-    ImGui::Text("SOCD Mode:");
+    ImGui::Text("%s", T("label_socd_mode"));
     if (ImGui::Combo("##socd", &host_config_socd_mode_, kSocdLabels, 6)) {
         host_config_dirty_ = true;
     }
 
     ImGui::Spacing();
-    ImGui::Text("Selected Stage (0xFFFFFFFF = unset):");
+    ImGui::Text("%s", T("label_selected_stage"));
     int stage_int = (int)host_config_stage_;
     if (ImGui::InputInt("##stage", &stage_int, 1, 1)) {
         if (stage_int < 0) stage_int = -1;
@@ -967,7 +1253,7 @@ void LauncherUI::RenderHostConfigWindow() {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
             "Unsaved changes — apply before hosting.");
     }
-    if (ImGui::Button("Apply (writes fm2k_host.ini, takes effect on next session)")) {
+    if (ImGui::Button(T("btn_apply_host_config"))) {
         FILE* f = fopen("fm2k_host.ini", "w");
         if (f) {
             fprintf(f, "[Host]\nSocdMode=%d\nSelectedStage=%u\n",
@@ -986,7 +1272,7 @@ void LauncherUI::RenderHostConfigWindow() {
 }
 
 void LauncherUI::RenderGameSelection() {
-    ImGui::Text("Games Folder");
+    ImGui::Text("%s", T("panel_games_folder"));
     static char path_buf[512] = {0};
     static bool initialized = false;
     
@@ -1003,7 +1289,7 @@ void LauncherUI::RenderGameSelection() {
     bool path_changed = ImGui::InputText("##GamesFolder", path_buf, sizeof(path_buf));
     
     ImGui::SameLine();
-    if (ImGui::Button("Set") || (path_changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+    if (ImGui::Button(T("btn_set")) || (path_changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
         if (on_games_folder_set) {
             // Update our internal path to match what user typed
             games_root_path_ = path_buf;
@@ -1013,14 +1299,14 @@ void LauncherUI::RenderGameSelection() {
     ImGui::PopID();
     
     ImGui::Separator();
-    ImGui::Text("Available FM2K Games");
+    ImGui::Text("%s", T("panel_available_games"));
     ImGui::Separator();
 
     if (scanning_games_) {
-        ImGui::Text("Scanning for games...");
+        ImGui::Text("%s", T("status_scanning_for_games"));
     } else if (games_.empty()) {
-        ImGui::Text("No games found in the specified directory.");
-        ImGui::Text("Please select a valid games folder.");
+        ImGui::Text("%s", T("status_no_games_found"));
+        ImGui::Text("%s", T("status_invalid_games_folder"));
     } else {
         // Simple list without child window to avoid focus scope conflicts
         for (size_t i = 0; i < games_.size(); ++i) {
@@ -1065,13 +1351,13 @@ void LauncherUI::RenderGameSelection() {
 }
 
 void LauncherUI::RenderNetworkConfig() {
-    if (ImGui::CollapsingHeader("Network Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader(T("panel_network_config"), ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent();
 
         // Session Type (Host/Join)
         static int session_type = 0; // 0: Host, 1: Join
-        ImGui::RadioButton("Host", &session_type, 0); ImGui::SameLine();
-        ImGui::RadioButton("Join", &session_type, 1);
+        ImGui::RadioButton(T("netcfg_host"), &session_type, 0); ImGui::SameLine();
+        ImGui::RadioButton(T("netcfg_join"), &session_type, 1);
 
         network_config_.is_host = (session_type == 0);
 
@@ -1121,11 +1407,11 @@ void LauncherUI::RenderNetworkConfig() {
             char address_with_port[128];
             snprintf(address_with_port, sizeof(address_with_port), "%s:%d", local_ip, network_config_.local_port);
 
-            ImGui::Text("Your address:");
+            ImGui::Text("%s", T("label_your_address"));
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", address_with_port);
             ImGui::SameLine();
-            if (ImGui::Button("Copy")) {
+            if (ImGui::Button(T("btn_copy"))) {
                 SDL_SetClipboardText(address_with_port);
             }
 
@@ -1140,7 +1426,7 @@ void LauncherUI::RenderNetworkConfig() {
                 network_config_.remote_address = paste_buf;
             }
             ImGui::SameLine();
-            if (ImGui::Button("Paste")) {
+            if (ImGui::Button(T("btn_paste"))) {
                 const char* clipboard = SDL_GetClipboardText();
                 if (clipboard && clipboard[0]) {
                     strncpy(paste_buf, clipboard, sizeof(paste_buf) - 1);
@@ -1163,25 +1449,30 @@ void LauncherUI::RenderNetworkConfig() {
 }
 
 void LauncherUI::RenderConnectionStatus() {
+    // ImGui popup IDs are hashed from the title string. Keep the ID stable
+    // across language switches by appending a `##` suffix — text after `##`
+    // is treated as ID-only and never displayed. This way the visible
+    // title localizes but the popup keeps its identity if someone changes
+    // language while a popup is open.
     if (launcher_state_ == LauncherState::Connecting) {
-        ImGui::OpenPopup("Connecting...");
+        ImGui::OpenPopup("##connecting_modal");
     }
 
-    if (ImGui::BeginPopupModal("Connecting...", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Establishing connection, please wait...");
+    if (ImGui::BeginPopupModal("##connecting_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%s", T("modal_connecting_body"));
         if (launcher_state_ != LauncherState::Connecting) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
-    
+
     if (launcher_state_ == LauncherState::Disconnected) {
-        ImGui::OpenPopup("Disconnected");
+        ImGui::OpenPopup("##disconnected_modal");
     }
 
-    if (ImGui::BeginPopupModal("Disconnected", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("The network connection was lost.");
-        if (ImGui::Button("OK")) {
+    if (ImGui::BeginPopupModal("##disconnected_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%s", T("hub_status_connection_lost"));
+        if (ImGui::Button(T("btn_ok"))) {
             if (on_session_stop) on_session_stop();
             ImGui::CloseCurrentPopup();
         }
@@ -1257,7 +1548,7 @@ void LauncherUI::SetTheme(UITheme theme) {
 }
 
 void LauncherUI::RenderSessionControls() {
-    if (ImGui::CollapsingHeader("Session Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader(T("panel_session_controls"), ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent();
 
         // Disable buttons if no game is selected
@@ -1285,10 +1576,10 @@ void LauncherUI::RenderSessionControls() {
         }();
 
         // ---------- USER-FACING SECTION ----------
-        ImGui::Text("Play:");
+        ImGui::Text("%s", T("label_play"));
         ImGui::Separator();
 
-        if (ImGui::Button("Online (Hub)", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("btn_play_online"), ImVec2(-1, 0))) {
             // Move the user to the Hub panel and, if they've already
             // got a game selected and a hub connection, drop them into
             // a per-game lobby on demand. Hub creates rooms lazily on
@@ -1310,7 +1601,7 @@ void LauncherUI::RenderSessionControls() {
             "Switch to the Hub panel. If a game is selected and you're "
             "connected, joins (or creates) a lobby for that game.");
 
-        if (ImGui::Button("Offline (Single Player)", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("btn_play_offline"), ImVec2(-1, 0))) {
             ::SetEnvironmentVariableA("FM2K_BOOT_TO_CSS_DIRECT",
                                       s_boot_strategy == 1 ? "1" : nullptr);
             ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP",
@@ -1329,49 +1620,49 @@ void LauncherUI::RenderSessionControls() {
                 on_offline_session_start();
             }
         }
-        ImGui::SetItemTooltip("Local-only — both players controlled at the same machine.");
+        ImGui::SetItemTooltip("%s", T("btn_play_offline_tooltip"));
 
         // ---------- DEVELOPER SECTION ----------
         if (developer_mode_) {
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Developer mode");
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%s", T("dev_section_header"));
             ImGui::Separator();
 
-            ImGui::Text("Boot strategy:");
-            ImGui::RadioButton("Safe — boot to title, auto-mash to CSS (universal)", &s_boot_strategy, 0);
+            ImGui::Text("%s", T("dev_boot_strategy"));
+            ImGui::RadioButton(T("dev_boot_safe"), &s_boot_strategy, 0);
             ImGui::SetItemTooltip(
                 "Boots to title_screen_manager (skips intro cutscene). The "
                 "hook auto-mashes button A with cursor pre-set to VS Player. "
                 "Works on every game — adds ~10 frames to boot.");
-            ImGui::RadioButton("Fast — boot directly to CSS (verified games only)", &s_boot_strategy, 1);
+            ImGui::RadioButton(T("dev_boot_fast"), &s_boot_strategy, 1);
             ImGui::SetItemTooltip(
                 "Skips title screen entirely. WORKS on WW. BREAKS StudioS "
                 "Fighters / Strip Fighter Zero — characters self-damage on "
                 "frame 0. Only enable per-game once verified safe.");
 
-            ImGui::Checkbox("Auto-mash title → CSS", &s_auto_title_skip);
+            ImGui::Checkbox(T("dev_auto_title_skip"), &s_auto_title_skip);
             ImGui::SetItemTooltip(
                 "Default ON. Disable to walk title screen manually with your "
                 "own inputs.");
 
             ImGui::Spacing();
-            ImGui::Text("Diagnostics:");
-            ImGui::Checkbox("Bypass trampoline (vanilla main_game_loop)", &s_bypass_trampoline);
+            ImGui::Text("%s", T("dev_diagnostics"));
+            ImGui::Checkbox(T("dev_bypass_trampoline"), &s_bypass_trampoline);
             ImGui::SetItemTooltip(
                 "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
                 "Offline only — netplay/spectator require the trampoline.");
 
-            ImGui::Checkbox("Skip VS-player-mode force-set", &s_skip_vs_mode_patch);
-            ImGui::SetItemTooltip("Don't force g_game_mode_flag=1 at boot.");
+            ImGui::Checkbox(T("dev_skip_vs_mode_patch"), &s_skip_vs_mode_patch);
+            ImGui::SetItemTooltip("%s", T("dev_skip_vs_mode_tooltip"));
 
-            ImGui::Checkbox("Force t4-walk patch (masks the real bug)", &s_force_t4_patch);
+            ImGui::Checkbox(T("dev_force_t4_patch"), &s_force_t4_patch);
             ImGui::SetItemTooltip(
                 "Re-enables the case-200 t4-walk neuter patch (0x408EC5).");
 
-            ImGui::Checkbox("T4 probe (log fighter pool conditions)", &s_t4_probe);
-            ImGui::SetItemTooltip("Pre-update pool walk; logs when count<2.");
+            ImGui::Checkbox(T("dev_t4_probe"), &s_t4_probe);
+            ImGui::SetItemTooltip("%s", T("dev_t4_probe_tooltip"));
 
-            if (ImGui::Checkbox("EB diag (palette flash / screen shake)", &s_eb_diag)) {
+            if (ImGui::Checkbox(T("dev_eb_diag"), &s_eb_diag)) {
                 // Apply immediately so EVERY launch path (offline, online,
                 // hub, dual-clients, spectator) inherits the env var.
                 // Persist to dev_flags.ini so the toggle survives launcher
@@ -1392,14 +1683,14 @@ void LauncherUI::RenderSessionControls() {
                 "restarts.");
 
             ImGui::Spacing();
-            if (ImGui::Button("Online Session (legacy)", ImVec2(-1, 0))) {
+            if (ImGui::Button(T("dev_online_legacy"), ImVec2(-1, 0))) {
                 if (on_online_session_start) {
                     on_online_session_start(network_config_);
                 }
             }
-            ImGui::SetItemTooltip("Network play using the network-config panel below (pre-hub direct P2P).");
+            ImGui::SetItemTooltip("%s", T("dev_online_legacy_tip"));
 
-            if (ImGui::Button("Stress Test (Determinism Check)", ImVec2(-1, 0))) {
+            if (ImGui::Button(T("dev_stress_test"), ImVec2(-1, 0))) {
                 if (on_stress_session_start) {
                     on_stress_session_start();
                 }
@@ -1409,7 +1700,7 @@ void LauncherUI::RenderSessionControls() {
                 "and compares save hashes — any DESYNC = local determinism bug.");
 
             ImGui::Spacing();
-            ImGui::Text("Local Testing:");
+            ImGui::Text("%s", T("dev_local_testing"));
             ImGui::Separator();
         
         // Get client status for dual client button
@@ -1423,7 +1714,7 @@ void LauncherUI::RenderSessionControls() {
             ImGui::BeginDisabled();
         }
         
-        if (ImGui::Button("Launch Dual Clients (Localhost)", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("dev_launch_dual"), ImVec2(-1, 0))) {
             if (on_launch_local_client1 && on_launch_local_client2 && game_selected) {
                 const auto& selected_game = games_[selected_game_index_];
 
@@ -1448,14 +1739,14 @@ void LauncherUI::RenderSessionControls() {
             ImGui::EndDisabled();
         }
 
-        ImGui::SetItemTooltip("Launch two separate game instances connected via localhost for network testing");
+        ImGui::SetItemTooltip("%s", T("dev_launch_dual_tip"));
 
         // "Launch Spectator" — spawns a third local instance that subscribes
         // to client1 (host on 7000) for replay-streamed spectating. Only
         // makes sense after Launch Dual Clients has the host running.
         bool can_spectate = on_launch_local_spectator && game_selected && client1_pid != 0;
         if (!can_spectate) ImGui::BeginDisabled();
-        if (ImGui::Button("Launch Spectator (subscribes to host)", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("dev_launch_spectator"), ImVec2(-1, 0))) {
             if (can_spectate) {
                 const auto& selected_game = games_[selected_game_index_];
                 bool ok = on_launch_local_spectator(selected_game.exe_path);
@@ -1465,7 +1756,7 @@ void LauncherUI::RenderSessionControls() {
             }
         }
         if (!can_spectate) ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Launch a third local instance that subscribes to client1 (host on port 7000) and replays the input stream");
+        ImGui::SetItemTooltip("%s", T("dev_launch_spectator_tip"));
 
         // "Launch Spectator 2 (chain)" — daisy-chain test. Subscribes to
         // spectator 1 (port 7002) instead of the host. Validates that
@@ -1474,7 +1765,7 @@ void LauncherUI::RenderSessionControls() {
         // running.
         bool can_spectate2 = on_launch_local_spectator2 && game_selected && client1_pid != 0;
         if (!can_spectate2) ImGui::BeginDisabled();
-        if (ImGui::Button("Launch Spectator 2 (chain to spec 1)", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("dev_launch_spectator2"), ImVec2(-1, 0))) {
             if (can_spectate2) {
                 const auto& selected_game = games_[selected_game_index_];
                 bool ok = on_launch_local_spectator2(selected_game.exe_path);
@@ -1484,11 +1775,11 @@ void LauncherUI::RenderSessionControls() {
             }
         }
         if (!can_spectate2) ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Launch a fourth local instance bound on 7003 that subscribes to spectator 1 on 7002 (daisy-chain validation). Spectator 1 must be running.");
+        ImGui::SetItemTooltip("%s", T("dev_launch_spectator2_tip"));
 
         if (clients_running) {
-            ImGui::Text("Clients running (PID: %u, %u)", client1_pid, client2_pid);
-            if (ImGui::Button("Terminate All Clients", ImVec2(-1, 0))) {
+            ImGui::Text(T("clients_running"), client1_pid, client2_pid);
+            if (ImGui::Button(T("dev_terminate_clients"), ImVec2(-1, 0))) {
                 if (on_terminate_all_clients) {
                     on_terminate_all_clients();
                 }
@@ -1499,12 +1790,12 @@ void LauncherUI::RenderSessionControls() {
         ImGui::Spacing();
         ImGui::Separator();
 
-        if (ImGui::Button("Stop Session", ImVec2(-1, 0))) {
+        if (ImGui::Button(T("btn_stop_session"), ImVec2(-1, 0))) {
             if (on_session_stop) {
                 on_session_stop();
             }
         }
-        ImGui::SetItemTooltip("Terminate the currently running game session");
+        ImGui::SetItemTooltip("%s", T("btn_stop_session_tooltip"));
 
         if (!game_selected) {
             ImGui::EndDisabled();
@@ -1594,6 +1885,7 @@ void LauncherUI::RenderHubPanel() {
                 hs.pending_challenge_from_id   = ev.challenge.from_id;
                 hs.pending_challenge_from_nick = ev.challenge.from_nick;
                 hs.show_challenge_modal = true;
+                FireChallengeNotification(ev.challenge.from_nick);
                 break;
             case K::ChallengeFailed:
                 hs.status_line = "challenge failed: " + ev.error;
@@ -1794,9 +2086,30 @@ void LauncherUI::RenderHubPanel() {
     });
 
     // ---- UI ----
-    ImGui::SeparatorText("Hub");
+    ImGui::SeparatorText(T("hub_section_header"));
 
-    static char s_nick[32] = "";
+    // Nick input — 128-byte buffer covers 32 visible codepoints even at
+    // 4 bytes per UTF-8 char (CJK / emoji). Hub caps incoming nicks to 32
+    // codepoints + sanitizes control chars (see hub.py). Local buffer is
+    // generous so the input field doesn't truncate mid-character.
+    static char s_nick[128] = "";
+    static bool s_use_discord_name = true;
+    static std::string s_discord_global_name;
+    // Pre-fill on first hub-panel render from the persisted auth cache so
+    // (a) users who set a custom nick see it again, (b) the "Use Discord
+    // name" checkbox tracks their last choice, and (c) we have the
+    // authoritative Discord global_name available for when they flip the
+    // checkbox back on.
+    static bool s_nick_initialized = false;
+    if (!s_nick_initialized) {
+        const auto cached = fm2k::discord_auth::LoadCached();
+        if (!cached.nick.empty()) {
+            std::snprintf(s_nick, sizeof(s_nick), "%s", cached.nick.c_str());
+        }
+        s_use_discord_name    = cached.use_discord_name;
+        s_discord_global_name = cached.discord_global_name;
+        s_nick_initialized = true;
+    }
     // Hub host string lives on the LauncherUI (member hub_host_) and is
     // edited from Settings → Hub Server… The Hub panel is read-only here.
     if (!hub_host_initialized_) {
@@ -1812,10 +2125,17 @@ void LauncherUI::RenderHubPanel() {
     // computed pick. Manual override persists across matches via the
     // FM2K_LOCAL_DELAY env var; "computed" clears the var so the hook
     // falls back to the auto path.
-    static int s_delay_override = 0;  // 0 = computed, 1..8 = manual frames
+    static int s_delay_override = 0;  // 0 = computed, 1..16 = manual frames
     {
+        // Manual delay range: 1..16 (was 1..8). Bumped because some
+        // intercontinental matches need delay >8 to ride out the worst-
+        // case RTT spikes without rollback churn. 16 frames at 100 Hz
+        // = 160 ms — past that the input lag is bad enough that nobody
+        // wants to play anyway, so capping there is fine.
         const char* delay_items[] = {
-            "computed", "1", "2", "3", "4", "5", "6", "7", "8"
+            "computed",
+            "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+            "9", "10", "11", "12", "13", "14", "15", "16",
         };
         ImGui::PushItemWidth(-120);
         ImGui::Combo("Delay", &s_delay_override, delay_items,
@@ -1825,8 +2145,9 @@ void LauncherUI::RenderHubPanel() {
             "Input delay (frames at 100 Hz). \"computed\" applies a "
             "CCCaster-style pick at match start: ceil(worst_one_way_ms "
             "/ 10) + 1, clamped [2, 15] — covers the worst spike since "
-            "the prior match. Pin 1..8 to override and ride a fixed "
-            "delay instead.");
+            "the prior match. Pin 1..16 to override and ride a fixed "
+            "delay instead. 16 = 160 ms, basically the upper limit of "
+            "playable delay-only netcode.");
         if (s_delay_override > 0) {
             char buf[8];
             std::snprintf(buf, sizeof(buf), "%d", s_delay_override);
@@ -1837,18 +2158,52 @@ void LauncherUI::RenderHubPanel() {
     }
 
     if (!hs.client.IsConnected()) {
+        // "Use Discord name" checkbox — when checked, the nick input is
+        // grayed and shows the user's Discord global_name (read-only).
+        // When unchecked, the user can edit their custom nick. Toggling
+        // doesn't destroy the custom nick — it just switches WHICH value
+        // gets sent on Connect. Persists immediately.
+        if (ImGui::Checkbox(T("hub_use_discord_name"), &s_use_discord_name)) {
+            auto cached_save = fm2k::discord_auth::LoadCached();
+            if (cached_save.valid) {
+                cached_save.use_discord_name = s_use_discord_name;
+                fm2k::discord_auth::SaveCached(cached_save);
+            }
+        }
+        // Display buffer: shows what'll be sent on Connect. When the
+        // checkbox is on, that's discord_global_name (read-only). When
+        // off, it's the editable custom nick (s_nick). Two separate
+        // buffers under the hood so flipping the checkbox doesn't
+        // clobber either source-of-truth.
+        char display_buf[128];
+        if (s_use_discord_name) {
+            std::snprintf(display_buf, sizeof(display_buf), "%s",
+                          s_discord_global_name.c_str());
+        } else {
+            std::snprintf(display_buf, sizeof(display_buf), "%s", s_nick);
+        }
         ImGui::PushItemWidth(-120);
-        ImGui::InputText("Nick", s_nick, sizeof(s_nick));
+        if (s_use_discord_name) ImGui::BeginDisabled();
+        if (ImGui::InputText(T("hub_nick"), display_buf, sizeof(display_buf))
+            && !s_use_discord_name) {
+            std::snprintf(s_nick, sizeof(s_nick), "%s", display_buf);
+        }
+        if (s_use_discord_name) ImGui::EndDisabled();
         ImGui::PopItemWidth();
         // Show the configured hub host as read-only context. Edit from
         // Settings → Hub Server…
-        ImGui::TextDisabled("Server: %s", hub_host_[0] ? hub_host_ : "2dfm.sytes.net");
+        ImGui::TextDisabled(T("hub_server"), hub_host_[0] ? hub_host_ : "2dfm.sytes.net");
         ImGui::SameLine();
         if (ImGui::SmallButton("change")) {
             show_hub_server_ = true;
         }
         const auto cached_auth_check = fm2k::discord_auth::LoadCached();
-        const bool nick_ok    = s_nick[0] != '\0';
+        // nick_ok: when "Use Discord name" is on, validity depends on whether
+        // we know what their Discord name actually is (populated post-OAuth).
+        // When off, just whether they typed something.
+        const bool nick_ok = s_use_discord_name
+            ? !s_discord_global_name.empty()
+            : (s_nick[0] != '\0');
         const bool signed_in  = cached_auth_check.valid;
         const bool can_connect = nick_ok && signed_in;
         const char* button_label =
@@ -1856,7 +2211,27 @@ void LauncherUI::RenderHubPanel() {
             !nick_ok   ? "(set a nick first)" : "Connect";
         if (!can_connect) ImGui::BeginDisabled();
         if (ImGui::Button(button_label, ImVec2(-1, 0))) {
-            hs.my_nick = s_nick;
+            // Pick the right nick to send: Discord global_name when the
+            // checkbox is on, custom nick otherwise. Custom nick still
+            // persists across the connect (so toggling the checkbox back
+            // off restores the user's last custom value).
+            const std::string outgoing_nick =
+                s_use_discord_name ? s_discord_global_name : std::string(s_nick);
+            hs.my_nick = outgoing_nick;
+            // Persist nick + checkbox state to discord_auth.json.
+            auto cached_save = fm2k::discord_auth::LoadCached();
+            if (cached_save.valid) {
+                bool dirty = false;
+                if (cached_save.nick != s_nick) {
+                    cached_save.nick = s_nick;
+                    dirty = true;
+                }
+                if (cached_save.use_discord_name != s_use_discord_name) {
+                    cached_save.use_discord_name = s_use_discord_name;
+                    dirty = true;
+                }
+                if (dirty) fm2k::discord_auth::SaveCached(cached_save);
+            }
             // Auto-pick a free UDP port: bind a socket to port 0
             // (OS-assigned ephemeral), read back the chosen port via
             // getsockname, close. Same-machine multi-launcher tests
@@ -1918,7 +2293,7 @@ void LauncherUI::RenderHubPanel() {
         ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
                            "Connected as %s", hs.my_nick.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Disconnect")) {
+        if (ImGui::SmallButton(T("hub_disconnect"))) {
             hs.client.Disconnect();
         }
     }
@@ -1928,33 +2303,44 @@ void LauncherUI::RenderHubPanel() {
     if (!hs.client.IsConnected()) return;
 
     // ---- Rooms ----
-    ImGui::SeparatorText("Rooms");
+    ImGui::SeparatorText(T("hub_rooms_header"));
     if (hs.rooms.empty()) {
-        ImGui::TextDisabled("No rooms yet — join one with the selected game below.");
+        ImGui::TextDisabled("%s", T("hub_no_rooms"));
     }
     if (ImGui::BeginTable("##rooms", 4,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Game");
-        ImGui::TableSetupColumn("Players",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Installed", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("",          ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn(T("col_game"));
+        ImGui::TableSetupColumn(T("col_players"),  ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(T("col_installed"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("",                 ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
-        for (auto& r : hs.rooms) {
+        // Sort by player count descending so the busiest rooms surface
+        // first. Stable secondary sort by room name (alpha) so empty/quiet
+        // rooms have a deterministic order between renders. Sort a copy so
+        // we don't mutate hs.rooms (which the hub broadcast handler also
+        // touches asynchronously — sorting in-place would race).
+        std::vector<fm2k::HubRoom> sorted_rooms = hs.rooms;
+        std::sort(sorted_rooms.begin(), sorted_rooms.end(),
+            [](const fm2k::HubRoom& a, const fm2k::HubRoom& b) {
+                if (a.user_count != b.user_count) return a.user_count > b.user_count;
+                return a.name < b.name;
+            });
+        for (auto& r : sorted_rooms) {
             int installed_idx = FindInstalledGameForRoom(games_, r.id);
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r.name.c_str());
             ImGui::TableSetColumnIndex(1); ImGui::Text("%d", r.user_count);
             ImGui::TableSetColumnIndex(2);
             if (installed_idx >= 0) {
-                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "yes");
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "%s", T("label_yes"));
             } else {
-                ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.4f, 1.0f), "no");
+                ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.4f, 1.0f), "%s", T("label_no"));
             }
             ImGui::TableSetColumnIndex(3);
             ImGui::PushID(r.id.c_str());
             if (r.id == hs.current_room_id) {
-                ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "joined");
-            } else if (ImGui::SmallButton("Join")) {
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f), "%s", T("label_joined"));
+            } else if (ImGui::SmallButton(T("btn_join"))) {
                 hs.client.JoinRoom(r.id, r.name);
             }
             ImGui::PopID();
@@ -1997,23 +2383,23 @@ void LauncherUI::RenderHubPanel() {
             active_pairs.emplace_back(&u, &it->second);
         }
 
-        ImGui::SeparatorText("Active Matches");
+        ImGui::SeparatorText(T("hub_active_matches_header"));
         if (active_pairs.empty()) {
-            ImGui::TextDisabled("(no matches in progress)");
+            ImGui::TextDisabled("%s", T("hub_no_active_matches"));
         } else if (ImGui::BeginTable("##active_matches", 3,
                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-            ImGui::TableSetupColumn("Match");
-            ImGui::TableSetupColumn("Room", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-            ImGui::TableSetupColumn("",     ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableSetupColumn(T("col_match"));
+            ImGui::TableSetupColumn(T("col_room"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("",            ImGuiTableColumnFlags_WidthFixed, 100.0f);
             ImGui::TableHeadersRow();
 
             for (auto& [a, b] : active_pairs) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::Text("%s vs %s", a->nick.c_str(), b->nick.c_str());
+                ImGui::Text(T("hub_active_match"), a->nick.c_str(), b->nick.c_str());
 
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(a->room_id.empty() ? "-" : a->room_id.c_str());
+                ImGui::TextUnformatted(a->room_id.empty() ? T("label_dash") : a->room_id.c_str());
 
                 ImGui::TableSetColumnIndex(2);
                 ImGui::PushID(a->id.c_str());
@@ -2025,9 +2411,9 @@ void LauncherUI::RenderHubPanel() {
                 // button greyed so users see the feature is intentional
                 // but disabled, not missing.
                 ImGui::BeginDisabled(true);
-                ImGui::SmallButton("Spectate");
+                ImGui::SmallButton(T("btn_spectate"));
                 ImGui::EndDisabled();
-                ImGui::SetItemTooltip("Disabled — spectator desyncs under investigation.");
+                ImGui::SetItemTooltip("%s", T("btn_spectate_disabled_tooltip"));
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2035,20 +2421,29 @@ void LauncherUI::RenderHubPanel() {
     }
 
     // ---- Users in current room ----
-    ImGui::SeparatorText(hs.current_room_id.empty()
-        ? "Players in current room"
-        : ("Players in " + hs.current_room_id).c_str());
+    // Build a localized "Players in <room>" header with snprintf so the
+    // translation string can position the room name wherever the language
+    // wants it (English: "Players in %s", JP: "%s のプレイヤー").
+    char players_header[160];
     if (hs.current_room_id.empty()) {
-        ImGui::TextDisabled("Join a room to see players.");
+        std::snprintf(players_header, sizeof(players_header), "%s",
+                      T("hub_players_header"));
+    } else {
+        std::snprintf(players_header, sizeof(players_header),
+                      T("hub_players_in_room"), hs.current_room_id.c_str());
+    }
+    ImGui::SeparatorText(players_header);
+    if (hs.current_room_id.empty()) {
+        ImGui::TextDisabled("%s", T("hub_no_room_selected"));
     } else if (hs.users.empty()) {
-        ImGui::TextDisabled("Empty room — wait for someone else to join.");
+        ImGui::TextDisabled("%s", T("hub_room_empty"));
     } else {
         if (ImGui::BeginTable("##users", 4,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-            ImGui::TableSetupColumn("Nick");
-            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-            ImGui::TableSetupColumn("Ping",   ImGuiTableColumnFlags_WidthFixed, 60.0f);
-            ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableSetupColumn(T("col_nick"));
+            ImGui::TableSetupColumn(T("col_status"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn(T("col_ping"),   ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("",              ImGuiTableColumnFlags_WidthFixed, 100.0f);
             ImGui::TableHeadersRow();
 
             // Tier → color mapping. Tester ($5) gets blue (0x2C7BDB,
@@ -2061,7 +2456,12 @@ void LauncherUI::RenderHubPanel() {
             const ImVec4 kTierThanks(0xFF / 255.0f, 0xBF / 255.0f, 0x03 / 255.0f, 1.0f);
             const ImVec4 kTierMonte (0xE5 / 255.0f, 0x39 / 255.0f, 0x35 / 255.0f, 1.0f);
             for (auto& [uid, u] : hs.users) {
-                if (uid == hs.my_id) continue;  // don't list self
+                // Self is shown in the list (top row, naturally — most
+                // hubs put your row at the top so you can see your own
+                // tier color + status without scrolling). The Challenge
+                // button is hidden for your own row below since
+                // self-challenges are nonsensical.
+                const bool is_self = (uid == hs.my_id);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 if (u.tier == "monte") {
@@ -2076,29 +2476,38 @@ void LauncherUI::RenderHubPanel() {
 
                 ImGui::TableSetColumnIndex(1);
                 ImVec4 c(0.6f, 0.6f, 0.6f, 1.0f);
-                if (u.status == "idle")        c = ImVec4(0.3f, 0.9f, 0.4f, 1.0f);
-                else if (u.status == "in_match") c = ImVec4(0.95f, 0.7f, 0.2f, 1.0f);
-                else if (u.status == "challenging") c = ImVec4(0.6f, 0.7f, 1.0f, 1.0f);
-                ImGui::TextColored(c, "%s", u.status.c_str());
+                // Localize status label too. The protocol value (u.status)
+                // stays untranslated — that's an internal protocol token,
+                // not user-facing text. Map it to a translation key.
+                const char* status_label = u.status.c_str();
+                if (u.status == "idle")             { c = ImVec4(0.3f, 0.9f, 0.4f, 1.0f); status_label = T("status_idle"); }
+                else if (u.status == "in_match")    { c = ImVec4(0.95f, 0.7f, 0.2f, 1.0f); status_label = T("status_in_match"); }
+                else if (u.status == "challenging") { c = ImVec4(0.6f, 0.7f, 1.0f, 1.0f); status_label = T("status_challenging"); }
+                ImGui::TextColored(c, "%s", status_label);
 
                 ImGui::TableSetColumnIndex(2);
                 ImGui::Text("%dms", u.rtt_ms);
 
                 ImGui::TableSetColumnIndex(3);
                 ImGui::PushID(uid.c_str());
-                bool can_challenge = (u.status == "idle");
-                if (!can_challenge) ImGui::BeginDisabled();
-                if (ImGui::SmallButton("Challenge")) {
-                    hs.client.Challenge(uid);
-                    // Populate outbound state so the next frame
-                    // renders the "Waiting for X..." modal. Cleared
-                    // by the hub-event handler on any outcome.
-                    hs.outgoing_challenge_to_id   = uid;
-                    hs.outgoing_challenge_to_nick = u.nick;
-                    hs.show_outgoing_challenge_modal = true;
-                    hs.status_line = "challenged " + u.nick + " — waiting for response";
+                // Self-row shows nothing in the action column — challenging
+                // yourself isn't a thing. Other rows get the Challenge button
+                // gated on idle status.
+                if (!is_self) {
+                    bool can_challenge = (u.status == "idle");
+                    if (!can_challenge) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton(T("btn_challenge"))) {
+                        hs.client.Challenge(uid);
+                        // Populate outbound state so the next frame
+                        // renders the "Waiting for X..." modal. Cleared
+                        // by the hub-event handler on any outcome.
+                        hs.outgoing_challenge_to_id   = uid;
+                        hs.outgoing_challenge_to_nick = u.nick;
+                        hs.show_outgoing_challenge_modal = true;
+                        hs.status_line = "challenged " + u.nick + " — waiting for response";
+                    }
+                    if (!can_challenge) ImGui::EndDisabled();
                 }
-                if (!can_challenge) ImGui::EndDisabled();
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2106,20 +2515,22 @@ void LauncherUI::RenderHubPanel() {
     }
 
     // ---- Incoming-challenge modal ----
+    // Stable `##incoming_challenge` popup ID so a language switch mid-popup
+    // doesn't break ImGui's hashed identity (see RenderConnectionStatus).
     if (hs.show_challenge_modal) {
-        ImGui::OpenPopup("Incoming challenge");
+        ImGui::OpenPopup("##incoming_challenge");
         hs.show_challenge_modal = false;
     }
-    if (ImGui::BeginPopupModal("Incoming challenge", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("%s wants to play.", hs.pending_challenge_from_nick.c_str());
+    if (ImGui::BeginPopupModal("##incoming_challenge", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text(T("modal_incoming_challenge_body"), hs.pending_challenge_from_nick.c_str());
         ImGui::Spacing();
-        if (ImGui::Button("Accept", ImVec2(120, 0))) {
+        if (ImGui::Button(T("btn_accept"), ImVec2(120, 0))) {
             hs.client.AcceptChallenge(hs.pending_challenge_from_id);
             hs.pending_challenge_from_id.clear();
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Decline", ImVec2(120, 0))) {
+        if (ImGui::Button(T("btn_decline"), ImVec2(120, 0))) {
             hs.client.DeclineChallenge(hs.pending_challenge_from_id);
             hs.pending_challenge_from_id.clear();
             ImGui::CloseCurrentPopup();
@@ -2133,11 +2544,11 @@ void LauncherUI::RenderHubPanel() {
     // handler clears show_outgoing_challenge_modal on any terminal
     // outcome (declined / failed / cancelled / match_start).
     if (hs.show_outgoing_challenge_modal) {
-        ImGui::OpenPopup("Challenge sent");
+        ImGui::OpenPopup("##outgoing_challenge");
     }
-    if (ImGui::BeginPopupModal("Challenge sent", nullptr,
+    if (ImGui::BeginPopupModal("##outgoing_challenge", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::Text("Waiting for %s to accept...",
+        ImGui::Text(T("modal_outgoing_challenge_body"),
                     hs.outgoing_challenge_to_nick.empty()
                         ? "opponent"
                         : hs.outgoing_challenge_to_nick.c_str());
@@ -2150,7 +2561,7 @@ void LauncherUI::RenderHubPanel() {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", dot_str);
         ImGui::Spacing();
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+        if (ImGui::Button(T("btn_cancel"), ImVec2(120, 0))) {
             hs.client.CancelChallenge(hs.outgoing_challenge_to_id);
             hs.show_outgoing_challenge_modal = false;
             hs.outgoing_challenge_to_id.clear();
@@ -2194,7 +2605,7 @@ void LauncherUI::RenderDebugTools() {
 void LauncherUI::RenderConsoleLog() {
     SDL_LockMutex(log_buffer_mutex_);
 
-    if (ImGui::Button("Clear")) {
+    if (ImGui::Button(T("btn_clear"))) {
         ClearLog();
     }
 
@@ -2214,11 +2625,11 @@ void LauncherUI::RenderConsoleLog() {
 }
 
 void LauncherUI::RenderMultiClientTools() {
-    ImGui::Text("Local Multi-Client Testing");
+    ImGui::Text("%s", T("dev_local_multi"));
     ImGui::Separator();
-    
+
     // Client Launch Controls
-    if (ImGui::CollapsingHeader("Launch Control", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader(T("panel_launch_control"), ImGuiTreeNodeFlags_DefaultOpen)) {
         // Get client status
         uint32_t client1_pid = 0, client2_pid = 0;
         bool status_available = false;
@@ -2229,10 +2640,10 @@ void LauncherUI::RenderMultiClientTools() {
         // Selected game display
         if (!games_.empty() && selected_game_index_ >= 0 && selected_game_index_ < (int)games_.size()) {
             const auto& selected_game = games_[selected_game_index_];
-            ImGui::Text("Selected Game: %s", selected_game.GetExeName().c_str());
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Path: %s", selected_game.exe_path.c_str());
+            ImGui::Text(T("label_selected_game"), selected_game.GetExeName().c_str());
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), T("label_path"), selected_game.exe_path.c_str());
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "⚠ No game selected");
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", T("warn_no_game_selected"));
         }
         
         ImGui::Separator();
@@ -2246,7 +2657,7 @@ void LauncherUI::RenderMultiClientTools() {
         }
         
         // Dual client launch button
-        if (ImGui::Button("Launch Dual Clients", ImVec2(200, 30))) {
+        if (ImGui::Button(T("dev_launch_dual_short"), ImVec2(200, 30))) {
             if (on_launch_local_client1 && on_launch_local_client2 && can_launch) {
                 const auto& selected_game = games_[selected_game_index_];
 
@@ -2277,7 +2688,7 @@ void LauncherUI::RenderMultiClientTools() {
             ImGui::BeginDisabled();
         }
         
-        if (ImGui::Button("Stop All Clients", ImVec2(150, 30))) {
+        if (ImGui::Button(T("btn_stop_all_clients"), ImVec2(150, 30))) {
             if (on_terminate_all_clients) {
                 bool success = on_terminate_all_clients();
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminate all clients: %s", success ? "success" : "failed");
@@ -2294,7 +2705,7 @@ void LauncherUI::RenderMultiClientTools() {
         ImGui::SameLine();
         bool can_spectate2 = on_launch_local_spectator && can_launch && client1_pid != 0;
         if (!can_spectate2) ImGui::BeginDisabled();
-        if (ImGui::Button("Launch Spectator", ImVec2(160, 30))) {
+        if (ImGui::Button(T("btn_launch_spectator_short"), ImVec2(160, 30))) {
             if (can_spectate2) {
                 const auto& selected_game = games_[selected_game_index_];
                 bool ok = on_launch_local_spectator(selected_game.exe_path);
@@ -2303,7 +2714,7 @@ void LauncherUI::RenderMultiClientTools() {
             }
         }
         if (!can_spectate2) ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Spawn a third local instance bound on 7002 that subscribes to host on 7000 (replay-streamed spectating). Requires Launch Dual Clients first.");
+        ImGui::SetItemTooltip("%s", T("btn_launch_spectator_short_tip"));
         
         if (!can_launch) {
             ImGui::EndDisabled();
@@ -2312,51 +2723,51 @@ void LauncherUI::RenderMultiClientTools() {
         ImGui::Separator();
         
         // Client status display
-        ImGui::Text("Client Status:");
-        
+        ImGui::Text("%s", T("label_client_status"));
+
         if (status_available) {
             // Client 1 status
             if (client1_pid != 0) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "● Client 1: Online (Host - 127.0.0.1:7000)");
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T("client1_online_host"));
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(PID: %u)", client1_pid);
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), T("label_pid"), client1_pid);
             } else {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "○ Client 1: Offline");
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", T("client1_offline"));
             }
             
             // Client 2 status
             if (client2_pid != 0) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "● Client 2: Online (Guest - 127.0.0.1:7001)");
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T("client2_online_guest"));
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(PID: %u)", client2_pid);
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), T("label_pid"), client2_pid);
             } else {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "○ Client 2: Offline");
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", T("client2_offline"));
             }
-            
+
             // Connection status
             if (client1_pid != 0 && client2_pid != 0) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "✓ Network Status: Connected");
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T("network_status_connected"));
             } else if (client1_pid != 0 || client2_pid != 0) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "⚠ Network Status: Waiting for second client");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", T("network_status_waiting"));
             } else {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "○ Network Status: No clients running");
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", T("network_status_no_clients"));
             }
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "⚠ Client status unavailable");
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", T("client_status_unavailable"));
         }
     }
-    
+
     ImGui::Separator();
-    
+
     // Client Debug Logs
-    if (ImGui::CollapsingHeader("Client Debug Logs", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("Real-time debug output from each client:");
+    if (ImGui::CollapsingHeader(T("debug_log_panel"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("%s", T("debug_log_realtime"));
         ImGui::Separator();
-        
+
         // Client 1 Log Section
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "● Client 1 Log (Host)");
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T("client1_log_host"));
         ImGui::SameLine();
-        if (ImGui::Button("Copy Client 1 Log")) {
+        if (ImGui::Button(T("debug_log_copy_c1"))) {
             // Read Client 1 log file and copy to clipboard
             std::ifstream log_file("FM2K_P1_Debug.log");
             if (log_file.is_open()) {
@@ -2410,16 +2821,16 @@ void LauncherUI::RenderMultiClientTools() {
                 }
                 ImGui::EndChild();
             } else {
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No log file available (client not started)");
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", T("debug_log_no_file"));
             }
         }
         
         ImGui::Separator();
         
         // Client 2 Log Section
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "● Client 2 Log (Guest)");
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "%s", T("client2_log_guest"));
         ImGui::SameLine();
-        if (ImGui::Button("Copy Client 2 Log")) {
+        if (ImGui::Button(T("debug_log_copy_c2"))) {
             // Read Client 2 log file and copy to clipboard
             std::ifstream log_file("FM2K_P2_Debug.log");
             if (log_file.is_open()) {
@@ -2473,23 +2884,23 @@ void LauncherUI::RenderMultiClientTools() {
                 }
                 ImGui::EndChild();
             } else {
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No log file available (client not started)");
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", T("debug_log_no_file"));
             }
         }
         
         ImGui::Separator();
         
         // Log Management
-        ImGui::Text("Log Management:");
-        if (ImGui::Button("Clear All Logs")) {
+        ImGui::Text("%s", T("debug_log_management"));
+        if (ImGui::Button(T("debug_log_clear_all"))) {
             // Clear both log files
             std::ofstream("FM2K_P1_Debug.log", std::ios::trunc).close();
             std::ofstream("FM2K_P2_Debug.log", std::ios::trunc).close();
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "All debug logs cleared");
         }
-        
+
         ImGui::SameLine();
-        if (ImGui::Button("Open Log Directory")) {
+        if (ImGui::Button(T("debug_log_open_dir"))) {
             // Open the current directory in file explorer
             system("explorer .");
         }
@@ -2506,16 +2917,16 @@ void LauncherUI::RenderNetworkTools() {
     }
 
     if (!stats_available) {
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No active session");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", T("status_no_active_session"));
         return;
     }
 
-    ImGui::Text("Frame: %u", stats.confirmed_frames);
-    ImGui::Text("Rollbacks: %u", stats.speculative_frames);
-    ImGui::Text("Frame Advantage: %.1f", stats.frame_advantage);
+    ImGui::Text(T("label_frame"), stats.confirmed_frames);
+    ImGui::Text(T("label_rollbacks"), stats.speculative_frames);
+    ImGui::Text(T("label_frame_advantage"), stats.frame_advantage);
 
     if (stats.speculative_frames == 0) {
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "No desyncs");
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", T("status_no_desyncs"));
     }
 }
 

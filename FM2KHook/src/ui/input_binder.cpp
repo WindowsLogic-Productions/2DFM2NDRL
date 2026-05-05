@@ -914,8 +914,11 @@ bool RenderWindow(int player_slot, bool* p_open) {
     double now = ImGui::GetTime();
     if (now - s_last_refresh > 1.5) { RefreshGamepadList(); s_last_refresh = now; }
 
+    // player_slot is 0-indexed (P1 = slot 0, P2 = slot 1). Display as
+    // 1-indexed in the window title since users think of themselves as
+    // P1/P2, never P0/P1.
     char title[64];
-    std::snprintf(title, sizeof(title), "FM2K Input Binder - Player %d", player_slot);
+    std::snprintf(title, sizeof(title), "FM2K Input Binder - Player %d", player_slot + 1);
 
     ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(title, p_open)) { ImGui::End(); return false; }

@@ -353,6 +353,20 @@ static bool PumpMessages() {
                         (unsigned)msg.wParam, (unsigned long)msg.lParam,
                         msg.hwnd);
         }
+        // Suppress solo-Alt menu activation. When the user taps Alt with
+        // no follow-up key, Windows sends WM_SYSCOMMAND/SC_KEYMENU which
+        // makes the game's WindowProc enter modal menu mode (DefWindowProc
+        // blocks the message pump until the user picks a menu item or
+        // presses Esc). FM2K has no menu, so the game just appears to
+        // freeze for a beat. Discard the no-key SC_KEYMENU but let other
+        // SC_* commands (SC_CLOSE on the X button, SC_RESTORE on un-min,
+        // SC_KEYMENU with an actual hotkey) pass through.
+        if (msg.message == WM_SYSCOMMAND
+            && (msg.wParam & 0xFFF0) == SC_KEYMENU
+            && msg.lParam == 0)
+        {
+            continue;  // swallowed
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }

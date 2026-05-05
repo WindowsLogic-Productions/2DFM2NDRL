@@ -763,6 +763,17 @@ private:
     std::string games_root_path_;  // Current games root directory
     int selected_game_index_ = -1; // -1 means no selection
     bool scanning_games_ = false;  // True while background discovery is running
+
+    // Challenge notification toggles. Defaults to all-on so players never
+    // miss an incoming challenge while tabbed out. Persists in
+    // %APPDATA%\FM2K_Rollback\settings.ini under keys notify_flash,
+    // notify_sound, notify_toast. Loaded on first menu-bar render and
+    // saved whenever the user toggles a checkbox in Settings →
+    // Notifications.
+    bool notify_flash_ = true;
+    bool notify_sound_ = true;
+    bool notify_toast_ = true;
+    bool notify_state_loaded_ = false;
     
     // Console Log
     ImGuiTextBuffer log_buffer_;
@@ -790,6 +801,12 @@ private:
     void RenderDiscordAuthWindow();     // Settings → Sign in with Discord…
     void LoadAudioMuteState();          // Read %APPDATA%\FM2K_Rollback\audio.ini
     void SaveAudioMuteState();          // Write same file (hook re-reads it)
+    void LoadNotifyState();             // Read notify_* keys from settings.ini
+    void SaveNotifyState();             // Write notify_* keys to settings.ini
+    // Fire all enabled challenge notifications: taskbar flash + sound chirp
+    // + Windows toast. Each piece is independently togglable in Settings.
+    // Called from the K::ChallengeReceived event handler.
+    void FireChallengeNotification(const std::string& from_nick);
 
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
