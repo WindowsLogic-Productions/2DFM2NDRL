@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SDL3/SDL.h"
+#include "FM2K_Integration.h"  // FM2K::Engine
 #include <string>
 #include <memory>
 #include <filesystem>
@@ -13,9 +14,15 @@ class FM2KGameInstance {
 public:
     FM2KGameInstance();
     ~FM2KGameInstance();
-    
+
     bool Initialize();
-    bool Launch(const std::string& exe_path);
+    // Launches the game in suspended state, injects the appropriate hook DLL
+    // (FM2KHook.dll for FM2K, FM95Hook.dll for FM95), then resumes. The hook
+    // DLL drives the rollback netcode. Engine selection also activates the
+    // Japanese-locale spoof at DLL_PROCESS_ATTACH (always-on for FM95Hook,
+    // env-gated for FM2KHook via FM2K_JP_LOCALE=1).
+    bool Launch(const std::string& exe_path,
+                FM2K::Engine engine = FM2K::Engine::FM2K);
     void Terminate();
     bool IsRunning() const { 
         if (!process_handle_) return false;
@@ -134,6 +141,7 @@ private:
     PROCESS_INFORMATION process_info_;
     std::string game_exe_path_;  // Store the game executable path
     std::string game_dll_path_;  // Store the game's KGT/DLL path
+    FM2K::Engine engine_ = FM2K::Engine::FM2K;  // Selects FM2KHook.dll vs FM95Hook.dll at injection
     
     // Shared memory for input communication with injected DLL
     HANDLE shared_memory_handle_;

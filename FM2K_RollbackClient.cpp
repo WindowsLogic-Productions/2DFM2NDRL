@@ -9,13 +9,18 @@
 #include "MinHook.h"
 #include "FM2K_GameInstance.h"
 #include "FM2K_Integration.h"
+#include "FM2K_GameIni.h"
+#include "FM2K_Utf8Path.h"
 #include "FM2KHook/src/ui/shared_mem.h"
+#define XXH_INLINE_ALL
+#include "vendored/xxhash/xxhash.h"
 #include "LocalSession.h"
 #include "OnlineSession.h"
 
 #include <chrono>
 #include <string>
 #include <cstring>
+#include <optional>
 #include <vector>
 #include <iostream>
 #include <thread>
@@ -24,6 +29,12 @@
 #include <tlhelp32.h>
 #include <fstream>
 #include <algorithm>
+#include <filesystem>
+#include <future>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstdint>
+#include <system_error>
 
 
 // -----------------------------------------------------------------------------
@@ -192,53 +203,289 @@ namespace Utils {
         return GetConfigDir() + "launcher.cfg";
     }
 
-    std::string LoadGamesRootPath() {
+    // Persisted games-root list lives in launcher.cfg as one path per line.
+    // The historical single-string format is just a one-line file, which the
+    // line-by-line reader handles transparently — that's our migration story.
+    std::vector<std::string> LoadGamesRootPaths() {
+        std::vector<std::string> result;
         std::string cfg = GetConfigFilePath();
         if (!SDL_GetPathInfo(cfg.c_str(), nullptr)) {
-            return {};
+            return result;
         }
 
-        SDL_IOStream* io = SDL_IOFromFile(cfg.c_str(), "r");
-        if (!io) {
+        std::ifstream in(cfg);
+        if (!in) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to open config file: %s", cfg.c_str());
-            return {};
+            return result;
         }
 
-        char buffer[1024];
-        size_t read = SDL_ReadIO(io, buffer, sizeof(buffer) - 1);
-        SDL_CloseIO(io);
-
-        if (read > 0) {
-            buffer[read] = '\0';
-            // Trim newlines
-            while (read > 0 && (buffer[read-1] == '\n' || buffer[read-1] == '\r')) {
-                buffer[--read] = '\0';
+        std::string line;
+        while (std::getline(in, line)) {
+            // Strip trailing CR (Windows-saved files) and surrounding whitespace.
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                     line.back() == ' '  || line.back() == '\t')) {
+                line.pop_back();
             }
-            return std::string(buffer);
+            size_t start = 0;
+            while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+                ++start;
+            }
+            if (start > 0) line.erase(0, start);
+            if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+            result.push_back(line);
         }
-        return {};
+        return result;
     }
 
-    void SaveGamesRootPath(const std::string& path) {
+    void SaveGamesRootPaths(const std::vector<std::string>& paths) {
         std::string cfg = GetConfigFilePath();
-        SDL_IOStream* io = SDL_IOFromFile(cfg.c_str(), "w");
-        if (!io) {
+        std::ofstream out(cfg, std::ios::trunc);
+        if (!out) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to write config file: %s", cfg.c_str());
             return;
         }
-
-        SDL_WriteIO(io, path.c_str(), SDL_strlen(path.c_str()));
-        SDL_WriteIO(io, "\n", 1);
-        SDL_CloseIO(io);
+        for (const auto& p : paths) {
+            if (p.empty()) continue;
+            out << p << "\n";
+        }
     }
 
     // -------------------------------------------------------------
-    // Lightweight games cache so we can show results instantly on
-    // next launch and avoid rescanning unchanged paths.
+    // Skip-validation cache.
+    //
+    // Cache key is the (canonical_exe_path, file_size, mtime) triple.
+    // When a fresh scan finds an exe candidate whose size+mtime match the
+    // cached entry, we reuse the previous validation result without
+    // re-running the FM2K signature/header check. This keeps warm
+    // rescans cheap on libraries with 50+ exes.
+    //
+    // File format (one record per line, '|'-separated):
+    //   exe_path|dll_path|size|mtime
+    //
+    // Lines that fail to parse are skipped silently (forward-compat).
     // -------------------------------------------------------------
+
+    struct GameCacheEntry {
+        std::string exe_path;
+        std::string dll_path;
+        uint64_t    size  = 0;
+        int64_t     mtime = 0;
+    };
 
     static std::string GetCacheFilePath() {
         return GetConfigDir() + "games.cache";
+    }
+
+    // Stat helper. Returns false if the file doesn't exist or we can't
+    // read its size/mtime. mtime uses SDL_PathInfo's modify_time (ns since
+    // epoch, monotonic-ish across runs) so cache hits don't fight the
+    // OS's clock skew on resumed-from-sleep machines.
+    static bool StatFile(const std::string& path, uint64_t& size, int64_t& mtime) {
+        SDL_PathInfo info;
+        if (!SDL_GetPathInfo(path.c_str(), &info)) return false;
+        if (info.type != SDL_PATHTYPE_FILE) return false;
+        size  = static_cast<uint64_t>(info.size);
+        mtime = static_cast<int64_t>(info.modify_time);
+        return true;
+    }
+
+    // Compute xxhash64 of an exe for clean-build identification. Pulls the
+    // whole file into memory (clean FM2K/FM95 exes are < 2 MB; this trades
+    // a buffered loop for simplicity). Returns 0 on any failure so callers
+    // can treat 0 as "unhashable / skip".
+    static uint64_t HashFileXXH64(const std::string& path) {
+        SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
+        if (!io) return 0;
+        Sint64 sz = SDL_GetIOSize(io);
+        if (sz <= 0 || sz > (64 * 1024 * 1024)) {  // 64 MB sanity cap
+            SDL_CloseIO(io);
+            return 0;
+        }
+        std::vector<unsigned char> buf(static_cast<size_t>(sz));
+        size_t got = SDL_ReadIO(io, buf.data(), buf.size());
+        SDL_CloseIO(io);
+        if (got != buf.size()) return 0;
+        return XXH64(buf.data(), buf.size(), /*seed=*/0);
+    }
+
+    // Known-clean exe registry — used by discovery to identify the exact
+    // build of each detected game. Hashes computed via xxhash64 of the full
+    // exe file. Add entries here when a new clean build is verified.
+    //
+    // To compute a hash for a new entry on a Linux/WSL host:
+    //   gcc xxh_oneshot.c -o /tmp/xxh && /tmp/xxh path/to/clean.exe
+    // (xxh_oneshot.c includes vendored/xxhash/xxhash.h with XXH_INLINE_ALL.)
+    struct KnownExe {
+        uint64_t      xxh64;
+        FM2K::Engine  engine;
+        const char*   label;
+    };
+    static constexpr KnownExe kKnownExes[] = {
+        // FM2K builds
+        {0x506FF9AB93D15134ULL, FM2K::Engine::FM2K, "WonderfulWorld v0.946"},
+        // FM95 builds
+        {0x36358AD6F9EC387BULL, FM2K::Engine::FM95, "Comic Party Wars (CPW)"},
+    };
+
+    // Look up an exe hash. Returns nullptr on miss.
+    static const KnownExe* FindKnownExe(uint64_t hash) {
+        for (const auto& k : kKnownExes) {
+            if (k.xxh64 == hash) return &k;
+        }
+        return nullptr;
+    }
+
+    // Engine fingerprint — scans the first 256 KB of the exe for the engine
+    // class strings. Reliable for clean FM2K/FM95 builds. Returns a confident
+    // Engine when a marker is found, or std::nullopt to fall through to the
+    // size heuristic.
+    //   FM2K: "KGT2KGAME" window class, "2DKGT2K" or "kgt2k.INI" tags.
+    //   FM95: "KGT95GAME" window class.
+    static std::optional<FM2K::Engine> SniffEngineFromStrings(const std::string& path) {
+        SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
+        if (!io) return std::nullopt;
+        std::vector<unsigned char> buf(256 * 1024);
+        size_t got = SDL_ReadIO(io, buf.data(), buf.size());
+        SDL_CloseIO(io);
+        if (got < 1024) return std::nullopt;
+
+        auto contains = [&](const char* needle) -> bool {
+            size_t n = SDL_strlen(needle);
+            if (n == 0 || n > got) return false;
+            for (size_t i = 0; i + n <= got; ++i) {
+                if (SDL_memcmp(buf.data() + i, needle, n) == 0) return true;
+            }
+            return false;
+        };
+
+        if (contains("KGT95GAME"))                       return FM2K::Engine::FM95;
+        if (contains("KGT2KGAME") || contains("2DKGT2K") ||
+            contains("kgt2k.INI"))                       return FM2K::Engine::FM2K;
+        return std::nullopt;
+    }
+
+    // File-size heuristic for engine detection when neither the hash registry
+    // nor the string sniff hits. Clean FM2K runtime binaries cluster around
+    // 1.1–1.7 MB (.text + .rsrc + embedded resource sprites varying per
+    // build). Clean FM95 binaries are much smaller (~400 KB) because the
+    // prototype shipped with less code and no sprite cache. Anything outside
+    // these bands is probably packed or unrelated.
+    static FM2K::Engine GuessEngineFromSize(uint64_t size_bytes) {
+        if (size_bytes <= 600 * 1024)                    return FM2K::Engine::FM95;
+        return FM2K::Engine::FM2K;  // default — covers the 1.1-1.7 MB FM2K cluster
+    }
+
+    // Detect known PE packers by walking the section table. Returns a label
+    // ("Enigma", "UPX", "MoleBox", "ASPack", "Themida", "PECompact") when a
+    // packer signature is found, or "" for clean PEs. This is the actual
+    // basis for warning the user — same-size unpacked-FM2K-engine builds
+    // (SCWU, vanpri, etc.) just have different hashes, NOT different
+    // structure, so they should NOT be flagged.
+    //
+    // Reads only the PE header + section table (typically < 4 KB), so it's
+    // cheap to run on every discovered exe.
+    static std::string DetectPackerFromPE(const std::string& path) {
+        SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
+        if (!io) return "";
+
+        // Pull the first 4 KB; section table on a 32-bit FM2K exe sits at
+        // ~0x180-0x300 — well inside this window.
+        unsigned char hdr[4096] = {};
+        size_t got = SDL_ReadIO(io, hdr, sizeof(hdr));
+        SDL_CloseIO(io);
+        if (got < 0x40) return "";
+
+        // DOS signature 'MZ', then e_lfanew at 0x3C points to the PE header.
+        if (hdr[0] != 'M' || hdr[1] != 'Z') return "";
+        uint32_t pe_off = *reinterpret_cast<uint32_t*>(hdr + 0x3C);
+        if (pe_off + 24 + 96 >= got) return "";  // need PE+COFF+OptHdr min
+        if (hdr[pe_off] != 'P' || hdr[pe_off+1] != 'E') return "";
+
+        // COFF header at pe_off+4: NumberOfSections at +2, SizeOfOptionalHeader at +16.
+        uint16_t num_sections    = *reinterpret_cast<uint16_t*>(hdr + pe_off + 6);
+        uint16_t opt_header_size = *reinterpret_cast<uint16_t*>(hdr + pe_off + 20);
+        if (num_sections == 0 || num_sections > 96) return "";
+
+        // Section table follows the optional header, 40 bytes per entry.
+        uint32_t sec_off = pe_off + 24 + opt_header_size;
+        struct PackerSig { const char* needle; const char* label; };
+        // Match against the 8-byte section name (null-padded). We compare
+        // case-insensitively against the start of each section name.
+        static constexpr PackerSig kSigs[] = {
+            {".enigma",  "Enigma Protector"},
+            {".themida", "Themida"},
+            {".taggant", "VMProtect"},  // VMProtect appends a taggant section
+            {"UPX0",     "UPX"},
+            {"UPX1",     "UPX"},
+            {".aspack",  "ASPack"},
+            {".adata",   "ASPack"},
+            {".molebox", "MoleBox"},
+            {".boom",    "MoleBox"},
+            {"MoleBox",  "MoleBox"},
+            {".pecompact","PECompact"},
+            {"PEC2",     "PECompact"},
+            {".asprotec","ASProtect"},
+            {".nsp",     "NsPack"},
+            {".vmp",     "VMProtect"},
+            {".petite",  "Petite"},
+            {".mpress",  "MPRESS"},
+            {".fsg",     "FSG"},
+            {".mew",     "MEW"},
+        };
+
+        for (uint16_t i = 0; i < num_sections; ++i) {
+            uint32_t row = sec_off + i * 40;
+            if (row + 8 >= got) break;
+            const char* name = reinterpret_cast<const char*>(hdr + row);
+            // Section names are 8-byte null-padded; compare prefixes case-insensitively.
+            for (const auto& sig : kSigs) {
+                size_t n = SDL_strlen(sig.needle);
+                if (n > 8) n = 8;
+                if (SDL_strncasecmp(name, sig.needle, n) == 0) {
+                    return sig.label;
+                }
+            }
+        }
+        return "";
+    }
+
+    // UTF-8 ↔ wide via Win32 so std::filesystem doesn't go through the
+    // system ANSI codepage (CP1252 on most non-Japanese installs),
+    // which silently rewrites unrepresentable codepoints — full-width
+    // forms ＣＰＷ (U+FF23/FF30/FF37) become '_' or '?' on the trip
+    // through path::string(). Use wide internally and convert at the
+    // boundaries so the launcher renders / caches the original bytes.
+    static std::wstring Utf8ToWide_(const std::string& s) {
+        if (s.empty()) return {};
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
+                                    nullptr, 0);
+        if (n <= 0) return {};
+        std::wstring w((size_t)n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
+                            w.data(), n);
+        return w;
+    }
+    static std::string WideToUtf8_(const std::wstring& w) {
+        if (w.empty()) return {};
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return {};
+        std::string s((size_t)n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                            s.data(), n, nullptr, nullptr);
+        return s;
+    }
+
+    static std::string CanonicalizePath(const std::string& p) {
+        std::error_code ec;
+        std::filesystem::path fs_p = Utf8ToWide_(p);
+        std::filesystem::path canon = std::filesystem::weakly_canonical(fs_p, ec);
+        if (ec) {
+            std::filesystem::path abs = std::filesystem::absolute(fs_p, ec);
+            if (ec) return p;
+            return WideToUtf8_(abs.generic_wstring());
+        }
+        return WideToUtf8_(canon.generic_wstring());
     }
 
     void SaveGameCache(const std::vector<FM2K::FM2KGameInfo>& games) {
@@ -249,28 +496,77 @@ namespace Utils {
         }
 
         for (const auto& g : games) {
-            out << g.exe_path << "|" << g.dll_path << "\n";
+            uint64_t size = 0;
+            int64_t  mtime = 0;
+            StatFile(g.exe_path, size, mtime);
+            out << g.exe_path << "|" << g.dll_path << "|"
+                << size << "|" << mtime << "\n";
         }
     }
 
-    std::vector<FM2K::FM2KGameInfo> LoadGameCache() {
-        std::vector<FM2K::FM2KGameInfo> cached;
+    // Load the on-disk cache as a map keyed by canonical exe path. The
+    // discovery walker uses this to skip validation on unchanged files.
+    std::unordered_map<std::string, GameCacheEntry> LoadGameCacheMap() {
+        std::unordered_map<std::string, GameCacheEntry> map;
         std::ifstream in(GetCacheFilePath());
-        if (!in) return cached; // No cache yet
+        if (!in) return map;
 
         std::string line;
         while (std::getline(in, line)) {
-            size_t sep = line.find('|');
-            if (sep == std::string::npos) continue;
-            std::string exe = line.substr(0, sep);
-            std::string dll = line.substr(sep + 1);
+            // Strip trailing CR.
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+                line.pop_back();
+            }
+            if (line.empty()) continue;
 
-            // Validate paths still exist
-            if (SDL_GetPathInfo(exe.c_str(), nullptr) && SDL_GetPathInfo(dll.c_str(), nullptr)) {
+            // Split on '|' into up to 4 fields.
+            size_t s1 = line.find('|');
+            if (s1 == std::string::npos) continue;
+            size_t s2 = line.find('|', s1 + 1);
+            if (s2 == std::string::npos) continue;
+            size_t s3 = line.find('|', s2 + 1);
+
+            GameCacheEntry e;
+            e.exe_path = line.substr(0, s1);
+            e.dll_path = line.substr(s1 + 1, s2 - s1 - 1);
+            if (s3 == std::string::npos) {
+                // Old (path-only) format — treat as a stale entry; size/mtime
+                // mismatch will force re-validation on first hit.
+                e.size  = 0;
+                e.mtime = 0;
+            } else {
+                std::string size_str  = line.substr(s2 + 1, s3 - s2 - 1);
+                std::string mtime_str = line.substr(s3 + 1);
+                try {
+                    e.size  = static_cast<uint64_t>(std::stoull(size_str));
+                    e.mtime = static_cast<int64_t>(std::stoll(mtime_str));
+                } catch (...) {
+                    e.size  = 0;
+                    e.mtime = 0;
+                }
+            }
+
+            std::string key = CanonicalizePath(e.exe_path);
+            map.emplace(std::move(key), std::move(e));
+        }
+        return map;
+    }
+
+    // Legacy entry point used to seed the UI before async discovery
+    // completes. Validates each cached entry's paths still exist; the full
+    // size/mtime skip-validation lives in the discovery path.
+    std::vector<FM2K::FM2KGameInfo> LoadGameCache() {
+        std::vector<FM2K::FM2KGameInfo> cached;
+        auto map = LoadGameCacheMap();
+        cached.reserve(map.size());
+        for (auto& kv : map) {
+            const auto& e = kv.second;
+            if (SDL_GetPathInfo(e.exe_path.c_str(), nullptr) &&
+                SDL_GetPathInfo(e.dll_path.c_str(), nullptr)) {
                 FM2K::FM2KGameInfo game;
-                game.exe_path = exe;
-                game.dll_path = dll;
-                game.is_host = true;
+                game.exe_path = e.exe_path;
+                game.dll_path = e.dll_path;
+                game.is_host  = true;
                 game.process_id = 0;
                 cached.push_back(std::move(game));
             }
@@ -368,6 +664,27 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // the runtime. Override with something meaningful.
     SetConsoleTitleA("FM2K Rollback Launcher");
 
+    // Pin the AppUserModelID for this process. Without an explicit AUMID
+    // Windows derives one from the EXE path and caches the displayed
+    // name from whichever VERSIONINFO it sees first — and once cached,
+    // toasts (Action Center), the taskbar grouping, and the "right-click
+    // → app name" surface keep showing the cached entry even after we
+    // ship a fixed VERSIONINFO. Setting our own AUMID gives Windows a
+    // stable identity it associates with our PE's actual FileDescription
+    // ("FM2K Rollback Launcher") instead of the libwinpthread-derived
+    // legacy one. Loaded dynamically because the symbol is in
+    // shobjidl_core.h which not every MinGW SDK ships.
+    {
+        using SetAumidFn = HRESULT (WINAPI*)(PCWSTR);
+        if (HMODULE sh = GetModuleHandleW(L"shell32.dll")) {
+            auto SetAumid = reinterpret_cast<SetAumidFn>(
+                GetProcAddress(sh, "SetCurrentProcessExplicitAppUserModelID"));
+            if (SetAumid) {
+                SetAumid(L"FM2K.Rollback.Launcher");
+            }
+        }
+    }
+
     std::cout << "=== FM2K Rollback Launcher ===\n";
     std::cout << "Initializing with SDL callbacks...\n\n";
     
@@ -406,7 +723,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             }
         } else if (arg == "--games") {
             if (i + 1 < argc) {
-                Utils::SaveGamesRootPath(argv[++i]);
+                // Treat --games as "set the games-roots list to a single
+                // path" for parity with the legacy command line. Users who
+                // want multiple roots can configure them in the UI.
+                Utils::SaveGamesRootPaths({ argv[++i] });
             }
         }
     }
@@ -524,8 +844,10 @@ FM2KLauncher::FM2KLauncher()
     
     // Initialize GekkoNet session management
     
-    // Load saved games directory (if any) so it can be used before Initialize() completes.
-    games_root_path_ = Utils::LoadGamesRootPath();
+    // Load saved games directories (if any) so they can be used before
+    // Initialize() completes. Old single-string configs migrate naturally
+    // because the persistence format is one path per line.
+    games_root_paths_ = Utils::LoadGamesRootPaths();
 }
 
 FM2KLauncher::~FM2KLauncher() {
@@ -595,8 +917,8 @@ bool FM2KLauncher::Initialize() {
         running_ = false;
     };
     
-    ui_->on_games_folder_set = [this](const std::string& folder) {
-        SetGamesRootPath(folder);
+    ui_->on_games_folders_set = [this](const std::vector<std::string>& folders) {
+        SetGamesRootPaths(folders);
     };
     
     // Connect debug state callbacks
@@ -832,13 +1154,39 @@ bool FM2KLauncher::Initialize() {
     ui_->on_get_client_status = [this](uint32_t& client1_pid, uint32_t& client2_pid) -> bool {
         bool client1_running = (client1_instance_ && client1_instance_->IsRunning());
         bool client2_running = (client2_instance_ && client2_instance_->IsRunning());
-        
+
         client1_pid = client1_running ? client1_instance_->GetProcessId() : 0;
         client2_pid = client2_running ? client2_instance_->GetProcessId() : 0;
-        
-        return client1_running || client2_running;  // Return true only if any clients are running
+
+        // Online (single-game) sessions live on game_instance_, not the
+        // dev-mode dual slots. Surface that PID through the same channel
+        // so the W/L/D shared-mem poll has something to read.
+        if (client1_pid == 0 && game_instance_ && game_instance_->IsRunning()) {
+            client1_pid = game_instance_->GetProcessId();
+            client1_running = true;
+        }
+
+        return client1_running || client2_running;
     };
-    
+
+    ui_->on_resolve_stage_name = [this](const std::string& game_id,
+                                        uint32_t stage_id) -> std::string {
+        if (stage_id == 0xFFFFFFFFu) return {};
+        const fm2k::KgtSummary* k = FindKgtByGameId(game_id);
+        if (!k) return {};
+        const std::string& n = k->StageName((int)stage_id);
+        return n;  // empty string if slot empty / out-of-range
+    };
+
+    ui_->on_resolve_char_name = [this](const std::string& game_id,
+                                       uint32_t char_id) -> std::string {
+        if (char_id == 0xFFFFFFFFu) return {};
+        const fm2k::KgtSummary* k = FindKgtByGameId(game_id);
+        if (!k) return {};
+        const std::string& n = k->PlayerName((int)char_id);
+        return n;
+    };
+
     // Network simulation callbacks removed - not connected to LocalNetworkAdapter
     
     ui_->on_get_rollback_stats = [this](RollbackStats& stats) -> bool {
@@ -846,8 +1194,8 @@ bool FM2KLauncher::Initialize() {
         return ReadRollbackStatsFromSharedMemory(stats);
     };
     
-    // If no games directory stored, default to launcher's directory
-    if (games_root_path_.empty()) {
+    // If no games directories stored, default to the launcher's own dir.
+    if (games_root_paths_.empty()) {
         std::string base_path;
         if (const char *sdl_base = SDL_GetBasePath()) {
             base_path = sdl_base;
@@ -861,15 +1209,17 @@ bool FM2KLauncher::Initialize() {
         if (!base_path.empty() && (base_path.back() == '/' || base_path.back() == '\\')) {
             base_path.pop_back();
         }
-        games_root_path_ = base_path;
+        if (!base_path.empty()) {
+            games_root_paths_.push_back(base_path);
+        }
     }
-    
+
     // Kick-off background discovery so the UI stays responsive. The results
     // will be delivered via the custom SDL event handled in HandleEvent().
     {
         auto cached_games = Utils::LoadGameCache();
         ui_->SetGames(cached_games);
-        ui_->SetGamesRootPath(games_root_path_);  // Update UI with current path
+        ui_->SetGamesRootPaths(games_root_paths_);  // Update UI with current paths
     }
     StartAsyncDiscovery();
     
@@ -1262,27 +1612,52 @@ void FM2KLauncher::StartAsyncDiscovery() {
     }
 }
 
-// Max depth from games_root to descend looking for .kgt files. Real-world
+// Max depth from a games root to descend looking for .kgt files. Real-world
 // libraries are organized publisher/game/[version/], so 6 covers everything
 // while preventing pathological symlink loops or scanning the whole drive.
 static constexpr int DISCOVERY_MAX_DEPTH = 6;
 
-// Walk state passed via SDL_EnumerateDirectory's userdata.
+// Walk state passed via SDL_EnumerateDirectory's userdata. Threads through
+// the on-disk cache map so we can skip re-validating unchanged files.
 struct DiscoveryWalkCtx {
     std::vector<FM2K::FM2KGameInfo>* games;
+    const std::unordered_map<std::string, Utils::GameCacheEntry>* cache;
     int depth_remaining;
 };
 
 static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name);
 
-static void ScanDirForGames(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games,
+// Look up an exe path in the cache. Returns true if the cache has an
+// entry whose size+mtime match the on-disk file — the caller can then
+// reuse the cached record without re-running validation.
+static bool TryUseCachedEntry(
+    const std::unordered_map<std::string, Utils::GameCacheEntry>* cache,
+    const std::string& exe_path,
+    Utils::GameCacheEntry& out)
+{
+    if (!cache || cache->empty()) return false;
+    std::string key = Utils::CanonicalizePath(exe_path);
+    auto it = cache->find(key);
+    if (it == cache->end()) return false;
+    uint64_t size = 0;
+    int64_t  mtime = 0;
+    if (!Utils::StatFile(exe_path, size, mtime)) return false;
+    if (it->second.size != size || it->second.mtime != mtime) return false;
+    out = it->second;
+    return true;
+}
+
+static void ScanDirForGames(const std::string& dir,
+                            std::vector<FM2K::FM2KGameInfo>& games,
+                            const std::unordered_map<std::string, Utils::GameCacheEntry>* cache,
                             int depth_remaining)
 {
     SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Scanning '%s' (depth_left=%d)",
                  dir.c_str(), depth_remaining);
 
-    // 1) Check this directory itself for *.kgt + matching *.exe.
+    // 1) Check this directory itself for *.kgt + matching *.exe (FM2K).
     int count = 0;
+    bool found_kgt_pair = false;
     char** list = SDL_GlobDirectory(dir.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
     if (list) {
         for (int i = 0; i < count; ++i) {
@@ -1301,19 +1676,125 @@ static void ScanDirForGames(const std::string& dir, std::vector<FM2K::FM2KGameIn
             std::string kgt_path = dir + "/" + kgt_name;
             SDL_free(exe_name);
 
-            if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Found game pair: EXE='%s', KGT='%s'",
-                            exe_path.c_str(), kgt_path.c_str());
-                games.emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
+            // Cache hit: reuse previous validation result without restating.
+            // We still hash the exe so engine detection stays accurate even
+            // for cached entries — the cache only skips stat, not identity.
+            Utils::GameCacheEntry cached_entry;
+            bool cache_hit = TryUseCachedEntry(cache, exe_path, cached_entry);
+            if (!cache_hit && !SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
+                continue;  // exe missing
             }
+
+            FM2K::FM2KGameInfo info{exe_path, kgt_path, 0, true};
+            info.xxh64 = Utils::HashFileXXH64(exe_path);
+
+            // Parse the .kgt for player/stage/demo name lists so the UI can
+            // populate dropdowns pre-launch. Failure is non-fatal: we still
+            // surface the game; the dropdowns just fall back to indices.
+            if (!fm2k::ParseKgtSummary(std::filesystem::u8path(kgt_path), info.kgt)) {
+                SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                             "KGT parse failed for '%s' — dropdowns will be empty",
+                             kgt_path.c_str());
+            }
+
+            // Engine detection cascade (best signal first):
+            //   1. exact-hash registry match -> known build, friendly label
+            //   2. KGT2KGAME / KGT95GAME string sniff -> exact engine
+            //   3. file-size heuristic (1.1-1.7 MB FM2K, <600 KB FM95)
+            // Then PE-section sniff for actual packers — only THIS produces a UI warning.
+            if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
+                info.engine      = known->engine;
+                info.clean_label = known->label;
+            } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
+                info.engine = *sniffed;
+            } else {
+                uint64_t sz = 0; int64_t mt = 0;
+                Utils::StatFile(exe_path, sz, mt);
+                info.engine = Utils::GuessEngineFromSize(sz);
+            }
+
+            info.packer_label = Utils::DetectPackerFromPE(exe_path);
+            info.is_clean     = info.packer_label.empty();
+
+            if (!info.packer_label.empty()) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Found PACKED exe: EXE='%s' packer='%s' engine=%s",
+                            exe_path.c_str(), info.packer_label.c_str(),
+                            FM2K::EngineName(info.engine));
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Found %s game: EXE='%s' xxh64=%016llx%s",
+                            FM2K::EngineName(info.engine), exe_path.c_str(),
+                            (unsigned long long)info.xxh64,
+                            info.clean_label.empty() ? "" : (" — " + info.clean_label).c_str());
+            }
+            games.push_back(std::move(info));
+            found_kgt_pair = true;
         }
         SDL_free(list);
     }
 
+    // 1b) FM95 fallback: directories with no .kgt but with .player files
+    //     alongside an .exe are likely FM95 prototype builds (e.g. CPW.exe).
+    //     FM95 has no master KGT data file — character data lives in .player
+    //     files loaded directly via cmdline.
+    if (!found_kgt_pair) {
+        int player_count = 0;
+        char** player_list = SDL_GlobDirectory(dir.c_str(), "*.player", SDL_GLOB_CASEINSENSITIVE, &player_count);
+        if (player_list && player_count > 0) {
+            int exe_count = 0;
+            char** exe_list = SDL_GlobDirectory(dir.c_str(), "*.exe", SDL_GLOB_CASEINSENSITIVE, &exe_count);
+            if (exe_list) {
+                for (int i = 0; i < exe_count; ++i) {
+                    if (!exe_list[i]) continue;
+                    const char* exe_basename = SDL_strrchr(exe_list[i], '/');
+                    if (!exe_basename) exe_basename = SDL_strrchr(exe_list[i], '\\');
+                    exe_basename = exe_basename ? exe_basename + 1 : exe_list[i];
+                    std::string exe_path = dir + "/" + exe_basename;
+                    if (!SDL_GetPathInfo(exe_path.c_str(), nullptr)) continue;
+
+                    FM2K::FM2KGameInfo info{exe_path, "", 0, true};
+                    info.xxh64 = Utils::HashFileXXH64(exe_path);
+
+                    if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
+                        info.engine      = known->engine;
+                        info.clean_label = known->label;
+                    } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
+                        info.engine = *sniffed;
+                    } else {
+                        uint64_t sz = 0; int64_t mt = 0;
+                        Utils::StatFile(exe_path, sz, mt);
+                        // .player-fallback path biases toward FM95 since that's
+                        // what triggered this branch, but defer to a clear FM2K
+                        // size signal if the exe sits in the FM2K cluster.
+                        info.engine = (sz > 600 * 1024) ? FM2K::Engine::FM2K
+                                                       : FM2K::Engine::FM95;
+                    }
+
+                    info.packer_label = Utils::DetectPackerFromPE(exe_path);
+                    info.is_clean     = info.packer_label.empty();
+
+                    if (!info.packer_label.empty()) {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Found PACKED game (no .kgt): EXE='%s' packer='%s' engine=%s",
+                                    exe_path.c_str(), info.packer_label.c_str(),
+                                    FM2K::EngineName(info.engine));
+                    } else {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Found %s game (no .kgt, %d .player files): EXE='%s'",
+                                    FM2K::EngineName(info.engine), player_count, exe_path.c_str());
+                    }
+                    games.push_back(std::move(info));
+                }
+                SDL_free(exe_list);
+            }
+        }
+        if (player_list) SDL_free(player_list);
+    }
+
     // 2) Recurse into subdirectories, decrementing depth budget.
     if (depth_remaining > 0) {
-        DiscoveryWalkCtx ctx{&games, depth_remaining - 1};
+        DiscoveryWalkCtx ctx{&games, cache, depth_remaining - 1};
         SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
     }
 }
@@ -1339,64 +1820,94 @@ static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* ori
         return SDL_ENUM_CONTINUE;
     }
 
-    ScanDirForGames(full_path, *ctx->games, ctx->depth_remaining);
+    ScanDirForGames(full_path, *ctx->games, ctx->cache, ctx->depth_remaining);
     return SDL_ENUM_CONTINUE;
 }
 
-static void DiscoverGamesRecursive(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games) {
-    DiscoveryWalkCtx ctx{&games, DISCOVERY_MAX_DEPTH - 1};
-    SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
-}
-
-std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
+// Walk one games root and produce a list of FM2K games found under it.
+// Self-contained so std::async can run multiple roots in parallel without
+// shared state beyond the read-only cache map.
+static std::vector<FM2K::FM2KGameInfo> ScanOneRoot(
+    const std::string& root,
+    const std::unordered_map<std::string, Utils::GameCacheEntry>& cache)
+{
     std::vector<FM2K::FM2KGameInfo> games;
-    const std::string& games_root = games_root_path_;
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Starting game discovery in directory: '%s'", games_root.c_str());
-
-    if (games_root.empty() || !SDL_GetPathInfo(games_root.c_str(), nullptr)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Games root path is empty or does not exist: '%s'", games_root.c_str());
+    if (root.empty() || !SDL_GetPathInfo(root.c_str(), nullptr)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Games root path is empty or does not exist: '%s'",
+                    root.c_str());
         return games;
     }
 
-    // First, check for KGT files in the root directory itself
-    int count = 0;
-    char **list = SDL_GlobDirectory(games_root.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
-    
-    if (list) {
-        for (int i = 0; i < count; ++i) {
-            if (!list[i]) continue;
-            
-            const char* kgt_name = SDL_strrchr(list[i], '/');
-            if (!kgt_name) kgt_name = SDL_strrchr(list[i], '\\');
-            kgt_name = kgt_name ? kgt_name + 1 : list[i];  // Skip the slash
-            
-            // Build paths for the root directory
-            char* exe_name = nullptr;
-            if (SDL_asprintf(&exe_name, "%.*s.exe", (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
-                continue;
-            }
-            
-            std::string exe_path = games_root + "/" + exe_name;
-            std::string kgt_path = games_root + "/" + kgt_name;
-            SDL_free(exe_name);
-            
-            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Found KGT in root: '%s', checking for EXE: '%s'", 
-                        kgt_path.c_str(), exe_path.c_str());
+    // Pull root and its descendants through the same scanner. Depth budget
+    // is full DISCOVERY_MAX_DEPTH because the root itself counts as level 0.
+    ScanDirForGames(root, games, &cache, DISCOVERY_MAX_DEPTH);
+    return games;
+}
 
-            if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Found valid game pair in root: EXE='%s', KGT='%s'", 
-                          exe_path.c_str(), kgt_path.c_str());
-                games.emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
-            }
+const fm2k::KgtSummary* FM2KLauncher::FindKgtByGameId(const std::string& game_id) const {
+    if (game_id.empty()) return nullptr;
+    // Hub-side `game_id` is the exe stem (basename without extension).
+    // Match case-insensitively because Windows filesystems are themselves
+    // case-insensitive and the hub propagates whatever case the original
+    // host used.
+    auto ieq = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower((unsigned char)a[i]) !=
+                std::tolower((unsigned char)b[i])) return false;
         }
-        SDL_free(list);
+        return true;
+    };
+    for (const auto& g : discovered_games_) {
+        if (!g.kgt.valid) continue;
+        std::string stem = fm2k::utf8path::StemUtf8(
+            std::filesystem::u8path(g.exe_path));
+        if (ieq(stem, game_id)) return &g.kgt;
+    }
+    return nullptr;
+}
+
+std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
+    // Snapshot the roots list — the launcher might mutate it while we walk.
+    std::vector<std::string> roots = games_root_paths_;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Starting game discovery across %d root(s)", (int)roots.size());
+    for (const auto& r : roots) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "  root: '%s'", r.c_str());
     }
 
-    // Then scan subdirectories
-    DiscoverGamesRecursive(games_root, games);
+    // Load the on-disk cache once and share it (read-only) with all walkers.
+    auto cache = Utils::LoadGameCacheMap();
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DiscoverGames: %d game(s) found under '%s'", (int)games.size(), games_root.c_str());
+    // Walk each root concurrently. std::async with a small per-root task is
+    // the right granularity — the work is filesystem-bound, not CPU-bound,
+    // so a thread pool would add complexity without buying anything.
+    std::vector<std::future<std::vector<FM2K::FM2KGameInfo>>> futures;
+    futures.reserve(roots.size());
+    for (const auto& root : roots) {
+        futures.push_back(std::async(std::launch::async, ScanOneRoot,
+                                     root, std::cref(cache)));
+    }
+
+    // Collect, de-duping by canonical absolute exe path so two roots that
+    // alias to the same install (symlink, junction, duplicate config entry)
+    // don't show the same game twice.
+    std::vector<FM2K::FM2KGameInfo> games;
+    std::unordered_set<std::string> seen;
+    for (auto& fut : futures) {
+        std::vector<FM2K::FM2KGameInfo> partial = fut.get();
+        for (auto& g : partial) {
+            std::string key = Utils::CanonicalizePath(g.exe_path);
+            if (!seen.insert(key).second) continue;
+            games.push_back(std::move(g));
+        }
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "DiscoverGames: %d unique game(s) found across %d root(s)",
+                (int)games.size(), (int)roots.size());
     return games;
 }
 
@@ -1437,10 +1948,11 @@ bool FM2KLauncher::LaunchGame(const FM2K::FM2KGameInfo& game) {
     // Apply any pending configuration before launching
     ApplyPendingConfigToInstance(game_instance_.get());
     
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Launching game with EXE: %s, KGT: %s", 
-                 game.exe_path.c_str(), game.dll_path.c_str());
-                 
-    if (!game_instance_->Launch(game.exe_path)) {
+    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Launching game with EXE: %s, KGT: %s, engine=%s",
+                 game.exe_path.c_str(), game.dll_path.c_str(),
+                 FM2K::EngineName(game.engine));
+
+    if (!game_instance_->Launch(game.exe_path, game.engine)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game: %s", game.exe_path.c_str());
         game_instance_.reset();
         return false;
@@ -1493,7 +2005,7 @@ void FM2KLauncher::StartOfflineSession() {
     
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Set FM2K_TRUE_OFFLINE=1 for pure offline session");
 
-    if (!game_instance_->Launch(selected_game_.exe_path)) {
+    if (!game_instance_->Launch(selected_game_.exe_path, selected_game_.engine)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game for offline session.");
         game_instance_.reset();
         return;
@@ -1541,7 +2053,7 @@ void FM2KLauncher::StartStressSession() {
         "Starting STRESS session: GekkoStressSession will force rollbacks "
         "every check_distance frames. Any DESYNC is a local determinism bug.");
 
-    if (!game_instance_->Launch(selected_game_.exe_path)) {
+    if (!game_instance_->Launch(selected_game_.exe_path, selected_game_.engine)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game for stress session.");
         game_instance_.reset();
         return;
@@ -1608,7 +2120,18 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
         "Online session: P%d port=%d remote=%s",
         player_index + 1, local_port, remote_addr.c_str());
 
-    if (!game_instance_->Launch(selected_game_.exe_path)) {
+    // Bake the host's resolved [GamePlay] config (defaults + per-game
+    // overrides + online anti-cheat clamps) into the game's own
+    // game.ini before CreateProcess. The game reads this file at
+    // startup; by writing it now both peers boot with the same round
+    // count / time / stage / etc. We restore the original ini in
+    // StopSession so leaving the launcher doesn't permanently mutate
+    // the user's offline settings. is_online=true forces HitJudge +
+    // GameInformation = 0 (debug overlays are cheating online).
+    fm2k::game_ini::ApplyForLaunch(selected_game_.exe_path,
+                                    /*is_online=*/true);
+
+    if (!game_instance_->Launch(selected_game_.exe_path, selected_game_.engine)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch game for online session.");
         game_instance_.reset();
         return;
@@ -1634,6 +2157,13 @@ void FM2KLauncher::StopSession() {
         game_instance_->Terminate();
         game_instance_.reset();
     }
+    // Restore the game's pristine game.ini from the .fm2krollback_bak
+    // backup ApplyForLaunch made. No-op when there's no backup (we
+    // never overrode anything for this game). Done after Terminate so
+    // we don't race the game holding its own ini open.
+    if (!selected_game_.exe_path.empty()) {
+        fm2k::game_ini::RestoreFromBackup(selected_game_.exe_path);
+    }
     SetState(LauncherState::GameSelection);
 }
 
@@ -1642,11 +2172,15 @@ void FM2KLauncher::SetSelectedGame(const FM2K::FM2KGameInfo& game) {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Game selected via code: %s", game.exe_path.c_str());
 }
 
-void FM2KLauncher::SetGamesRootPath(const std::string& path) {
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Set games root path: %s", path.c_str());
-    games_root_path_ = path;
-    Utils::SaveGamesRootPath(path);
-    if (ui_) ui_->SetGamesRootPath(path);  // Update UI with new path
+void FM2KLauncher::SetGamesRootPaths(const std::vector<std::string>& paths) {
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Set games root paths: %d entry/entries", (int)paths.size());
+    for (const auto& p : paths) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "  - %s", p.c_str());
+    }
+    games_root_paths_ = paths;
+    Utils::SaveGamesRootPaths(paths);
+    if (ui_) ui_->SetGamesRootPaths(paths);  // Update UI with new paths
 
     // Kick off background discovery so the UI stays responsive
     StartAsyncDiscovery();
