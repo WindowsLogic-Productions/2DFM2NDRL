@@ -208,7 +208,7 @@ struct CtrlPacket {
         // Address-mapped fields are written via direct memcpy to the
         // documented FM2K addresses inside the receiver.
         struct {
-            uint32_t selected_stage;    // → 0x470188 (u32). 0xFFFFFFFF = unset
+            uint32_t selected_stage;    // → FM2K::ADDR_SELECTED_STAGE (0x43010c on FM2K). 0xFFFFFFFF = unset
             uint32_t round_count;       // best-of-N (1/3/5). 0 = unset
             uint32_t round_time_sec;    // per-round time limit. 0 = unset
             uint32_t game_speed_pct;    // 100 = normal. 0 = unset
@@ -262,8 +262,15 @@ constexpr uint8_t NETPLAY_PROTOCOL_VERSION = 1;
 
 // Timeouts (in milliseconds)
 constexpr uint32_t CONNECT_TIMEOUT_MS = 5000;       // 5 seconds to connect
-constexpr uint32_t PING_INTERVAL_MS = 1000;         // Ping every 1 second
-constexpr uint32_t PING_TIMEOUT_MS = 3000;          // 3 missed pings = disconnect
+// Heartbeat cadence — tuned 2026-05-05 to balance "fast detection on
+// real DC" vs "ride out lag spikes / Win32 modal title-drag pauses".
+// 250ms ping × 6 missed = 1500ms tolerance. The hook also installs a
+// WM_TIMER pump in imgui_overlay's WndProc that keeps ControlChannel_
+// Poll() ticking inside DefWindowProc's modal loop (title drag, menu
+// open), so dragging a window no longer triggers a disconnect on the
+// peer side. Real-DC detection is still ~1.5s end-to-end.
+constexpr uint32_t PING_INTERVAL_MS = 250;          // Ping every 250ms (4Hz)
+constexpr uint32_t PING_TIMEOUT_MS  = 1500;         // ~6 missed pings = disconnect
 constexpr uint32_t BATTLE_READY_TIMEOUT_MS = 5000;  // 5 seconds to start battle
 
 // Packet send intervals (in frames at 100 FPS)

@@ -172,6 +172,30 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
     g_punch_peer.sin_addr.s_addr = peer_ip_be;
     g_punch_peer.sin_port        = htons(peer_port);
 
+    // Loopback shortcut: same-machine peers don't need NAT punch. Two
+    // FM2K instances on 127.0.0.1 were eating ~2.4s each on the
+    // relay-fallback timeout and 30×10ms burst, all to fight a NAT
+    // that doesn't exist. Send a tiny CTRL_PUNCH burst (still needed
+    // so the peer's TAG_CTRL_PUNCH handler authenticates us) and
+    // return synchronously — no relay wait, no thread.
+    if (peer_ip_be == htonl(INADDR_LOOPBACK)) {
+        SOCKET sock = ControlChannel_GetSocket();
+        if (sock != INVALID_SOCKET) {
+            uint8_t pkt[2 + MATCH_TOKEN_LEN] = {MAGIC, TAG_CTRL_PUNCH};
+            std::memcpy(pkt + 2, g_match_token, MATCH_TOKEN_LEN);
+            for (int i = 0; i < 3; ++i) {
+                sendto(sock,
+                       reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                       reinterpret_cast<sockaddr*>(&g_punch_peer),
+                       sizeof(g_punch_peer));
+            }
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: loopback peer %s:%u — skipping NAT punch / relay wait",
+            ip_str, (unsigned)peer_port);
+        return;
+    }
+
     g_punching.store(true);
     g_punch_thread = std::thread([ip_str_copy = std::string(ip_str), peer_port]() {
         // Boost only this thread's priority — process-wide boost would

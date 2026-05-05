@@ -109,8 +109,21 @@ void RenderDebugOverlay() {
             int32_t p2_x = *(int32_t*)(obj_pool + 1 * DebugAddrs::OBJECT_SIZE + DebugAddrs::OBJ_X_OFFSET);
             int32_t p2_y = *(int32_t*)(obj_pool + 1 * DebugAddrs::OBJECT_SIZE + DebugAddrs::OBJ_Y_OFFSET);
 
-            uint32_t* p1_hp = (uint32_t*)FM2K::ADDR_P1_HP;
-            uint32_t* p2_hp = (uint32_t*)FM2K::ADDR_P2_HP;
+            // HP source differs by engine. FM2K has globals at fixed addresses;
+            // FM95 stores HP per-object inside the pool slot (offset 72 = pos
+            // field reused as HP for character objects). Pull from whichever
+            // applies — globals.h's FM95 ifdef sets ADDR_P*_HP to 0 sentinel
+            // so a direct deref would crash.
+            uint32_t p1_hp_val = 0, p2_hp_val = 0;
+            if constexpr (FM2K::kIsFM2K) {
+                p1_hp_val = *(uint32_t*)FM2K::ADDR_P1_HP;
+                p2_hp_val = *(uint32_t*)FM2K::ADDR_P2_HP;
+            } else {
+                // FM95: read HP from the per-player main object's +72 field.
+                // pool[0] / pool[1] hold the player main objects.
+                p1_hp_val = *(uint32_t*)(obj_pool + 0 * DebugAddrs::OBJECT_SIZE + 72);
+                p2_hp_val = *(uint32_t*)(obj_pool + 1 * DebugAddrs::OBJECT_SIZE + 72);
+            }
 
             ImGui::TextColored(ImVec4(0,1,0,1), "Player Positions (CRITICAL FOR DESYNC)");
             ImGui::Columns(2);
@@ -118,14 +131,14 @@ void RenderDebugOverlay() {
             ImGui::Text("P1 Position:");
             ImGui::Text("  X: %d", p1_x);
             ImGui::Text("  Y: %d", p1_y);
-            ImGui::Text("  HP: %u", *p1_hp);
+            ImGui::Text("  HP: %u", p1_hp_val);
 
             ImGui::NextColumn();
 
             ImGui::Text("P2 Position:");
             ImGui::Text("  X: %d", p2_x);
             ImGui::Text("  Y: %d", p2_y);
-            ImGui::Text("  HP: %u", *p2_hp);
+            ImGui::Text("  HP: %u", p2_hp_val);
 
             ImGui::Columns(1);
 
