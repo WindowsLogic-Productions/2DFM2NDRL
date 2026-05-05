@@ -1072,44 +1072,52 @@ void LauncherUI::FireChallengeNotification(const std::string& from_nick) {
     }
 
     // 3) Windows toast / balloon notification via Shell_NotifyIconW
-    // (wide-string variant). Use the W version specifically so non-ASCII
-    // nicks (Armonté, テスト, español) render correctly. Shell_NotifyIconA
-    // would interpret our UTF-8 bytes as the system codepage (CP1252 on
-    // most US installs), so "é" (UTF-8 `C3 A9`) shows up as "Ã©" mangled.
-    // Wide-API call sites take UTF-16 throughout and the OS routes it to
-    // the Action Center toast on Windows 10/11. We don't keep a persistent
-    // tray icon; Add+Modify+Delete fires the balloon and cleans up.
+    // (wide-string variant). The W variant is critical so non-ASCII nicks
+    // (Armonté, テスト, español) render correctly — Shell_NotifyIconA
+    // would interpret UTF-8 bytes through the system codepage (CP1252 on
+    // most US installs), turning "é" (`C3 A9`) into "Ã©" garbage.
+    //
+    // Single-balloon protocol:
+    //   NIM_ADD    with NIF_ICON | NIF_TIP only      — register, no toast
+    //   NIM_MODIFY with NIF_INFO + content fields    — fires exactly 1 toast
+    //   NIM_DELETE                                   — cleanup
+    // Earlier impl set NIF_INFO on both ADD and MODIFY which fired TWO
+    // balloons (one per call) — fixed by splitting the flag set.
     if (notify_toast_ && hwnd) {
-        // Build the body string in UTF-8 first, then convert to UTF-16
-        // for the Win32 wide-string call. Body is "X wants to play." —
-        // we localize via T() so JP/ES users get translated text too.
         char body_utf8[256];
         std::snprintf(body_utf8, sizeof(body_utf8),
                       T("modal_incoming_challenge_body"), from_nick.c_str());
 
         NOTIFYICONDATAW nid{};
-        nid.cbSize           = sizeof(nid);
-        nid.hWnd             = hwnd;
-        nid.uID              = 1;
-        nid.uFlags           = NIF_INFO | NIF_ICON | NIF_TIP;
-        nid.hIcon            = LoadIcon(nullptr, IDI_APPLICATION);
-        nid.dwInfoFlags      = NIIF_INFO;
+        nid.cbSize  = sizeof(nid);
+        nid.hWnd    = hwnd;
+        nid.uID     = 1;
+        nid.hIcon   = LoadIcon(nullptr, IDI_APPLICATION);
 
         auto utf8_to_wide = [](const char* in, wchar_t* out, int out_len) {
             if (!in || !out || out_len <= 0) return;
             int n = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, out_len);
             if (n <= 0) out[0] = L'\0';
         };
-
         utf8_to_wide("FM2K Rollback Launcher", nid.szTip,
                      (int)(sizeof(nid.szTip)/sizeof(WCHAR)));
+
+        // Step 1: register the icon (no NIF_INFO yet → no balloon).
+        nid.uFlags = NIF_ICON | NIF_TIP;
+        Shell_NotifyIconW(NIM_ADD, &nid);
+
+        // Step 2: modify with the balloon info (this fires the one toast).
+        nid.uFlags     = NIF_INFO | NIF_ICON | NIF_TIP;
+        nid.dwInfoFlags = NIIF_INFO;
         utf8_to_wide(T("modal_incoming_challenge_title"), nid.szInfoTitle,
                      (int)(sizeof(nid.szInfoTitle)/sizeof(WCHAR)));
         utf8_to_wide(body_utf8, nid.szInfo,
                      (int)(sizeof(nid.szInfo)/sizeof(WCHAR)));
-
-        Shell_NotifyIconW(NIM_ADD,    &nid);
         Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+        // Step 3: cleanup. Windows captures the balloon info before
+        // releasing the icon slot, so the toast still appears in Action
+        // Center even after this Delete returns.
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
