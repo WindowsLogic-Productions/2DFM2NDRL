@@ -293,29 +293,73 @@ static bool HubPreflightPunch(uint16_t local_port,
 // user sees their per-file inventory (filename | size | content_hash)
 // without having to dig through the full hook log themselves.
 //
-// The hook log lives at <game_dir>/logs/FM2K_P{idx}_Debug.log.
-// Returns a friendly error string (still safe to display) if the file
-// can't be read or no manifest section is present.
+// The hook log normally lives at <game_dir>/logs/FM2K_P{idx}_Debug.log.
+// When the game is installed under C:\Program Files\ and the hook
+// process isn't elevated, Windows VirtualStore redirects the write
+// to %LOCALAPPDATA%\VirtualStore\<original_path>. We probe both
+// locations and pick whichever has the freshest "manifest" content.
+// Returns a friendly error string (still safe to display) if neither
+// path contains a usable log.
 static std::string ExtractGameHashManifest(const std::filesystem::path& exe_path,
                                            int player_index) {
     if (exe_path.empty()) return "(no game selected)";
-    const std::filesystem::path log_path =
-        exe_path.parent_path() / "logs" /
-        (std::string("FM2K_P") + std::to_string(player_index + 1) + "_Debug.log");
+    const std::string base =
+        std::string("FM2K_P") + std::to_string(player_index + 1) + "_Debug.log";
+    const std::filesystem::path canonical_log =
+        exe_path.parent_path() / "logs" / base;
 
-    FILE* f = _wfopen(log_path.wstring().c_str(), L"rb");
-    if (!f) {
+    auto read_log = [](const std::filesystem::path& p) -> std::string {
+        FILE* f = _wfopen(p.wstring().c_str(), L"rb");
+        if (!f) return {};
+        std::vector<char> buf;
+        char chunk[8192];
+        while (size_t n = std::fread(chunk, 1, sizeof(chunk), f)) {
+            buf.insert(buf.end(), chunk, chunk + n);
+        }
+        std::fclose(f);
+        return std::string(buf.begin(), buf.end());
+    };
+
+    // VirtualStore mirror path: %LOCALAPPDATA%\VirtualStore\<rest>
+    // where <rest> is the original full path WITHOUT the drive letter.
+    // Win32 paints LocalAppData\VirtualStore over the install dir
+    // for unprivileged writes to Program Files / Windows / etc.
+    std::filesystem::path virtualstore_log;
+    {
+        wchar_t lad[MAX_PATH] = {0};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH) > 0) {
+            // Strip drive prefix ("C:\foo\bar" -> "foo\bar"). On a
+            // standard Windows install drive letter is always 2 chars
+            // ("C:") followed by a separator; relative_path() drops both.
+            std::filesystem::path rel = canonical_log.relative_path();
+            // relative_path() of "C:\Program Files\..." gives "Program
+            // Files\..." which is exactly what VirtualStore wants.
+            virtualstore_log =
+                std::filesystem::path(lad) / "VirtualStore" / rel;
+        }
+    }
+
+    // Read both candidates; prefer the one that actually contains a
+    // manifest marker (in case both exist but only one was written
+    // this session — e.g. an old non-virtualized log lingering).
+    std::string text = read_log(canonical_log);
+    if (text.empty() ||
+        (text.find("local manifest follows") == std::string::npos &&
+         text.find("GameHash: manifest") == std::string::npos))
+    {
+        if (!virtualstore_log.empty()) {
+            std::string vs = read_log(virtualstore_log);
+            if (!vs.empty()) {
+                text = std::move(vs);
+            }
+        }
+    }
+    if (text.empty()) {
         return std::string("(couldn't open ") +
-               fm2k::utf8path::FilenameUtf8(log_path) +
-               " — no log to extract from)";
+               fm2k::utf8path::FilenameUtf8(canonical_log) +
+               " from either the game folder or VirtualStore — "
+               "is the launcher running with the wrong privileges?)";
     }
-    std::vector<char> buf;
-    char chunk[8192];
-    while (size_t n = std::fread(chunk, 1, sizeof(chunk), f)) {
-        buf.insert(buf.end(), chunk, chunk + n);
-    }
-    std::fclose(f);
-    std::string text(buf.begin(), buf.end());
 
     // Find the LAST manifest dump. Two possible markers, in order of
     // preference:

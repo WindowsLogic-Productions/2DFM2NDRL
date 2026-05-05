@@ -242,21 +242,29 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                     "Netplay: local manifest follows (compare against peer's "
                     "log line-by-line):");
-                {
-                    const char* m = fm2k::game_hash::ManifestLocal();
-                    // Stream out one line at a time so the per-file rows
-                    // stay readable even at high file counts. The
-                    // canonical manifest is "name|size|hash\n" lines.
-                    const char* p = m;
-                    while (*p) {
-                        const char* nl = std::strchr(p, '\n');
-                        size_t len = nl ? (size_t)(nl - p) : std::strlen(p);
-                        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                            "  %.*s", (int)len, p);
-                        if (!nl) break;
-                        p = nl + 1;
-                    }
-                }
+                // Iterate the cached entries vector directly. We used
+                // to split the cached manifest STRING line-by-line via
+                // strchr('\n'), but that path turned out to corrupt one
+                // entry's render in some installs (placeholder22.player
+                // showed up as "placeholder22|-", missing extension and
+                // size). Going through entries gets bytes byte-equivalent
+                // to the boot-time per-entry log.
+                fm2k::game_hash::ForEachManifestEntry(
+                    [](const char* name, uint64_t size, uint64_t content_hash,
+                       void* /*user*/) {
+                        if (content_hash != 0) {
+                            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                "  %s|%llu|%016llx",
+                                name,
+                                (unsigned long long)size,
+                                (unsigned long long)content_hash);
+                        } else {
+                            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                "  %s|%llu|-",
+                                name,
+                                (unsigned long long)size);
+                        }
+                    }, nullptr);
                 SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_HASH_MISMATCH);
                 break;
             }

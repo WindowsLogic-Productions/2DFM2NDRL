@@ -257,14 +257,29 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         if (g_relay_configured) {
             for (int i = 0; i < 200 && !g_peer_authenticated.load(); ++i) {
                 Sleep(10);
+                // If the gameplay handshake already completed via direct
+                // UDP, drop the relay-engage idea entirely. CTRL_PUNCH
+                // (0xCD) didn't ack but 0xCC HELLO/HELLO_ACK did — the
+                // path between peers is fine for our actual gameplay
+                // packets. Engaging relay anyway would route every
+                // subsequent packet through the hub for no reason and
+                // (worse) tear down a working session if relay quality
+                // is worse than direct.
+                if (ControlChannel_IsConnected()) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "NAT: relay-engage skipped — direct UDP already "
+                        "carrying gameplay traffic (handshake completed "
+                        "via 0xCC); CTRL_PUNCH ack lost but path works");
+                    return;
+                }
             }
-            if (!g_peer_authenticated.load()) {
+            if (!g_peer_authenticated.load() && !ControlChannel_IsConnected()) {
                 g_relay_mode.store(true);
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "NAT: direct punch did not authenticate after 2s — "
                     "relay mode ENGAGED");
             }
-        } else if (!g_peer_authenticated.load()) {
+        } else if (!g_peer_authenticated.load() && !ControlChannel_IsConnected()) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                 "NAT: direct punch failed and no relay configured — peer "
                 "may stay unreachable");
