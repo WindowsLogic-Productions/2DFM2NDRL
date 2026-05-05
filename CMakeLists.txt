@@ -260,6 +260,19 @@ target_link_options(FM2KHook PRIVATE
 )
 
 # Main executable
+# Pre-build version stamper. Writes version_local.h with the current
+# semver code + git SHA + build timestamp. Re-runs every build so the
+# binary always knows its own version (used by the auto-updater to
+# decide if a published release is newer).
+add_custom_target(fm2k_version
+    COMMAND ${CMAKE_COMMAND} -E env bash
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/make_version.sh"
+    BYPRODUCTS "${CMAKE_CURRENT_SOURCE_DIR}/version_local.h"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Stamping version_local.h"
+    VERBATIM
+)
+
 add_executable(FM2K_RollbackLauncher
     # Main launcher files
     FM2K_RollbackClient.cpp
@@ -268,11 +281,18 @@ add_executable(FM2K_RollbackLauncher
     LocalSession.cpp
     FM2K_LauncherUI.cpp
     FM2K_HubClient.cpp
+    FM2K_DiscordAuth.cpp
+    FM2K_Updater.cpp
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
     # ImGui-based input binder (shared with the hook overlay) — depends only
     # on SDL3 + ImGui, no project-specific includes.
     FM2KHook/src/ui/input_binder.cpp
+    # Win32 resource — embeds assets/icon.ico into the PE so Explorer + the
+    # taskbar pull the smiley straight off the EXE (WM_SETICON only covers
+    # the live window's title bar). windres compiles this to a COFF object
+    # at configure time because LANGUAGES include RC.
+    launcher.rc
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 
@@ -286,7 +306,18 @@ target_link_options(FM2K_RollbackLauncher PRIVATE
 )
 
 # Add FM2KHook as dependency
-add_dependencies(FM2K_RollbackLauncher FM2KHook)
+add_dependencies(FM2K_RollbackLauncher FM2KHook fm2k_version)
+
+# FM2KUpdater.exe — companion process spawned by the launcher to
+# perform the actual EXE/DLL replacement after launcher exit. Tiny
+# binary, zero deps beyond Win32. See tools/FM2KUpdater.cpp.
+add_executable(FM2KUpdater tools/FM2KUpdater.cpp)
+target_link_options(FM2KUpdater PRIVATE
+    -static
+    -static-libgcc
+    -static-libstdc++
+)
+add_dependencies(FM2K_RollbackLauncher FM2KUpdater)
 
 target_link_libraries(FM2K_RollbackLauncher PRIVATE
     GekkoNet

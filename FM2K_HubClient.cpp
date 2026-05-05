@@ -87,6 +87,33 @@ size_t FindKey(const std::string& s, const std::string& key) {
     }
 }
 
+// Hex-nibble lookup for \uXXXX decode. Returns -1 on non-hex.
+static int JsonHexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Append `cp` (any 21-bit code point) to `out` as UTF-8 bytes.
+static void JsonAppendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back((char)cp);
+    } else if (cp < 0x800) {
+        out.push_back((char)(0xC0 | (cp >> 6)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back((char)(0xE0 | (cp >> 12)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back((char)(0xF0 | (cp >> 18)));
+        out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
 std::string GetStr(const std::string& s, const std::string& key) {
     size_t p = FindKey(s, key);
     if (p == std::string::npos || p >= s.size() || s[p] != '"') return {};
@@ -96,15 +123,54 @@ std::string GetStr(const std::string& s, const std::string& key) {
         if (s[p] == '\\' && p + 1 < s.size()) {
             char n = s[p + 1];
             switch (n) {
-                case 'n': out += '\n'; break;
-                case 'r': out += '\r'; break;
-                case 't': out += '\t'; break;
-                case '"': out += '"';  break;
-                case '\\':out += '\\'; break;
-                case '/': out += '/';  break;
-                default:  out += n;    break;  // approximate: \uXXXX skipped here
+                case 'n': out += '\n'; p += 2; break;
+                case 'r': out += '\r'; p += 2; break;
+                case 't': out += '\t'; p += 2; break;
+                case 'b': out += '\b'; p += 2; break;
+                case 'f': out += '\f'; p += 2; break;
+                case '"': out += '"';  p += 2; break;
+                case '\\':out += '\\'; p += 2; break;
+                case '/': out += '/';  p += 2; break;
+                case 'u': {
+                    // \uXXXX → UTF-8. Without this, Discord/hub-supplied
+                    // nicks containing non-ASCII (e.g. "é" → "é")
+                    // displayed as the literal "u00e9" in the UI.
+                    if (p + 5 >= s.size()) { out += n; p += 2; break; }
+                    int h0 = JsonHexNibble(s[p+2]);
+                    int h1 = JsonHexNibble(s[p+3]);
+                    int h2 = JsonHexNibble(s[p+4]);
+                    int h3 = JsonHexNibble(s[p+5]);
+                    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) {
+                        out += n; p += 2; break;
+                    }
+                    uint32_t cu = (uint32_t)((h0<<12)|(h1<<8)|(h2<<4)|h3);
+                    p += 6;  // consumed \uXXXX
+                    // Surrogate pair: high \uD800..\uDBFF + low \uDC00..\uDFFF
+                    // combine into one code point.
+                    if (cu >= 0xD800u && cu <= 0xDBFFu &&
+                        p + 5 < s.size() && s[p] == '\\' && s[p+1] == 'u')
+                    {
+                        int l0 = JsonHexNibble(s[p+2]);
+                        int l1 = JsonHexNibble(s[p+3]);
+                        int l2 = JsonHexNibble(s[p+4]);
+                        int l3 = JsonHexNibble(s[p+5]);
+                        if (l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0) {
+                            uint32_t lo = (uint32_t)((l0<<12)|(l1<<8)|(l2<<4)|l3);
+                            if (lo >= 0xDC00u && lo <= 0xDFFFu) {
+                                uint32_t cp = 0x10000u +
+                                    ((cu - 0xD800u) << 10) +
+                                    (lo - 0xDC00u);
+                                JsonAppendUtf8(out, cp);
+                                p += 6;
+                                break;
+                            }
+                        }
+                    }
+                    JsonAppendUtf8(out, cu);
+                    break;
+                }
+                default:  out += n; p += 2; break;
             }
-            p += 2;
         } else {
             out += s[p++];
         }
@@ -184,6 +250,7 @@ HubUser ParseUser(const std::string& obj) {
     u.status      = GetStr(obj, "status");
     u.opponent_id = GetStr(obj, "opponent_id");
     u.rtt_ms      = GetInt(obj, "rtt_ms", 0);
+    u.tier        = GetStr(obj, "tier");
     return u;
 }
 
@@ -216,7 +283,8 @@ HubClient::~HubClient() {
 }
 
 bool HubClient::Connect(const std::string& host, uint16_t port,
-                        const std::string& path, const std::string& nick) {
+                        const std::string& path, const std::string& nick,
+                        const std::string& hub_token) {
     if (running_.load()) return false;  // already connecting / connected
     // A previous failed Connect leaves io_ in a finished-but-joinable
     // state — IoThread returned, but std::thread doesn't auto-detach.
@@ -225,6 +293,10 @@ bool HubClient::Connect(const std::string& host, uint16_t port,
     if (io_.joinable()) {
         io_.join();
     }
+    // Stash the token for IoThread → hello-send to read. Member state
+    // because std::thread argument forwarding caps at 4 here without
+    // pulling in another tuple wrapper.
+    hub_token_ = hub_token;
     running_.store(true);
     io_ = std::thread(&HubClient::IoThread, this, host, port, path, nick);
     return true;
@@ -387,9 +459,16 @@ void HubClient::IoThread(std::string host, uint16_t port,
                 "HubClient: WebSocket upgraded → %s:%u%s",
                 host.c_str(), (unsigned)port, path.c_str());
 
-    // Send hello first.
+    // Send hello first. Includes hub_token when the user has signed
+    // in with Discord; the hub uses it to validate against the patron
+    // role list before accepting the connection.
     {
-        std::string hello = "{\"type\":\"hello\",\"nick\":\"" + EscapeJsonString(nick) + "\"}";
+        std::string hello = "{\"type\":\"hello\",\"nick\":\""
+                            + EscapeJsonString(nick) + "\"";
+        if (!hub_token_.empty()) {
+            hello += ",\"hub_token\":\"" + EscapeJsonString(hub_token_) + "\"";
+        }
+        hello += "}";
         DWORD r = WinHttpWebSocketSend(ws_,
             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
             hello.data(), (DWORD)hello.size());
@@ -639,6 +718,26 @@ void HubClient::OnMessage(const std::string& msg) {
 
     if (type == "peer_disconnected") {
         ev.kind = HubEvent::Kind::PeerDisconnected;
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "error") {
+        // Server-issued error — most commonly auth_required when the
+        // launcher connects without a valid Discord hub_token. Surface
+        // both reason and detail so the UI can show something useful.
+        const std::string reason = GetStr(msg, "reason");
+        const std::string detail = GetStr(msg, "detail");
+        std::string combined = reason;
+        if (!detail.empty()) {
+            if (!combined.empty()) combined += ": ";
+            combined += detail;
+        }
+        if (combined.empty()) combined = "hub error";
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "HubClient: hub error — %s", combined.c_str());
+        ev.kind  = HubEvent::Kind::Error;
+        ev.error = std::move(combined);
         EmitEvent(std::move(ev));
         return;
     }

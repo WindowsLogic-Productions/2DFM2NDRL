@@ -96,6 +96,16 @@ static uint32_t g_desync_count = 0;
 static uint32_t g_last_desync_log_tick = 0;
 static int g_local_delay = 1;  // Computed from RTT at battle start
 
+// Connection-lifetime cache for the computed (auto) battle delay. Pinned
+// at the FIRST battle-session start after CONNECTED and reused for every
+// subsequent CSS->battle transition until disconnect. Without this we
+// recomputed per-battle off whatever stale rtt_worst happened to be sitting
+// in the bucket — a single CSS spike would slam delay to 15 on a 6 ms link.
+// Cleared on Netplay_Shutdown / Netplay_OnDisconnect so a reconnect picks
+// a fresh value next time.
+static int  g_session_delay_cached       = 0;
+static bool g_session_delay_cache_valid  = false;
+
 // Highest frame number we've ever recorded into the replay/spectator stream.
 // Reset on each Netplay_StartBattle (g_netplay_frame also resets to 0).
 // Gates the GekkoAdvance recording path against runahead duplicates — each
@@ -308,6 +318,10 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 "Netplay: Remote disconnected");
             ControlChannel_SetConnected(false);
             g_simple_state = SimpleState::DISCONNECTED;
+            // Drop the pinned auto-delay so the next connection measures
+            // fresh (peer might be on a different network now).
+            g_session_delay_cache_valid = false;
+            g_session_delay_cached      = 0;
             break;
 
         case CtrlMsg::HOST_CONFIG: {
@@ -356,7 +370,9 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             break;
 
         case CtrlMsg::SPEC_JOIN_ACK:
-            SpectatorNode_HandleJoinAck(from, packet->data.spec_join_ack.host_session_kind);
+            SpectatorNode_HandleJoinAck(from,
+                                        packet->data.spec_join_ack.host_session_kind,
+                                        packet->data.spec_join_ack.host_tcp_port);
             break;
 
         case CtrlMsg::SPEC_JOIN_REDIRECT:
@@ -425,10 +441,6 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     g_received_hello = false;
     g_received_hello_ack = false;
 
-    // Initialize spectator tree node — accepts subscribers on the same
-    // multiplexed UDP socket. Does not open a separate listen socket.
-    SpectatorNode_Init();
-
     // Store network config
     g_local_port = local_port;
     strncpy(g_remote_addr, remote_addr, sizeof(g_remote_addr) - 1);
@@ -442,6 +454,10 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
             return false;
         }
     }
+
+    // Initialize spectator tree node AFTER NetSocket — its TCP listener
+    // binds to the UDP socket's port number (TCP/UDP share port space).
+    SpectatorNode_Init();
 
     // Hub-driven NAT traversal. If FM2K_HUB_* env vars are present,
     // the launcher started this match via the hub — fire a STUN probe
@@ -529,8 +545,8 @@ bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
     }
 
     // Stand up the spectator node (initializes its state) and request to join
-    // the host. The 0xCE INPUT_BATCH datagrams will start flowing back once
-    // the host accepts.
+    // the host. INPUT_BATCH frames flow over a TCP connection opened on
+    // JOIN_ACK; UDP carries only handshake + heartbeat.
     SpectatorNode_Init();
 
     const sockaddr_in* upstream = NetSocket_GetRemoteAddr();
@@ -567,6 +583,8 @@ void Netplay_Shutdown() {
     g_simple_state = SimpleState::DISCONNECTED;
     g_received_hello = false;
     g_received_hello_ack = false;
+    g_session_delay_cache_valid = false;
+    g_session_delay_cached      = 0;
 }
 
 // =============================================================================
@@ -1247,36 +1265,69 @@ bool Netplay_StartBattle() {
     g_remote_css_ready  = false;
     g_css_advance_ready = false;
 
-    // Per-player local delay via GekkoNet's native API. Each peer picks its
-    // own value — no cross-peer negotiation. A laggy player can add delay
-    // to smooth their experience without forcing it on the opponent.
+    // Per-player local delay. Computed ONCE per connection at the first
+    // battle-session start, then cached and reused across every CSS->
+    // battle transition until disconnect.
     //
-    // Two paths:
-    //   (a) FM2K_LOCAL_DELAY env var set to 1..15: use that verbatim.
-    //       Honors the user's manual override from the launcher UI.
-    //   (b) Otherwise: compute from measured RTT.
-    //         local_delay = ceil(one_way_ms / 10) + 1, clamped [2, 15].
-    int local_delay = 0;
+    // Formula uses MEAN one-way latency (not worst). CCCaster's
+    // `latency.getWorst() + 1` works for them because they run a tight
+    // 30-ping burst right before session creation; we opportunistically
+    // accumulate samples over the entire CSS period, so a single
+    // outlier (Discord notification spike, Windows scheduler hiccup)
+    // would inflate "worst" and lock in a too-high delay for the rest
+    // of the match. Mean is robust to that and gives matched delays
+    // between peers on stable links.
+    //
+    // FM2K runs at 100 Hz, so 10 ms is one frame budget.
+    //   local_delay = max(2, ceil(mean_one_way_ms / 10))
+    // Floor of 2 keeps GekkoNet's prediction window happy on
+    // sub-millisecond loopback.
+    //
+    // FM2K_LOCAL_DELAY env var set to 1..15 forces a manual value (UI
+    // override). Manual override is checked every battle so the user
+    // can flip the override mid-session; AUTO is pinned for the
+    // connection lifetime.
+    int  local_delay = 0;
+    enum DelaySource { DS_MANUAL, DS_COMPUTED, DS_CACHED } delay_source = DS_COMPUTED;
     if (const char* env = std::getenv("FM2K_LOCAL_DELAY"); env && env[0]) {
         int v = std::atoi(env);
-        if (v >= 1 && v <= 15) local_delay = v;
+        if (v >= 1 && v <= 15) { local_delay = v; delay_source = DS_MANUAL; }
     }
-    uint32_t rtt_ms = ControlChannel_GetRttMs();
-    uint32_t one_way_ms = rtt_ms / 2;
+    const uint32_t rtt_mean_ms  = ControlChannel_GetRttMs();
+    const uint32_t rtt_worst_ms = ControlChannel_GetWorstRttMs();
+    const uint32_t mean_one_way = rtt_mean_ms / 2;
     if (local_delay == 0) {
-        if (one_way_ms < 10) one_way_ms = 10;
-        local_delay = (int)((one_way_ms + 9) / 10) + 1;
-        if (local_delay < 2)  local_delay = 2;
-        if (local_delay > 15) local_delay = 15;
+        if (g_session_delay_cache_valid) {
+            local_delay  = g_session_delay_cached;
+            delay_source = DS_CACHED;
+        } else {
+            // First battle of this connection: compute, pin, log.
+            // ceil(mean_one_way / 10), then max(2, ...).
+            local_delay = (int)((mean_one_way + 9) / 10);
+            if (local_delay < 2)  local_delay = 2;
+            if (local_delay > 15) local_delay = 15;
+            g_session_delay_cached      = local_delay;
+            g_session_delay_cache_valid = true;
+            delay_source = DS_COMPUTED;
+            // Worst-RTT bucket reset on first compute. We don't read it
+            // for the formula anymore but TickHealth still updates it,
+            // and a fresh window helps the diagnostic log line stay
+            // tied to the upcoming match window.
+            ControlChannel_ResetWorstRttMs();
+        }
     }
 
     int prediction_window = 8;
 
+    const char* source_str =
+        delay_source == DS_MANUAL   ? "manual" :
+        delay_source == DS_CACHED   ? "auto (cached)" :
+                                      "auto (computed)";
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: RTT=%ums one_way=%ums -> local_delay=%d (%s), prediction_window=%d",
-        rtt_ms, one_way_ms, local_delay,
-        std::getenv("FM2K_LOCAL_DELAY") ? "manual" : "auto",
-        prediction_window);
+        "Netplay: RTT mean=%ums worst=%ums one_way_mean=%ums -> "
+        "local_delay=%d (%s), prediction_window=%d",
+        rtt_mean_ms, rtt_worst_ms, mean_one_way, local_delay,
+        source_str, prediction_window);
 
     GekkoConfig config = {};
     config.num_players = 2;
@@ -1785,6 +1836,67 @@ bool Netplay_ProcessBattleInputPhase() {
                 // "inter-frame leak between confirmed advances."
                 const uint32_t rng_pre_advance = *(uint32_t*)0x41FB1C;
 
+                // Speculative-advance carve-out for palette flash state.
+                //
+                // Why: original_update_game is the game's update_game_state @
+                // 0x404CD0 — a 7-instruction stub that does nothing but
+                // decrement two palette flash timers (g_timer_countdown1 @
+                // 0x4456E4 and g_timer_countdown2 @ 0x447D91). PGI also runs
+                // character_state_machine which may re-fire [EB] and write
+                // timer = duration during a script's trigger anim slot.
+                //
+                // Under runahead = 4, every wall-clock frame fires 1 confirmed
+                // + 4 speculative AdvanceEvents. Each speculative advance also
+                // hits update_game_state, decrementing palette timers. Net:
+                // palette drains 5x per wall-clock frame instead of 1x — a
+                // 43-frame palette flash plays for ~9 wall-clock frames and
+                // then "cuts out", which is the bug user reported.
+                //
+                // Fix: snapshot the palette flash structs before PGI runs,
+                // and after UG returns, restore them IFF this advance is
+                // speculative (running_ahead). Confirmed advances drain the
+                // timer naturally; speculative advances are a no-op on
+                // palette state. End result: timer drains 1/wall-clock-frame
+                // matching vanilla.
+                //
+                // Why not the same fix for shake? Shake is decremented in
+                // RENDER (ProcessShakeEffect), not sim. Render runs at most
+                // once per wall-clock frame regardless of advance count, so
+                // shake already drains correctly. Verified empirically — the
+                // same diag log shows shake decrementing 1/frame while
+                // palette decremented 5/frame.
+                constexpr uintptr_t kEffectSys1Addr = 0x447D7D;
+                constexpr size_t    kEffectSys1Size = 42;
+                constexpr uintptr_t kPflash2Addr    = 0x4456D0;
+                constexpr size_t    kPflash2Size    = 44;
+                struct PaletteSnapshot {
+                    uint8_t  effect_sys1[kEffectSys1Size];   // 0x447D7D, 42 B
+                    uint8_t  pflash2[kPflash2Size];          // 0x4456D0, palette-flash-2 struct
+                    uint32_t rng_seed;                       // 0x41FB1C
+                };
+                PaletteSnapshot pal_pre{};
+                const bool running_ahead = update->data.adv.running_ahead;
+                if (running_ahead) {
+                    std::memcpy(pal_pre.effect_sys1,
+                                (void*)kEffectSys1Addr,
+                                kEffectSys1Size);
+                    std::memcpy(pal_pre.pflash2, (void*)kPflash2Addr, kPflash2Size);
+                    // Snapshot RNG too. Same reason: under runahead, PGI
+                    // (character_state_machine and friends) calls game_rand()
+                    // multiple times per advance. With 1 confirmed + 4
+                    // speculative advances per wall-clock frame, sim RNG
+                    // progresses ~5x faster than vanilla, which means
+                    // ProcessColorInterpolation mode 3 (the random palette
+                    // flash mode used by Bewear 214B) reads a different
+                    // seed than vanilla would — same draw-rate, same
+                    // duration, but different colors per frame. Restoring
+                    // RNG after speculative advances makes sim RNG progress
+                    // 1/wall-clock-frame matching vanilla, so palette mode 3
+                    // (and any other render-side RNG consumer) sees the
+                    // same seed at render time as offline 2DFM_Player.
+                    pal_pre.rng_seed = *(uint32_t*)0x41FB1C;
+                }
+
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
                 if (original_process_game_inputs) {
@@ -1792,6 +1904,14 @@ bool Netplay_ProcessBattleInputPhase() {
                 }
                 if (original_update_game) {
                     original_update_game();
+                }
+
+                if (running_ahead) {
+                    std::memcpy((void*)kEffectSys1Addr,
+                                pal_pre.effect_sys1,
+                                kEffectSys1Size);
+                    std::memcpy((void*)kPflash2Addr, pal_pre.pflash2, kPflash2Size);
+                    *(uint32_t*)0x41FB1C = pal_pre.rng_seed;
                 }
 
                 g_is_rolling_back = false;

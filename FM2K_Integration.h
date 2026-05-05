@@ -786,6 +786,10 @@ private:
     void RenderSlotInspectionWindow();  // Stub
     void RenderHubPanel();              // Fightcade-style lobby
     void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
+    void RenderHubServerWindow();       // Settings → Hub Server… host editor
+    void RenderDiscordAuthWindow();     // Settings → Sign in with Discord…
+    void LoadAudioMuteState();          // Read %APPDATA%\FM2K_Rollback\audio.ini
+    void SaveAudioMuteState();          // Write same file (hook re-reads it)
 
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
@@ -799,12 +803,36 @@ private:
     bool show_input_binder_p1_ = false;
     bool show_input_binder_p2_ = false;
     bool show_host_config_     = false;
+    bool show_hub_server_      = false;     // Settings → Hub Server… window
+    bool show_discord_auth_    = false;     // Settings → Sign in with Discord… window
     bool input_binder_initialized_ = false;
+
+    // Audio mute toggles (Settings menu). Persisted to
+    // %APPDATA%\FM2K_Rollback\audio.ini; the hook DLL re-reads that file
+    // ~once per second from inside the dispatcher so changes propagate
+    // mid-game without IPC. Booted from the file on first menu render.
+    bool mute_bgm_ = false;
+    bool mute_se_  = false;
+    bool mute_state_loaded_ = false;
 
     // Host-config staged values (committed on Apply → fm2k_host.ini + env var).
     int      host_config_socd_mode_ = 1;          // tournament default
     uint32_t host_config_stage_     = 0xFFFFFFFFu;// 0xFFFFFFFF = unset
     bool     host_config_dirty_     = false;
+
+    // Hub server hostname / IP. Edited from Settings → Hub Server…
+    // (used to live in the Hub panel; moved out so casual users don't
+    // see it by default). Persisted via FM2K_HUB_HOST env var on
+    // connect. Empty = use FM2K_HUB_HOST env var or 2dfm.sytes.net.
+    char     hub_host_[128] = {};
+    bool     hub_host_initialized_ = false;
+
+    // Discord OAuth status, surfaced in the menu bar's sign-in pill.
+    // Refreshed on startup, on sign-in completion, and on sign-out;
+    // never read every frame so we don't hammer the .json file.
+    bool     discord_signed_in_  = false;
+    std::string discord_nick_;
+    bool     discord_state_loaded_ = false;
 
     // Hub client + per-frame drained state. Owned by the launcher
     // (forward-declared in LauncherUI scope to avoid pulling

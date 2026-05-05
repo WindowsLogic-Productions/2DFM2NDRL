@@ -35,6 +35,11 @@ struct HubUser {
     std::string status;        // "idle" | "challenging" | "in_match"
     std::string opponent_id;
     int rtt_ms = 0;
+    // Patreon tier label sent by hub. "tester" ($5 — blue name) or
+    // "thanks" ($10 Special Thanks — gold name). Empty string for legacy
+    // hubs that don't include the field; the launcher treats empty/unknown
+    // values as plain (no recolor).
+    std::string tier;
 };
 
 struct HubRoom {
@@ -123,8 +128,18 @@ public:
     // Begin async connect. Returns true on dispatch (thread launched);
     // actual connection state lands as a Connected/Disconnected event.
     // host: bare hostname or IP (no scheme). port: TCP. path: "/".
+    // hub_token: opaque string the launcher caches after Discord OAuth
+    // sign-in. The hub validates it on hello and rejects connections
+    // with a `auth_required` error if empty/invalid. Pass "" to attempt
+    // an unauthenticated connect (only works against a hub started
+    // with FM2K_HUB_AUTH_DISABLE=1).
     bool Connect(const std::string& host, uint16_t port, const std::string& path,
-                 const std::string& nick);
+                 const std::string& nick, const std::string& hub_token);
+    // Compat overload — defaults hub_token to empty.
+    bool Connect(const std::string& host, uint16_t port, const std::string& path,
+                 const std::string& nick) {
+        return Connect(host, port, path, nick, std::string{});
+    }
 
     void Disconnect();
 
@@ -169,6 +184,10 @@ private:
     std::thread io_;
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
+    // Discord OAuth hub_token, supplied at Connect() time and embedded
+    // in the WS hello payload. Empty when running against a hub that
+    // disables auth (FM2K_HUB_AUTH_DISABLE=1 server-side).
+    std::string hub_token_;
 
     std::mutex out_mtx_;
     std::condition_variable out_cv_;

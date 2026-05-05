@@ -46,8 +46,10 @@
  *   - Match phase: TODO map from FM2K's game_state struct (0x470020+0x220) */
 
 #include "parity_recorder.h"
+#include "../core/globals.h"  // Fm2k_BuildLogPath
 
 #include <kgt/kgt_parity_snapshot.h>
+#include <windows.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -341,10 +343,19 @@ void Close() {
 }
 
 bool MaybeAutoOpen() {
-    /* Honor FM2K_PARITY_RECORD_PATH env var: if set, open at startup. */
+    /* Honor FM2K_PARITY_RECORD_PATH env var: if set, open at startup.
+     * Relative paths (no drive letter, no leading slash) get routed into
+     * `<game_dir>/logs/` via Fm2k_BuildLogPath. Absolute paths pass through
+     * unchanged. */
     const char* path = std::getenv("FM2K_PARITY_RECORD_PATH");
-    if (path && *path) return Open(path);
-    return false;
+    if (!path || !*path) return false;
+    bool is_absolute = (path[1] == ':') || path[0] == '/' || path[0] == '\\';
+    if (is_absolute) return Open(path);
+    char resolved[MAX_PATH];
+    if (!Fm2k_BuildLogPath(resolved, sizeof(resolved), path)) {
+        return Open(path);  // fallback: cwd
+    }
+    return Open(resolved);
 }
 
 }  /* namespace ParityRecorder */

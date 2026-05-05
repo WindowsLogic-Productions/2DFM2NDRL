@@ -13,11 +13,12 @@ ninja || {
 # without touching the unstripped originals in build/, so we can still
 # pull symbols (addr2line / objdump) when diagnosing logs from users.
 STAGED_DIR=$(mktemp -d)
-cp FM2K_RollbackLauncher.exe FM2KHook.dll "$STAGED_DIR/"
+cp FM2K_RollbackLauncher.exe FM2KHook.dll FM2KUpdater.exe "$STAGED_DIR/"
 i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM2K_RollbackLauncher.exe"
 i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM2KHook.dll"
+i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM2KUpdater.exe"
 
-cp "$STAGED_DIR/FM2K_RollbackLauncher.exe" "$STAGED_DIR/FM2KHook.dll" /mnt/c/games/
+cp "$STAGED_DIR/FM2K_RollbackLauncher.exe" "$STAGED_DIR/FM2KHook.dll" "$STAGED_DIR/FM2KUpdater.exe" /mnt/c/games/
 cp "$STAGED_DIR/FM2KHook.dll" /mnt/c/games/2dfm/wanwan/   # Windows resolves DLL from CPW.exe's dir first
 [ -d /mnt/c/games/2dfm/pkmncc ] && cp "$STAGED_DIR/FM2KHook.dll" /mnt/c/games/2dfm/pkmncc/
 
