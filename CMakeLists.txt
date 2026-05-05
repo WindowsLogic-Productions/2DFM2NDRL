@@ -138,6 +138,9 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/imgui
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/imgui/backends
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/minhook/include
+    # Stock miniz lives in its own dir so its `#include "miniz.h"` resolves
+    # without colliding with SDL_image's patched copy at vendored/SDL_image/src/.
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendored/miniz
 )
 
 # ImGui core sources (shared between launcher and hook)
@@ -244,20 +247,69 @@ target_compile_definitions(MinHook PRIVATE
 # Add FM2KHook subdirectory
 add_subdirectory(FM2KHook)
 
-# Set FM2KHook output properties
-set_target_properties(FM2KHook PROPERTIES 
+# Set FM2KHook output properties — both engines (FM2KHook + FM95Hook) ship
+# alongside the launcher exe so it can pick the right DLL per game.engine.
+set_target_properties(FM2KHook FM95Hook PROPERTIES
     PREFIX ""  # Remove "lib" prefix
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
 )
 
-# Add pthread static linking for FM2KHook
+# Strip libwinpthread.a's `.rsrc` section so its VS_VERSION_INFO doesn't
+# get merged into our final binaries alongside the one from launcher.rc /
+# FM2KHook resource scripts. ld merges every input archive's RT_VERSION
+# resource into the output PE; with two blocks present at resource ID 1
+# Windows reads libwinpthread's first ("POSIX WinThreads for Windows")
+# and that string leaks into Explorer details, taskbar tooltips, and
+# Shell_NotifyIcon toast titles.
+#
+# Configure-time fix: `objcopy --remove-section=.rsrc` operates directly
+# on a static archive, dropping the `.rsrc` section from every member
+# object without touching any other section. We link --whole-archive
+# against the cleaned copy so all libwinpthread symbols resolve from it,
+# and the system -lwinpthread is then a no-op (no unresolved symbols
+# left for it to satisfy → its `.rsrc` never gets pulled in).
+execute_process(
+    COMMAND ${CMAKE_C_COMPILER} -print-file-name=libwinpthread.a
+    OUTPUT_VARIABLE SYS_LIBWINPTHREAD
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+get_filename_component(SYS_LIBWINPTHREAD "${SYS_LIBWINPTHREAD}" REALPATH)
+set(CLEAN_LIBWINPTHREAD "${CMAKE_BINARY_DIR}/libwinpthread_no_rsrc.a")
+add_custom_command(
+    OUTPUT  "${CLEAN_LIBWINPTHREAD}"
+    DEPENDS "${SYS_LIBWINPTHREAD}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${SYS_LIBWINPTHREAD}" "${CLEAN_LIBWINPTHREAD}"
+    COMMAND ${CMAKE_OBJCOPY} --remove-section=.rsrc "${CLEAN_LIBWINPTHREAD}"
+    # `version.o` inside libwinpthread.a is *only* a .rsrc container —
+    # stripping its sole section leaves an empty/invalid object that ld
+    # rejects ("member ... is not an object"). It contributes only the
+    # VERSIONINFO resource we're trying to suppress, so dropping the
+    # member entirely from the archive is the right move. `ar d` is
+    # silent on missing members so this is safe across libwinpthread
+    # versions where the file might be named differently or absent.
+    COMMAND ${CMAKE_AR} d "${CLEAN_LIBWINPTHREAD}" version.o || true
+    COMMENT "Stripping .rsrc from libwinpthread.a -> ${CLEAN_LIBWINPTHREAD}"
+    VERBATIM
+)
+add_custom_target(libwinpthread_no_rsrc DEPENDS "${CLEAN_LIBWINPTHREAD}")
+
+# Add pthread static linking for FM2KHook + FM95Hook
 target_link_options(FM2KHook PRIVATE
     -static
     -static-libgcc
     -static-libstdc++
     -pthread
-    -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive
+    -Wl,-Bstatic,--whole-archive "${CLEAN_LIBWINPTHREAD}" -Wl,--no-whole-archive
 )
+add_dependencies(FM2KHook libwinpthread_no_rsrc)
+target_link_options(FM95Hook PRIVATE
+    -static
+    -static-libgcc
+    -static-libstdc++
+    -pthread
+    -Wl,-Bstatic,--whole-archive "${CLEAN_LIBWINPTHREAD}" -Wl,--no-whole-archive
+)
+add_dependencies(FM95Hook libwinpthread_no_rsrc)
 
 # Main executable
 # Pre-build version stamper. Writes version_local.h with the current
@@ -274,6 +326,13 @@ add_custom_target(fm2k_version
 )
 
 add_executable(FM2K_RollbackLauncher
+    # launcher.rc must be FIRST so its compiled .res is the first
+    # resource-bearing object on the link line. MinGW's libwinpthread.a
+    # ships its own VS_VERSION_INFO ("POSIX WinThreads for Windows") and
+    # ld merges every input's RT_VERSION resource into the final EXE.
+    # Windows reads whichever block appears first in the resource
+    # directory — putting ours first makes it win without surgery.
+    launcher.rc
     # Main launcher files
     FM2K_RollbackClient.cpp
     FM2K_GameInstance.cpp
@@ -284,30 +343,36 @@ add_executable(FM2K_RollbackLauncher
     FM2K_DiscordAuth.cpp
     FM2K_Locale.cpp
     FM2K_Updater.cpp
+    FM2K_GameIni.cpp
+    FM2K_DDrawRedirect.cpp
+    FM2K_CncDDraw.cpp
+    FM2K_KgtParser.cpp
+    # Stock miniz (public domain) for in-process zip extraction. SDL_image
+    # ships its own statically-scoped copy with archive APIs disabled, so
+    # this independent copy gives us mz_zip_reader_* without disturbing
+    # the SDL_image build.
+    vendored/miniz/miniz.c
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
     # ImGui-based input binder (shared with the hook overlay) — depends only
     # on SDL3 + ImGui, no project-specific includes.
     FM2KHook/src/ui/input_binder.cpp
-    # Win32 resource — embeds assets/icon.ico into the PE so Explorer + the
-    # taskbar pull the smiley straight off the EXE (WM_SETICON only covers
-    # the live window's title bar). windres compiles this to a COFF object
-    # at configure time because LANGUAGES include RC.
-    launcher.rc
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 
 # Static linking flags for MinGW-GCC
-target_link_options(FM2K_RollbackLauncher PRIVATE 
-    -static 
-    -static-libgcc 
+target_link_options(FM2K_RollbackLauncher PRIVATE
+    -static
+    -static-libgcc
     -static-libstdc++
     -pthread
-    -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive
+    # Use the .rsrc-stripped libwinpthread (see config above) so its
+    # VS_VERSION_INFO doesn't conflict with our launcher.rc one.
+    -Wl,-Bstatic,--whole-archive "${CLEAN_LIBWINPTHREAD}" -Wl,--no-whole-archive
 )
 
 # Add FM2KHook as dependency
-add_dependencies(FM2K_RollbackLauncher FM2KHook fm2k_version)
+add_dependencies(FM2K_RollbackLauncher FM2KHook fm2k_version libwinpthread_no_rsrc)
 
 # FM2KUpdater.exe — companion process spawned by the launcher to
 # perform the actual EXE/DLL replacement after launcher exit. Tiny

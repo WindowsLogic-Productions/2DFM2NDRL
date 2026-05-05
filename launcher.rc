@@ -1,0 +1,49 @@
+// Win32 resource script for FM2K_RollbackLauncher.exe.
+//
+// Defines:
+//   - The icon Explorer / the taskbar / Alt-Tab pull off the PE.
+//   - VERSIONINFO with FileDescription / ProductName / etc.
+//
+// Why VERSIONINFO matters: with no app-supplied version metadata,
+// Windows falls back to inheriting it from a statically-linked DLL.
+// In our case that's MinGW-w64's libwinpthread, whose FileDescription
+// is "POSIX WinThreads for Windows" — that string ended up showing in
+// Shell_NotifyIcon toast titles, Explorer's details pane, and the
+// taskbar caption when the SDL window didn't have focus. A real
+// VERSIONINFO block on the EXE wins out everywhere.
+
+#include "version_rc.h"
+#include <winver.h>
+
+IDI_APP_ICON ICON "assets/icon.ico"
+
+1 VERSIONINFO
+FILEVERSION    FM2K_VER_MAJOR,FM2K_VER_MINOR,FM2K_VER_PATCH,FM2K_VER_BUILD
+PRODUCTVERSION FM2K_VER_MAJOR,FM2K_VER_MINOR,FM2K_VER_PATCH,FM2K_VER_BUILD
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0x0L
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+{
+    BLOCK "StringFileInfo"
+    {
+        // 040904B0 = English (US, 0x0409) + Unicode codepage (0x04B0).
+        BLOCK "040904B0"
+        {
+            VALUE "CompanyName",      "FM2K Rollback"
+            VALUE "FileDescription",  "FM2K Rollback Launcher"
+            VALUE "FileVersion",      FM2K_VER_STRING
+            VALUE "InternalName",     "FM2K_RollbackLauncher"
+            VALUE "OriginalFilename", "FM2K_RollbackLauncher.exe"
+            VALUE "ProductName",      "FM2K Rollback Launcher"
+            VALUE "ProductVersion",   FM2K_VER_STRING
+            VALUE "LegalCopyright",   "MIT licensed"
+        }
+    }
+    BLOCK "VarFileInfo"
+    {
+        // 0x0409 = LANG_ENGLISH_US, 1200 = Unicode (UTF-16) charset.
+        VALUE "Translation", 0x0409, 1200
+    }
+}
