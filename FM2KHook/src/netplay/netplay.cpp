@@ -229,10 +229,35 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             if (local_hash != 0 && peer_hash != 0 && local_hash != peer_hash) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                     "Netplay: GAME DATA MISMATCH — peer=0x%08X us=0x%08X (%s). "
-                    "Aborting handshake; check that both peers have the same .kgt + "
-                    ".player roster.",
+                    "Aborting handshake; have both peers send each other their "
+                    "FM2K_*_Debug.log file and diff the 'GameHash: manifest' "
+                    "section to find which file differs.",
                     peer_hash, local_hash, fm2k::game_hash::DescribeLocal());
-                SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DISCONNECT);
+                // Re-dump the local manifest right next to the error so users
+                // who scroll up from the bottom of the log see exactly what
+                // we hashed without hunting for the original "GameHash:
+                // manifest" line up at boot time. Multi-line so a peer
+                // reading the log can quickly spot a different size or
+                // content hash on a specific filename.
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Netplay: local manifest follows (compare against peer's "
+                    "log line-by-line):");
+                {
+                    const char* m = fm2k::game_hash::ManifestLocal();
+                    // Stream out one line at a time so the per-file rows
+                    // stay readable even at high file counts. The
+                    // canonical manifest is "name|size|hash\n" lines.
+                    const char* p = m;
+                    while (*p) {
+                        const char* nl = std::strchr(p, '\n');
+                        size_t len = nl ? (size_t)(nl - p) : std::strlen(p);
+                        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                            "  %.*s", (int)len, p);
+                        if (!nl) break;
+                        p = nl + 1;
+                    }
+                }
+                SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_HASH_MISMATCH);
                 break;
             }
             ControlChannel_SendHelloAck(static_cast<uint8_t>(g_player_index));

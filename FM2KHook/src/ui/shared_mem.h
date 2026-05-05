@@ -31,6 +31,12 @@ enum FM2KMatchOutcome : uint8_t {
     // session-stop on the launcher but does NOT contribute to W/L/D —
     // the match never reached battle, so there's nothing to record.
     FM2K_MATCH_OUTCOME_CSS_ABORT   = 5,
+    // Game-data hash mismatch on HELLO (#57). Peers' .player/.kgt/.exe
+    // rosters disagree, sim would silently desync. Treated like
+    // CSS_ABORT for W/L/D (no record), but the launcher shows a
+    // distinct toast pointing the user at the hook log's manifest
+    // dump so they can find the offending file.
+    FM2K_MATCH_OUTCOME_HASH_MISMATCH = 6,
 };
 
 struct FM2KSharedMemData {

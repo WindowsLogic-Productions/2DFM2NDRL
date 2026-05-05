@@ -25,4 +25,12 @@ uint32_t Compute();
 // Cached alongside the hash. Empty when Compute() has never been called.
 const char* DescribeLocal();
 
+// Full canonical manifest (one line per file: "name|size|content_hash"
+// for .kgt/.exe, "name|size|-" for .player). Cached on first Compute().
+// Used by the HELLO mismatch path so the hook log captures the full
+// list of files that fed the hash — peers can diff their logs to find
+// which entry diverges. "(not computed yet)" sentinel when Compute()
+// has never been called.
+const char* ManifestLocal();
+
 }  // namespace fm2k::game_hash
