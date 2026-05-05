@@ -76,6 +76,16 @@ struct LauncherUI::HubState {
     std::string outgoing_challenge_to_nick;
     bool        show_outgoing_challenge_modal = false;
 
+    // Hash-mismatch popup state. Set when the hook publishes a
+    // FM2K_MATCH_OUTCOME_HASH_MISMATCH; cleared when the user
+    // dismisses the modal. The log_excerpt is the most recent
+    // "GameHash: manifest" block read from the spawned game's hook
+    // log so the popup can show *what* hashed (per-file name|size|
+    // content_hash) and the user knows which file to compare against
+    // their peer.
+    bool        show_hash_mismatch_modal = false;
+    std::string hash_mismatch_log_excerpt;
+
     // Active hub-driven match. Set on K::MatchStart from ev.match.token,
     // cleared once we publish a match_result to the hub. Used by the
     // shared-mem poll path so a single bump of `match_outcome_seq` in
@@ -276,6 +286,72 @@ static bool HubPreflightPunch(uint16_t local_port,
         (long long)elapsed, sends_done, peer_ip.c_str(),
         (unsigned)peer_port, (int)local_port);
     return peer_seen;
+}
+
+// Read the spawned game's hook log and extract the most recent
+// "GameHash: manifest" block. Used by the hash-mismatch popup so the
+// user sees their per-file inventory (filename | size | content_hash)
+// without having to dig through the full hook log themselves.
+//
+// The hook log lives at <game_dir>/logs/FM2K_P{idx}_Debug.log.
+// Returns a friendly error string (still safe to display) if the file
+// can't be read or no manifest section is present.
+static std::string ExtractGameHashManifest(const std::filesystem::path& exe_path,
+                                           int player_index) {
+    if (exe_path.empty()) return "(no game selected)";
+    const std::filesystem::path log_path =
+        exe_path.parent_path() / "logs" /
+        (std::string("FM2K_P") + std::to_string(player_index + 1) + "_Debug.log");
+
+    FILE* f = _wfopen(log_path.wstring().c_str(), L"rb");
+    if (!f) {
+        return std::string("(couldn't open ") +
+               fm2k::utf8path::FilenameUtf8(log_path) +
+               " — no log to extract from)";
+    }
+    std::vector<char> buf;
+    char chunk[8192];
+    while (size_t n = std::fread(chunk, 1, sizeof(chunk), f)) {
+        buf.insert(buf.end(), chunk, chunk + n);
+    }
+    std::fclose(f);
+    std::string text(buf.begin(), buf.end());
+
+    // Find the LAST manifest dump. Two possible markers, in order of
+    // preference:
+    //   1. "local manifest follows"  — emitted by netplay.cpp on the
+    //      actual hash-mismatch path. Always present when this popup
+    //      fires from a current build, and includes the offending
+    //      hashes both peers traded inline above the dump.
+    //   2. "GameHash: manifest"      — emitted by game_hash.cpp once
+    //      at boot, INFO level. Fallback for cases where we open the
+    //      log on a session that didn't actually hit a mismatch yet,
+    //      or older hook builds before the per-mismatch dump landed.
+    size_t pos = text.rfind("local manifest follows");
+    if (pos == std::string::npos) {
+        pos = text.rfind("GameHash: manifest");
+    }
+    if (pos == std::string::npos) {
+        return "(log present, but no manifest dump found — older hook "
+               "build, or the log was rotated. Open the log in a text "
+               "editor and search for 'manifest'.)";
+    }
+    // Walk back to start of the line.
+    size_t line_start = pos;
+    while (line_start > 0 && text[line_start - 1] != '\n') --line_start;
+    // Take the next ~120 lines max.
+    std::string out;
+    size_t cursor = line_start;
+    int lines = 0;
+    while (cursor < text.size() && lines < 120) {
+        size_t nl = text.find('\n', cursor);
+        if (nl == std::string::npos) nl = text.size();
+        out.append(text, cursor, nl - cursor);
+        out.push_back('\n');
+        cursor = nl + 1;
+        ++lines;
+    }
+    return out;
 }
 
 static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games,
@@ -3259,6 +3335,46 @@ void LauncherUI::PollMatchOutcome() {
                     return;
                 }
 
+                // Hash mismatch: peers' game files diverge. Closes the
+                // local session and surfaces a clear toast pointing the
+                // user at the hook log so they can identify the
+                // offending file. Same no-record treatment as CSS_ABORT —
+                // no battle, no W/L/D delta.
+                if (outcome_u8 == FM2K_MATCH_OUTCOME_HASH_MISMATCH) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: GAME DATA MISMATCH — see launcher popup for "
+                        "the per-file manifest.");
+                    hs.status_line = "game files don't match peer";
+                    // Read this game's hook log and extract the
+                    // "GameHash: manifest" block so the popup can
+                    // render the actual filename | size | content-hash
+                    // rows that fed the local hash. The user diffs
+                    // against the peer's log (which they get over
+                    // Discord) to find the offending row.
+                    // Player index: 0 for host, 1 for guest. Drives the
+                    // hook log filename (FM2K_P1 vs FM2K_P2).
+                    const int player_index =
+                        network_config_.is_host ? 0 : 1;
+                    std::filesystem::path game_exe;
+                    if (selected_game_index_ >= 0 &&
+                        selected_game_index_ < (int)games_.size()) {
+                        game_exe = games_[selected_game_index_].exe_path;
+                    }
+                    hs.hash_mismatch_log_excerpt =
+                        ExtractGameHashManifest(game_exe, player_index);
+                    hs.show_hash_mismatch_modal = true;
+                    FireSystemNotification(
+                        T("toast_hash_mismatch_title"),
+                        T("toast_hash_mismatch_body"));
+                    if (on_session_stop) on_session_stop();
+                    hs.current_match_token.clear();
+                    hs.current_match_peer_id.clear();
+                    hs.current_match_peer_nick.clear();
+                    UnmapViewOfFile(data);
+                    CloseHandle(h);
+                    return;
+                }
+
                 const char* outcome_str = nullptr;
                 switch (outcome_u8) {
                     case FM2K_MATCH_OUTCOME_SELF_WON:   outcome_str = "self_won"; break;
@@ -4584,6 +4700,46 @@ void LauncherUI::RenderHubPanel() {
         // the popup is open, so just stop reopening it: the next frame
         // sees show_outgoing_challenge_modal=false and skips OpenPopup.
         if (!hs.show_outgoing_challenge_modal) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // ---- Hash-mismatch popup ----
+    // Fires when the hook publishes FM2K_MATCH_OUTCOME_HASH_MISMATCH.
+    // Shows the local game's "GameHash: manifest" excerpt so the user
+    // can diff against the peer's log to find the offending file.
+    if (hs.show_hash_mismatch_modal) {
+        ImGui::OpenPopup("##hash_mismatch");
+    }
+    if (ImGui::BeginPopupModal("##hash_mismatch", nullptr,
+                               ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::Text("Game data mismatch — match cancelled.");
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "Your .kgt / .player roster differs from your peer's. "
+            "Below is what we hashed locally. Send this to your peer (or "
+            "exchange hook logs) — the row with a different size or "
+            "content_hash is the file that needs to match. Read the hook "
+            "log for more details.");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("Local manifest (filename | size | content_hash):");
+        // Scrolling read-only text region. Wide on purpose so the
+        // hash columns line up.
+        ImGui::InputTextMultiline(
+            "##hash_mm_log",
+            hs.hash_mismatch_log_excerpt.data(),
+            hs.hash_mismatch_log_excerpt.size() + 1,
+            ImVec2(720, 280),
+            ImGuiInputTextFlags_ReadOnly);
+        ImGui::Spacing();
+        if (ImGui::Button("Copy to clipboard", ImVec2(160, 0))) {
+            ImGui::SetClipboardText(hs.hash_mismatch_log_excerpt.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2(120, 0))) {
+            hs.show_hash_mismatch_modal = false;
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

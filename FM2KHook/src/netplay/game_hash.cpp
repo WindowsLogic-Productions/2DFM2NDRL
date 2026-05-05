@@ -20,12 +20,33 @@ namespace {
 uint32_t s_cached_hash = 0;
 bool     s_computed    = false;
 char     s_describe[128] = {};
+// Full per-file manifest cached alongside the hash so we can dump it
+// to the log on a HELLO mismatch. Two peers can diff each other's
+// hook logs to find the offending file: "Para has Bewear.player size
+// 1234567 but I have 1234580 — they edited the .player." Without
+// this they'd see only the rolled-up 32-bit hashes and have no path
+// to a fix beyond "send each other your install."
+std::string s_manifest;
 
 std::filesystem::path GameDir() {
     char buf[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
     return std::filesystem::path(buf).parent_path();
+}
+
+// Path to the running game executable (the one we're injected into).
+// Used to filter out unrelated .exes that share the game folder —
+// installer leftovers (unins000.exe, update.exe), bundled launchers
+// (Pokemon Close Combat Launcher.exe), or third-party tools the user
+// dropped in (antimicrox.exe, lilithport.exe). Only the game's own
+// .exe affects sim correctness; the rest just bloated the hash and
+// caused legitimate cross-install plays to mismatch.
+std::filesystem::path GameExePath() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    return std::filesystem::path(buf);
 }
 
 // UTF-8 path conversion via Win32 wide APIs. std::filesystem::path's
@@ -75,6 +96,20 @@ uint32_t Compute() {
                     "GameHash: GetModuleFileNameA failed; hash=0");
         s_cached_hash = 0;
         return 0;
+    }
+
+    // Lowercase UTF-8 filename of the game's own executable. Used
+    // below to filter the .exe pass to ONLY the game exe — every
+    // other .exe in the directory (installer remnants, bundled
+    // launchers, antimicrox, etc.) is unrelated to sim correctness.
+    std::string game_exe_lower;
+    {
+        auto exe = GameExePath();
+        if (!exe.empty()) {
+            game_exe_lower = WideToUtf8(exe.filename().wstring());
+            for (auto& c : game_exe_lower)
+                c = (char)std::tolower((unsigned char)c);
+        }
     }
 
     // Per-extension policy:
@@ -130,14 +165,25 @@ uint32_t Compute() {
         const auto& p = e.path();
         const bool is_player = MatchesExt(p, ".player");
         const bool is_kgt    = MatchesExt(p, ".kgt");
-        const bool is_exe    = MatchesExt(p, ".exe");
-        if (!is_player && !is_kgt && !is_exe) continue;
+        const bool is_exe_ext = MatchesExt(p, ".exe");
+        if (!is_player && !is_kgt && !is_exe_ext) continue;
 
         // Wide → UTF-8 so the canonical hash input is identical bytes
         // on every peer regardless of stdlib narrow-conversion quirks.
         std::string name = WideToUtf8(p.filename().wstring());
         std::string lower = name;
         for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+
+        // .exe filter: only the GAME's own exe (the one we're injected
+        // into) affects sim correctness. Skip unrelated .exes the user
+        // happens to keep alongside (installer / launcher / cheat
+        // tools) so cross-install plays don't trip the mismatch check
+        // on cosmetic differences. game_exe_lower is the running
+        // module's filename; if we couldn't resolve it (rare), fall
+        // back to including all .exes — better safe than nothing.
+        const bool is_exe = is_exe_ext &&
+            (game_exe_lower.empty() || lower == game_exe_lower);
+        if (is_exe_ext && !is_exe) continue;
 
         uint64_t sz = 0;
         std::error_code ec2;
@@ -199,9 +245,37 @@ uint32_t Compute() {
                   n_player, n_kgt, n_exe, s_cached_hash);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "GameHash: %s", s_describe);
+    // Stash the canonical manifest for hash-mismatch diagnostics.
+    // Keep it lightweight (one line per file already, no per-line
+    // formatting changes needed). Truncated description flag is
+    // implicit — if the dir has 200+ files, the log line will be
+    // long but each line is still parseable.
+    s_manifest = canon;
+    // Per-file log as INFO so each peer's hook log records exactly
+    // which entries went into the hash. On a mismatch, two peers
+    // diff their logs and the offending row jumps out.
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "GameHash: manifest (%zu entries):", entries.size());
+    for (const auto& e : entries) {
+        if (e.content_hash != 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "  %s|%llu|%016llx",
+                        e.name_lower.c_str(),
+                        (unsigned long long)e.size,
+                        (unsigned long long)e.content_hash);
+        } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "  %s|%llu|-",
+                        e.name_lower.c_str(),
+                        (unsigned long long)e.size);
+        }
+    }
     return s_cached_hash;
 }
 
 const char* DescribeLocal() { return s_describe; }
+const char* ManifestLocal() {
+    return s_manifest.empty() ? "(not computed yet)" : s_manifest.c_str();
+}
 
 }  // namespace fm2k::game_hash
