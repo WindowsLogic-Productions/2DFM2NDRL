@@ -84,10 +84,44 @@ void ApplyDefaultsP1(PlayerBindings& pb) {
     kb(Bit::START, SDL_SCANCODE_RETURN);
 }
 
+void ApplyDefaultsP2(PlayerBindings& pb) {
+    // P2 defaults: numpad layout so two players can share a single keyboard
+    // without conflicts. Same shape as P1 (left/right/up/down + 6 attack
+    // buttons + start) but mapped to the right side of a 104-key layout.
+    //
+    // If a second gamepad is plugged in, the user can rebind P2's slots
+    // to it via the binder UI; the gamepad_index field defaults to 1
+    // here so the FIRST gamepad-bound row a user adds picks up gamepad
+    // index 1 (P1 picks 0). This matches the user-facing convention:
+    // P1 = primary device, P2 = second device / keyboard fallback.
+    auto kb = [&](Bit b, SDL_Scancode sc) {
+        Binding& s = pb.bits[(size_t)b];
+        s.source = Binding::Source::KEYBOARD;
+        s.code = (int)sc;
+        s.axis_dir = 0;
+        s.gamepad_index = 1;  // default routes future gamepad bindings to pad #2
+    };
+    kb(Bit::LEFT,  SDL_SCANCODE_KP_4);
+    kb(Bit::RIGHT, SDL_SCANCODE_KP_6);
+    kb(Bit::UP,    SDL_SCANCODE_KP_8);
+    kb(Bit::DOWN,  SDL_SCANCODE_KP_2);
+    // 6 attack buttons + Start. UIOJKL is the canonical "right hand"
+    // layout for P2 keyboard share — mirrors P1's ZXCV/ASD (Z X C
+    // lower row, A S D upper row) on the home-row keys around U/J.
+    kb(Bit::A,     SDL_SCANCODE_J);
+    kb(Bit::B,     SDL_SCANCODE_K);
+    kb(Bit::C,     SDL_SCANCODE_L);
+    kb(Bit::D,     SDL_SCANCODE_U);
+    kb(Bit::E,     SDL_SCANCODE_I);
+    kb(Bit::F,     SDL_SCANCODE_O);
+    kb(Bit::START, SDL_SCANCODE_KP_ENTER);
+}
+
 void ApplyDefaults(int player) {
     PlayerBindings& pb = g_players[player];
     for (auto& s : pb.bits) s = Binding{};
-    if (player == 0) ApplyDefaultsP1(pb);
+    if (player == 0)      ApplyDefaultsP1(pb);
+    else if (player == 1) ApplyDefaultsP2(pb);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,19 +423,33 @@ std::string DefaultProfileBaseDir() {
 }
 
 std::string SanitizeProfileName(const char* name) {
-    // Filenames go on disk — strip path separators / control chars.
-    // Allow alnum, '_', '-', '.' and ' '. Anything else becomes '_'.
+    // Filenames go on disk — strip ONLY the Windows-forbidden chars
+    // and ASCII control bytes. Letting non-ASCII through preserves
+    // UTF-8 sequences for games shipped by Japanese authors (e.g.
+    // ＣＰＷ.exe → "ＣＰＷ" profile name). Original sanitizer treated
+    // every byte 0x80+ as "not isalnum" and replaced with '_', which
+    // turned full-width filenames into rows of underscores in the
+    // launcher UI ("Use override for ＣＰＷ" → "Use override for ___").
+    //
+    // Win32 NTFS forbids: < > : " / \ | ? * and 0x00-0x1F. Everything
+    // else (including the full Unicode BMP and beyond as UTF-8 bytes)
+    // is legal in a filename via the W-API.
     std::string out;
     if (!name) return out;
     for (const char* p = name; *p; ++p) {
         unsigned char c = (unsigned char)*p;
-        if (std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == ' ') {
-            out.push_back((char)c);
-        } else {
-            out.push_back('_');
+        if (c < 0x20) {
+            out.push_back('_');                  // control char
+            continue;
         }
+        switch (c) {
+            case '<': case '>': case ':': case '"':
+            case '/': case '\\': case '|': case '?': case '*':
+                out.push_back('_');
+                continue;
+        }
+        out.push_back((char)c);
     }
-    // Trim trailing dots/spaces that Windows doesn't tolerate in filenames.
     while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
     return out;
 }
@@ -903,25 +951,19 @@ uint16_t Sample_Win32(int player_slot) {
 #endif
 }
 
-bool RenderWindow(int player_slot, bool* p_open) {
+// Render just the binder body (no ImGui::Begin/End). Use this when
+// embedding the binder inside another container — e.g. a tab page in
+// the launcher's consolidated Settings window. Returns true if any
+// binding changed this frame so the caller can call Save().
+bool RenderBody(int player_slot) {
     if (!g_initialized) Init();
     if (player_slot < 0 || player_slot >= kPlayers) return false;
 
     bool changed = false;
 
-    // Cheap periodic gamepad refresh -- handles hot-plug.
     static double s_last_refresh = 0.0;
     double now = ImGui::GetTime();
     if (now - s_last_refresh > 1.5) { RefreshGamepadList(); s_last_refresh = now; }
-
-    // player_slot is 0-indexed (P1 = slot 0, P2 = slot 1). Display as
-    // 1-indexed in the window title since users think of themselves as
-    // P1/P2, never P0/P1.
-    char title[64];
-    std::snprintf(title, sizeof(title), "FM2K Input Binder - Player %d", player_slot + 1);
-
-    ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(title, p_open)) { ImGui::End(); return false; }
 
     PlayerBindings& pb = g_players[player_slot];
 
@@ -933,6 +975,104 @@ bool RenderWindow(int player_slot, bool* p_open) {
             ImGui::Text("  [%zu] %s", i, GamepadNameAt((int)i));
         }
         ImGui::Unindent();
+    }
+
+    // ------------------------------------------------------------------
+    // Per-player primary device picker.
+    //
+    // Without this, "P1 controller goes to player 2 too" is the default
+    // experience — every gamepad-bound row stores its own gamepad_index,
+    // and ApplyDefaultsP1/P2 leave gamepad bindings empty so the user
+    // adds them one by one through capture, all picking up index 0.
+    //
+    // The dropdown below selects ONE primary device for this player slot
+    // and propagates that index across all of this player's gamepad-
+    // sourced bindings in one shot. Keyboard rows are untouched. Future
+    // SDL3 multi-keyboard support (per the SDL_KeyboardEvent.which
+    // field) will add a "primary keyboard" option to the same dropdown
+    // — keyboard bindings on a player become device-scoped instead of
+    // OS-global GetAsyncKeyState polling.
+    // ------------------------------------------------------------------
+    {
+        // Discover this player's CURRENT primary gamepad index by looking
+        // at the first gamepad-sourced binding (capture sets all of them
+        // to the same index when the user changes the dropdown).
+        int current_idx = -1;  // -1 = keyboard only
+        for (const auto& b : pb.bits) {
+            if (b.source == Binding::Source::GAMEPAD_BUTTON ||
+                b.source == Binding::Source::GAMEPAD_AXIS) {
+                current_idx = b.gamepad_index;
+                break;
+            }
+        }
+        // If no gamepad bindings exist on this player, surface the slot's
+        // intended default index (P1=0, P2=1) so the dropdown still reads
+        // sensibly. The actual binding-side index updates only when the
+        // user picks a row in the dropdown AND a gamepad binding exists.
+        const int default_idx = (player_slot == 0) ? 0 : 1;
+        if (current_idx < 0) current_idx = default_idx;
+        if (current_idx >= (int)g_gamepad_ids.size()) {
+            current_idx = g_gamepad_ids.empty() ? -1 : 0;
+        }
+
+        // Build the combo preview string. -1 = keyboard only.
+        char preview[160];
+        if (current_idx < 0) {
+            std::snprintf(preview, sizeof(preview), "Keyboard only");
+        } else {
+            std::snprintf(preview, sizeof(preview), "[%d] %s",
+                          current_idx, GamepadNameAt(current_idx));
+        }
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted(player_slot == 0
+                                ? "Player 1 device:"
+                                : "Player 2 device:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        const char* combo_id = (player_slot == 0) ? "##p1_dev" : "##p2_dev";
+        if (ImGui::BeginCombo(combo_id, preview)) {
+            // Keyboard only entry — clears gamepad bindings on this player.
+            bool sel = (current_idx < 0);
+            if (ImGui::Selectable("Keyboard only", sel)) {
+                // Convert any gamepad-bound rows back to NONE so the
+                // user explicitly re-binds via capture if they want
+                // gamepad input on this player.
+                for (auto& b : pb.bits) {
+                    if (b.source == Binding::Source::GAMEPAD_BUTTON ||
+                        b.source == Binding::Source::GAMEPAD_AXIS) {
+                        b = Binding{};
+                    }
+                    // Update keyboard rows' gamepad_index too so any
+                    // future gamepad capture starts from a known state.
+                    b.gamepad_index = -1;
+                }
+                changed = true;
+            }
+            // One row per available SDL gamepad.
+            for (int i = 0; i < (int)g_gamepad_ids.size(); ++i) {
+                char row[160];
+                std::snprintf(row, sizeof(row), "[%d] %s",
+                              i, GamepadNameAt(i));
+                bool sel_i = (current_idx == i);
+                if (ImGui::Selectable(row, sel_i)) {
+                    // Propagate to all of this player's gamepad-sourced
+                    // bindings AND to the per-player default index used
+                    // when the user adds a new gamepad capture.
+                    for (auto& b : pb.bits) {
+                        b.gamepad_index = i;
+                    }
+                    changed = true;
+                }
+                if (sel_i) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled(
+            "Routes this player's gamepad bindings to the chosen device. "
+            "Keyboard rows are unaffected. Multi-keyboard support is a "
+            "follow-up — when SDL_KeyboardID lands the dropdown will "
+            "include per-keyboard entries.");
     }
 
     // Per-game profile toggle. Shows the active game name (if a game is
@@ -1144,6 +1284,17 @@ bool RenderWindow(int player_slot, bool* p_open) {
     ImGui::Separator();
     ImGui::Text("Sampled mask: 0x%03X", (unsigned)Sample(player_slot));
 
+    return changed;
+}
+
+bool RenderWindow(int player_slot, bool* p_open) {
+    if (player_slot < 0 || player_slot >= kPlayers) return false;
+    char title[64];
+    std::snprintf(title, sizeof(title),
+                  "FM2K Input Binder - Player %d", player_slot + 1);
+    ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(title, p_open)) { ImGui::End(); return false; }
+    bool changed = RenderBody(player_slot);
     ImGui::End();
     return changed;
 }

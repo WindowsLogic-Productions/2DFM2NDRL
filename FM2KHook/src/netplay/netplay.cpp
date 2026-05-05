@@ -4,6 +4,7 @@
 // - Uses game's internal timer for frame counting
 #include "netplay.h"
 #include "control_channel.h"
+#include "game_hash.h"
 #include "input.h"
 #include "savestate.h"
 #include "replay.h"
@@ -12,6 +13,7 @@
 #include "globals.h"
 #include "gekkonet.h"
 #include "../audio/sound_rollback.h"
+#include "../ui/shared_mem.h"  // SharedMem_PublishMatchOutcome
 #include <SDL3/SDL_log.h>
 #include <ws2tcpip.h>
 #include <cstdlib>
@@ -162,7 +164,7 @@ extern "C" void Hook_SetSOCDMode(int mode);
 // changes mid-session propagate. No-op when the local peer isn't host.
 static void Netplay_BroadcastHostConfig() {
     if (g_player_index != 0) return;  // only host pushes config
-    const uint32_t stage = *(uint32_t*)0x470188;
+    const uint32_t stage = *(uint32_t*)FM2K::ADDR_SELECTED_STAGE;
     const uint8_t  socd  = (uint8_t)Hook_GetSOCDModePublic();
     ControlChannel_SendHostConfig(
         /*selected_stage*/  stage,
@@ -211,14 +213,33 @@ static void CheckFullyConnected() {
 
 static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) {
     switch (packet->header.type) {
-        case CtrlMsg::HELLO:
+        case CtrlMsg::HELLO: {
+            const uint32_t local_hash = fm2k::game_hash::Compute();
+            const uint32_t peer_hash  = packet->data.hello.game_hash;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received HELLO from player %d",
-                packet->data.hello.player_id);
+                "Netplay: Received HELLO from player %d (peer_hash=0x%08X local_hash=0x%08X)",
+                packet->data.hello.player_id,
+                peer_hash, local_hash);
+            // Game-data hash check (#57). 0 on either side means the
+            // peer is older / we couldn't enumerate — fall through to
+            // the existing handshake flow so we don't break legacy
+            // clients during rollout. Both sides nonzero + different
+            // = abort: write a DISCONNECT outcome so the launcher's
+            // PollMatchOutcome surfaces a toast and closes the game.
+            if (local_hash != 0 && peer_hash != 0 && local_hash != peer_hash) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Netplay: GAME DATA MISMATCH — peer=0x%08X us=0x%08X (%s). "
+                    "Aborting handshake; check that both peers have the same .kgt + "
+                    ".player roster.",
+                    peer_hash, local_hash, fm2k::game_hash::DescribeLocal());
+                SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DISCONNECT);
+                break;
+            }
             ControlChannel_SendHelloAck(static_cast<uint8_t>(g_player_index));
             g_received_hello = true;
             CheckFullyConnected();
             break;
+        }
 
         case CtrlMsg::HELLO_ACK:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -236,20 +257,31 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             break;
 
         case CtrlMsg::BATTLE_READY: {
+            // After CSS GekkoSession is fully up (g_css_synced=true) the
+            // BATTLE_READY rendezvous is over — any leftover packets are
+            // network-buffered echoes from the rendezvous window and can
+            // be silently dropped. Without this gate the unconditional
+            // echo below would ping-pong forever between both peers,
+            // logging "Sent / Received BATTLE_READY" every ~10ms for the
+            // entire CSS phase.
+            if (g_css_synced) {
+                break;
+            }
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Received BATTLE_READY from remote");
             g_remote_css_ready = true;
 
-            // Loss-tolerant echo — same pattern as BATTLE_ENTERING / BATTLE_END.
-            // When peers return to CSS at slightly different wall-clock times
-            // (one finishes battle-end-sync ~300 ms before the other), the
-            // ahead peer creates its CSS GekkoSession on the first BATTLE_READY
-            // it sees, then STOPS sending its own BATTLE_READY. The lagging
-            // peer's BATTLE_READYs after that point arrive here, set the flag
-            // (already true), and used to do nothing else — so the lagging
-            // peer never received the ahead peer's signal and stayed stuck
-            // resending BATTLE_READY forever. Echo back when we've already
-            // signaled locally so the lagging peer always sees our flag.
+            // Loss-tolerant echo — same pattern as BATTLE_ENTERING /
+            // BATTLE_END. When peers return to CSS at slightly
+            // different wall-clock times (one finishes battle-end-sync
+            // ~300 ms before the other), the ahead peer creates its CSS
+            // GekkoSession on the first BATTLE_READY it sees, then
+            // STOPS sending its own BATTLE_READY. The lagging peer's
+            // BATTLE_READYs after that point arrive here and need an
+            // echo back, otherwise the lagging peer never sees our
+            // signal and stays stuck resending forever. Bounded by the
+            // !g_css_synced gate above — echo only happens during the
+            // rendezvous window, terminates when sync completes.
             if (g_local_css_ready) {
                 ControlChannel_SendBattleReady();
             }
@@ -277,16 +309,20 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 remote_proposal, prev_agreed, g_battle_entry_swap_frame);
 
             // Echo our own BATTLE_ENTERING back if we've already signaled
-            // locally. Without this echo a single dropped packet causes
-            // deadlock: if remote received our signal but we never received
-            // theirs (or vice versa), the resender in PollBattleSync is
-            // gated on !g_remote_battle_entered which is now true, so it
-            // stops firing. Meanwhile remote keeps re-sending, and gets
-            // no reply. The echo guarantees both sides eventually see each
-            // other's signal regardless of which direction the loss was in.
-            // Idempotent on receiver: g_remote_battle_entered stays true.
+            // locally — needed for the lossy-network case where remote
+            // received our signal but their echo to us was dropped.
+            // Without rate-limiting, both peers echo every echo from the
+            // other and we get an infinite ping-pong storm (observed
+            // hundreds of sends in a single millisecond). 100ms cap is
+            // far below the swap-frame transition window so packet-loss
+            // recovery still works, but the storm can't run away.
             if (g_local_battle_entered) {
-                ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+                static uint32_t last_echo_ms = 0;
+                const uint32_t now_ms = GetTickCount();
+                if (now_ms - last_echo_ms >= 100) {
+                    ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+                    last_echo_ms = now_ms;
+                }
             }
             break;
         }
@@ -306,9 +342,14 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 "Netplay: Received BATTLE_END (remote_swap=%u, prev_agreed=%u, agreed=%u)",
                 remote_proposal, prev_agreed, g_battle_end_swap_frame);
 
-            // Same loss-tolerant echo as BATTLE_ENTERING — see comment above.
+            // Same rate-limited echo as BATTLE_ENTERING.
             if (g_local_battle_end_signaled) {
-                ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+                static uint32_t last_echo_ms = 0;
+                const uint32_t now_ms = GetTickCount();
+                if (now_ms - last_echo_ms >= 100) {
+                    ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+                    last_echo_ms = now_ms;
+                }
             }
             break;
         }
@@ -335,12 +376,13 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 hc.selected_stage, hc.round_count, hc.round_time_sec,
                 hc.game_speed_pct, (unsigned)hc.socd_mode);
 
-            // Stage selection — direct memcpy to FM2K's selected-stage global.
-            // Address verified in FM2K_Integration.h:78. The host writes its
-            // pick here at battle entry; client mirrors before its own
-            // pre-battle code reads the field.
+            // Stage selection — direct memcpy to FM2K's selected-stage
+            // global (FM2K::ADDR_SELECTED_STAGE; IDA-verified in WW as
+            // 0x43010c, the var that vs_round_function reads when
+            // calling LoadStageFile(wParam)). The previous addr
+            // 0x470188 had no xrefs and writes were silently ignored.
             if (hc.selected_stage != 0xFFFFFFFF) {
-                *(uint32_t*)0x470188 = hc.selected_stage;
+                *(uint32_t*)FM2K::ADDR_SELECTED_STAGE = hc.selected_stage;
             }
 
             // SOCD mode — wire through the runtime setter. Persists for
@@ -514,8 +556,10 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
         }
     }
 
-    // Send HELLO
-    ControlChannel_SendHello(static_cast<uint8_t>(player_index), 0);
+    // Send HELLO with our local game-data fingerprint (#57). Receiver
+    // compares against its own and aborts the handshake on mismatch.
+    ControlChannel_SendHello(static_cast<uint8_t>(player_index),
+                             fm2k::game_hash::Compute());
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Initialized, connecting...");
     return true;
@@ -744,6 +788,19 @@ bool Netplay_ProcessCSS() {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "CSS: GekkoNet syncing %u/%u",
                     event->data.syncing.current, event->data.syncing.max);
+                break;
+            case GekkoPlayerDisconnected:
+                // Peer's CSS-phase Gekko session went silent past
+                // DISCONNECT_TIMEOUT. Publish CSS_ABORT (NOT DISCONNECT)
+                // so the launcher closes the surviving local game but
+                // doesn't record this in W/L/D — battle never started,
+                // there's no result to commit. DISCONNECT outcome is
+                // reserved for "peer dropped during battle", which IS
+                // a forfeit and counts.
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "CSS: peer disconnected (handle=%d) — publishing CSS_ABORT outcome",
+                    event->data.disconnected.handle);
+                SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_CSS_ABORT);
                 break;
             case GekkoDesyncDetected:
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -975,9 +1032,27 @@ static bool Netplay_StartCSSSession() {
         return g_session_kind == SessionKind::CSS;
     }
 
+    // Compute CSS delay dynamically from current RTT instead of pinning
+    // at the conservative CSS_LOCAL_DELAY=6. With prediction=0 lockstep,
+    // delay too low for the actual link makes CSS visibly choppy: every
+    // frame stalls waiting for peer input. Same formula the battle path
+    // uses: ceil(mean_one_way_ms / 10ms), floored at 2, capped at 15.
+    // RTT samples come from the existing PING / HELLO ack cycle so this
+    // is meaningful by the time we create the CSS session (post-HELLO_ACK).
+    int css_delay = CSS_LOCAL_DELAY;  // fallback
+    {
+        const uint32_t rtt_mean_ms  = ControlChannel_GetRttMs();
+        if (rtt_mean_ms > 0) {
+            const uint32_t mean_one_way = rtt_mean_ms / 2;
+            int d = (int)((mean_one_way + 9) / 10);
+            if (d < 2)  d = 2;
+            if (d > 15) d = 15;
+            css_delay = d;
+        }
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Netplay: Creating CSS GekkoSession (lockstep, prediction=0, delay=%d)",
-        CSS_LOCAL_DELAY);
+        css_delay);
 
     GekkoConfig config = {};
     config.num_players              = 2;
@@ -1018,9 +1093,9 @@ static bool Netplay_StartCSSSession() {
     for (int i = 0; i < 2; i++) {
         if (i == g_player_index) {
             gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
-            gekko_set_local_delay(g_session, i, CSS_LOCAL_DELAY);
+            gekko_set_local_delay(g_session, i, css_delay);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "CSS: Added local player at slot %d (delay=%d)", i, CSS_LOCAL_DELAY);
+                "CSS: Added local player at slot %d (delay=%d)", i, css_delay);
         } else {
             GekkoNetAddress addr = {};
             addr.data = (void*)g_remote_addr;
@@ -1043,7 +1118,7 @@ static bool Netplay_StartCSSSession() {
     g_css_advance_p1    = 0;
     g_css_advance_p2    = 0;
     g_css_frame         = 0;
-    g_local_delay       = CSS_LOCAL_DELAY;
+    g_local_delay       = css_delay;
 
     AddSubscribedSpectatorsToSession();
 
@@ -1257,6 +1332,152 @@ bool Netplay_StartBattle() {
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Starting battle GekkoSession");
+
+    // Capture per-match character IDs + resolved .player filenames
+    // while the CSS-side state is still live. Held in shared mem so
+    // the launcher can include them in the hub `match_result` payload
+    // after Netplay_EndBattle wipes CSS. Addresses come from
+    // FM2K_Integration.h (launcher-side header) — inlined here because
+    // the hook DLL has its own minimal FM2K:: namespace in globals.h
+    // that doesn't pull in the full Integration header.
+    //
+    // Roster table at 0x435474 (`g_char_slot_data`): array of 256-byte
+    // CP932 (Shift-JIS) filename strings, indexed by the same char_id
+    // that lives at P1/P2_CHARACTER_ID_ADDR. Convert CP932 → UTF-8
+    // via Win32 before publishing so JP names survive round-tripping
+    // through the JSON hub protocol intact.
+    {
+        // Engine-aware via globals.h: FM2K reads CCCaster-style address pair
+        // at 0x470180/4 with the 258-slot g_char_slot_data table at 0x435474;
+        // FM95 reads its per-player CSS struct at 0x432720/0x432730 with the
+        // 50-slot g_player_file_name_array at 0x463CF0.
+        constexpr uintptr_t kP1CharIdAddr  = FM2K::ADDR_P1_SELECTED_CHAR;
+        constexpr uintptr_t kP2CharIdAddr  = FM2K::ADDR_P2_SELECTED_CHAR;
+        constexpr uintptr_t kCharSlotData  = FM2K::ADDR_CHAR_FILENAME_TABLE;
+        constexpr size_t    kSlotStride    = FM2K::CHAR_FILENAME_STRIDE;
+        constexpr size_t    kSlotCount     = FM2K::CHAR_FILENAME_COUNT;
+
+        const uint32_t p1_char = *(const uint32_t*)kP1CharIdAddr;
+        const uint32_t p2_char = *(const uint32_t*)kP2CharIdAddr;
+
+        auto resolve_name = [&](uint32_t id, char* out, size_t out_cap) {
+            out[0] = '\0';
+            if (id >= kSlotCount) return;
+            const char* cp932 =
+                reinterpret_cast<const char*>(kCharSlotData + id * kSlotStride);
+            // Bound the read at the slot stride so a missing NUL never
+            // walks off into the next slot's data.
+            const int len_932 = (int)strnlen(cp932, kSlotStride);
+            if (len_932 == 0) return;
+
+            wchar_t wbuf[kSlotStride];
+            int wlen = MultiByteToWideChar(932, 0, cp932, len_932,
+                                           wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
+            if (wlen <= 0) return;
+            int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen,
+                                            out, (int)(out_cap - 1),
+                                            nullptr, nullptr);
+            if (u8len <= 0) { out[0] = '\0'; return; }
+            out[u8len] = '\0';
+        };
+
+        char p1_name[FM2K_MATCH_CHAR_NAME_MAX] = {};
+        char p2_name[FM2K_MATCH_CHAR_NAME_MAX] = {};
+        resolve_name(p1_char, p1_name, sizeof(p1_name));
+        resolve_name(p2_char, p2_name, sizeof(p2_name));
+
+        SharedMem_PublishMatchChars(p1_char, p2_char, p1_name, p2_name);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay: match chars p1=%u(\"%s\") p2=%u(\"%s\")",
+            p1_char, p1_name, p2_char, p2_name);
+    }
+
+    // Random stage (#56 — Lilithport-style seeded xorshift). The
+    // launcher hands us a host-generated seed via FM2K_STAGE_RANDOM_SEED
+    // when both peers agree on random stage. We re-seed once per
+    // process from that env var (g_xorshift_seeded), then advance one
+    // step per Netplay_StartBattle and write the resulting index to
+    // FM2K's stage memory. Both peers run the same xorshift sequence
+    // from the same seed, so rematches keep rolling identically with
+    // zero per-rematch wire traffic.
+    {
+        constexpr uintptr_t kSelectedStageAddr = FM2K::ADDR_SELECTED_STAGE;
+        static bool      g_xorshift_seeded = false;
+        static uint32_t  g_xs_a = 1812433254u, g_xs_b = 3713160357u,
+                         g_xs_c = 3109174145u, g_xs_d = 64984499u;
+        static int       g_stage_min = 0;
+        static int       g_stage_max = -1;   // -1 = random disabled
+
+        if (!g_xorshift_seeded) {
+            g_xorshift_seeded = true;
+            const char* seed_env = std::getenv("FM2K_STAGE_RANDOM_SEED");
+            const char* min_env  = std::getenv("FM2K_STAGE_RANDOM_MIN");
+            const char* max_env  = std::getenv("FM2K_STAGE_RANDOM_MAX");
+            // One-shot diagnostic: if the env vars aren't visible to
+            // the hook process, random-stage silently does nothing
+            // (g_stage_max stays -1) and every match plays on whatever
+            // stage_id the CSS cursor happens to be on. Logging both
+            // presence + value lets us tell apart "host disabled" vs
+            // "env didn't propagate to game process".
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: random-stage env: SEED=%s MIN=%s MAX=%s",
+                seed_env ? seed_env : "(unset)",
+                min_env  ? min_env  : "(unset)",
+                max_env  ? max_env  : "(unset)");
+            if (seed_env && *seed_env) {
+                uint32_t seed = (uint32_t)std::strtoul(seed_env, nullptr, 10);
+                if (seed != 0) {
+                    // Lilith's seeding scheme — same constants so a
+                    // shared seed produces the same a[4] state on both
+                    // peers (cross-implementation parity if anyone ever
+                    // wants Lilith-FM2K interop, though we don't ship
+                    // that today).
+                    uint32_t s = seed;
+                    uint32_t* arr[4] = {&g_xs_a, &g_xs_b, &g_xs_c, &g_xs_d};
+                    for (int i = 0; i < 4; ++i) {
+                        s = 1812433253u * (s ^ (s >> 30)) + (uint32_t)i;
+                        *arr[i] = s;
+                    }
+                    g_stage_min = (min_env && *min_env)
+                        ? std::atoi(min_env) : 0;
+                    g_stage_max = (max_env && *max_env)
+                        ? std::atoi(max_env) : -1;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: random-stage seeded (seed=%u min=%d max=%d)",
+                        (unsigned)seed, g_stage_min, g_stage_max);
+                }
+            }
+        }
+
+        if (g_stage_max >= g_stage_min && g_stage_max >= 0) {
+            // Advance one step. xorshift128 — identical to Lilith's
+            // RandomStage() arrival-no-args branch (stdafx.cpp:670).
+            uint32_t t  = g_xs_a ^ (g_xs_a << 11);
+            g_xs_a = g_xs_b; g_xs_b = g_xs_c; g_xs_c = g_xs_d;
+            g_xs_d = (g_xs_d ^ (g_xs_d >> 19)) ^ (t ^ (t >> 8));
+            const uint32_t span = (uint32_t)(g_stage_max - g_stage_min + 1);
+            const uint32_t roll = g_xs_d % span;
+            const uint32_t stage = (uint32_t)g_stage_min + roll;
+            *(uint32_t*)kSelectedStageAddr = stage;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: random stage rolled=%u (range %d..%d)",
+                stage, g_stage_min, g_stage_max);
+        }
+
+        // Stage_id capture for the hub match_result payload. Done AFTER
+        // the random-stage roll so we publish the post-roll value, not
+        // the stale CSS pre-roll one. FM95 has no documented selected-
+        // stage scalar yet (ADDR_SELECTED_STAGE == 0); publish unknown.
+        if constexpr (FM2K::ADDR_SELECTED_STAGE != 0) {
+            const uint32_t stage_id =
+                *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE;
+            SharedMem_PublishMatchStage(stage_id);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: match stage_id=%u", stage_id);
+        } else {
+            SharedMem_PublishMatchStage(0xFFFFFFFFu);
+        }
+    }
 
     // Reset CSS state when entering battle
     g_css_active        = false;
@@ -1498,6 +1719,34 @@ bool Netplay_StartStressBattle() {
 }
 
 void Netplay_EndBattle() {
+    // Capture match outcome BEFORE we destroy the session — reading HP
+    // at this point reflects the final state of the just-ended battle.
+    // Outcome is from the local player's perspective; the launcher
+    // forwards it as a `match_result` to the hub, which correlates
+    // both peers' reports for stats. Only meaningful for actual
+    // GekkoGameSessions (player vs player); spectate sessions and
+    // stress runs skip the publish.
+    if (g_session && g_session_kind == SessionKind::BATTLE) {
+        const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
+        const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
+        FM2KMatchOutcome outcome = FM2K_MATCH_OUTCOME_NONE;
+        if (p1_hp == 0 && p2_hp == 0)              outcome = FM2K_MATCH_OUTCOME_DRAW;
+        else if (p1_hp > 0 && p2_hp == 0)          outcome = (g_player_index == 0)
+                                                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                                                            : FM2K_MATCH_OUTCOME_PEER_WON;
+        else if (p2_hp > 0 && p1_hp == 0)          outcome = (g_player_index == 1)
+                                                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                                                            : FM2K_MATCH_OUTCOME_PEER_WON;
+        // Both HPs > 0: timeout / non-KO end (rematch trigger, return-to-
+        // CSS without final round). We can't tell who won — log as draw.
+        else                                        outcome = FM2K_MATCH_OUTCOME_DRAW;
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay: match outcome p1_hp=%u p2_hp=%u outcome=%d",
+            p1_hp, p2_hp, (int)outcome);
+        SharedMem_PublishMatchOutcome(outcome);
+    }
+
     if (g_session) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "Netplay: Ending GekkoNet session (kind=%d)", (int)g_session_kind);
@@ -1630,6 +1879,25 @@ bool Netplay_ProcessBattleInputPhase() {
                     "Netplay: GekkoNet syncing %u/%u",
                     event->data.syncing.current, event->data.syncing.max);
                 break;
+
+            case GekkoPlayerDisconnected: {
+                // Peer dropped (timeout / closed game / network died). Publish
+                // a DISCONNECT outcome so the launcher's shared-mem poll
+                // forwards a match_result to the hub AND tears down the
+                // surviving local game. Fires on CSS too — without this the
+                // survivor froze on the character-select screen with music
+                // playing when their opponent closed during CSS (real bug
+                // report 2026-05-05).
+                if (g_session_kind == SessionKind::BATTLE ||
+                    g_session_kind == SessionKind::CSS) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: peer disconnected (handle=%d kind=%d) — publishing DISCONNECT outcome",
+                        event->data.disconnected.handle,
+                        (int)g_session_kind);
+                    SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DISCONNECT);
+                }
+                break;
+            }
 
             case GekkoDesyncDetected: {
                 g_desync_count++;

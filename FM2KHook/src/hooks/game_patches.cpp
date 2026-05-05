@@ -156,3 +156,69 @@ void PatchVsRoundCase200T4FalsePositive() {
             "PATCH: Failed to patch case-200 t4 walk");
     }
 }
+
+void NeuterFullscreenTogglesForCncDdraw() {
+    // Single-byte flips — same shape as BypassMultiInstanceCheck. Each
+    // turns a `jnz short` (0x75) into `jmp short` (0xEB) so the WndProc's
+    // "if VK matches, toggle global + InitializeDirectDraw" body is
+    // unconditionally skipped. Displacement byte after the opcode stays
+    // the same — both forms are 2 bytes total.
+    //
+    // FM2K (WonderfulWorld_ver_0946):
+    //   0x4060f3  F4         in main_window_proc @ 0x405f50
+    //   0x406288  Alt+Enter  same WndProc, WM_SYSKEYDOWN case
+    //   Toggle target: g_graphics_mode @ 0x424704
+    //
+    // FM95 (CPW.exe) has no F4 toggle (binding absent) but still has the
+    // Alt+Enter path:
+    //   0x40bbf1  Alt+Enter  in main_window_proc @ 0x40b930
+    //   Toggle target: g_ddraw_fullscreen_mode @ 0x42557c
+    struct Patch { uintptr_t addr; uint8_t expect_first; const char* label; };
+    Patch patches_fm2k[] = {
+        { 0x4060f3, 0x75, "FM2K F4 (WM_KEYDOWN)"      },
+        { 0x406288, 0x75, "FM2K Alt+Enter (WM_SYSKEYDOWN)" },
+    };
+    Patch patches_fm95[] = {
+        { 0x40bbf1, 0x75, "FM95 Alt+Enter (WM_SYSKEYDOWN)" },
+    };
+    Patch* patches      = nullptr;
+    size_t patch_count  = 0;
+    if constexpr (FM2K::kIsFM2K) {
+        patches = patches_fm2k;
+        patch_count = sizeof(patches_fm2k) / sizeof(patches_fm2k[0]);
+    } else if constexpr (FM2K::kIsFM95) {
+        patches = patches_fm95;
+        patch_count = sizeof(patches_fm95) / sizeof(patches_fm95[0]);
+    }
+
+    for (size_t i = 0; i < patch_count; ++i) {
+        const auto& p = patches[i];
+        auto* byte = reinterpret_cast<uint8_t*>(p.addr);
+        if (IsBadReadPtr(byte, 1)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "PATCH: %s site at 0x%08X unreadable — wrong build?",
+                p.label, (unsigned)p.addr);
+            continue;
+        }
+        if (*byte != p.expect_first) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "PATCH: %s site at 0x%08X has 0x%02X (expected 0x%02X) — "
+                "binary doesn't match the build the patch was validated "
+                "against; skipping",
+                p.label, (unsigned)p.addr, *byte, p.expect_first);
+            continue;
+        }
+        DWORD old_protect = 0;
+        if (!VirtualProtect(byte, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "PATCH: VirtualProtect for %s failed (err=%lu)",
+                p.label, GetLastError());
+            continue;
+        }
+        *byte = 0xEB;  // jnz -> jmp
+        VirtualProtect(byte, 1, old_protect, &old_protect);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "PATCH: neutered %s at 0x%08X (jnz -> jmp)",
+            p.label, (unsigned)p.addr);
+    }
+}

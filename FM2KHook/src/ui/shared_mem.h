@@ -9,7 +9,29 @@
 // ============================================================================
 
 constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 2;
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 8;
+
+// Maximum bytes for a UTF-8-encoded character name in the shared mem
+// outcome payload. FM2K stores .player filenames as 256-byte CP932
+// (Shift-JIS) strings in g_char_slot_data; UTF-8 expansion of typical
+// JP names sits well under 96 bytes (30 codepoints × 3 B), and we
+// truncate-with-null on overflow rather than refusing to publish.
+constexpr size_t   FM2K_MATCH_CHAR_NAME_MAX = 96;
+
+// Match outcome enum, sent hook → launcher when a battle session ends.
+// Launcher forwards as a `match_result` message to the hub. See
+// docs/dev/launcher_followups.md for the W-L-D protocol.
+enum FM2KMatchOutcome : uint8_t {
+    FM2K_MATCH_OUTCOME_NONE        = 0,  // no outcome reported yet
+    FM2K_MATCH_OUTCOME_SELF_WON    = 1,
+    FM2K_MATCH_OUTCOME_PEER_WON    = 2,
+    FM2K_MATCH_OUTCOME_DRAW        = 3,
+    FM2K_MATCH_OUTCOME_DISCONNECT  = 4,
+    // CSS-phase abort (peer left before battle started). Triggers
+    // session-stop on the launcher but does NOT contribute to W/L/D —
+    // the match never reached battle, so there's nothing to record.
+    FM2K_MATCH_OUTCOME_CSS_ABORT   = 5,
+};
 
 struct FM2KSharedMemData {
     uint32_t magic;           // FM2K_SHARED_MEM_MAGIC - validates mapping
@@ -31,10 +53,71 @@ struct FM2KSharedMemData {
     uint32_t rng_seed;        // Current RNG seed (for monitoring)
     uint32_t render_fps;      // Render FPS
 
-    uint8_t  _reserved[8];   // Future use
+    // Match outcome reporting. The hook bumps `match_outcome_seq` once
+    // per resolved battle session (Netplay_EndBattle); the launcher polls
+    // and notices the bump, reads `match_outcome`, and sends a
+    // `match_result` to the hub. seq starts at 0; first real outcome
+    // arrives as seq=1. Launcher tracks last-seen-seq locally.
+    uint32_t match_outcome_seq;
+    uint8_t  match_outcome;   // FM2KMatchOutcome
+    uint8_t  _reserved[3];
+
+    // Per-match character indexes captured at battle start (Netplay_
+    // StartBattleSession). Persist across the match so the launcher
+    // can still read them after Netplay_EndBattle wipes the CSS state.
+    // Read live from FM2K::P1_CHARACTER_ID_ADDR / P2_CHARACTER_ID_ADDR
+    // when those values are still valid (during CSS → battle), and
+    // forwarded to the hub as part of match_result so per-character
+    // W/L/D and matchup tables work. 0xFFFFFFFF = unknown / not yet
+    // captured. Bumped together with `match_outcome_seq`.
+    uint32_t match_p1_char_id;
+    uint32_t match_p2_char_id;
+
+    // Resolved .player filenames from FM2K's g_char_slot_data roster
+    // (0x435474 in WonderfulWorld; each slot is 256 B CP932). Hook
+    // converts CP932 → UTF-8 before publishing so the launcher and
+    // hub can hand the bytes through unchanged. Empty (first byte = 0)
+    // when the hook hasn't resolved a name yet (e.g. older shared-mem
+    // version mid-launch). Bumped together with match_outcome_seq.
+    char     match_p1_char_name[FM2K_MATCH_CHAR_NAME_MAX];
+    char     match_p2_char_name[FM2K_MATCH_CHAR_NAME_MAX];
+
+    // Selected stage_id captured at battle start (FM2K::ADDR_SELECTED_STAGE).
+    // 0xFFFFFFFF = unknown / not captured (FM95: not yet wired).
+    // Stage *name* is resolved on the launcher side via FindKgtByGameId
+    // because there's no documented in-memory stage-filename table; the
+    // launcher already has the parsed KGT, so the hook only ships the id.
+    // Bumped together with match_outcome_seq.
+    uint32_t match_stage_id;
+
+    // Bumped exactly once per Netplay_StartBattleSession (after chars +
+    // stage are published). The launcher gates `match_progress` on
+    // this seq advancing, so:
+    //   - Inter-battle CSS window: seq doesn't advance, no fire,
+    //     lobby keeps the post-rotate empty row → "(in CSS)" visual.
+    //   - New battle starts: hook bumps seq, launcher reads new chars
+    //     + stage and fires match_progress under the rotated token.
+    // Independent from match_outcome_seq (which is per END_battle).
+    uint32_t match_chars_seq;
+
+    // Launcher → hook stats feed (#48-extension). The hook renders the
+    // game titlebar from here so the user sees their record live in
+    // CSS / battle without alt-tabbing to the launcher. Set valid_*
+    // sentinels are -1 (== not received yet); a fresh QueryRecord
+    // round-trip overwrites with real values.
+    int32_t  ui_wins;             // overall W
+    int32_t  ui_losses;           // overall L
+    int32_t  ui_draws;            // overall D
+    int32_t  ui_vs_wins;          // vs current peer
+    int32_t  ui_vs_losses;
+    int32_t  ui_vs_draws;
+    char     ui_peer_nick[64];    // current peer's display name (UTF-8)
+    char     ui_my_nick[64];      // own display name (UTF-8)
 };
 
-static_assert(sizeof(FM2KSharedMemData) <= 64, "Keep shared mem small");
+// Bumped to 512 to fit the launcher → hook stats feed added in
+// version 6 (W-L-D + peer nick + my nick). Still well under 4 KB.
+static_assert(sizeof(FM2KSharedMemData) <= 512, "Keep shared mem small");
 
 // Shared memory lifecycle
 bool InitializeSharedMemory();
@@ -45,3 +128,44 @@ void SharedMem_Update();
 
 // Get pointer (nullptr if not initialized)
 FM2KSharedMemData* GetSharedMemory();
+
+// Publish the outcome of a just-finished battle. Only needs to be called
+// once per battle session (from Netplay_EndBattle). Bumps the seq counter
+// so the launcher's poll detects the new value as fresh.
+void SharedMem_PublishMatchOutcome(FM2KMatchOutcome outcome);
+
+// Stash the P1/P2 character IDs that this battle is being fought with.
+// Called from Netplay_StartBattleSession while the CSS-side values are
+// still valid; held in shared mem until Netplay_EndBattle so the
+// launcher's match_result payload can carry them. p1/p2 = 0xFFFFFFFF
+// to clear.
+//
+// p1_name_utf8 / p2_name_utf8: the resolved .player filename (without
+// extension) for each side, already converted to UTF-8 by the caller.
+// Pass nullptr to leave the corresponding name slot empty. The buffer
+// is truncated to FM2K_MATCH_CHAR_NAME_MAX-1 bytes and null-terminated;
+// no validation that the input is well-formed UTF-8 — callers convert
+// from CP932 via Win32 before calling.
+void SharedMem_PublishMatchChars(uint32_t p1_char_id, uint32_t p2_char_id,
+                                 const char* p1_name_utf8 = nullptr,
+                                 const char* p2_name_utf8 = nullptr);
+
+// Stash the selected stage_id for the upcoming battle. Same lifecycle as
+// SharedMem_PublishMatchChars — the launcher reads it at end-of-match
+// alongside char_ids/names and forwards as part of the hub match_result.
+// Pass 0xFFFFFFFF to clear / mark unknown.
+void SharedMem_PublishMatchStage(uint32_t stage_id);
+
+// Launcher-side write hook for the v6 stats feed. The launcher process
+// opens the same FM2K_SharedMem_<pid> mapping read-write and stuffs
+// W-L-D + peer nick fields here whenever Hub::QueryRecord returns a
+// fresh record or MatchStart names a new opponent. The game-side hook
+// reads from these fields when formatting the in-game titlebar.
+//
+// Called from launcher; safe to call from hook side too (will just
+// re-stamp its own copy). Pass -1 for any wins/losses/draws value to
+// mean "not yet known"; pass nullptr for nicks to leave them blank.
+void SharedMem_PublishUiStats(int32_t wins, int32_t losses, int32_t draws,
+                              int32_t vs_wins, int32_t vs_losses, int32_t vs_draws,
+                              const char* peer_nick_utf8,
+                              const char* my_nick_utf8);
