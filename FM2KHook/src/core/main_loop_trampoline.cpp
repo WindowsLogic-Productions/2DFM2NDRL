@@ -17,8 +17,10 @@
 #include "main_loop_trampoline.h"
 #include "globals.h"
 #include "../hooks/hooks.h"
+#include "../hooks/wndproc_subclass.h"
 #include "../netplay/netplay.h"
 #include "../netplay/control_channel.h"
+#include "../netplay/game_hash.h"
 #include "../netplay/spectator_node.h"
 #include "../ui/shared_mem.h"
 #include "../parity/parity_recorder.h"
@@ -312,9 +314,13 @@ static LoopPhase ClassifyPhase() {
         return LoopPhase::TRAMPOLINE_BATTLE;
     }
 
+    // Engine-aware phase mapping. On FM2K g_game_mode hits 2000/3000+; on
+    // FM95 it stays near 0 and phase lives in the object pool — IsCSSMode /
+    // IsBattleMode (hooks.cpp, declared in hooks.h) do the right walk for
+    // each engine.
     uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-    if (mode >= 3000 && mode < 4000) return LoopPhase::TRAMPOLINE_BATTLE;
-    if (mode == 2000)                return LoopPhase::CSS;
+    if (IsBattleMode(mode)) return LoopPhase::TRAMPOLINE_BATTLE;
+    if (IsCSSMode(mode))    return LoopPhase::CSS;
     return LoopPhase::NATIVE;
 }
 
@@ -352,6 +358,20 @@ static bool PumpMessages() {
                         (unsigned)msg.message, (unsigned)msg.wParam,
                         (unsigned)msg.wParam, (unsigned long)msg.lParam,
                         msg.hwnd);
+        }
+        // Suppress solo-Alt menu activation. When the user taps Alt with
+        // no follow-up key, Windows sends WM_SYSCOMMAND/SC_KEYMENU which
+        // makes the game's WindowProc enter modal menu mode (DefWindowProc
+        // blocks the message pump until the user picks a menu item or
+        // presses Esc). FM2K has no menu, so the game just appears to
+        // freeze for a beat. Discard the no-key SC_KEYMENU but let other
+        // SC_* commands (SC_CLOSE on the X button, SC_RESTORE on un-min,
+        // SC_KEYMENU with an actual hotkey) pass through.
+        if (msg.message == WM_SYSCOMMAND
+            && (msg.wParam & 0xFFF0) == SC_KEYMENU
+            && msg.lParam == 0)
+        {
+            continue;  // swallowed
         }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
@@ -530,8 +550,12 @@ static void RunBattleTick() {
             }
         }
         if (pre_mode >= 3000 && pre_mode < 4000) {
-            // Score-cross trigger: pre_score >= 0 AND post_score < pre
-            if (pre_score >= 0 && post_score < pre_score) {
+            // Score-cross trigger: only the actual zero crossing
+            // (pre>=0, post<0) fires the case-200 → state-300 path.
+            // Some games (Vanguard Princess, etc.) use score as a
+            // per-frame ticking meter, so any-decrement detection
+            // floods the log without capturing a real transition.
+            if (pre_score >= 0 && post_score < 0) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "[CASE200-TRIP] score path fired: %d -> %d (case 200 "
                     "decremented past 0 → state 300)",
@@ -614,18 +638,27 @@ static void RunCssTick() {
     // Stress mode + offline both run CSS natively — no peer, no lockstep.
     const bool skip_netplay = g_offline_mode || g_stress_mode;
 
-    // Connection barrier — networked mode only. Block until both peers have
-    // done the HELLO / ACK handshake. During this period neither peer has run
-    // any sim yet.
+    // No connection barrier here. Same reasoning as RunNativeTick:
+    // freezing the render path while we wait for handshake leaves the
+    // user staring at an unresponsive CSS window for several seconds —
+    // they tab out, see "not responding", and force-close. The CSS
+    // state machine is fine to tick unsynchronized in this window:
+    // Netplay_ProcessCSS already handles the !g_remote_css_ready case
+    // by running the game locally without driving GekkoNet, and on the
+    // first synced frame it reseeds the RNG so peers re-converge. We
+    // still pump ControlChannel/HELLO here so handshake makes
+    // progress; if the MM-timer-driven Poll didn't already finish it,
+    // this completes it.
     if (!skip_netplay && !Netplay_IsConnected()) {
         ControlChannel_Poll();
         static uint32_t last_poll = 0;
         uint32_t now = GetTickCount();
         if (now - last_poll > 500) {
-            ControlChannel_SendHello((uint8_t)g_player_index, 0);
+            ControlChannel_SendHello((uint8_t)g_player_index,
+                                     fm2k::game_hash::Compute());
             last_poll = now;
         }
-        return;
+        // Fall through — let the CSS tick.
     }
 
     // CSS lockstep + stall: Netplay_ProcessCSS returns false while we're
@@ -662,25 +695,28 @@ static void RunNativeTick() {
 
     const bool skip_netplay = g_offline_mode || g_stress_mode;
 
-    // Connection gate — networked mode only. Don't tick the game (no
-    // process_game_inputs, no update_game, no render-snapshot mutation)
-    // until both peers have HELLO/HELLO_ACK'd. Without this, both games
-    // launch freely, the auto-mash drives them through title → CSS, and
-    // the existing CSS-phase barrier ends up the fallback — which the
-    // user sees as "stays in Connecting until CSS, then snaps."
+    // Title screen: no netplay state, no sim-determinism requirement.
+    // We used to block here on Netplay_IsConnected() to avoid the
+    // "Connecting → snap-to-ready at CSS" UX flash, but it caused the
+    // peer whose window came up first to sit frozen on the title
+    // screen for the duration of the handshake gap (up to ~1s on
+    // loopback even after the NAT-skip optimization, more on real
+    // networks). Result: asymmetric CSS arrival.
     //
-    // Mirror of RunCssTick's barrier. Both phases (NATIVE = title,
-    // CSS = char select) block on Netplay_IsConnected. Battle mode has
-    // its own BATTLE_READY barrier downstream.
+    // Tick the title screen freely; pump the control channel and
+    // resend HELLO until handshake completes. The CSS barrier
+    // (RunCssTick) and the BATTLE_READY barrier downstream still hold
+    // peers in lockstep before any sim-relevant frame runs.
     if (!skip_netplay && !Netplay_IsConnected()) {
         ControlChannel_Poll();
         static uint32_t last_poll = 0;
         uint32_t now = GetTickCount();
         if (now - last_poll > 500) {
-            ControlChannel_SendHello((uint8_t)g_player_index, 0);
+            ControlChannel_SendHello((uint8_t)g_player_index,
+                                     fm2k::game_hash::Compute());
             last_poll = now;
         }
-        return;
+        // Fall through — let the title screen advance.
     }
 
     if (!skip_netplay) {
@@ -810,8 +846,10 @@ static void RunSpectatorTick() {
                 const uint32_t p2_hp   = *(uint32_t*)0x4EDCC4;
                 const uint32_t timer   = *(uint32_t*)0x470044;
                 // Real battle positions in object pool. (Earlier this read
-                // 0x470020 which is the CSS slot index — useless for
-                // detecting in-match drift.)
+                // 0x470020 which is the CSS-selected character index
+                // (g_p1_selected_char_idx) — useless for detecting
+                // in-match drift since it's set during char-select and
+                // doesn't change once battle starts.)
                 constexpr uintptr_t POOL = 0x4701E0;
                 constexpr size_t    SLOT = 382;
                 const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
@@ -847,6 +885,38 @@ static void RunSpectatorTick() {
 // ============================================================================
 // ENTRY POINT
 // ============================================================================
+
+// Per-frame engine work, callable from either the FM2K trampoline loop OR
+// FM95's host-driven update_game callsite. Returns the LoopPhase actually
+// executed so callers can decide whether the host's natural render call
+// should still fire (NATIVE) or be skipped (BATTLE / CSS — we already
+// drove update + render via AdvanceEvent / RenderFrameWithSnapshot).
+//
+// FM2K caller: TrampolineMainLoop wraps this with QPC-anchored pacing +
+// SleepToTarget. Host main_game_loop is replaced wholesale.
+//
+// FM95 caller (Hook_UpdateGameState path — Phase 2 wiring): the host's
+// natural WinMain pumps messages and runs its own timeGetTime catchup
+// loop, so the FM95 path skips PumpMessages and SleepToTarget — calls
+// this directly to drive one frame of GekkoNet save/load/advance dispatch.
+LoopPhase TrampolineFrameTick() {
+    LoopPhase phase = ClassifyPhase();
+    switch (phase) {
+        case LoopPhase::TRAMPOLINE_BATTLE:
+            RunBattleTick();
+            break;
+        case LoopPhase::CSS:
+            RunCssTick();
+            break;
+        case LoopPhase::NATIVE:
+            RunNativeTick();
+            break;
+        case LoopPhase::SPECTATOR_PLAYBACK:
+            RunSpectatorTick();
+            break;
+    }
+    return phase;
+}
 
 BOOL TrampolineMainLoop() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -894,9 +964,22 @@ BOOL TrampolineMainLoop() {
             return TRUE;
         }
 
-        switch (ClassifyPhase()) {
+        // Try installing the WndProc subclass each tick until it sticks.
+        // Cheap: bails immediately once already-installed. The window
+        // class "KGT2KGAME" comes up shortly after WinMain registers its
+        // class, so this typically lands within the first few frames.
+        // Subclass swallows Alt-tap menu activation + drives a
+        // WM_TIMER inside DefWindowProc's modal loops so window drag /
+        // system menu open don't pause our networking.
+        FM2KWndProc::TryInstall();
+
+        // Run one frame's worth of engine work. The body lives in
+        // TrampolineFrameTick so the FM95 host-driven path can reuse it.
+        LoopPhase phase = TrampolineFrameTick();
+
+        // Phase-specific pacing.
+        switch (phase) {
             case LoopPhase::TRAMPOLINE_BATTLE:
-                RunBattleTick();
                 // Pass the live frames_ahead so SleepToTarget applies the
                 // 1.6% slowdown when the host is ahead of the client (or
                 // vice versa). Without this the host runs rigid 10 ms
@@ -907,19 +990,11 @@ BOOL TrampolineMainLoop() {
                 // no-op there.
                 SleepToTarget(tick_start, 10, Netplay_GetFramesAhead());
                 break;
-
             case LoopPhase::CSS:
-                RunCssTick();
-                SleepToTarget(tick_start, 10);
-                break;
-
             case LoopPhase::NATIVE:
-                RunNativeTick();
                 SleepToTarget(tick_start, 10);
                 break;
-
             case LoopPhase::SPECTATOR_PLAYBACK: {
-                RunSpectatorTick();
                 // FF with hysteresis. Live edge: queue oscillates around
                 // LIVE_TARGET, sleep 10 ms (100 Hz). Backfill (>FF_ENTER):
                 // sleep 1 ms (~1000 Hz) to drain the catch-up window.

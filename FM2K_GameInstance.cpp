@@ -1,4 +1,6 @@
 #include "FM2K_GameInstance.h"
+#include "FM2K_DDrawRedirect.h"
+#include "FM2K_GameIni.h"
 #include "FM2K_Integration.h"
 #include "FM2KHook/src/ui/shared_mem.h"  // FM2KSharedMemData (read-only stats from hook)
 // DLL injection approach - no direct hooks needed
@@ -7,6 +9,7 @@
 #include <filesystem>
 #include <locale>
 #include <codecvt>
+#include <vector>
 #include <windows.h>
 
 // Save state profile removed - now using optimized FastGameState system
@@ -21,11 +24,12 @@ constexpr uint32_t DLL_INIT_TIMEOUT_MS = 5000;
 constexpr uint32_t IPC_EVENT_TIMEOUT_MS = 100;
 
 // Helper functions
-[[maybe_unused]] static std::wstring GetDLLPath() {
+[[maybe_unused]] static std::wstring GetDLLPath(FM2K::Engine engine = FM2K::Engine::FM2K) {
     wchar_t buffer[MAX_PATH];
     GetModuleFileNameW(nullptr, buffer, MAX_PATH);
     std::filesystem::path exe_path(buffer);
-    return exe_path.parent_path() / L"FM2KHook.dll";
+    const wchar_t* dll_name = (engine == FM2K::Engine::FM95) ? L"FM95Hook.dll" : L"FM2KHook.dll";
+    return exe_path.parent_path() / dll_name;
 }
 
 // Helper function to convert UTF-8 to wide string using Windows API
@@ -35,6 +39,84 @@ std::wstring UTF8ToWide(const std::string& str) {
     std::wstring wstr(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), wstr.data(), size_needed);
     return wstr;
+}
+
+// Build a CREATE_UNICODE_ENVIRONMENT block from the parent's current
+// environment with `prepend_path_dir` spliced onto the front of PATH (with a
+// `;` separator), and any `extra_vars` appended (each as a "KEY=VALUE"
+// wide string). Returns the doubly-NUL-terminated wide buffer ready to
+// hand to CreateProcessW. Empty vector on failure (caller falls back to
+// nullptr / inherited env).
+//
+// Why a fresh block instead of mutating the parent: the existing flow at
+// the call site sets FM2K_* env vars on the parent, calls CreateProcess,
+// then unsets them. That's racy across rapid-fire dual-client launches and
+// doesn't compose with the cnc-ddraw redirect (we don't want the parent's
+// PATH permanently mutated). Building our own block sidesteps both. We
+// snapshot the parent env *after* the FM2K_* vars are pushed in, so they
+// flow through to the child unchanged.
+std::vector<wchar_t> BuildEnvBlockWithPathPrepend(
+    const std::wstring& prepend_path_dir,
+    const std::vector<std::wstring>& extra_vars = {}) {
+    LPWCH parent_env = GetEnvironmentStringsW();
+    if (!parent_env) return {};
+
+    // Walk the doubly-NUL-terminated parent block, copying each KEY=VALUE
+    // entry into `out`. When we hit `PATH=...`, prepend prepend_path_dir.
+    // Comparison is case-insensitive — Windows env-var names are.
+    std::vector<wchar_t> out;
+    bool path_seen = false;
+    for (LPWCH p = parent_env; *p; ) {
+        size_t len = wcslen(p);
+        bool is_path = false;
+        if (len >= 5) {
+            // "PATH=" prefix, case-insensitive.
+            wchar_t k0 = p[0], k1 = p[1], k2 = p[2], k3 = p[3];
+            if ((k0 == L'P' || k0 == L'p') && (k1 == L'A' || k1 == L'a') &&
+                (k2 == L'T' || k2 == L't') && (k3 == L'H' || k3 == L'h') &&
+                p[4] == L'=') {
+                is_path = true;
+            }
+        }
+        if (is_path) {
+            path_seen = true;
+            // Emit "PATH=<prepend>;<rest_of_value>\0"
+            const wchar_t kPrefix[] = L"PATH=";
+            out.insert(out.end(), kPrefix, kPrefix + 5);
+            out.insert(out.end(), prepend_path_dir.begin(), prepend_path_dir.end());
+            // Existing value starts at p+5. Only insert ';' separator if
+            // the existing PATH is non-empty (avoids a stray trailing ';').
+            const wchar_t* existing = p + 5;
+            if (*existing) {
+                out.push_back(L';');
+                out.insert(out.end(), existing, existing + (len - 5));
+            }
+            out.push_back(L'\0');
+        } else {
+            out.insert(out.end(), p, p + len + 1);  // includes the entry's NUL
+        }
+        p += len + 1;
+    }
+    FreeEnvironmentStringsW(parent_env);
+
+    if (!path_seen) {
+        // No PATH= in parent env (rare but possible): synthesize one.
+        const wchar_t kPrefix[] = L"PATH=";
+        out.insert(out.end(), kPrefix, kPrefix + 5);
+        out.insert(out.end(), prepend_path_dir.begin(), prepend_path_dir.end());
+        out.push_back(L'\0');
+    }
+    // Append extra KEY=VALUE entries. Caller is responsible for not
+    // duplicating keys already in the parent env — we don't dedupe here
+    // (CreateProcess takes the first occurrence). For our use case (a
+    // launch-scoped CNC_DDRAW_CONFIG_FILE that the user almost never
+    // sets in their shell), the first-wins rule is fine.
+    for (const auto& kv : extra_vars) {
+        out.insert(out.end(), kv.begin(), kv.end());
+        out.push_back(L'\0');
+    }
+    out.push_back(L'\0');  // doubly-NUL-terminated
+    return out;
 }
 
 } // anonymous namespace
@@ -71,7 +153,14 @@ bool FM2KGameInstance::Initialize() {
     return true;
 }
 
-bool FM2KGameInstance::Launch(const std::string& exe_path) {
+bool FM2KGameInstance::Launch(const std::string& exe_path, FM2K::Engine engine) {
+    engine_ = engine;
+    // Stash for Terminate() — RestoreFromBackup needs the exe path to
+    // locate the game.ini we mutated.
+    game_exe_path_ = exe_path;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "FM2KGameInstance::Launch engine=%s exe=%s",
+                FM2K::EngineName(engine), exe_path.c_str());
     // Use SDL3's cross-platform filesystem helpers for existence checks.
     if (!SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -86,20 +175,41 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
     std::string exe_path_win = exe_path;
     std::replace(exe_path_win.begin(), exe_path_win.end(), '/', '\\');
 
-    // Extract directory from exe path for working directory
-    std::filesystem::path exe_file_path(exe_path_win);
-    std::string working_dir = exe_file_path.parent_path().string();
-    
+    // Path strings come in as UTF-8 (SDL_GlobDirectory / Windows shell drag-
+    // drop / config files). Construct the filesystem::path directly from the
+    // wide form so the parent_path / stem operations work on Unicode-correct
+    // data — going `path(std::string)` then `parent_path().string()` on
+    // MinGW round-trips through the system ANSI codepage, mangling JP
+    // names like ＣＰＷ.exe into '_'-soup before we ever reach CreateProcess.
+    std::wstring wide_exe_path     = UTF8ToWide(exe_path_win);
+    std::filesystem::path exe_file_path(wide_exe_path);
+    std::wstring wide_working_dir  = exe_file_path.parent_path().wstring();
+    std::wstring wide_cmd_line     = L"\"" + wide_exe_path + L"\"";
+
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
 
-    std::wstring wide_exe_path(exe_path_win.begin(), exe_path_win.end());
-    std::wstring wide_cmd_line = L"\"" + wide_exe_path + L"\"";
-    std::wstring wide_working_dir(working_dir.begin(), working_dir.end());
-
+    // Convert wide_working_dir back to UTF-8 just for the debug log
+    // (SDL_LogDebug takes narrow). The actual CreateProcessW call below
+    // uses the wide form so JP-named directories don't mangle.
+    std::string working_dir_utf8;
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0,
+                                    wide_working_dir.data(),
+                                    (int)wide_working_dir.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            working_dir_utf8.assign((size_t)n, '\0');
+            WideCharToMultiByte(CP_UTF8, 0,
+                                wide_working_dir.data(),
+                                (int)wide_working_dir.size(),
+                                working_dir_utf8.data(), n,
+                                nullptr, nullptr);
+        }
+    }
     SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Creating process: %s", exe_path_win.c_str());
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Working directory: %s", working_dir.c_str());
+    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Working directory: %s", working_dir_utf8.c_str());
 
     // Set environment variables in current process (child will inherit them)
     for (const auto& [name, value] : environment_variables_) {
@@ -110,21 +220,75 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
         }
     }
 
+    // When the cnc-ddraw redirect is active, build a private env block with
+    // our cnc-ddraw dir prepended to PATH. The child process's loader walks
+    // PATH when resolving the patched `2DFMD.dll` import, so this is the
+    // load-bearing piece — without it the IAT rewrite produces a
+    // "DLL not found" failure. The block is constructed *after* the
+    // FM2K_* var injection above, so those flow through to the child too.
+    const bool ddraw_redirect_enabled = FM2K::ddraw_redirect::ShouldRedirect();
+
+    // Pin FM2K to fullscreen mode in its [GamePlay] ini before the game
+    // reads it at startup. Lets cnc-ddraw own actual window-mode
+    // presentation via its own `windowmode` ini key. RestoreFromBackup
+    // in the launcher's StopSession path unwinds this same backup.
+    if (ddraw_redirect_enabled) {
+        std::filesystem::path exe_fs(UTF8ToWide(exe_path));
+        if (!fm2k::game_ini::ForceFullscreenForLaunch(exe_fs)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "GameIni: ForceFullscreenForLaunch failed — game may launch windowed and fight cnc-ddraw");
+        }
+    }
+    std::wstring cnc_ddraw_dir;
+    std::vector<wchar_t> env_block;
+    LPVOID lp_environment = nullptr;
+    DWORD  creation_flags = CREATE_SUSPENDED;
+    if (ddraw_redirect_enabled) {
+        cnc_ddraw_dir = FM2K::ddraw_redirect::ResolveCncDdrawDir();
+        if (!cnc_ddraw_dir.empty()) {
+            // Pin cnc-ddraw's ini path to <our_dir>\ddraw.ini via the
+            // documented CNC_DDRAW_CONFIG_FILE env var (config.c:1994).
+            // Without this pin, cnc-ddraw resolves the ini relative to
+            // its own dll path (which is also our dir, so it'd land on
+            // the same file in practice) — but if the game folder also
+            // has a stray ddraw.ini from a prior manual install, the
+            // fallback at config.c:2011 (".\\ddraw.ini" = CWD = game
+            // folder) can grab that instead. Setting the env var is
+            // the unambiguous answer and matches our "config lives next
+            // to our renamed dll" model.
+            std::wstring ini_path_var =
+                L"CNC_DDRAW_CONFIG_FILE=" + cnc_ddraw_dir + L"\\ddraw.ini";
+            std::vector<std::wstring> extras = { ini_path_var };
+            env_block = BuildEnvBlockWithPathPrepend(cnc_ddraw_dir, extras);
+            if (!env_block.empty()) {
+                lp_environment = env_block.data();
+                creation_flags |= CREATE_UNICODE_ENVIRONMENT;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "DDrawRedirect: PATH prepended with %ls; "
+                    "CNC_DDRAW_CONFIG_FILE=%ls\\ddraw.ini",
+                    cnc_ddraw_dir.c_str(), cnc_ddraw_dir.c_str());
+            }
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DDrawRedirect: enabled but ResolveCncDdrawDir returned empty — falling back to inherited env, redirect will likely fail with DLL not found");
+        }
+    }
+
     if (!CreateProcessW(
         wide_exe_path.c_str(),    // Application name
         const_cast<LPWSTR>(wide_cmd_line.c_str()), // Command line
         nullptr,                   // Process handle not inheritable
         nullptr,                   // Thread handle not inheritable
         FALSE,                     // Set handle inheritance to FALSE
-        CREATE_SUSPENDED,          // Create suspended for DLL injection
-        nullptr, // Use parent's environment block
+        creation_flags,            // CREATE_SUSPENDED + optional CREATE_UNICODE_ENVIRONMENT
+        lp_environment,            // Custom env block when redirect enabled, else inherited
         wide_working_dir.c_str(), // Use game's directory as starting directory
         &si,                       // Pointer to STARTUPINFO structure
         &pi                        // Pointer to PROCESS_INFORMATION structure
     )) {
         DWORD error = GetLastError();
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, 
-            "CreateProcess failed for %s with error: %lu", 
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "CreateProcess failed for %s with error: %lu",
             exe_path.c_str(), error);
         return false;
     }
@@ -132,7 +296,7 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
     process_info_ = pi;
     process_handle_ = pi.hProcess;
     process_id_ = pi.dwProcessId;
-    
+
     // Clean up environment variables to avoid conflicts with next client
     for (const auto& [name, value] : environment_variables_) {
         ::SetEnvironmentVariableA(name.c_str(), nullptr);  // Remove the variable
@@ -140,10 +304,27 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
 
     SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Process created with ID: %lu", process_id_);
 
-    // Inject simple hook DLL
-    std::wstring dll_path = GetDLLPath();
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Using DLL path: %s", 
-                std::string(dll_path.begin(), dll_path.end()).c_str());
+    // Patch the IAT before any user code runs — the loader hasn't resolved
+    // imports yet at this point (LdrInitializeThunk runs on first
+    // ResumeThread). On a successful patch, when ResumeThread fires below,
+    // the loader will look for `2DFMD.dll` instead of `DDRAW.dll`, fall
+    // through KnownDlls (no match), and find our renamed cnc-ddraw via the
+    // PATH we prepended above. On failure (no DDRAW.dll import in this
+    // EXE, or RPM/WPM error) we fall through and let the process resume
+    // unmodified — the loader resolves DDRAW.dll the normal way and the
+    // game runs without cnc-ddraw, which is the same as redirect-off.
+    if (ddraw_redirect_enabled) {
+        if (!FM2K::ddraw_redirect::RedirectImport(process_handle_)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DDrawRedirect: patch did not apply — game will load stock ddraw.dll");
+        }
+    }
+
+    // Inject hook DLL — FM2KHook.dll for FM2K, FM95Hook.dll for FM95.
+    std::wstring dll_path = GetDLLPath(engine_);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Using DLL path: %s (engine=%s)",
+                std::string(dll_path.begin(), dll_path.end()).c_str(),
+                FM2K::EngineName(engine_));
     
     if (!SetupProcessForHooking(std::string(dll_path.begin(), dll_path.end()))) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to inject hook DLL");
@@ -161,6 +342,21 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
     // Note: Shared memory is no longer used - config is passed via environment variables
     // (FM2K_PLAYER_INDEX, FM2K_LOCAL_PORT, FM2K_REMOTE_ADDR, etc.)
 
+    // If the redirect was applied, re-read the patch site one more time
+    // before resuming the main thread. If the bytes have reverted between
+    // RedirectImport and now (which would point at AV / runtime-hook
+    // interference), this catches it. Note: the FM2KHook injection above
+    // ran a remote thread which itself triggered process-init in the
+    // target; if the loader-side static-import resolution happened on
+    // that thread, the EXE's ddraw thunks have ALREADY been bound by
+    // this point and we'd see whichever name won.
+    if (ddraw_redirect_enabled) {
+        std::string seen = FM2K::ddraw_redirect::VerifyPatch(process_handle_);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "DDrawRedirect: post-injection patch site reads as '%s'",
+            seen.c_str());
+    }
+
     // Resume the game process (hook DLL will start running now)
     ResumeThread(process_info_.hThread);
 
@@ -169,7 +365,7 @@ bool FM2KGameInstance::Launch(const std::string& exe_path) {
 
 void FM2KGameInstance::Terminate() {
     UninstallHooks();
-    
+
     // Cleanup shared memory
     CleanupSharedMemory();
 
@@ -177,6 +373,18 @@ void FM2KGameInstance::Terminate() {
         TerminateProcess(process_handle_, 0);
         CloseHandle(process_handle_);
         process_handle_ = nullptr;
+    }
+
+    // Restore the pristine game.ini from any .fm2krollback_bak made by
+    // ApplyForLaunch (online clamps) or ForceFullscreenForLaunch
+    // (cnc-ddraw redirect). Done after the game process is killed so
+    // we don't race a still-running game holding its own ini open.
+    // No-op when no backup exists. Online StopSession also calls
+    // RestoreFromBackup separately — second call is a no-op since
+    // the backup is already consumed.
+    if (!game_exe_path_.empty()) {
+        std::filesystem::path exe_fs(UTF8ToWide(game_exe_path_));
+        fm2k::game_ini::RestoreFromBackup(exe_fs);
     }
 
     if (process_info_.hThread) {

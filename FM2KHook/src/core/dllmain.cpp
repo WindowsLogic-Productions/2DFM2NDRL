@@ -5,18 +5,23 @@
 #include "netplay_state.h"
 #include "control_channel.h"
 #include "shared_mem.h"
+#include "../locale/locale_spoof.h"
 
 // Forward-declare just the new patch function. We can't include
 // game_patches.h here because dllmain.cpp keeps static duplicates of
 // the older patch functions and the extern declarations would conflict.
 extern void PatchVsRoundCase200T4FalsePositive();
+extern void NeuterFullscreenTogglesForCncDdraw();
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <mmsystem.h>
+#include <psapi.h>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <cctype>
+#include <string>
 
 // =============================================================================
 // LOG-FILE PATH HELPER
@@ -253,11 +258,121 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             // background windows drop to ~64fps (appears as 60fps).
             timeBeginPeriod(1);
 
-            // Apply game patches FIRST before anything else
-            BypassMultiInstanceCheck();
-            ApplyBootToCharacterSelectPatches();
-            ApplyCharacterSelectModePatches();
-            DisableCursorHiding();
+            // Read player index early so the log filename is right.
+            if (char* env_player = std::getenv("FM2K_PLAYER_INDEX")) {
+                g_player_index = std::atoi(env_player);
+            }
+
+            // Init console + file logging FIRST so every later step
+            // (locale spoof, FM2K patches, hook init) is captured in
+            // <game_dir>/logs/FM2K_P*_Debug.log.
+            FreeConsole();
+            AllocConsole();
+            FILE* fDummy;
+            freopen_s(&fDummy, "CONOUT$", "w", stdout);
+            freopen_s(&fDummy, "CONOUT$", "w", stderr);
+            freopen_s(&fDummy, "CONIN$", "r", stdin);
+            char title[64];
+            std::snprintf(title, sizeof(title), "FM2K P%d Console", g_player_index + 1);
+            SetConsoleTitleA(title);
+            InitFileLogging();
+            SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
+
+            // ddraw-redirect diagnostic: enumerate every loaded module and
+            // log the names + paths of anything matching ddraw / 2dfmd. This
+            // runs from the FM2KHook injection thread, so process init has
+            // already happened — the EXE's static imports are loaded by now,
+            // including whichever ddraw flavor the loader picked. If our
+            // patch worked, we should see 2DFMD.dll in the list. If we see
+            // DDRAW.dll instead (from system32 / KnownDlls), the patch
+            // didn't influence import resolution.
+            {
+                HMODULE mods[256] = {};
+                DWORD needed = 0;
+                HANDLE proc = GetCurrentProcess();
+                if (EnumProcessModulesEx(proc, mods, sizeof(mods), &needed,
+                                         LIST_MODULES_ALL)) {
+                    const DWORD count = needed / sizeof(HMODULE);
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "DDrawDiag: %lu modules loaded; scanning for ddraw/2dfmd:",
+                        (unsigned long)count);
+                    bool any_match = false;
+                    for (DWORD i = 0; i < count; ++i) {
+                        char name[MAX_PATH] = {};
+                        if (GetModuleBaseNameA(proc, mods[i], name, sizeof(name))) {
+                            // Case-insensitive substring match
+                            std::string lower = name;
+                            for (auto& c : lower) c = (char)tolower((unsigned char)c);
+                            if (lower.find("ddraw") != std::string::npos ||
+                                lower.find("2dfmd") != std::string::npos) {
+                                char path[MAX_PATH] = {};
+                                GetModuleFileNameExA(proc, mods[i], path, sizeof(path));
+                                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "DDrawDiag:   MATCH base='%s' path='%s' handle=0x%p",
+                                    name, path, (void*)mods[i]);
+                                any_match = true;
+                            }
+                        }
+                    }
+                    if (!any_match) {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "DDrawDiag: NO ddraw/2dfmd module loaded — "
+                            "neither system DDRAW.dll nor our 2DFMD.dll "
+                            "is present (game might not have static-imported it).");
+                    }
+                } else {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "DDrawDiag: EnumProcessModulesEx failed: %lu",
+                        GetLastError());
+                }
+            }
+
+            // Locale spoofing — Japanese codepage / LCID + GDI/USER32 ANSI
+            // text rendering hooks. Always-on for BOTH FM2K and FM95 builds:
+            // re-encoding ASCII strings through CP932 round-trips identically
+            // so English-only games stay byte-equivalent, while JP games
+            // (CPW, WW, AOB, etc.) get proper text rendering instead of
+            // mojibake. Opt-OUT via FM2K_NO_JP_LOCALE=1 for diagnosis.
+            // The legacy FM2K_JP_LOCALE env var is now a no-op (still
+            // tolerated so older configs don't error).
+            //
+            // MUST run before host CRT init — i.e. before ResumeThread fires
+            // the game's main thread. DllMain in our injection thread is
+            // the right place.
+            {
+                const char* env_off = std::getenv("FM2K_NO_JP_LOCALE");
+                const bool disabled = (env_off && std::strcmp(env_off, "1") == 0);
+                if (!disabled) {
+                    InstallLocaleSpoof();
+                } else {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "LocaleSpoof: DISABLED via FM2K_NO_JP_LOCALE=1");
+                }
+            }
+
+            // FM2K-only binary patches. The literal addresses (0x405d05,
+            // 0x409CD9, 0x470058, 0x4049e0/e6) are FM2K-engine-specific —
+            // applying them to FM95 (CPW) just stomps random bytes in its
+            // address space and breaks the host. Gate on the engine flag
+            // so the FM95 build is a no-op here.
+            if constexpr (FM2K::kIsFM2K) {
+                BypassMultiInstanceCheck();
+                ApplyBootToCharacterSelectPatches();
+                ApplyCharacterSelectModePatches();
+                DisableCursorHiding();
+            }
+            // Neuter F4 / Alt+Enter game-side fullscreen toggles when
+            // cnc-ddraw is loaded — its keyboard hook owns those keys
+            // now, the game's redundant toggle would fight cnc-ddraw's
+            // render state. Detection: 2DFMD.dll is present in the
+            // process iff the launcher applied the IAT redirect at
+            // suspended-process start. Engine-aware: FM2K patches F4 +
+            // Alt+Enter, FM95 (CPW) patches Alt+Enter only (no F4
+            // binding in CPW's WndProc).
+            if (GetModuleHandleA("2DFMD.dll") != nullptr) {
+                NeuterFullscreenTogglesForCncDdraw();
+            }
             // [DISABLED] t4-walk patch was a workaround that masked the
             // real bug — StudioS chars take script-driven damage on the
             // very first frame of battle (HW write bp on g_p1_hp caught
@@ -272,30 +387,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 PatchVsRoundCase200T4FalsePositive();
             }
 
-            // Create our own console
-            FreeConsole();
-            AllocConsole();
-            FILE* fDummy;
-            freopen_s(&fDummy, "CONOUT$", "w", stdout);
-            freopen_s(&fDummy, "CONOUT$", "w", stderr);
-            freopen_s(&fDummy, "CONIN$", "r", stdin);
-
-            // Read player index from environment
-            char* env_player = getenv("FM2K_PLAYER_INDEX");
-            if (env_player) {
-                g_player_index = atoi(env_player);
-            }
-
-            // Set console title
-            char title[64];
-            snprintf(title, sizeof(title), "FM2K P%d Console", g_player_index + 1);
-            SetConsoleTitleA(title);
-
-            // Initialize file logging (writes to FM2K_P1_Debug.log or FM2K_P2_Debug.log)
-            InitFileLogging();
-
-            SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
+            // (Console + file logging are set up at the top of DLL_PROCESS_ATTACH
+            // so locale-spoof and patch logs land in the file too.)
 
             // Initialize shared memory for launcher status reporting
             if (!InitializeSharedMemory()) {
@@ -398,6 +491,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         // Restore default timer resolution
         timeEndPeriod(1);
+
+        // Locale spoof teardown (idempotent if not installed).
+        UninstallLocaleSpoof();
 
         // Shutdown in reverse order
         ShutdownHooks();

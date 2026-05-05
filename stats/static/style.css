@@ -1,0 +1,111 @@
+/* FM2K Stats — minimal, opinionated. Dark theme to match the launcher's
+   default look. No JS, no external font, no third-party CSS. */
+
+:root {
+  --bg:        #14171c;
+  --bg-elev:   #1c2128;
+  --border:    #30363d;
+  --text:      #e6edf3;
+  --text-dim:  #8b949e;
+  --accent:    #58a6ff;
+  --win:       #4ade80;
+  --loss:      #f87171;
+  --draw:      #c4b5fd;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+               "MS Gothic", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+header {
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  padding: 0.75rem 1.25rem;
+}
+nav { display: flex; gap: 1.25rem; align-items: baseline; }
+nav .brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text);
+  text-decoration: none;
+}
+nav a { color: var(--accent); text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+
+main {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+footer {
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  text-align: center;
+  padding: 1rem;
+  margin-top: 3rem;
+}
+
+a { color: var(--accent); }
+
+.hero {
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.hero h1 { margin: 0 0 0.25rem 0; font-size: 1.75rem; }
+.hero .lede { color: var(--text-dim); margin: 0; }
+.hero .totals {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+.hero .totals li { color: var(--text-dim); }
+.hero .totals strong { color: var(--text); font-size: 1.25rem; }
+
+section { margin: 2rem 0; }
+section h2 {
+  font-size: 1.1rem;
+  margin: 0 0 0.75rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.empty { color: var(--text-dim); font-style: italic; }
+
+table.grid {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+table.grid th, table.grid td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+table.grid th {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+table.grid tbody tr:last-child td { border-bottom: 0; }
+table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+tr.r-win  td:last-child { color: var(--win);  font-weight: 600; }
+tr.r-loss td:last-child { color: var(--loss); font-weight: 600; }
+tr.r-draw td:last-child { color: var(--draw); font-weight: 600; }
