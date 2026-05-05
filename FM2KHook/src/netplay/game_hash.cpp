@@ -101,6 +101,37 @@ uint32_t Compute() {
     if (s_computed) return s_cached_hash;
     s_computed = true;
 
+    // TEMP: hash check disabled while we debug the v0.2.1/v0.2.2
+    // canon corruption that produced spurious mismatches between
+    // peers with byte-identical .player + .kgt + .exe content (e.g.
+    // user vs Vikaar with same pkmncc.kgt content_hash but different
+    // overall hash). Returning 0 hits the "peer is older / can't
+    // enumerate" backwards-compat branch in netplay.cpp:229
+    // (`local_hash != 0 && peer_hash != 0 && ...`), so the mismatch
+    // check never fires regardless of what the peer reports. We
+    // still build s_describe + s_manifest_entries so the popup +
+    // boot log keep working for offline diagnostic purposes.
+    //
+    // Re-enable for local testing by setting FM2K_HASH_CHECK=1
+    // (any non-zero value); the env var only affects the local
+    // hash output, not the peer side, so two peers can collaborate
+    // on testing by both flipping it on. Once the canon-build
+    // corruption is fixed the env-var gate goes away.
+    const char* env_enable = std::getenv("FM2K_HASH_CHECK");
+    const bool hash_enabled = env_enable && env_enable[0] != '\0' &&
+                              env_enable[0] != '0';
+    if (!hash_enabled) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "GameHash: check DISABLED (set FM2K_HASH_CHECK=1 to "
+            "re-enable). Returning 0; peer mismatch check will skip.");
+        s_cached_hash = 0;
+        // Still populate s_describe so the launcher status line and
+        // Hub HELLO log have something readable.
+        std::snprintf(s_describe, sizeof(s_describe),
+                      "(hash check disabled)");
+        return 0;
+    }
+
     auto dir = GameDir();
     if (dir.empty()) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
