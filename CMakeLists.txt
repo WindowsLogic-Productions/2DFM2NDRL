@@ -282,6 +282,7 @@ add_executable(FM2K_RollbackLauncher
     FM2K_LauncherUI.cpp
     FM2K_HubClient.cpp
     FM2K_DiscordAuth.cpp
+    FM2K_Locale.cpp
     FM2K_Updater.cpp
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
