@@ -106,4 +106,23 @@ extern char g_remote_addr[64];
 // GekkoNet active to drive save/load/advance events) but skips socket setup.
 extern bool g_stress_mode;
 
+// Spectator mode: this instance is a passive viewer, not a player. Skips
+// the HELLO/HELLO_ACK netplay handshake and instead sends SPEC_JOIN_REQ to
+// the configured remote (the host) at startup. The trampoline pins the
+// phase to SPECTATOR_PLAYBACK regardless of game_mode so the local FM2K's
+// CSS doesn't run native lockstep code while waiting for upstream.
+// Set via FM2K_SPECTATOR_MODE=1 env var.
+extern bool g_spectator_mode;
+
+// ============================================================================
+// LOG-FILE PATH HELPER
+// ============================================================================
+// All hook-side diagnostic / debug log files (FM2K_P*_Debug.log, EB diag,
+// rng trace, parity recorder, replay diff log, etc.) go through here so they
+// land in `<game_dir>/logs/<filename>` instead of cluttering the game folder.
+// `out` must be at least MAX_PATH bytes. Creates the logs directory lazily
+// on first call. Returns true on success; on failure leaves `out` unchanged
+// (callers can fall back to writing in cwd).
+bool Fm2k_BuildLogPath(char* out, size_t out_size, const char* filename);
+
 #endif // GLOBALS_H

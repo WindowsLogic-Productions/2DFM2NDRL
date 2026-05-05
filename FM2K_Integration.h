@@ -538,6 +538,16 @@ private:
     // Multi-client testing instances
     std::unique_ptr<FM2KGameInstance> client1_instance_;
     std::unique_ptr<FM2KGameInstance> client2_instance_;
+    // Local spectator instance — subscribes to client1 (host) on its
+    // multiplexed UDP port and replays the input stream. Used by the
+    // launcher's "Launch Spectator" button so we can validate the
+    // spectator pipeline against a live local dual-client session.
+    std::unique_ptr<FM2KGameInstance> spectator_instance_;
+    // Second local spectator that subscribes to spectator_instance_ rather
+    // than the host — exercises the daisy-chain relay (host → spec1 → spec2).
+    // Validates that a relay node correctly forwards confirmed-input frames
+    // it received from upstream to its own subscribers.
+    std::unique_ptr<FM2KGameInstance> spectator2_instance_;
     FM2K::FM2KGameInfo selected_game_;
     NetworkConfig network_config_;
     LauncherState current_state_;
@@ -552,6 +562,26 @@ private:
     
     // Multi-client testing helpers
     bool LaunchLocalClient(const std::string& game_path, bool is_host, int port);
+    // Launch a local spectator pointing at the host (client1) on host_port.
+    // Spectator-mode hook will SPEC_JOIN_REQ the host and start replaying
+    // the streamed input history (CSS + battle).
+    bool LaunchLocalSpectator(const std::string& game_path,
+                              int spectator_port,
+                              int host_port);
+    // Daisy-chain test: launches a second spectator that subscribes to the
+    // first spectator instead of the host. Verifies relay-node forwarding.
+    bool LaunchLocalSpectator2(const std::string& game_path,
+                               int spectator_port,
+                               int upstream_port);
+    // Launch a spectator pointing at an arbitrary remote host (typically
+    // received via hub spectate_grant). Used by the lobby UI's "click an
+    // active match to watch it" path. spectator_port is local UDP bind;
+    // host_ip:host_port is where the spectator's FM2K_REMOTE_ADDR points
+    // and the SpectatorNode JOIN_REQ is sent.
+    bool LaunchRemoteSpectator(const std::string& game_path,
+                               int spectator_port,
+                               const std::string& host_ip,
+                               int host_port);
     bool TerminateAllClients();
     
     
@@ -599,6 +629,10 @@ public:
     std::function<void()> on_offline_session_start;
     std::function<void(const NetworkConfig&)> on_online_session_start;
     std::function<void()> on_stress_session_start;  // Single-instance GekkoStressSession determinism test
+    // Click-to-spectate. host_ip:host_port comes from the hub's
+    // spectate_grant. Launcher should boot a local FM2K spectator instance
+    // pointing at that addr (LaunchRemoteSpectator).
+    std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     std::function<void(const std::string&)> on_games_folder_set;
@@ -694,6 +728,8 @@ public:
     // Multi-client process management  
     std::function<bool(const std::string&)> on_launch_local_client1;     // Launch first client as host
     std::function<bool(const std::string&)> on_launch_local_client2;     // Launch second client as guest
+    std::function<bool(const std::string&)> on_launch_local_spectator;   // Launch spectator subscribing to client1
+    std::function<bool(const std::string&)> on_launch_local_spectator2;  // Launch second spectator subscribing to first (daisy-chain test)
     std::function<bool()> on_terminate_all_clients;                      // Kill all launched clients
     std::function<bool(uint32_t&, uint32_t&)> on_get_client_status;      // Get client process IDs (client1_pid, client2_pid)
     
@@ -748,6 +784,70 @@ private:
     void RenderConsoleLog();
     void RenderObjectAnalysis();        // Stub
     void RenderSlotInspectionWindow();  // Stub
+    void RenderHubPanel();              // Fightcade-style lobby
+    void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
+    void RenderHubServerWindow();       // Settings → Hub Server… host editor
+    void RenderDiscordAuthWindow();     // Settings → Sign in with Discord…
+    void LoadAudioMuteState();          // Read %APPDATA%\FM2K_Rollback\audio.ini
+    void SaveAudioMuteState();          // Write same file (hook re-reads it)
+
+    // Developer mode toggle. End-user UI hides the offline-bisect
+    // checkboxes, dual-client launcher, stress test, and spectator
+    // chain test. Enabled via FM2K_DEV_MODE=1 env var on launch or
+    // via View → Developer Mode in the menu bar.
+    bool developer_mode_ = false;
+
+    // Settings windows toggled from the menu bar. input_binder_initialized_
+    // gates Init() to a single call (gamepad subsystem startup) the first
+    // time the user opens either binder window.
+    bool show_input_binder_p1_ = false;
+    bool show_input_binder_p2_ = false;
+    bool show_host_config_     = false;
+    bool show_hub_server_      = false;     // Settings → Hub Server… window
+    bool show_discord_auth_    = false;     // Settings → Sign in with Discord… window
+    bool input_binder_initialized_ = false;
+
+    // Audio mute toggles (Settings menu). Persisted to
+    // %APPDATA%\FM2K_Rollback\audio.ini; the hook DLL re-reads that file
+    // ~once per second from inside the dispatcher so changes propagate
+    // mid-game without IPC. Booted from the file on first menu render.
+    bool mute_bgm_ = false;
+    bool mute_se_  = false;
+    bool mute_state_loaded_ = false;
+
+    // Host-config staged values (committed on Apply → fm2k_host.ini + env var).
+    int      host_config_socd_mode_ = 1;          // tournament default
+    uint32_t host_config_stage_     = 0xFFFFFFFFu;// 0xFFFFFFFF = unset
+    bool     host_config_dirty_     = false;
+
+    // Hub server hostname / IP. Edited from Settings → Hub Server…
+    // (used to live in the Hub panel; moved out so casual users don't
+    // see it by default). Persisted via FM2K_HUB_HOST env var on
+    // connect. Empty = use FM2K_HUB_HOST env var or 2dfm.sytes.net.
+    char     hub_host_[128] = {};
+    bool     hub_host_initialized_ = false;
+
+    // Discord OAuth status, surfaced in the menu bar's sign-in pill.
+    // Refreshed on startup, on sign-in completion, and on sign-out;
+    // never read every frame so we don't hammer the .json file.
+    bool     discord_signed_in_  = false;
+    std::string discord_nick_;
+    bool     discord_state_loaded_ = false;
+
+    // Hub client + per-frame drained state. Owned by the launcher
+    // (forward-declared in LauncherUI scope to avoid pulling
+    // FM2K_HubClient.h into the header). Defined out-of-line in
+    // FM2K_LauncherUI.cpp.
+    struct HubState;
+    std::unique_ptr<HubState> hub_state_;
+
+public:
+    // Tell the hub the current match (if any) has ended. Called by
+    // FM2KLauncher::StopSession on both the user-initiated stop and
+    // the game-process-died path. No-op when not in a hub-driven
+    // session (the hub will silently treat the match_ended for an
+    // already-idle user as a noop).
+    void NotifyHubMatchEnded();
 
     // Helper methods
     void ShowGameValidationStatus(const FM2K::FM2KGameInfo& game);

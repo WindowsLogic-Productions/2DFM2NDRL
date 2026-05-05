@@ -28,6 +28,9 @@ bool NetSocket_IsInitialized();
 // Get the raw socket handle (for debugging)
 SOCKET NetSocket_GetHandle();
 
+// Get the bound local UDP port (host byte order). Returns 0 if not initialized.
+uint16_t NetSocket_GetLocalPort();
+
 // Get remote address info (for GekkoNet adapter)
 const sockaddr_in* NetSocket_GetRemoteAddr();
 
@@ -40,8 +43,27 @@ const sockaddr_in* NetSocket_GetRemoteAddr();
 // Updates CSS state, handles connection keepalive
 void ControlChannel_Poll();
 
+// Borrow the underlying UDP SOCKET for nat_traversal/STUN. Returns
+// INVALID_SOCKET if the channel hasn't been initialized. Caller must
+// not closesocket() — the socket is owned by control_channel.
+SOCKET ControlChannel_GetSocket();
+
+// Latch a verified peer address into the slot used by ControlChannel_Send.
+// Called from nat_traversal when the first authenticated CTRL_PUNCH packet
+// lands — the existing 0xCC HELLO/HELLO_ACK loop then sends to the right
+// place. Idempotent; subsequent calls overwrite (which is fine, the peer
+// addr should only update on legitimate authentication).
+void ControlChannel_LatchPeerAddr(const sockaddr_in& peer);
+
 // Send a control packet to remote peer
 void ControlChannel_Send(const CtrlPacket& packet);
+
+// Send a control packet to a specific address, bypassing the latched
+// remote-peer slot. Required for spectator-tree replies (SPEC_JOIN_ACK,
+// SPEC_JOIN_REDIRECT) where the destination is a subscriber that isn't
+// the gameplay opposite-peer; using ControlChannel_Send for those would
+// route the ACK to the wrong client and put it in an unintended state.
+void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest);
 
 // Check if control channel is connected (received HELLO_ACK)
 bool ControlChannel_IsConnected();
@@ -51,6 +73,14 @@ uint32_t ControlChannel_GetLastRecvMs();
 
 // Get round-trip time estimate (ping)
 uint32_t ControlChannel_GetRttMs();
+
+// Worst RTT observed since last ResetWorstRttMs() call. Used by
+// Netplay_StartBattleSession to compute CCCaster-style local delay
+// (delay covers the worst spike, not just the mean) at session
+// creation time.
+uint32_t ControlChannel_GetWorstRttMs();
+uint32_t ControlChannel_GetRttSampleCount();
+void     ControlChannel_ResetWorstRttMs();
 
 // =============================================================================
 // CONTROL CHANNEL - CONVENIENCE FUNCTIONS
@@ -65,8 +95,10 @@ void ControlChannel_SendHelloAck(uint8_t player_id);
 // Send PING for keepalive
 void ControlChannel_SendPing();
 
-// Send CSS raw input with frame number for lockstep
-void ControlChannel_SendCSSInput(uint16_t input, uint32_t frame);
+// CSS raw inputs were sent via the control channel as a custom CCCaster-style
+// ring buffer. They now ride a dedicated GekkoNet CSS session (prediction=0
+// lockstep). The CtrlMsg::CSS_INPUT enum and the css_input payload struct are
+// kept as deprecated stubs for backward-compat with peers running older code.
 
 // Send CSS cursor position update [deprecated - use CSS input instead]
 void ControlChannel_SendCursor(uint8_t x, uint8_t y);
@@ -83,26 +115,48 @@ void ControlChannel_SendCharUnlock();
 // Send CSS start signal (both players synced, start counting frames NOW)
 void ControlChannel_SendCSSStart();
 
-// Send battle ready signal (for CSS sync). Carries the sender's proposed
-// local input delay so both peers can agree on max() before starting the
-// GekkoNet session — otherwise mismatched RTT samples produce asymmetric
-// per-peer local delay and one side feels more input lag than the other.
-void ControlChannel_SendBattleReady(uint8_t proposed_local_delay);
+// Send battle ready signal (for CSS sync). GekkoNet supports per-player local
+// input delay natively — each peer sets its own value via gekko_set_local_delay,
+// so no cross-peer negotiation is needed here. This packet is just a CSS-sync
+// signal with no payload.
+void ControlChannel_SendBattleReady();
 
 // Send battle acknowledgment
 void ControlChannel_SendBattleAck();
 
-// Send battle entering signal (game_mode changed to battle)
-void ControlChannel_SendBattleEntering();
+// Send battle entering signal (game_mode changed to battle).
+// swap_frame carries the proposed CSS-session frame at which to swap CSS
+// session for battle session. Both peers compute swap_frame = local_css_frame
+// + SWAP_FRAME_BUFFER and exchange; receiver takes max(local, remote).
+void ControlChannel_SendBattleEntering(uint32_t swap_frame);
 
 // Send battle start (both sides ready)
 void ControlChannel_SendBattleStart(uint32_t start_frame);
 
-// Send battle end
-void ControlChannel_SendBattleEnd();
+// Send battle end (game_mode left the [3000,4000) range).
+// swap_frame carries the proposed battle-session frame at which to destroy
+// the battle session and create a CSS session for the next match. Same
+// max(local, remote) convergence as BATTLE_ENTERING.
+void ControlChannel_SendBattleEnd(uint32_t swap_frame);
+
+// Host pushes its current match settings (selected stage, round count, time
+// limit, game speed, SOCD mode) to client + spectators. Receiver mem-writes
+// the address-mapped fields and adopts SOCD mode locally. Use 0xFFFFFFFF /
+// 0 / 0xFF for "leave at default; don't write" on per-field basis.
+void ControlChannel_SendHostConfig(uint32_t selected_stage,
+                                   uint32_t round_count,
+                                   uint32_t round_time_sec,
+                                   uint32_t game_speed_pct,
+                                   uint8_t  socd_mode);
 
 // Send clean disconnect
 void ControlChannel_SendDisconnect();
+
+// Send a short chat message to the remote peer (truncated to 23 chars + NUL).
+// Peer-to-peer, low-latency — intended for in-match quick chat only.
+// Full chat (history, lobby-scoped) goes over the lobby TCP channel when
+// the matchmaking server lands.
+void ControlChannel_SendChat(const char* text);
 
 // =============================================================================
 // GEKKONET CUSTOM ADAPTER
@@ -121,8 +175,11 @@ void DestroyMultiplexAdapter();
 // CALLBACKS - Set by netplay.cpp to handle received control messages
 // =============================================================================
 
-// Callback function type for control messages
-typedef void (*ControlMsgCallback)(const CtrlPacket* packet);
+// Callback function type for control messages. Source address is included so
+// spectator-tree join paths (SPEC_JOIN_REQ from unknown peers, SPEC_JOIN_ACK
+// from upstream) can identify the peer without relying on the latched
+// remote_sockaddr used for gameplay.
+typedef void (*ControlMsgCallback)(const CtrlPacket* packet, const sockaddr_in& from);
 
 // Set callback for when control messages are received
 void ControlChannel_SetCallback(ControlMsgCallback callback);

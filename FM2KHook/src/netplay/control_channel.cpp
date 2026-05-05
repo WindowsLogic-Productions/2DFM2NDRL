@@ -2,6 +2,9 @@
 #include "control_channel.h"
 #include "globals.h"
 #include "gekkonet.h"
+#include "spectator_node.h"
+#include "spectator_tcp.h"
+#include "nat_traversal.h"
 #include <SDL3/SDL_log.h>
 #include <vector>
 #include <cstring>
@@ -27,6 +30,13 @@ static uint32_t g_last_recv_time = 0;
 static uint32_t g_last_ping_time = 0;
 static uint32_t g_rtt_ms = 0;
 static uint32_t g_ping_send_time = 0;
+
+// Worst-RTT accumulator (CCCaster-style). Tracks the maximum RTT observed
+// over a rolling window so Netplay_StartBattleSession can pick a delay
+// that covers the spike, not just the mean. Reset by ResetWorstRttMs()
+// at the start of each session-config measurement window.
+static uint32_t g_rtt_worst_ms = 0;
+static uint32_t g_rtt_sample_count = 0;
 
 // Player ID (set from globals)
 static uint8_t g_local_player_id = 0;
@@ -86,13 +96,28 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
         return false;
     }
 
+    // SO_REUSEADDR — allows rebinding to a port still in TIME_WAIT
+    // from a previous run. Without this, restarting the launcher
+    // within ~30s of a previous session hits WSAEADDRINUSE (10048).
+    BOOL reuse = TRUE;
+    setsockopt(g_socket, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
     // Bind to local port
     g_local_sockaddr.sin_family = AF_INET;
     g_local_sockaddr.sin_addr.s_addr = INADDR_ANY;
     g_local_sockaddr.sin_port = htons(local_port);
 
     if (bind(g_socket, (sockaddr*)&g_local_sockaddr, sizeof(g_local_sockaddr)) == SOCKET_ERROR) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: bind() failed: %d", WSAGetLastError());
+        int err = WSAGetLastError();
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "NetSocket: bind() failed on port %d (err=%d). %s",
+            (int)local_port, err,
+            err == WSAEADDRINUSE
+                ? "Port already in use — another launcher instance is on this port. "
+                  "If running two launchers on the same machine, configure each "
+                  "with a different FM2K_LOCAL_PORT (e.g. 7000 and 7001)."
+                : "");
         closesocket(g_socket);
         g_socket = INVALID_SOCKET;
         WSACleanup();
@@ -166,6 +191,11 @@ SOCKET NetSocket_GetHandle() {
     return g_socket;
 }
 
+uint16_t NetSocket_GetLocalPort() {
+    if (!g_socket_initialized) return 0;
+    return ntohs(g_local_sockaddr.sin_port);
+}
+
 const sockaddr_in* NetSocket_GetRemoteAddr() {
     return &g_remote_sockaddr;
 }
@@ -176,6 +206,37 @@ const sockaddr_in* NetSocket_GetRemoteAddr() {
 
 static void RawSend(const void* data, size_t len) {
     if (g_socket == INVALID_SOCKET) return;
+
+    // Relay mode: wrap every gameplay byte in a 0xCF envelope and ship
+    // to the hub-supplied relay endpoint. The relay forwards by
+    // session_id to the other peer, who unwraps in their own
+    // RawReceive. Direct g_remote_sockaddr is bypassed entirely.
+    if (::fm2k::nat::IsRelayMode()) {
+        const sockaddr_in* relay = ::fm2k::nat::GetRelayAddr();
+        if (!relay) return;
+        // 18-byte header (0xCF 0x01 + 16-byte session_id) + payload.
+        // Most FM2K control / GekkoNet packets are well under 1500B so
+        // a 2KB stack buffer is plenty.
+        uint8_t wrapped[2048];
+        size_t wrapped_len = ::fm2k::nat::WrapForRelay(
+            reinterpret_cast<const uint8_t*>(data), len,
+            wrapped, sizeof(wrapped));
+        if (wrapped_len == 0) return;  // payload too large
+        int result = sendto(g_socket,
+                            reinterpret_cast<const char*>(wrapped),
+                            (int)wrapped_len, 0,
+                            reinterpret_cast<const sockaddr*>(relay),
+                            sizeof(*relay));
+        if (result == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "NetSocket: relay sendto failed: %d", err);
+            }
+        }
+        return;
+    }
+
     if (g_remote_sockaddr.sin_port == 0) return;  // peer address not known yet (host waiting for client)
 
     int result = sendto(g_socket, (const char*)data, (int)len, 0,
@@ -213,13 +274,36 @@ static void RawReceive() {
 
         g_last_recv_time = GetTimeMs();
 
+        // Relay-envelope unwrap. If this is a 0xCF packet for our
+        // configured relay session, strip the 18-byte header and treat
+        // the inner bytes as if they arrived directly from the peer.
+        // Skip peer-address learning for the inner packet — the actual
+        // sockaddr is the relay, which we don't want latched as peer.
+        bool from_relay = false;
+        const uint8_t* eff_data = reinterpret_cast<const uint8_t*>(g_recv_buffer);
+        size_t eff_len = static_cast<size_t>(recv_len);
+        const uint8_t* inner = nullptr;
+        size_t inner_len = 0;
+        if (recv_len >= 1 && static_cast<uint8_t>(g_recv_buffer[0]) == 0xCF) {
+            if (::fm2k::nat::UnwrapFromRelay(eff_data, eff_len, &inner, &inner_len)) {
+                eff_data = inner;
+                eff_len  = inner_len;
+                from_relay = true;
+            } else {
+                continue;  // bad envelope or wrong session — drop
+            }
+        }
+        const uint8_t first = eff_len ? eff_data[0] : 0;
+
         // Check if this is a control packet (magic byte 0xCC)
-        if (recv_len >= 1 && static_cast<uint8_t>(g_recv_buffer[0]) == CTRL_MAGIC) {
-            // Learn the peer's actual source address from the first authenticated
-            // packet. The host's configured remote is only a best-guess default
-            // (e.g. "127.0.0.1:7001"); the client may be bound on any port.
-            // Updating here makes HELLO_ACK / subsequent traffic reach the real peer.
-            if (!g_connected &&
+        if (eff_len >= 1 && first == CTRL_MAGIC) {
+            // Peer-address learning. Skip when the packet came in via
+            // the relay envelope — the actual sockaddr is the relay,
+            // and latching the relay as g_remote_sockaddr would later
+            // cause RawSend (in non-relay mode) to send to the relay
+            // instead of the peer. In relay mode we don't need a
+            // peer addr at all (RawSend's relay branch ignores it).
+            if (!from_relay && !g_connected &&
                 (g_remote_sockaddr.sin_addr.s_addr != from_addr.sin_addr.s_addr ||
                  g_remote_sockaddr.sin_port != from_addr.sin_port)) {
                 char ip_buf[INET_ADDRSTRLEN] = {};
@@ -232,8 +316,8 @@ static void RawReceive() {
             }
 
             // Control packet - process immediately
-            if (recv_len >= sizeof(CtrlPacketHeader)) {
-                const CtrlPacket* packet = reinterpret_cast<const CtrlPacket*>(g_recv_buffer);
+            if (eff_len >= sizeof(CtrlPacketHeader)) {
+                const CtrlPacket* packet = reinterpret_cast<const CtrlPacket*>(eff_data);
 
                 // Update ack
                 if (packet->header.seq > g_recv_seq) {
@@ -255,12 +339,19 @@ static void RawReceive() {
 
                 // Forward all messages to callback (including PING/PONG for logging)
                 if (g_msg_callback) {
-                    g_msg_callback(packet);
+                    g_msg_callback(packet, from_addr);
                 }
             }
+        } else if (eff_len >= 1 && first == 0xCD) {
+            // NAT-layer datagram (0xCD) — STUN ack or peer punch probe.
+            // Defined in nat_traversal.h. Returning here keeps the byte
+            // out of GekkoNet's queue and the spectator path.
+            ::fm2k::nat::HandleDatagram(eff_data, eff_len, from_addr);
         } else {
             // GekkoNet packet - queue for adapter
-            std::vector<char> pkt_data(g_recv_buffer, g_recv_buffer + recv_len);
+            std::vector<char> pkt_data(
+                reinterpret_cast<const char*>(eff_data),
+                reinterpret_cast<const char*>(eff_data) + eff_len);
             g_gekko_packet_queue.push_back({std::move(pkt_data), from_addr});
         }
     }
@@ -270,11 +361,44 @@ static void RawReceive() {
 // CONTROL CHANNEL
 // =============================================================================
 
+SOCKET ControlChannel_GetSocket() {
+    return g_socket;
+}
+
+void ControlChannel_LatchPeerAddr(const sockaddr_in& peer) {
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+    if (g_remote_sockaddr.sin_addr.s_addr != peer.sin_addr.s_addr ||
+        g_remote_sockaddr.sin_port        != peer.sin_port) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "ControlChannel: peer addr latched -> %s:%u (was %u)",
+            ip, (unsigned)ntohs(peer.sin_port),
+            (unsigned)ntohs(g_remote_sockaddr.sin_port));
+    }
+    g_remote_sockaddr = peer;
+}
+
 void ControlChannel_Poll() {
     if (!g_socket_initialized) return;
 
     // Receive all pending packets
     RawReceive();
+
+    // TCP path for the spectator INPUT_BATCH stream. Host-side: drain
+    // the listener accept queue + read-discard from connected subs.
+    // Spectator-side: drive the upstream connect to completion + drain
+    // inbound bytes through the SpecDataHeader parser. Each call is
+    // non-blocking and cheap when nothing is pending; safe to run on
+    // both host and spectator processes (no-op when not applicable).
+    SpectatorTCP::PollAccepts();
+    SpectatorTCP::PollIncoming();
+    SpectatorTCP::PollUpstream();
+
+    // Pair freshly-accepted TCP clients to known subscriber slots and ship
+    // deferred INITIAL_MATCH/backfill. Runs on host (which doesn't go
+    // through SpectatorNode_TickHealth's spectator path); idempotent and
+    // cheap when there are no subscribers.
+    SpectatorNode_TickHostMaintenance();
 
     // Check for timeout
     uint32_t now = GetTimeMs();
@@ -303,6 +427,21 @@ void ControlChannel_Send(const CtrlPacket& packet) {
     RawSend(&pkt, sizeof(pkt));
 }
 
+void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest) {
+    if (!g_socket_initialized) return;
+    if (g_socket == INVALID_SOCKET) return;
+    if (dest.sin_port == 0) return;
+
+    CtrlPacket pkt = packet;
+    pkt.header.magic     = CTRL_MAGIC;
+    pkt.header.seq       = ++g_send_seq;
+    pkt.header.ack       = g_recv_seq;
+    pkt.header.player_id = g_local_player_id;
+
+    sendto(g_socket, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
+           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+}
+
 bool ControlChannel_IsConnected() {
     return g_connected;
 }
@@ -313,6 +452,21 @@ uint32_t ControlChannel_GetLastRecvMs() {
 
 uint32_t ControlChannel_GetRttMs() {
     return g_rtt_ms;
+}
+
+uint32_t ControlChannel_GetWorstRttMs() {
+    return g_rtt_worst_ms;
+}
+
+uint32_t ControlChannel_GetRttSampleCount() {
+    return g_rtt_sample_count;
+}
+
+void ControlChannel_ResetWorstRttMs() {
+    g_rtt_worst_ms     = g_rtt_ms;  // seed with the most recent sample so
+                                    // we never report 0 if no PONGs land
+                                    // in the next window
+    g_rtt_sample_count = (g_rtt_ms > 0) ? 1 : 0;
 }
 
 void ControlChannel_SetCallback(ControlMsgCallback callback) {
@@ -352,14 +506,6 @@ void ControlChannel_SendPing() {
     pkt.data.sync.frame = GetTimeMs();  // Include send time for RTT calculation
     ControlChannel_Send(pkt);
     g_ping_send_time = GetTimeMs();
-}
-
-void ControlChannel_SendCSSInput(uint16_t input, uint32_t frame) {
-    CtrlPacket pkt = {};
-    pkt.header.type = CtrlMsg::CSS_INPUT;
-    pkt.data.css_input.input = input;
-    pkt.data.css_input.frame = frame;
-    ControlChannel_Send(pkt);
 }
 
 void ControlChannel_SendCursor(uint8_t x, uint8_t y) {
@@ -405,17 +551,25 @@ void ControlChannel_SendCSSStart() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent CSS_START");
 }
 
-void ControlChannel_SendBattleReady(uint8_t proposed_local_delay) {
+void ControlChannel_SendBattleReady() {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_READY;
-    // Reuse the sync.frame field as a generic u32 payload to carry our
-    // proposed local delay. Low byte = delay; other bytes reserved.
-    pkt.data.sync.frame = (uint32_t)proposed_local_delay;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_READY");
+}
+
+void ControlChannel_SendChat(const char* text) {
+    if (!text) return;
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::CHAT;
+    // Truncate to 23 chars + guaranteed NUL terminator.
+    std::strncpy(pkt.data.chat.text, text, sizeof(pkt.data.chat.text) - 1);
+    pkt.data.chat.text[sizeof(pkt.data.chat.text) - 1] = '\0';
     ControlChannel_Send(pkt);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "ControlChannel: Sent BATTLE_READY (proposed_local_delay=%u)",
-                (unsigned)proposed_local_delay);
+                "ControlChannel: Sent CHAT \"%s\"", pkt.data.chat.text);
 }
 
 void ControlChannel_SendBattleAck() {
@@ -426,12 +580,14 @@ void ControlChannel_SendBattleAck() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ACK");
 }
 
-void ControlChannel_SendBattleEntering() {
+void ControlChannel_SendBattleEntering(uint32_t swap_frame) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_ENTERING;
+    pkt.data.sync.frame = swap_frame;
     ControlChannel_Send(pkt);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ENTERING");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent BATTLE_ENTERING (swap_frame=%u)", swap_frame);
 }
 
 void ControlChannel_SendBattleStart(uint32_t start_frame) {
@@ -444,12 +600,35 @@ void ControlChannel_SendBattleStart(uint32_t start_frame) {
                 start_frame);
 }
 
-void ControlChannel_SendBattleEnd() {
+void ControlChannel_SendBattleEnd(uint32_t swap_frame) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_END;
+    pkt.data.sync.frame = swap_frame;
     ControlChannel_Send(pkt);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_END");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent BATTLE_END (swap_frame=%u)", swap_frame);
+}
+
+void ControlChannel_SendHostConfig(uint32_t selected_stage,
+                                   uint32_t round_count,
+                                   uint32_t round_time_sec,
+                                   uint32_t game_speed_pct,
+                                   uint8_t  socd_mode)
+{
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::HOST_CONFIG;
+    pkt.data.host_config.selected_stage  = selected_stage;
+    pkt.data.host_config.round_count     = round_count;
+    pkt.data.host_config.round_time_sec  = round_time_sec;
+    pkt.data.host_config.game_speed_pct  = game_speed_pct;
+    pkt.data.host_config.socd_mode       = socd_mode;
+    ControlChannel_Send(pkt);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: Sent HOST_CONFIG (stage=%u rounds=%u time=%u speed=%u socd=%u)",
+                selected_stage, round_count, round_time_sec, game_speed_pct,
+                (unsigned)socd_mode);
 }
 
 void ControlChannel_SendDisconnect() {
@@ -466,13 +645,66 @@ void ControlChannel_SendDisconnect() {
 // Shares socket with control channel, filters control packets
 // =============================================================================
 
-// Adapter send function - sends directly via our socket
+// Adapter send function - sends directly via our socket.
+//
+// Pre-spectator era this ignored `addr` and sent to the single peer via
+// RawSend → g_remote_sockaddr. With spectator support GekkoNet now
+// addresses multiple destinations (player + spectators), so we honor the
+// supplied address. Format on the wire is "ip:port" (matches what
+// MultiplexAdapter_Receive constructs from inbound sockaddr_in via
+// inet_ntoa+ntohs). Falls back to RawSend(g_remote_sockaddr) when the
+// addr string can't be parsed (defensive).
 static void MultiplexAdapter_Send(GekkoNetAddress* addr, const char* data, int length) {
     if (g_socket == INVALID_SOCKET) return;
+    if (!addr || !addr->data || addr->size <= 0) {
+        RawSend(data, length);
+        return;
+    }
 
-    // GekkoNet packets go directly (no prefix needed)
-    // The address is ignored - we always send to g_remote_addr
-    RawSend(data, length);
+    // Parse "ip:port" — addr->data may not be null-terminated, copy out.
+    char addr_buf[64] = {};
+    int n = (addr->size < (int)sizeof(addr_buf) - 1) ? addr->size : (int)sizeof(addr_buf) - 1;
+    std::memcpy(addr_buf, addr->data, n);
+    char* colon = std::strrchr(addr_buf, ':');
+    if (!colon) {
+        RawSend(data, length);
+        return;
+    }
+    *colon = '\0';
+    const char* ip_str = addr_buf;
+    const int   port   = std::atoi(colon + 1);
+    if (port <= 0 || port > 65535) {
+        RawSend(data, length);
+        return;
+    }
+
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, ip_str, &dst.sin_addr) != 1) {
+        RawSend(data, length);
+        return;
+    }
+
+    // In relay mode all gameplay traffic must still go through the relay
+    // wrapper. RawSend handles that path internally; we keep the explicit
+    // peer address only for direct (non-relay) sends. TODO: spectators
+    // through a relay are a separate problem (the relay only knows about
+    // one session_id pair); for now spectators go direct only.
+    if (::fm2k::nat::IsRelayMode()) {
+        RawSend(data, length);
+        return;
+    }
+
+    int result = sendto(g_socket, data, length, 0,
+                        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+    if (result == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "MultiplexAdapter: sendto(%s:%d) failed: %d", ip_str, port, err);
+        }
+    }
 }
 
 // Adapter receive function - returns queued GekkoNet packets
@@ -537,6 +769,8 @@ void DestroyMultiplexAdapter() {
 // Handle incoming PONG to calculate RTT
 void ControlChannel_HandlePong(uint32_t sent_time) {
     g_rtt_ms = GetTimeMs() - sent_time;
+    if (g_rtt_ms > g_rtt_worst_ms) g_rtt_worst_ms = g_rtt_ms;
+    ++g_rtt_sample_count;
 }
 
 // Mark connection as established (called when HELLO_ACK received)

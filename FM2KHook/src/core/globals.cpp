@@ -20,3 +20,6 @@ char g_remote_addr[64] = "127.0.0.1:7001";
 
 // Stress-test mode (FM2K_STRESS_MODE=1): single-instance determinism test
 bool g_stress_mode = false;
+
+// Spectator mode (FM2K_SPECTATOR_MODE=1): passive viewer.
+bool g_spectator_mode = false;

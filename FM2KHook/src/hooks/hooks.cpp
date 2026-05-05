@@ -2,6 +2,9 @@
 // Sync barrier: block game until both clients connected (CCCaster-style)
 #include "hooks.h"
 #include "globals.h"
+
+#include <cstdlib>
+#include <cstring>
 #include "netplay.h"
 #include "control_channel.h"
 #include "imgui_overlay.h"
@@ -9,6 +12,8 @@
 #include "savestate.h"  // CHAR_SLOT_BASE, CHAR_SLOT_SIZE (corrected by Wave C audit)
 #include "../core/main_loop_trampoline.h"  // TrampolineMainLoop — owns the outer loop
 #include "../audio/sound_rollback.h"        // Mike Z desired/actual sound layer
+#include "../netplay/spectator_node.h"      // spectator playback queue accessors
+#include "../ui/input_binder.h"             // FM2KInputBinder::Sample_Win32 + Bindings
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -72,10 +77,52 @@ static timeGetTime_t original_timeGetTime = nullptr;
 uint32_t g_virtual_time_ms = 0;  // bumped by 10 per AdvanceEvent in netplay.cpp
 
 static DWORD WINAPI Hook_timeGetTime() {
-    if (Netplay_IsActive()) {
+    // Host: virtual clock during an active GekkoNet session so the per-peer
+    // simulation evolves on a deterministic 10 ms/frame schedule.
+    // Spectator: same — must return virtual clock once playback is driving
+    // the sim, otherwise game code that consumes timeGetTime (animations,
+    // particle pacing, etc.) sees wall-clock time and diverges from the
+    // host's recorded execution every single frame. RunSpectatorTick is
+    // responsible for bumping g_virtual_time_ms each successful advance.
+    if (Netplay_IsActive() || SpectatorNode_IsPlayingBack()) {
         return g_virtual_time_ms;
     }
     return original_timeGetTime ? original_timeGetTime() : 0;
+}
+
+// ============================================================================
+// CreateFile share-mode override
+// ============================================================================
+// FM2K opens character files (`.player`, etc.) with dwShareMode=0 — exclusive.
+// When two instances launch from the same folder, the second hits
+// ERROR_SHARING_VIOLATION ("Player Open error[…]"). Force-OR the shared-read
+// flags so multiple readers can coexist. Writes are still serialized by
+// the OS — we only widen sharing, never narrow it.
+//
+// Hooked at the kernel32 entry points; both A and W variants because old
+// VC runtimes route through CreateFileA but newer code paths may use W.
+using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
+                                       DWORD, DWORD, HANDLE);
+using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
+                                       DWORD, DWORD, HANDLE);
+static CreateFileA_t original_CreateFileA = nullptr;
+static CreateFileW_t original_CreateFileW = nullptr;
+
+static constexpr DWORD kRelaxedShareMode =
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share,
+                                      LPSECURITY_ATTRIBUTES sa, DWORD disp,
+                                      DWORD flags, HANDLE tmpl) {
+    return original_CreateFileA(name, access, share | kRelaxedShareMode,
+                                sa, disp, flags, tmpl);
+}
+
+static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share,
+                                      LPSECURITY_ATTRIBUTES sa, DWORD disp,
+                                      DWORD flags, HANDLE tmpl) {
+    return original_CreateFileW(name, access, share | kRelaxedShareMode,
+                                sa, disp, flags, tmpl);
 }
 
 // ============================================================================
@@ -106,12 +153,331 @@ extern "C" void Hook_CheckGameModeTransition_Public();
 static void CheckGameModeTransition();
 extern "C" void Hook_CheckGameModeTransition_Public() { CheckGameModeTransition(); }
 
+// =============================================================================
+// SOCD (Simultaneous Opposite Cardinal Direction) cleaner
+// =============================================================================
+//
+// Ported from CCCaster's filterSimulDirState() in
+// targets/DllControllerUtils.hpp. Applied to the 11-bit FM2K input before
+// returning from Hook_GetPlayerInput, AFTER the facing-direction swap so
+// modes operate on game-internal F/B/U/D semantics rather than raw stick.
+//
+// FM2K bits: LEFT=0x001 RIGHT=0x002 UP=0x004 DOWN=0x008.
+//
+// Modes (FM2K_SOCD_MODE env var, default = 1):
+//   0 — Default        L+R held → R wins  | U+D held → U wins
+//   1 — L/R Cancel     L+R held → neutral | U+D held → U wins   <-- DEFAULT (Hitbox-style)
+//   2 — U/D Cancel     L+R held → R wins  | U+D held → neutral
+//   3 — Both Cancel    L+R held → neutral | U+D held → neutral
+//   4 — Up Bias        L+R held → R wins  | U+D held → U wins   (= 0 today)
+//   5 — Hitbox+Up      L+R held → neutral | U+D held → U wins   (= 1 today)
+//
+// Modes 4/5 are kept for CCCaster compat; behavior currently matches 0/1
+// because FM2K already drops DOWN on U+D (no separate "down-wins" branch
+// to disambiguate). If we want a DOWN-priority crouch-bias mode later
+// it'd be a 7th value.
+static int g_socd_mode_runtime = -1;  // -1 = uninitialized; runtime override of env var.
+
+static int Hook_GetSOCDMode() {
+    if (g_socd_mode_runtime < 0) {
+        const char* env = std::getenv("FM2K_SOCD_MODE");
+        g_socd_mode_runtime = 1;  // tournament default
+        if (env && env[0] >= '0' && env[0] <= '5' && env[1] == '\0') {
+            g_socd_mode_runtime = env[0] - '0';
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SOCD: mode=%d (FM2K_SOCD_MODE override='%s')",
+            g_socd_mode_runtime, env ? env : "<unset>");
+    }
+    return g_socd_mode_runtime;
+}
+
+// Set the SOCD mode at runtime. Used by HOST_CONFIG receiver to adopt
+// host's mode, and by future settings UI. Mode must be 0..5; out-of-range
+// values are ignored.
+extern "C" void Hook_SetSOCDMode(int mode) {
+    if (mode < 0 || mode > 5) return;
+    if (g_socd_mode_runtime != mode) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SOCD: mode change %d -> %d", g_socd_mode_runtime, mode);
+        g_socd_mode_runtime = mode;
+    }
+}
+
+// Public accessor for the SOCD mode — needed by netplay.cpp's HOST_CONFIG
+// broadcaster which can't reach the static.
+extern "C" int Hook_GetSOCDModePublic() {
+    return Hook_GetSOCDMode();
+}
+
+static inline uint16_t Hook_ApplySOCD(uint16_t input) {
+    constexpr uint16_t LEFT  = 0x001;
+    constexpr uint16_t RIGHT = 0x002;
+    constexpr uint16_t UP    = 0x004;
+    constexpr uint16_t DOWN  = 0x008;
+    const int mode = Hook_GetSOCDMode();
+
+    if ((input & (LEFT | RIGHT)) == (LEFT | RIGHT)) {
+        if (mode & 1) {
+            input &= ~(LEFT | RIGHT);  // cancel both
+        } else {
+            input &= ~LEFT;            // R wins
+        }
+    }
+    if ((input & (UP | DOWN)) == (UP | DOWN)) {
+        if (mode & 2) {
+            input &= ~(UP | DOWN);     // cancel both
+        } else {
+            input &= ~DOWN;            // U wins
+        }
+    }
+    return input;
+}
+
+// Pending input pair captured by Hook_GetPlayerInput's capture_and_return,
+// at file scope so Hook_FlushPendingCapture can drain it from outside the
+// hook (specifically at CSS→battle transition, before the battle session
+// gates capture_and_return out). Without this drain the trailing CSS frame
+// — the one carrying the confirm input that flips game_mode 2000→3000 —
+// stays trapped in g_capture_p[] and the spectator never receives it.
+static uint16_t g_capture_p[2] = {0, 0};
+static uint32_t g_capture_recorded_idx = UINT32_MAX;
+
+// Flush the pending (p1, p2) capture to the spectator stream and clear
+// the pending state so the next capture starts from scratch. Idempotent:
+// safe to call when nothing is pending (no-op).
+extern "C" void Hook_FlushPendingCapture() {
+    if (g_capture_recorded_idx == UINT32_MAX) return;
+    SpectatorNode_OnFrameConfirmed(g_capture_p[0], g_capture_p[1]);
+    g_capture_p[0] = g_capture_p[1] = 0;
+    g_capture_recorded_idx = UINT32_MAX;
+}
+
+// Battle-transition diagnostic. Activates a frame-by-frame state-dump
+// window centered on every game_mode transition so we can compare what
+// games like StudioS Fighters / SFZ are doing differently from
+// WonderfulWorld at battle entry. The window is a few hundred frames so
+// we catch the bail-back-to-CSS pattern (typical: ~140 frames in
+// "battle" before reverting).
+static int  g_battle_diag_frames_remaining = 0;  // counts down per call
+static uint32_t g_battle_diag_frame_idx = 0;     // counter for log lines
+
+extern "C" void Hook_BattleDiag_TickIfActive() {
+    if (g_battle_diag_frames_remaining <= 0) return;
+
+    uint32_t mode  = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    uint32_t rng   = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    // g_input_buffer_index @ 0x447EE0
+    uint32_t buf_idx = *(uint32_t*)0x447EE0;
+    // g_last_frame_time @ 0x447DD4
+    uint32_t lft   = *(uint32_t*)0x447DD4;
+    // g_frame_time_ms @ 0x41E2F0
+    uint32_t fr_ms = *(uint32_t*)0x41E2F0;
+
+    // Char slot active flags (0xDF41 from each slot base) + state flags
+    // (0x7CA6) — battle init reads these to decide whether to stay in
+    // battle. Slots 0 and 1 are P1/P2.
+    constexpr uintptr_t SLOT_BASE = 0x4D1D90;
+    constexpr size_t    SLOT_SZ   = 57407;
+    uint8_t s0_active = *(uint8_t*)(SLOT_BASE + 0xDF41);
+    uint8_t s1_active = *(uint8_t*)(SLOT_BASE + SLOT_SZ + 0xDF41);
+    uint8_t s0_flags  = *(uint8_t*)(SLOT_BASE + 0x7CA6);
+    uint8_t s1_flags  = *(uint8_t*)(SLOT_BASE + SLOT_SZ + 0x7CA6);
+    // The two main_game_loop prologue writes — slot+0xDF75, slot+0xDF79
+    uint32_t s0_dF75 = *(uint32_t*)(SLOT_BASE + 0xDF75);
+    uint32_t s0_dF79 = *(uint32_t*)(SLOT_BASE + 0xDF79);
+
+    // Round timer + HPs (real addresses from IDA: g_p1_hp = 0x4DFC85,
+    // p2 = +0xDF40 stride. The ones at 0x47010C / 0x47030C are
+    // g_demo_mode_player_id, NOT player HP. Wrong addresses earlier
+    // showed hp=0/0 always which masked an important signal.)
+    uint32_t round_timer = *(uint32_t*)0x470060;
+    constexpr uintptr_t HP_BASE = 0x4DFC85;
+    constexpr uintptr_t HP_STRIDE = 57407;
+    uint32_t p1_hp = *(uint32_t*)(HP_BASE);
+    uint32_t p2_hp = *(uint32_t*)(HP_BASE + HP_STRIDE);
+
+    // vs_round_function state machine — these decide whether battle
+    // proceeds or bails back to CSS:
+    //   g_score_value @ 0x470050 — countdown timer; case 200 decrements
+    //     each frame, reaching -1 routes to case 300 (round end → CSS).
+    //     If battle init sets this to a small/negative value, battle
+    //     immediately bails. Almost certainly StudioS's bug signature.
+    //   round_state_field — *(g_object_data_ptr + 338) — the case
+    //     selector itself (1 → 100 → 110 → 200 → 300 etc).
+    //   g_round_end_flag @ 0x424718 — case 200 also bails to 300 if
+    //     this is set.
+    //   g_round_state @ 0x47004C — top-level round phase (0/1/2).
+    //   g_game_mode_flag @ 0x470058 — VS / Story / Team selector that
+    //     changes which init-path runs in case 1.
+    //   g_round_limit @ 0x470048 — number of rounds to play.
+    //   g_game_timer @ 0x470044 — match clock.
+    int32_t score_value     = *(int32_t*)0x470050;
+    uint32_t round_end_flag = *(uint32_t*)0x424718;
+    uint32_t round_state    = *(uint32_t*)0x47004C;
+    uint8_t  game_mode_flag = *(uint8_t*)0x470058;
+    uint32_t round_limit    = *(uint32_t*)0x470048;
+    uint32_t game_timer     = *(uint32_t*)0x470044;
+    // LABEL_201 in vs_round_function: bail to CSS when these hit round_limit
+    // in Story/Team mode. Both incremented by case 410/420/430/510/520/530.
+    // g_match_phase @ 0x4DFC6D (in P1 char slot), g_round_sub_state @ 0x4EDCAC
+    uint32_t match_phase    = *(uint32_t*)0x4DFC6D;
+    uint32_t round_sub      = *(uint32_t*)0x4EDCAC;
+    // g_round_timer_counter @ 0x424F00 — used by game_state_manager's
+    // CSS-confirm timer (counts to 100 then transitions to battle)
+    uint32_t round_tick_ctr = *(uint32_t*)0x424F00;
+    uint32_t obj0_state338  = 0;
+    int32_t  obj0_state342  = 0;  // case-110/112 countdown timer
+    void* obj_data_ptr = *(void**)0x4CFA00;
+    if (obj_data_ptr) {
+        obj0_state338 = *(uint32_t*)((uint8_t*)obj_data_ptr + 338);
+        obj0_state342 = *(int32_t*)((uint8_t*)obj_data_ptr + 342);
+    }
+    // lParam @ 0x430114 — case-100 Story-mode score = 100*lParam - 1
+    uint32_t lparam_save = *(uint32_t*)0x430114;
+    // Object pool active type-4 fighter count — case-200 Story-mode bails
+    // when this < 2. Replicate the EXACT walk from vs_round_function:
+    //   if (entry.type == 4 &&
+    //       entry[+4] == 0 &&
+    //       hp[char_slot[entry[+342]]] != 0) ++count;
+    // Pool: 0x4701E0, 1024 entries × 382 bytes. Per-entry +342 holds
+    // the char-slot index this object belongs to; HP at HP_BASE +
+    // slot_idx * 57407.
+    // Re-derived from the actual asm at 0x408E90:
+    //   pool base = 0x4701E0 (g_object_pool.payload)
+    //   eax starts at base + 0x156, iterates +0x17E (382) per entry.
+    //   cmp [eax-0x156], 4   → entry+0   = type     (uint32)
+    //   cmp [eax+4],     0   → entry+0x15A (=346) = alive_flag (uint32, 0=alive)
+    //   mov ebp, [eax]       → entry+0x156 (=342) = slot_idx (uint32)
+    //   * 57407, +g_p1_hp, hp != 0
+    int active_type4 = 0;
+    int total_type4 = 0;
+    {
+        const uint8_t* pool = (const uint8_t*)0x4701E0;
+        for (int i = 0; i < 1024; i++) {
+            const uint8_t* e = pool + i * 382;
+            uint32_t type = *(const uint32_t*)(e + 0);
+            if (type != 4) continue;
+            total_type4++;
+            uint32_t alive_flag = *(const uint32_t*)(e + 346);
+            if (alive_flag != 0) continue;
+            uint32_t slot_idx = *(const uint32_t*)(e + 342);
+            if (slot_idx >= 8) continue;
+            uint32_t slot_hp = *(const uint32_t*)(HP_BASE + slot_idx * HP_STRIDE);
+            if (slot_hp == 0) continue;
+            active_type4++;
+        }
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "[BD %4u] mode=%u rng=0x%08X "
+        "mp=%u rs=%u rtc=%u "         // LABEL_201 trigger: mp/rs hitting rlim
+        "rs338=%u score=%d t4=%d/%d "
+        "ref=%u gmf=%u rlim=%u gt=%u "
+        "hp=%u/%u",
+        g_battle_diag_frame_idx, mode, rng,
+        match_phase, round_sub, round_tick_ctr,
+        obj0_state338, score_value, active_type4, total_type4,
+        round_end_flag, game_mode_flag, round_limit, game_timer,
+        p1_hp, p2_hp);
+    (void)fr_ms; (void)s0_dF75; (void)s0_dF79;
+    (void)buf_idx; (void)lft; (void)round_timer;
+    (void)obj0_state342; (void)round_state; (void)lparam_save;
+    (void)s0_active; (void)s0_flags; (void)s1_active; (void)s1_flags;
+
+    g_battle_diag_frame_idx++;
+    g_battle_diag_frames_remaining--;
+}
+
 static void CheckGameModeTransition() {
     uint32_t current_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
 
     if (current_mode != g_last_game_mode) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "Hooks: game_mode changed: %u -> %u", g_last_game_mode, current_mode);
+
+        // Whenever the game crosses any CSS↔battle boundary, kick off a
+        // 300-frame (3 second @ 100 Hz) state dump so we can diff
+        // working games (WonderfulWorld) vs broken ones (SFZ, StudioS
+        // Fighters) at battle entry. Reset the per-window counter.
+        bool boundary =
+            (IsCSSMode(g_last_game_mode)    && IsBattleMode(current_mode)) ||
+            (IsBattleMode(g_last_game_mode) && IsCSSMode(current_mode));
+        if (boundary) {
+            g_battle_diag_frames_remaining = 300;
+            g_battle_diag_frame_idx = 0;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                ">>> BATTLE-DIAG window OPEN (300 frames) <<<");
+        }
+
+        // Spectator: never run player-state-machine code on transitions
+        // (no BATTLE_ENTERING, no GekkoNet session, etc.). But we DO need
+        // to mirror the deterministic RNG reseeds the host performs at
+        // both 2000→3000 (Netplay_StartBattle) and at every CSS-SYNC
+        // (Netplay_ProcessCSS). Without this mirroring the spectator's RNG
+        // diverges from the host the moment battle starts: spectator's
+        // RNG is whatever CSS evolved to, host's was just force-written
+        // back to 0x12345678. One frame is enough to desync.
+        if (g_spectator_mode) {
+            constexpr uint32_t HOST_FIXED_SEED = 0x12345678;
+            bool was_battle = IsBattleMode(g_last_game_mode);
+            bool is_battle  = IsBattleMode(current_mode);
+            bool was_css    = IsCSSMode(g_last_game_mode);
+            bool is_css     = IsCSSMode(current_mode);
+
+            if (!was_battle && is_battle) {
+                // CSS → battle. Mirror Netplay_StartBattle's seed pin AND
+                // SaveState_Save's first-call "initial sync" reset of input
+                // tracking state. Host hits this reset on its first battle
+                // SaveEvent (savestate.cpp:223-237). Spectator never runs
+                // Save/Load, so without this mirror the spectator carries
+                // its CSS-evolved input_buffer_index (~600) into battle while
+                // the host's is reset to 0 — every input_history[idx-N]
+                // read (combo windows, charge inputs) returns different
+                // values on the two sides. Permanent battle desync.
+                *(uint32_t*)FM2K::ADDR_RANDOM_SEED = HOST_FIXED_SEED;
+                *(uint32_t*)0x447EE0 = 0;            // g_input_buffer_index
+                *(uint32_t*)0x4456FC = 0;            // render frame counter
+                memset((void*)0x447F00, 0, 0x20);    // g_prev_input_state
+                memset((void*)0x447F40, 0, 0x20);    // g_processed_input
+                memset((void*)0x447F60, 0, 0x20);    // g_input_changes
+                memset((void*)0x4280D8, 0, 0x2008);  // input_history rings (P1+P2)
+
+                // CRITICAL: initialize the SoundRollback channel table so the
+                // dispatch_script_sound hook's Mike-Z dedup logic returns the
+                // same suppress/pass decisions on spectator as on host. Without
+                // this, host suppresses ~thousands of redundant sound dispatches
+                // (RecordDesired returns true → original dispatcher skipped),
+                // but spectator's table is empty (RecordDesired returns false)
+                // → spectator runs original_dispatch_script_sound for EVERY
+                // call. Whatever game_rand calls live inside FM2K's
+                // dispatch_script_sound (pitch/pan jitter most likely) then
+                // run on spectator but not host → RNG drifts on every frame
+                // with sound activity. Verified via paired [HOST-FP]/[SPEC-FP]
+                // logs: bf=0..270 RNG matched, bf=300+ diverged after first
+                // sound dispatch, with all other state (HP/timer/pos/input)
+                // still matching = isolated to RNG.
+                SoundRollback::Init();
+
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Spectator: battle entry — pinned RNG to 0x%08X, "
+                            "reset input_buf_idx + edge state + history rings, "
+                            "SoundRollback::Init",
+                            HOST_FIXED_SEED);
+            } else if (!was_css && is_css) {
+                // Anything → CSS (rematch). Mirror Netplay_ProcessCSS's
+                // CSS-SYNC reseed so the next match's CSS evolves the
+                // RNG identically to the host's.
+                *(uint32_t*)FM2K::ADDR_RANDOM_SEED = HOST_FIXED_SEED;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Spectator: CSS entry — pinned RNG to 0x%08X",
+                            HOST_FIXED_SEED);
+                // (Save/load mirror tear-down removed — see battle-entry comment.)
+            }
+
+            g_last_game_mode = current_mode;
+            return;
+        }
 
         bool was_battle = IsBattleMode(g_last_game_mode);
         bool is_battle = IsBattleMode(current_mode);
@@ -120,6 +486,15 @@ static void CheckGameModeTransition() {
             // ENTERING BATTLE MODE - Signal entry, but DON'T start GekkoNet yet
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 ">>> ENTERING BATTLE MODE - Signaling remote, waiting for sync");
+
+            // Drain the trailing CSS-frame capture before the battle session
+            // gates capture_and_return out. The pair sitting in g_capture_p[]
+            // is the LAST CSS frame — the one whose confirm flipped game_mode.
+            // Without this flush, spectator never sees that frame, never
+            // flips its own game_mode, and desyncs at battle entry.
+            extern void Hook_FlushPendingCapture();
+            Hook_FlushPendingCapture();
+
             if (!g_offline_mode && Netplay_IsConnected()) {
                 Netplay_SignalBattleEntry();
                 g_battle_entry_signaled = true;
@@ -127,13 +502,21 @@ static void CheckGameModeTransition() {
                 // after both clients have entered battle mode
             }
         } else if (was_battle && !is_battle) {
-            // LEAVING BATTLE MODE - Stop GekkoNet
+            // LEAVING BATTLE MODE - Signal exit; trampoline tears down the
+            // GekkoNet session at the agreed swap_frame so both peers
+            // (and any spectators) destroy in lockstep. Synchronous
+            // teardown here would leave a few frames of mismatched session
+            // state on the wire and risk spectator desync at the boundary.
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "<<< LEAVING BATTLE MODE - Stopping GekkoNet session");
-            if (Netplay_IsActive()) {
+                "<<< LEAVING BATTLE MODE - Signaling swap_frame exit");
+            if (!g_offline_mode && Netplay_IsActive()) {
+                Netplay_SignalBattleEnd();
+            } else if (Netplay_IsActive()) {
+                // Offline / stress paths still tear down synchronously —
+                // there's no remote peer to negotiate with.
                 Netplay_EndBattle();
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "GekkoNet session stopped, back to control channel");
+                    "GekkoNet session stopped (offline path)");
             }
             g_battle_entry_signaled = false;
         }
@@ -151,6 +534,253 @@ static void CheckGameModeTransition() {
 // Battle: return synchronized input from GekkoNet with facing adjustment
 int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    // (Removed FM2K_INPUT_DUMP block — calling original_get_player_input
+    // for diagnostic purposes had a SIDE EFFECT: it ran FM2K's keyboard-
+    // poll → .ini-binding pipeline, which leaked .ini-bound key presses
+    // into FM2K's internal edge-detection state EVEN WHEN our binder was
+    // supposed to be the sole input source. Symptom was that custom
+    // binder binds AND game.ini binds both fired simultaneously. Bit
+    // mappings are confirmed (A=0x010 .. F=0x200, START=0x400 by
+    // induction); diagnostic served its purpose, now it's gone.)
+
+    // Single capture-and-return funnel. EVERY return path goes through
+    // this lambda so we record the (p1, p2) input pair into the host's
+    // session_history every time the input-buffer-index ticks (= one
+    // full FM2K frame). Recording starts at FM2K boot — captures title-
+    // screen no-ops, auto-mash, pre-rendezvous CSS, post-rendezvous
+    // GekkoNet-merged inputs, battle frames — one canonical log spanning
+    // the entire connection. Late-joining spectators get this whole log
+    // via SendSessionBackfillTo and replay deterministically from frame 0.
+    //
+    // Spectators (g_spectator_mode) DO NOT record — they consume from
+    // pb_queue, not produce. Stress / offline DO record but the log is
+    // never sent (no subscribers).
+    // capture_and_return: every returned input from this hook on the HOST
+    // side is the source of truth for the spectator stream. We pair the
+    // current frame's (p1, p2) returns and emit them via
+    // SpectatorNode_OnFrameConfirmed at the moment the frame boundary
+    // ticks (g_input_buffer_index advances). The spectator drives its
+    // local FM2K from that exact same input pair, popped one per sim
+    // tick. Because every change to FM2K's state is input-driven from a
+    // canonical default state at boot, replaying the input log in order
+    // produces a 1:1 sim — title-screen auto-mash, CSS cursor moves,
+    // battle commands all included.
+    //
+    // The pending pair lives at file scope (g_capture_*) instead of
+    // lambda statics so Hook_FlushPendingCapture() can drain the trailing
+    // CSS frame at CSS→battle transition — without that flush, the LAST
+    // CSS frame's pair (the one whose confirm input flips game_mode) sits
+    // in g_capture_p[] forever because the next frame's capture is gated
+    // out by Netplay_IsActive once the battle session starts. Spectator
+    // never sees that frame, never flips game_mode, desync.
+    //
+    // SKIP CONDITIONS:
+    //   * g_spectator_mode: spectator only consumes, never produces.
+    //   * Netplay_IsActive() (battle): GekkoNet runahead+rollback fires
+    //       this hook ~5x per real frame. Battle confirmed-frame capture
+    //       is gated in netplay.cpp's AdvanceEvent handler instead.
+    auto capture_and_return = [player_id](int result) -> int {
+        if (g_spectator_mode) return result;
+        if (Netplay_IsActive()) return result;
+        const uint32_t cur_idx = *(uint32_t*)0x447EE0;
+        if (cur_idx != g_capture_recorded_idx) {
+            if (g_capture_recorded_idx != UINT32_MAX) {
+                SpectatorNode_OnFrameConfirmed(g_capture_p[0], g_capture_p[1]);
+            }
+            g_capture_recorded_idx = cur_idx;
+        }
+        g_capture_p[player_id & 1] = (uint16_t)result;
+        return result;
+    };
+
+    // Title-screen menu-cursor write. Must fire on BOTH host AND spectator —
+    // it's a state side-effect of the auto-title-skip protocol, not an
+    // input. session_history only records returned input values, so a
+    // spectator replaying host's recorded auto-mash button-A pulses would
+    // navigate from g_menu_selection=0 (default = "VS CPU"/first option)
+    // and end up in the wrong scene tree. We force g_menu_selection=1
+    // ("VS Player") on every node so the same recorded input pattern
+    // resolves to the same menu transitions everywhere.
+    {
+        static const char* env_skip = std::getenv("FM2K_AUTO_TITLE_SKIP");
+        const bool auto_skip = !(env_skip && std::strcmp(env_skip, "0") == 0);
+        static bool s_cursor_set_global = false;
+        if (auto_skip && !s_cursor_set_global && game_mode == 1000) {
+            *(uint32_t*)0x424780 = 1;  // g_menu_selection = VS Player
+            s_cursor_set_global = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "TitleMenuCursor: pre-set g_menu_selection=1 (host or spectator)");
+        }
+    }
+
+    // Spectator process — SINGLE source of truth: the popped input pair
+    // (host's recorded p1/p2 for the current sim frame). No keyboard read,
+    // no auto-mash, no fall-through to anything else. The hook is only
+    // ever called from inside RunSpectatorTick → original_process_game_inputs,
+    // which we only invoke after popping a frame from the queue.
+    //
+    // Battle-mode facing fix mirrors host's branch — same 11-bit input,
+    // same left/right swap when char_active && !state_flag_8.
+    if (g_spectator_mode) {
+        uint16_t input = (player_id == 0)
+            ? SpectatorNode_GetCurrentP1Input()
+            : SpectatorNode_GetCurrentP2Input();
+
+        constexpr size_t CHAR_ACTIVE_FLAG_OFFSET = 0xDF41;
+        constexpr size_t CHAR_STATE_FLAGS_OFFSET = 0x7CA6;
+        bool facing_reversed = true;
+        if (game_mode >= 3000 && game_mode < 4000) {
+            uintptr_t slot_base = CHAR_SLOT_BASE + (size_t)input_type * CHAR_SLOT_SIZE;
+            uint8_t char_active = *(uint8_t*)(slot_base + CHAR_ACTIVE_FLAG_OFFSET);
+            if (char_active != 0) {
+                uint8_t char_flags = *(uint8_t*)(slot_base + CHAR_STATE_FLAGS_OFFSET);
+                if ((char_flags & 8) == 0) facing_reversed = false;
+            }
+        }
+        if (!facing_reversed) {
+            uint16_t left_bit  = (input & 0x001);
+            uint16_t right_bit = (input & 0x002);
+            input = (input & ~0x003) | (left_bit << 1) | (right_bit >> 1);
+        }
+        input = Hook_ApplySOCD(input);
+        return (int)input;  // spectator path doesn't record
+    }
+
+    // Auto-mash through title screen → menu → CSS. Default ON unless
+    // FM2K_AUTO_TITLE_SKIP=0. With the boot-to-title patch (push 0x0C)
+    // the game starts in title_screen_manager (g_game_mode=1000). We
+    // pre-set g_menu_selection=1 (VS Player is always index 1 in
+    // g_titleMenu_modeList[]) and pulse button A (bit 4 = 0x010) on
+    // alternate frames until g_game_mode flips to 2000 (CSS reached).
+    //
+    // Critical: alternate per-FRAME, not per-CALL. get_player_input
+    // is called twice per frame (once for each player) — if we
+    // increment a counter on every call and use parity, P1 and P2
+    // get opposite values and neither sees a rising edge after frame
+    // 1. Use g_input_buffer_index @ 0x447EE0 instead — it ticks once
+    // per frame from the game's own input pipeline, so both players'
+    // calls in the same frame return the same value.
+    {
+        static const char* env_skip = std::getenv("FM2K_AUTO_TITLE_SKIP");
+        const bool auto_skip = !(env_skip && std::strcmp(env_skip, "0") == 0);
+        static bool s_done = false;
+        static bool s_cursor_set = false;
+        static uint32_t s_started_frame = 0;
+        if (auto_skip && !s_done) {
+            if (game_mode >= 2000) {
+                s_done = true;
+                uint32_t now = *(uint32_t*)0x447EE0;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "AutoTitleSkip: reached g_game_mode=%u, handing input "
+                    "back to user (took %u input-buffer ticks)",
+                    game_mode, now - s_started_frame);
+            } else if (game_mode == 1000) {
+                if (!s_cursor_set) {
+                    // Menu cursor itself is now written in the hoisted
+                    // block at the top of this function (runs on host AND
+                    // spectator). Here we just record the start-frame for
+                    // the auto-mash duration log and flip s_cursor_set.
+                    s_cursor_set = true;
+                    s_started_frame = *(uint32_t*)0x447EE0;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "AutoTitleSkip: starting button-A mash from input_buf=%u",
+                        s_started_frame);
+                }
+                // 4-tick pattern (0x010, 0x010, 0, 0) ensures a rising
+                // edge every 4 frames: prev=0 → cur=0x010 fires the
+                // edge detector. Holding the button for 2 frames lets
+                // the title menu's "any-button" check (& 0x3F0) sample
+                // a stable value before the release. ~25 Hz of
+                // confirms — fast enough to march title → menu → CSS
+                // in ~16 frames, slow enough not to skip past states
+                // the menu hasn't latched yet.
+                uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                return capture_and_return(((buf_idx >> 1) & 1) ? 0 : 0x010);
+            }
+        }
+    }
+
+
+    // FM2K_PARITY_AUTOPLAY: drive title→CSS→battle via a deterministic
+    // input sequence. Short-circuits the netplay/CSS/spectator branches
+    // — autoplay owns input completely. Phase-aware (uses live
+    // game_mode to pick inputs per CSS section). The game's CSS state
+    // machine (game_state_manager @ 0x406FC0) reads:
+    //   g_processed_input[i] for direction (bits 0..3 = L/R/U/D)
+    //   g_input_changes[i] & 0x3F0 for attack-button rising-edge (confirm)
+    // The original get_player_input returns RAW input; the game's
+    // process_game_inputs converts raw → processed_input and computes
+    // changes from prev frame. So returning a clean rising-edge of
+    // bit 0x10 (button A) on a CSS frame triggers the confirm path.
+    {
+        static const char* env_autoplay = std::getenv("FM2K_PARITY_AUTOPLAY");
+        if (env_autoplay && std::strcmp(env_autoplay, "1") == 0) {
+            static uint32_t s_call_count = 0;
+            const uint32_t call = s_call_count++;
+            const uint32_t frame = call / 2u;
+            const uint16_t Z = 0x010u;
+            uint16_t out = 0u;
+
+            // WW game_mode states (per vs_round_function @ 0x4086A0 +
+            // game_state_manager @ 0x406FC0):
+            //   0     = boot/title intro
+            //   2000  = CSS active
+            //   3000  = battle active
+            // No 4000+ values; battle stays at 3000 throughout match.
+            // For clean idle-parity capture, send Z every 30 frames
+            // until we reach battle (advances title prompts + confirms
+            // both CSS slots) and then idle (out=0) so the captured
+            // frames show pure-idle physics with no synthetic attack
+            // inputs polluting the comparison against kgt's idle run.
+            if (game_mode < 3000u) {
+                if ((frame % 30u) == 0u) out = Z;
+            }
+            // mode >= 3000: idle (out stays 0)
+
+            /* Diagnostic: log on first hit + every game_mode change AND
+             * every 120 frames once we hit battle (game_mode >= 3000) so
+             * we can see HP/active-flag populating after CSS exit.
+             * HP source corrected: g_p1_hp=0x4DFC85, g_p2_hp=0x4EDCC4
+             * (verified via IDA xref of vs_round_function @ 0x4086A0). */
+            static uint32_t s_last_logged_mode = 0xFFFFFFFFu;
+            static uint32_t s_last_periodic = 0u;
+            const bool mode_changed = (game_mode != s_last_logged_mode);
+            const bool periodic = (game_mode >= 3000u) &&
+                                  ((frame - s_last_periodic) >= 120u);
+            if (mode_changed || periodic) {
+                const uint32_t p1_action = *(uint32_t*)0x47019Cu;
+                const uint32_t p2_action = *(uint32_t*)0x4701A0u;
+                const int32_t  p1_pos    = *(int32_t*) 0x470020u;
+                const int32_t  p2_pos    = *(int32_t*) 0x470024u;
+                const uint32_t timer     = *(uint32_t*)0x424F00u;
+                const uint8_t  char0_act = *(uint8_t*) 0x4DFCD1u;
+                const uint8_t  char1_act = *(uint8_t*)(0x4DFCD1u + 57407u);
+                const uint32_t p1_hp     = *(uint32_t*)0x4DFC85u;
+                const uint32_t p1_max_hp = *(uint32_t*)0x4DFC91u;
+                const uint32_t p2_hp     = *(uint32_t*)0x4EDCC4u;
+                const uint32_t p2_max_hp = *(uint32_t*)0x4EDCD0u;
+                const int32_t  cam_x     = *(int32_t*) 0x447F2Cu;
+                const int32_t  cam_y     = *(int32_t*) 0x447F30u;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[AUTOPLAY] frame=%u mode=%u p1act=%u p2act=%u "
+                    "p1pos=%d p2pos=%d ctimer=%u "
+                    "char0_act=%u char1_act=%u "
+                    "p1_hp=%u/%u p2_hp=%u/%u cam=(%d,%d) out=0x%03X",
+                    frame, game_mode, p1_action, p2_action,
+                    p1_pos, p2_pos, timer,
+                    char0_act, char1_act,
+                    p1_hp, p1_max_hp, p2_hp, p2_max_hp,
+                    cam_x, cam_y, out);
+                s_last_logged_mode = game_mode;
+                if (periodic) s_last_periodic = frame;
+            }
+            return capture_and_return((int)out);
+        }
+    }
+
+    // (Spectator branch lifted to the top of the function — runs before
+    // auto-mash so spectator's local FM2K replays host's recorded inputs
+    // instead of generating its own auto-mash sequence.)
 
     // Battle mode with GekkoNet active - return synced input with facing fix
     if (Netplay_IsActive()) {
@@ -196,6 +826,7 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             uint16_t right_bit = (input & 0x002);
             input = (input & ~0x003) | (left_bit << 1) | (right_bit >> 1);
         }
+        input = Hook_ApplySOCD(input);
 
         // Log only the first 4 calls (initial handshake verification). After
         // that stay silent — Hook_GetPlayerInput fires 2x per sim tick, and
@@ -210,17 +841,76 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
         }
         battle_log_count++;
 
-        return input;
+        return capture_and_return((int)input);
     }
 
     // CSS mode with connection - return CSS input from control channel
     if (IsCSSMode(game_mode) && Netplay_IsConnected()) {
         uint16_t input = Netplay_GetCSSInput(player_id);
-        return input;
+        input = Hook_ApplySOCD(input);
+        return capture_and_return((int)input);
     }
 
-    // Offline or menu: use original function
-    return original_get_player_input ? original_get_player_input(player_id, input_type) : 0;
+    // Offline or menu: use the binder if active, else fall through to FM2K's
+    // own get_player_input. Same gating as Input_CaptureLocal — Init() is
+    // idempotent and resolves to %APPDATA%\FM2K_Rollback\fm2k_inputs.ini
+    // (matching the launcher's save path) so launcher-bound keys / pads
+    // drive offline play here, GekkoNet-online play through Input_CaptureLocal.
+    {
+        static int  s_last_check_tick = 0;
+        static bool s_binder_active   = false;
+        const int now_tick = (int)GetTickCount();
+        if ((now_tick - s_last_check_tick) > 1000 || s_last_check_tick == 0) {
+            s_last_check_tick = now_tick;
+            FM2KInputBinder::Init();
+            const auto& pb = FM2KInputBinder::Bindings(0);
+            s_binder_active = false;
+            for (const auto& b : pb.bits) {
+                if (b.source != FM2KInputBinder::Binding::Source::NONE) {
+                    s_binder_active = true;
+                    break;
+                }
+            }
+        }
+        if (s_binder_active) {
+            // input_type is the character slot (same convention the battle /
+            // spectator branches above use to compute slot_base for facing-fix).
+            // 0 = P1 character → P1 bindings, 1 = P2 character → P2 bindings.
+            // Without this distinction both players get the SAME input from
+            // P1's bindings — the bug we just fixed.
+            const int slot = (input_type & 1);
+            uint16_t bound = FM2KInputBinder::Sample_Win32(slot);
+            // Apply the same battle facing-fix the original_get_player_input
+            // path applies (so offline matches behave the same way as the
+            // game's own input flow).
+            constexpr size_t CHAR_ACTIVE_FLAG_OFFSET_OFL = 0xDF41;
+            constexpr size_t CHAR_STATE_FLAGS_OFFSET_OFL = 0x7CA6;
+            bool facing_reversed = true;
+            if (game_mode >= 3000 && game_mode < 4000) {
+                uintptr_t slot_base = CHAR_SLOT_BASE + (size_t)input_type * CHAR_SLOT_SIZE;
+                uint8_t char_active = *(uint8_t*)(slot_base + CHAR_ACTIVE_FLAG_OFFSET_OFL);
+                if (char_active != 0) {
+                    uint8_t char_flags = *(uint8_t*)(slot_base + CHAR_STATE_FLAGS_OFFSET_OFL);
+                    if ((char_flags & 8) == 0) facing_reversed = false;
+                }
+            }
+            if (!facing_reversed) {
+                uint16_t left_bit  = (bound & 0x001);
+                uint16_t right_bit = (bound & 0x002);
+                bound = (bound & ~0x003) | (left_bit << 1) | (right_bit >> 1);
+            }
+            bound = Hook_ApplySOCD(bound);
+            return capture_and_return((int)bound);
+        }
+    }
+
+    // No binder config — vanilla FM2K input path.
+    int orig = original_get_player_input
+        ? original_get_player_input(player_id, input_type)
+        : 0;
+
+    orig = (int)Hook_ApplySOCD((uint16_t)orig);
+    return capture_and_return(orig);
 }
 
 // Hook: UpdateGameState
@@ -230,6 +920,77 @@ int __cdecl Hook_UpdateGameState() {
 
     // Offline mode - just pass through
     if (g_offline_mode) {
+        // T4 probe: when FM2K_T4_PROBE=1, walk the fighter object pool
+        // before each update_game tick using the EXACT same logic as
+        // vs_round_function case-200 (type==4, flag@+346==0, HP@slot>0).
+        // Log when count<2 with details on which entry failed which
+        // condition. This captures what case-200 will see when it runs
+        // inside this update_game call, so we can pinpoint why the t4
+        // walk false-trips on StudioS games (whereas WW always shows 2).
+        static const char* env_t4probe = std::getenv("FM2K_T4_PROBE");
+        if (game_mode >= 3000 && game_mode < 4000
+            && env_t4probe && std::strcmp(env_t4probe, "1") == 0)
+        {
+            const uint8_t* pool = (const uint8_t*)0x4701E0;
+            constexpr uintptr_t HP_BASE   = 0x4DFC85;
+            constexpr uintptr_t HP_STRIDE = 57407;
+            int count = 0;
+            int t4_seen = 0;
+            int fail_flag = 0, fail_hp = 0, fail_slot = 0;
+            uint32_t fail_e[4] = {0,0,0,0};
+            uint32_t fail_why[4] = {0,0,0,0};  // 1=flag, 2=hp, 3=slot
+            int fail_n = 0;
+            for (int i = 0; i < 1024; i++) {
+                const uint8_t* e = pool + i * 382;
+                uint32_t type = *(const uint32_t*)(e + 0);
+                if (type != 4) continue;
+                t4_seen++;
+                uint32_t flag346 = *(const uint32_t*)(e + 346);
+                uint32_t slot    = *(const uint32_t*)(e + 342);
+                if (flag346 != 0) {
+                    fail_flag++;
+                    if (fail_n < 4) { fail_e[fail_n]=i; fail_why[fail_n]=1; fail_n++; }
+                    continue;
+                }
+                if (slot >= 8) {
+                    fail_slot++;
+                    if (fail_n < 4) { fail_e[fail_n]=i; fail_why[fail_n]=3; fail_n++; }
+                    continue;
+                }
+                uint32_t hp = *(const uint32_t*)(HP_BASE + slot * HP_STRIDE);
+                if (hp == 0) {
+                    fail_hp++;
+                    if (fail_n < 4) { fail_e[fail_n]=i; fail_why[fail_n]=2; fail_n++; }
+                    continue;
+                }
+                count++;
+            }
+            static int s_last_count = -1;
+            if (count < 2 && (count != s_last_count || (g_frame_counter % 60) == 0)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "[T4-PROBE f=%u] count=%d t4_seen=%d "
+                    "fails: flag@346=%d hp=%d slot=%d "
+                    "first4=[e=%u why=%u, e=%u why=%u, e=%u why=%u, e=%u why=%u] "
+                    "(why: 1=flag@+346!=0, 2=HP[slot]==0, 3=slot>=8)",
+                    g_frame_counter, count, t4_seen,
+                    fail_flag, fail_hp, fail_slot,
+                    fail_e[0], fail_why[0], fail_e[1], fail_why[1],
+                    fail_e[2], fail_why[2], fail_e[3], fail_why[3]);
+            }
+            s_last_count = count;
+        }
+
+        g_frame_counter++;
+        return original_update_game ? original_update_game() : 0;
+    }
+
+    // Spectator mode: the trampoline's RunSpectatorTick owns the sim drive
+    // (it pops streamed inputs and calls original_update_game itself). This
+    // hook still fires because update_game runs from inside that trampoline
+    // call — but we must not run any of the player-side battle-sync /
+    // Netplay_StartBattle / GekkoStressSession paths below. Just bump the
+    // frame counter and pass through to the real update_game.
+    if (g_spectator_mode) {
         g_frame_counter++;
         return original_update_game ? original_update_game() : 0;
     }
@@ -451,9 +1212,24 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
         HWND game_window = GetOurGameWindow();
         if (game_window) {
             char title[256];
-            const char* role = (g_player_index == 0) ? "HOST" : "CLIENT";
+            const char* role =
+                g_spectator_mode      ? "SPECTATOR" :
+                (g_player_index == 0) ? "HOST"      : "CLIENT";
             bool active = Netplay_IsActive();
             bool connected = Netplay_IsConnected();
+
+            // Spectator title — queue depth tells you at a glance whether
+            // we're at live edge (~SPECTATOR_LIVE_TARGET buffered),
+            // backfilling (>FF_ENTER), or starved.
+            if (g_spectator_mode) {
+                size_t qd = SpectatorNode_PendingFrameCount();
+                bool sub = SpectatorNode_IsSubscribedUpstream();
+                snprintf(title, sizeof(title),
+                    "FM2K [P3 SPECTATOR] %s | FPS:%d | queue:%zu",
+                    sub ? "Subscribed" : "Connecting...", g_current_fps, qd);
+                SetWindowTextA(game_window, title);
+                return;
+            }
 
             if (active) {
                 GekkoNetworkStats stats = Netplay_GetNetworkStats();
@@ -478,9 +1254,30 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                 }
             } else if (connected) {
                 uint32_t ping = Netplay_GetPingMs();
+                // Label the actual phase from g_game_mode, not just
+                // "CSS". The title bar previously stuck on "CSS" the
+                // moment handshake completed even though the game was
+                // still in the title state machine.
+                //   0       boot/early init
+                //   1000    title — splash + demo loop + main menu
+                //   2000    CSS (character select)
+                //   3000-3999 battle (handled by `active` branch above)
+                //   anything else → fall through to the numeric value
+                uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+                const char* phase = nullptr;
+                char phase_buf[16] = {};
+                if      (mode == 0)               phase = "BOOT";
+                else if (mode == 1000)            phase = "TITLE";
+                else if (mode == 2000)            phase = "CSS";
+                else if (mode >= 3000 && mode < 4000) phase = "BATTLE";
+                else {
+                    std::snprintf(phase_buf, sizeof(phase_buf), "MODE %u",
+                                  (unsigned)mode);
+                    phase = phase_buf;
+                }
                 snprintf(title, sizeof(title),
-                    "FM2K [%s] CSS | FPS:%d | RTT:%ums",
-                    role, g_current_fps, ping);
+                    "FM2K [%s] %s | FPS:%d | RTT:%ums",
+                    role, phase, g_current_fps, ping);
             } else if (!g_offline_mode) {
                 snprintf(title, sizeof(title),
                     "FM2K [%s] Connecting... | FPS:%d",
@@ -513,6 +1310,39 @@ typedef int(__cdecl* DispatchScriptSoundFunc)(int);
 static DispatchScriptSoundFunc original_dispatch_script_sound = nullptr;
 
 int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
+    // Mute gates — applied UNCONDITIONALLY (offline + online + spectator).
+    // Re-checks the audio.ini file ~once per second so the launcher's
+    // toggle reaches the running game without a separate IPC channel.
+    {
+        static uint32_t s_last_check = 0;
+        const uint32_t now_ms = GetTickCount();
+        if (now_ms - s_last_check > 1000) {
+            s_last_check = now_ms;
+            SoundRollback::RefreshMuteFromDisk();
+        }
+    }
+    if (script_item != 0) {
+        const uint8_t cmd_byte = *reinterpret_cast<uint8_t*>(script_item + 40);
+        const uint8_t cmd_low  = cmd_byte & 0xF;
+        const bool    looping  = (cmd_byte & 0x10) != 0;
+
+        // Audio classification — verified against WonderfulWorld disasm
+        // (0x403430 dispatcher) + LilithPort's BGM_VOLUME / SE_VOLUME
+        // hook sites (stdafx.h:152-159, MainForm.cpp:2719-2733):
+        //   cmd_low 0           → stop everything (never muted)
+        //   cmd_low 1, loop=0   → SFX (one-shot WAV, vtable Play(..., 0))
+        //   cmd_low 1, loop=1   → BGM as looping WAV (Play(..., 1))
+        //   cmd_low 2           → BGM via MIDI (WriteTempMIDIAndPlay)
+        //   cmd_low 3           → BGM via CD audio (InitializeCDAudio)
+        // Most 2DFM games play BGM via case 1 + loop; case 2/3 are rare.
+        const bool is_bgm = (cmd_low == 2) ||
+                            (cmd_low == 3) ||
+                            (cmd_low == 1 && looping);
+        const bool is_sfx = (cmd_low == 1 && !looping);
+        if (is_bgm && SoundRollback::IsMusicMuted()) return 0;
+        if (is_sfx && SoundRollback::IsSfxMuted())   return 0;
+    }
+
     if (!Netplay_IsActive() || script_item == 0) {
         return original_dispatch_script_sound(script_item);
     }
@@ -567,7 +1397,11 @@ void __cdecl Hook_RenderGame() {
     // In trampoline mode, render goes through RenderFrameWithSnapshot in
     // main_loop_trampoline.cpp. This hook still catches direct calls from
     // the game (e.g. init/menu paths) — run diagnostics and pass through.
+    // Also fires under FM2K_BYPASS_TRAMPOLINE=1 (vanilla main_game_loop)
+    // so [EB] diag works for A/B testing the trampoline against the
+    // vanilla render path.
     Hook_RenderDiagnostics_Tick();
+    EbDiag_Dump("PRE-SAVE");
 
     // CRITICAL: Save/restore RNG around render to prevent render-path RNG
     // consumption from breaking determinism. ProcessShakeEffect and
@@ -589,17 +1423,58 @@ void __cdecl Hook_RenderGame() {
     // Same idea as the existing RNG protection, extended to the other
     // three. That way render can freely update visual counters but the
     // gameplay-authoritative memory image is unchanged across renders.
-    bool protect_regions = Netplay_IsActive();
+    //
+    // SPECTATOR FIX: include SpectatorNode_IsPlayingBack() — without it,
+    // Hook_RenderGame (this function) ran UNPROTECTED on spectators when
+    // FM2K-internal code triggered render directly (instead of through the
+    // trampoline's RenderFrameWithSnapshot, which already had this check).
+    // ProcessShakeEffect / ProcessColorInterpolation / sprite_rendering_engine
+    // call game_rand() — those calls accumulated into spectator's RNG but
+    // were rolled back on host. RNG drifted by exactly that delta over time,
+    // showing up as paired [HOST-FP]/[SPEC-FP] divergence with all other
+    // sim state matching (HP/timer/pos/input identical, only RNG differed).
+    bool protect_regions = Netplay_IsActive() || SpectatorNode_IsPlayingBack();
 
-    uint32_t saved_rng = 0;
     static uint8_t s_saved_object_pool[0x5F800];
     static uint8_t s_saved_afterimage_pool[WaveCAddrs::AFTERIMAGE_POOL_SZ];
     static uint8_t s_saved_input_tracking[0xA0];
 
+    // Carve-outs: SHAKE_EFFECTS @ 0x447DA9 (40 B) and EFFECT_SYS1 @
+    // 0x447D7D (42 B, palette flash 1) MUST NOT be restored, or render's
+    // per-frame mutations to those regions get reverted every render.
+    // Mirrors the carve-outs in main_loop_trampoline.cpp::
+    // RenderFrameWithSnapshot. Both regions sit inside the afterimage_pool
+    // slice; EFFECT_SYS1 is just before the shake block.
+    constexpr uintptr_t kPflash1Addr   = 0x447D7D;
+    constexpr size_t    kPflash1Size   = 42;
+    constexpr size_t    kPflash1Offset = kPflash1Addr - WaveCAddrs::AFTERIMAGE_POOL;
+    constexpr size_t    kPflash1End    = kPflash1Offset + kPflash1Size;
+    constexpr uintptr_t kShakeAddr     = 0x447DA9;
+    constexpr size_t    kShakeSize     = 40;
+    constexpr size_t    kShakeOffset   = kShakeAddr - WaveCAddrs::AFTERIMAGE_POOL;  // 0x479
+    constexpr size_t    kShakeEnd      = kShakeOffset + kShakeSize;
+    static_assert(kPflash1End <= kShakeOffset, "EFFECT_SYS1 must end before shake block");
     if (protect_regions) {
-        saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-        memcpy(s_saved_object_pool,     (void*)FM2K::ADDR_OBJECT_POOL,       FM2K::SIZE_OBJECT_POOL);
-        memcpy(s_saved_afterimage_pool, (void*)WaveCAddrs::AFTERIMAGE_POOL,  WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // RNG intentionally NOT saved/restored — render's game_rand calls
+        // need to propagate so palette mode 3 / shake mode 4 produce
+        // animated random values matching vanilla. See trampoline comment.
+        //
+        // Object pool also NOT saved/restored — palette mode 1
+        // (Tyrogue fade-to-black) needs ProcessColorInterpolation's per-frame
+        // writes to g_object_data_ptr+68/72/76/80 to PERSIST into the next
+        // frame's object pool, otherwise the fade visually undoes itself
+        // when the timer reaches 0.
+        (void)s_saved_object_pool;
+        // Afterimage save: three slices skipping both EFFECT_SYS1 and shake.
+        memcpy(s_saved_afterimage_pool,
+               (void*)WaveCAddrs::AFTERIMAGE_POOL,
+               kPflash1Offset);
+        memcpy(s_saved_afterimage_pool + kPflash1End,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + kPflash1End),
+               kShakeOffset - kPflash1End);
+        memcpy(s_saved_afterimage_pool + kShakeEnd,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + kShakeEnd),
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - kShakeEnd);
         memcpy(s_saved_input_tracking,  (void*)0x447EE0,                     0xA0);
     }
 
@@ -608,27 +1483,40 @@ void __cdecl Hook_RenderGame() {
     // object-pool animation state on wall-clock cadence and desyncs peers.
     bool gate_render = Netplay_IsActive();
     bool do_render = !gate_render || g_frame_pending_render;
+    EbDiag_Dump("PRE-RENDER");
     if (do_render && original_render_game) {
         original_render_game();
         g_frame_pending_render = false;
     }
+    EbDiag_Dump("POST-RENDER");
 
     if (protect_regions) {
-        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
-        memcpy((void*)FM2K::ADDR_OBJECT_POOL,      s_saved_object_pool,     FM2K::SIZE_OBJECT_POOL);
-        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL, s_saved_afterimage_pool, WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // (RNG and object_pool restores removed — see save block.)
+        // Afterimage restore: mirror of the 3-slice split save — both
+        // EFFECT_SYS1 and shake regions in live memory keep whatever
+        // render-side code just wrote.
+        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
+               s_saved_afterimage_pool,
+               kPflash1Offset);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + kPflash1End),
+               s_saved_afterimage_pool + kPflash1End,
+               kShakeOffset - kPflash1End);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + kShakeEnd),
+               s_saved_afterimage_pool + kShakeEnd,
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - kShakeEnd);
         memcpy((void*)0x447EE0,                    s_saved_input_tracking,  0xA0);
     }
+    EbDiag_Dump("POST-RESTORE");
 
     // Update shared memory with current stats for launcher
     SharedMem_Update();
 
-    // GekkoNet frame pacing - called after render, matching GekkoNet examples.
-    // Uses precise QPC timing to hit 10ms target (100fps).
-    // When ahead of remote, slows down by 1.6% to prevent rollback cascade.
-    if (Netplay_IsActive()) {
-        Netplay_HandleFrameTime();
-    }
+    // GekkoNet frame-pacing drift correction now lives in the
+    // trampoline's SleepToTarget — that function applies the 1.6%
+    // slowdown when ahead of peer. The Sleep(extra_ms) trick that
+    // used to be in Netplay_HandleFrameTime was unreliable (Sleep
+    // granularity, fights with QPC-based outer loop) and didn't
+    // actually converge frames_ahead.
 }
 
 // Hook: RunGameLoop
@@ -649,12 +1537,98 @@ BOOL __cdecl Hook_RunGameLoop() {
         }
     }
 
+    // Diagnostic: FM2K_BYPASS_TRAMPOLINE=1 falls through to vanilla
+    // main_game_loop. All other hooks (input, update, render, RNG) still
+    // fire as detours, so we can isolate the trampoline as a cause vs the
+    // individual hooks. Use only for offline tests — netplay/spectator
+    // require the trampoline's phase dispatcher to drive Save/Load/Advance.
+    static const char* env_bypass = std::getenv("FM2K_BYPASS_TRAMPOLINE");
+    static bool bypass = (env_bypass && std::strcmp(env_bypass, "1") == 0);
+    if (bypass) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: FM2K_BYPASS_TRAMPOLINE=1 — calling vanilla "
+                    "main_game_loop. Trampoline phase dispatcher "
+                    "DISABLED. Netplay/spectator will not work.");
+        return original_run_game_loop ? original_run_game_loop() : TRUE;
+    }
+
     return TrampolineMainLoop();
 }
 
-// Hook: GameRand - pass through
+// RNG-call trace — gated on FM2K_RNG_TRACE=1 env var. Each call records
+// (call_index, caller_pc, rng_pre, rng_post) as 16-byte little-endian
+// records to FM2K_rng_trace_pid<PID>.bin in cwd. Used to diff host vs
+// spectator processes and find the first divergent rng call site.
+//
+// Off-by-default (no env var): trampoline branch is just two predictable
+// loads + a never-taken branch, single-digit nanoseconds added to the hook.
+namespace {
+static FILE*    g_rng_trace_fp        = nullptr;
+static uint64_t g_rng_call_index      = 0;
+static bool     g_rng_trace_resolved  = false;
+static bool     g_rng_trace_enabled   = false;
+static uint32_t g_rng_trace_max_calls = 0;  // 0 = unlimited
+
+static void RngTrace_ResolveOnce() {
+    if (g_rng_trace_resolved) return;
+    g_rng_trace_resolved = true;
+    const char* env = std::getenv("FM2K_RNG_TRACE");
+    g_rng_trace_enabled = (env && std::strcmp(env, "1") == 0);
+    const char* env_max = std::getenv("FM2K_RNG_TRACE_MAX");
+    if (env_max) {
+        g_rng_trace_max_calls = (uint32_t)std::strtoul(env_max, nullptr, 10);
+    } else {
+        g_rng_trace_max_calls = 2'000'000;  // ~32 MB cap default
+    }
+    if (g_rng_trace_enabled) {
+        char base[64];
+        std::snprintf(base, sizeof(base),
+                      "FM2K_rng_trace_pid%lu.bin",
+                      (unsigned long)GetCurrentProcessId());
+        char path[MAX_PATH];
+        if (!Fm2k_BuildLogPath(path, sizeof(path), base)) {
+            std::snprintf(path, sizeof(path), "%s", base);
+        }
+        g_rng_trace_fp = std::fopen(path, "wb");
+        if (g_rng_trace_fp) {
+            // Larger buffer keeps the per-call overhead amortized.
+            std::setvbuf(g_rng_trace_fp, nullptr, _IOFBF, 1 << 20);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "RngTrace: enabled — writing to %s (max=%u calls)",
+                        path, g_rng_trace_max_calls);
+        } else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "RngTrace: failed to open %s for write", path);
+            g_rng_trace_enabled = false;
+        }
+    }
+}
+}
+
+// Hook: GameRand
+// Records the call to the trace file (if enabled) then forwards.
 uint32_t __cdecl Hook_GameRand() {
-    return original_game_rand ? original_game_rand() : 0;
+    RngTrace_ResolveOnce();
+    if (!g_rng_trace_enabled) {
+        return original_game_rand ? original_game_rand() : 0;
+    }
+    const uint32_t ret_addr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    const uint32_t pre  = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    const uint32_t r    = original_game_rand ? original_game_rand() : 0;
+    const uint32_t post = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    if (g_rng_trace_fp &&
+        (g_rng_trace_max_calls == 0 || g_rng_call_index < g_rng_trace_max_calls))
+    {
+        uint32_t rec[4] = {
+            (uint32_t)g_rng_call_index, ret_addr, pre, post
+        };
+        std::fwrite(rec, 1, sizeof(rec), g_rng_trace_fp);
+        // Flush every 10k calls (~100 frames at ~100 calls/frame) so a
+        // process kill loses at most ~1 sec of trace.
+        if ((g_rng_call_index & 0x1FFFu) == 0) std::fflush(g_rng_trace_fp);
+    }
+    ++g_rng_call_index;
+    return r;
 }
 
 // Hook: ProcessGameInputs
@@ -832,6 +1806,37 @@ bool InitializeHooks() {
         } else {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Hooks: GetProcAddress(timeGetTime) failed");
+        }
+    }
+
+    // CreateFileA/W share-mode override — force shared reads so two
+    // instances launched from the same game folder don't get
+    // ERROR_SHARING_VIOLATION on .player / .kgt opens.
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    if (kernel32) {
+        void* real_CreateFileA = (void*)GetProcAddress(kernel32, "CreateFileA");
+        void* real_CreateFileW = (void*)GetProcAddress(kernel32, "CreateFileW");
+        if (real_CreateFileA) {
+            if (MH_CreateHook(real_CreateFileA, (void*)Hook_CreateFileA,
+                              (void**)&original_CreateFileA) != MH_OK ||
+                MH_EnableHook(real_CreateFileA) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook CreateFileA");
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: CreateFileA hooked (relaxed share mode)");
+            }
+        }
+        if (real_CreateFileW) {
+            if (MH_CreateHook(real_CreateFileW, (void*)Hook_CreateFileW,
+                              (void**)&original_CreateFileW) != MH_OK ||
+                MH_EnableHook(real_CreateFileW) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook CreateFileW");
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: CreateFileW hooked (relaxed share mode)");
+            }
         }
     }
 

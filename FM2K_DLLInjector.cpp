@@ -4,42 +4,79 @@
 namespace FM2K {
 
 bool DLLInjector::InjectAndInit(HANDLE process, const std::wstring& dll_path) {
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Starting DLL injection process...");
-    
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Inject: starting (pid=%lu, dll=%ls)",
+        (unsigned long)GetProcessId(process), dll_path.c_str());
+
     if (!process) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Invalid process handle for injection");
         return false;
     }
 
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Getting LoadLibraryW address...");
     // Get LoadLibraryW address
     LPVOID load_lib_addr = GetLoadLibraryAddr(process);
     if (!load_lib_addr) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to get LoadLibraryW address");
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Inject: GetLoadLibraryW failed — kernel32.dll missing or stripped (rare). "
+            "If this triggered, paste this log and your antivirus name on Discord.");
         return false;
     }
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "LoadLibraryW found at %p", load_lib_addr);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Inject: LoadLibraryW @ %p", load_lib_addr);
 
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Creating remote thread to load DLL: %ls", dll_path.c_str());
-    // Create remote thread to load DLL
     HANDLE thread = CreateLoadLibraryThread(process, load_lib_addr, dll_path);
     if (!thread) {
         DWORD error = GetLastError();
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, 
-            "Failed to create remote thread for DLL injection. Error: %lu", error);
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Inject: CreateRemoteThread failed (err=%lu). "
+            "Common causes: antivirus blocking remote thread injection (Windows "
+            "Defender, Bitdefender, Kaspersky), or running launcher without admin "
+            "while game has elevated process protection. Try running launcher "
+            "as administrator.", error);
         return false;
     }
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Remote thread created successfully");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Inject: remote LoadLibraryW thread spawned");
 
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Waiting for DLL initialization...");
-    // Wait for DLL to initialize
+    // Wait for DLL to signal — but if it times out, dig into WHY.
     if (!WaitForDLLInit(5000)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "DLL initialization timed out after 5 seconds");
+        // Was the LoadLibrary thread itself successful?
+        DWORD lib_handle = 0;
+        DWORD wait2 = WaitForSingleObject(thread, 100);
+        if (wait2 == WAIT_OBJECT_0) {
+            GetExitCodeThread(thread, &lib_handle);
+            if (lib_handle == 0) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Inject: LoadLibraryW returned NULL — the DLL itself failed to "
+                    "load. Most common causes: (a) DLL file is blocked by Windows "
+                    "(right-click FM2KHook.dll → Properties → tick Unblock), "
+                    "(b) missing Visual C++ runtime / mingw runtime in target process, "
+                    "(c) DLL path contains characters Windows can't pass to "
+                    "LoadLibrary. DLL was: %ls", dll_path.c_str());
+            } else {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Inject: LoadLibraryW returned a module handle (0x%lx) but the "
+                    "DLL never signaled FM2KHook_Initialized. Hook DllMain probably "
+                    "ran but hung or crashed BEFORE finishing init. Check the game's "
+                    "FM2K_P*_Debug.log next to the EXE — DllMain prints the first "
+                    "few init steps. If that log is empty, MinHook_Initialize most "
+                    "likely failed (incompatible game or 32/64-bit mismatch).",
+                    lib_handle);
+            }
+        } else {
+            // LoadLibrary thread is still running after 5.1s — really hung.
+            DWORD pid_alive = WaitForSingleObject(process, 0);
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "Inject: LoadLibraryW thread is still running after 5.1s "
+                "(process %s). DllMain is hung or doing very heavy work. "
+                "Check FM2K_P*_Debug.log; if the game window appears but logs "
+                "stop part-way, MinHook setup may be deadlocking on a hook target.",
+                pid_alive == WAIT_TIMEOUT ? "alive" : "dead");
+        }
         CloseHandle(thread);
         return false;
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DLL injected and initialized successfully");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Inject: DLL signaled init complete");
     CloseHandle(thread);
     return true;
 }

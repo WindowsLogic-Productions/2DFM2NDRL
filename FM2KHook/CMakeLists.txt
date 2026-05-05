@@ -24,11 +24,18 @@ add_library(FM2KHook SHARED
     src/netplay/netplay.cpp
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
+    src/netplay/replay.cpp
+    src/netplay/spectator_node.cpp
+    src/netplay/spectator_tcp.cpp
+    src/netplay/nat_traversal.cpp
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI
     src/ui/imgui_overlay.cpp
     src/ui/shared_mem.cpp
+    src/ui/input_binder.cpp
+    # Parity — kgtengine cross-engine ground-truth recorder
+    src/parity/parity_recorder.cpp
 )
 
 # Export symbols for DLL
@@ -50,6 +57,10 @@ target_link_libraries(FM2KHook PRIVATE
     ws2_32
     winmm
     d3d9
+    # XInput for the input binder's Win32 polling path. Use xinput9_1_0
+    # (ships with Win7+ in-box) to avoid the redist requirement of the
+    # current xinput1_4.
+    xinput9_1_0
 )
 
 # Include directories - add all src subdirectories so includes work
@@ -67,6 +78,10 @@ target_include_directories(FM2KHook PRIVATE
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/include
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/GekkoLib/include
     ${CMAKE_SOURCE_DIR}/vendored/imgui
+    # kgtengine parity-snapshot header (sibling repo at /mnt/c/dev/kgtengine).
+    # FM2KHook/CMakeLists.txt is at /mnt/c/dev/wanwan/FM2KHook/, so go up two
+    # levels (../..) to reach /mnt/c/dev/, then into kgtengine/include.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../kgtengine/include
 )
 
 # Set output directories

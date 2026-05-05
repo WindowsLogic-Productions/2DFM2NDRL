@@ -16,11 +16,22 @@
 #include <cstdint>
 
 enum class LoopPhase {
-    NATIVE,           // Menu / intro / results — full original flow reproduced
-    CSS,              // Character select — control-channel-lockstep, no GekkoNet
-    TRAMPOLINE_BATTLE // GekkoNet drives sim + save + load + advance
+    NATIVE,             // Menu / intro / results — full original flow reproduced
+    CSS,                // Character select — control-channel-lockstep, no GekkoNet
+    TRAMPOLINE_BATTLE,  // GekkoNet drives sim + save + load + advance
+    SPECTATOR_PLAYBACK  // Inputs sourced from spectator stream queue, no GekkoNet
 };
 
 // Entry point replacing main_game_loop wholesale. Returns the same BOOL the
 // original did: non-zero on normal exit via WM_QUIT, zero on abnormal.
 BOOL TrampolineMainLoop();
+
+// [EB]-OPCODE DIAGNOSTIC: log shake-effect timer + camera position at the
+// given render-boundary phase (PRE-SAVE / PRE-RENDER / POST-RENDER /
+// POST-RESTORE). Gated on FM2K_EB_DIAG=1 env var; output goes to a per-PID
+// `FM2K_eb_diag_pid<PID>.log` next to the game EXE (NOT the main launcher
+// log). Used by both the trampoline render path AND Hook_RenderGame so
+// FM2K_BYPASS_TRAMPOLINE=1 still produces diag output for A/B testing
+// against the trampoline path. Cheap when env not set (single static-bool
+// branch). Frame counter advances on each PRE-SAVE call.
+void EbDiag_Dump(const char* tag);

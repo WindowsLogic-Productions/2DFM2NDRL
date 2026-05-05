@@ -1,6 +1,8 @@
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL_main.h>
 #include "SDL3/SDL.h"
+#include <SDL3_image/SDL_image.h>
+#include "app_icon_data.h"
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
@@ -360,6 +362,12 @@ namespace Utils {
 extern "C" {
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    // Rename the console window we get for the console-subsystem EXE.
+    // Default title is the full EXE path or, on some launches, the
+    // MinGW-w64 toolchain string ("POSIX WinThreads") inherited from
+    // the runtime. Override with something meaningful.
+    SetConsoleTitleA("FM2K Rollback Launcher");
+
     std::cout << "=== FM2K Rollback Launcher ===\n";
     std::cout << "Initializing with SDL callbacks...\n\n";
     
@@ -566,6 +574,22 @@ bool FM2KLauncher::Initialize() {
     };
     ui_->on_session_stop = [this]() {
         StopSession();
+    };
+    ui_->on_spectate_match = [this](const std::string& host_ip, int host_port) {
+        // Need an installed game to point the spectator at; reuse whatever
+        // the launcher currently has selected.
+        if (selected_game_.exe_path.empty()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectate: no game selected — pick one before clicking Spectate");
+            return;
+        }
+        // Pick a free local UDP port for the spectator's bind. 7002 by
+        // convention (above the host's 7000 and the client's 7001).
+        // If a spectator is already running, LaunchRemoteSpectator returns
+        // false; user can stop it from the multi-client tools first.
+        constexpr int SPEC_LOCAL_PORT = 7002;
+        LaunchRemoteSpectator(selected_game_.exe_path, SPEC_LOCAL_PORT,
+                              host_ip, host_port);
     };
     ui_->on_exit = [this]() {
         running_ = false;
@@ -788,6 +812,17 @@ bool FM2KLauncher::Initialize() {
     ui_->on_launch_local_client2 = [this](const std::string& game_path) -> bool {
         return LaunchLocalClient(game_path, false, 7001);  // Guest on port 7001
     };
+
+    ui_->on_launch_local_spectator = [this](const std::string& game_path) -> bool {
+        // Spectator subscribes to client1 (host on 7000), itself bound on 7002.
+        return LaunchLocalSpectator(game_path, /*spectator_port=*/7002, /*host_port=*/7000);
+    };
+
+    ui_->on_launch_local_spectator2 = [this](const std::string& game_path) -> bool {
+        // Daisy-chain: spectator 2 subscribes to spectator 1 (port 7002),
+        // bound on 7003. Validates the relay-forward path.
+        return LaunchLocalSpectator2(game_path, /*spectator_port=*/7003, /*upstream_port=*/7002);
+    };
     
     ui_->on_terminate_all_clients = [this]() -> bool {
         bool success = TerminateAllClients();
@@ -947,13 +982,33 @@ void FM2KLauncher::Render() {
 }
 
 bool FM2KLauncher::InitializeSDL() {
+    // Hints MUST be set before the gamepad subsystem starts. SDL3
+    // reads HIDAPI/RawInput hints when it stands up the joystick
+    // backend, NOT lazily — setting them later (e.g. inside the
+    // input binder's Init()) is a no-op. Without HIDAPI_PS3 the
+    // PS3 controller (and Qanba sticks in PS3 mode) fall through to
+    // a generic HID joystick path that has no SDL gamepad mapping,
+    // so SDL_GetGamepadButton sees nothing and the binder ignores
+    // every press. Mirrors revolve_input_sdl3's setup order.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI,         "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS3,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH,  "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT,       "1");
+
     // Initialize SDL with all necessary subsystems
     SDL_InitFlags init_flags = SDL_INIT_VIDEO | SDL_INIT_GAMEPAD;
-    
+
     if (!SDL_Init(init_flags)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_Init failed: %s", SDL_GetError());
         return false;
     }
+
+    // Gamepad events flow into SDL's event queue and update polled
+    // state; the binder reads the polled state via SDL_GetGamepadButton.
+    // Without this enabled, polled state never refreshes on Windows.
+    SDL_SetGamepadEventsEnabled(true);
     
     // Create window with SDL_Renderer graphics context
     float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
@@ -978,7 +1033,11 @@ bool FM2KLauncher::InitializeSDL() {
         return false;
     }
 
-    // Create a default icon if none exists
+    // App icon. We try paths first (so a future assets/icon.bmp drop-in
+    // overrides without a rebuild), then fall back to an embedded
+    // base64-decoded PNG (placeholder smiley). If both fail, draw a
+    // 32×32 blue square. SDL3_image is statically linked so IMG_Load_IO
+    // handles the PNG without an external SDL_image.dll.
     SDL_Surface* icon = nullptr;
     const char* icon_paths[] = {
         "assets/icon.bmp",
@@ -994,7 +1053,55 @@ bool FM2KLauncher::InitializeSDL() {
         }
     }
 
-    // If no icon file found, create a simple colored square as icon
+    if (!icon) {
+        // Decode the embedded base64 PNG. Decoder is short and self-
+        // contained — pulling SDL_base64 would mean wiring another
+        // header path, not worth it for a one-shot at startup.
+        const char* b64 = fm2k::kAppIconBase64;
+        const size_t b64_len = std::strlen(b64);
+        std::vector<uint8_t> png_bytes;
+        png_bytes.reserve((b64_len * 3) / 4 + 4);
+        auto val = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        uint32_t buf = 0;
+        int      bits = 0;
+        for (size_t i = 0; i < b64_len; ++i) {
+            const char c = b64[i];
+            if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                if (c == '=') break;
+                continue;
+            }
+            const int v = val(c);
+            if (v < 0) continue;
+            buf = (buf << 6) | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                png_bytes.push_back((uint8_t)((buf >> bits) & 0xFFu));
+            }
+        }
+        SDL_IOStream* io = SDL_IOFromConstMem(png_bytes.data(), png_bytes.size());
+        if (io) {
+            icon = IMG_Load_IO(io, /*closeio=*/true);
+            if (icon) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Loaded embedded smiley icon (%zu bytes PNG)",
+                            png_bytes.size());
+            } else {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "IMG_Load_IO failed for embedded icon: %s",
+                            SDL_GetError());
+            }
+        }
+    }
+
+    // If still no icon, draw a 32×32 blue square as final fallback.
     if (!icon) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "No icon file found, creating default icon");
         icon = SDL_CreateSurface(32, 32, SDL_PIXELFORMAT_RGBA32);
@@ -1016,6 +1123,62 @@ bool FM2KLauncher::InitializeSDL() {
     // Set window icon if we have one
     if (icon) {
         SDL_SetWindowIcon(window_, icon);
+
+        // Console window (conhost) inherits a generic icon when we attach
+        // via AllocConsole / parent inheritance. Convert the SDL surface
+        // to an HICON and SendMessage(WM_SETICON) to the console window
+        // so the smiley shows up in the title bar + Alt-Tab. Skipped if
+        // there's no console (launcher started without one — then
+        // GetConsoleWindow returns NULL).
+        if (HWND console_hwnd = GetConsoleWindow()) {
+            // Normalize to RGBA32 — DIB section we hand to CreateIconIndirect
+            // expects 32-bit BGRA top-down. ConvertSurface returns NULL on
+            // mismatch but a fresh copy on success; we own it.
+            SDL_Surface* rgba = SDL_ConvertSurface(icon, SDL_PIXELFORMAT_BGRA32);
+            if (rgba) {
+                SDL_LockSurface(rgba);
+                BITMAPV5HEADER bi = {};
+                bi.bV5Size        = sizeof(bi);
+                bi.bV5Width       = rgba->w;
+                bi.bV5Height      = -rgba->h;          // top-down
+                bi.bV5Planes      = 1;
+                bi.bV5BitCount    = 32;
+                bi.bV5Compression = BI_BITFIELDS;
+                bi.bV5RedMask     = 0x00FF0000;
+                bi.bV5GreenMask   = 0x0000FF00;
+                bi.bV5BlueMask    = 0x000000FF;
+                bi.bV5AlphaMask   = 0xFF000000;
+                HDC screen_dc = GetDC(nullptr);
+                void* dib_pixels = nullptr;
+                HBITMAP color_bmp = CreateDIBSection(
+                    screen_dc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+                    &dib_pixels, nullptr, 0);
+                ReleaseDC(nullptr, screen_dc);
+                if (color_bmp && dib_pixels) {
+                    std::memcpy(dib_pixels, rgba->pixels,
+                                (size_t)rgba->w * rgba->h * 4u);
+                    HBITMAP mask_bmp = CreateBitmap(rgba->w, rgba->h, 1, 1, nullptr);
+                    ICONINFO info = {};
+                    info.fIcon    = TRUE;
+                    info.hbmMask  = mask_bmp;
+                    info.hbmColor = color_bmp;
+                    HICON hicon = CreateIconIndirect(&info);
+                    if (hicon) {
+                        SendMessageW(console_hwnd, WM_SETICON,
+                                     ICON_SMALL, (LPARAM)hicon);
+                        SendMessageW(console_hwnd, WM_SETICON,
+                                     ICON_BIG,   (LPARAM)hicon);
+                        // Don't DestroyIcon — the console keeps a reference
+                        // for the lifetime of the window. Leaks one icon
+                        // handle on launcher exit, which is fine.
+                    }
+                    if (mask_bmp) DeleteObject(mask_bmp);
+                    DeleteObject(color_bmp);
+                }
+                SDL_UnlockSurface(rgba);
+                SDL_DestroySurface(rgba);
+            }
+        }
     }
 
     // No tray icon - just a normal window application
@@ -1099,10 +1262,69 @@ void FM2KLauncher::StartAsyncDiscovery() {
     }
 }
 
+// Max depth from games_root to descend looking for .kgt files. Real-world
+// libraries are organized publisher/game/[version/], so 6 covers everything
+// while preventing pathological symlink loops or scanning the whole drive.
+static constexpr int DISCOVERY_MAX_DEPTH = 6;
+
+// Walk state passed via SDL_EnumerateDirectory's userdata.
+struct DiscoveryWalkCtx {
+    std::vector<FM2K::FM2KGameInfo>* games;
+    int depth_remaining;
+};
+
+static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name);
+
+static void ScanDirForGames(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games,
+                            int depth_remaining)
+{
+    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Scanning '%s' (depth_left=%d)",
+                 dir.c_str(), depth_remaining);
+
+    // 1) Check this directory itself for *.kgt + matching *.exe.
+    int count = 0;
+    char** list = SDL_GlobDirectory(dir.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
+    if (list) {
+        for (int i = 0; i < count; ++i) {
+            if (!list[i]) continue;
+
+            const char* kgt_name = SDL_strrchr(list[i], '/');
+            if (!kgt_name) kgt_name = SDL_strrchr(list[i], '\\');
+            kgt_name = kgt_name ? kgt_name + 1 : list[i];
+
+            char* exe_name = nullptr;
+            if (SDL_asprintf(&exe_name, "%.*s.exe",
+                             (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
+                continue;
+            }
+            std::string exe_path = dir + "/" + exe_name;
+            std::string kgt_path = dir + "/" + kgt_name;
+            SDL_free(exe_name);
+
+            if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Found game pair: EXE='%s', KGT='%s'",
+                            exe_path.c_str(), kgt_path.c_str());
+                games.emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
+            }
+        }
+        SDL_free(list);
+    }
+
+    // 2) Recurse into subdirectories, decrementing depth budget.
+    if (depth_remaining > 0) {
+        DiscoveryWalkCtx ctx{&games, depth_remaining - 1};
+        SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
+    }
+}
+
 static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name) {
-    auto* games = static_cast<std::vector<FM2K::FM2KGameInfo>*>(userdata);
-    
-    // Build path using forward slashes to avoid double backslash issues
+    auto* ctx = static_cast<DiscoveryWalkCtx*>(userdata);
+
+    if (SDL_strcmp(name, ".") == 0 || SDL_strcmp(name, "..") == 0) {
+        return SDL_ENUM_CONTINUE;
+    }
+
     std::string dir_str = origdir;
     if (!dir_str.empty() && dir_str.back() != '/' && dir_str.back() != '\\') {
         dir_str += '/';
@@ -1111,53 +1333,19 @@ static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* ori
 
     SDL_PathInfo info;
     if (!SDL_GetPathInfo(full_path.c_str(), &info)) {
-        return SDL_ENUM_CONTINUE; // Cannot stat, but continue to next.
+        return SDL_ENUM_CONTINUE;
+    }
+    if (info.type != SDL_PATHTYPE_DIRECTORY) {
+        return SDL_ENUM_CONTINUE;
     }
 
-    if (info.type == SDL_PATHTYPE_DIRECTORY) {
-        if (SDL_strcmp(name, ".") != 0 && SDL_strcmp(name, "..") != 0) {
-            // For directories, look for KGT files directly inside
-            int count = 0;
-            char **list = SDL_GlobDirectory(full_path.c_str(), "*.kgt", /*flags=*/0, &count);
-            
-            if (list) {
-                for (int i = 0; i < count; ++i) {
-                    if (!list[i]) continue;
-                    
-                    const char* kgt_name = SDL_strrchr(list[i], '/');
-                    if (!kgt_name) kgt_name = SDL_strrchr(list[i], '\\');
-                    kgt_name = kgt_name ? kgt_name + 1 : list[i];  // Skip the slash
-                    
-                    // Build paths using string concatenation with forward slashes
-                    char* exe_name = nullptr;
-                    if (SDL_asprintf(&exe_name, "%.*s.exe", (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
-                        continue;
-                    }
-                    
-                    std::string exe_path = full_path + "/" + exe_name;
-                    std::string kgt_path = full_path + "/" + kgt_name;
-                    SDL_free(exe_name);
-
-                    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Found KGT in '%s': '%s', checking for EXE: '%s'", 
-                                name, kgt_path.c_str(), exe_path.c_str());
-
-                    if (SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Found valid game pair in '%s': EXE='%s', KGT='%s'", 
-                                  name, exe_path.c_str(), kgt_path.c_str());
-                        games->emplace_back(FM2K::FM2KGameInfo{exe_path, kgt_path, 0, true});
-                    }
-                }
-                SDL_free(list);
-            }
-        }
-    }
-
-    return SDL_ENUM_CONTINUE; // Continue enumeration
+    ScanDirForGames(full_path, *ctx->games, ctx->depth_remaining);
+    return SDL_ENUM_CONTINUE;
 }
 
 static void DiscoverGamesRecursive(const std::string& dir, std::vector<FM2K::FM2KGameInfo>& games) {
-    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Scanning directory: '%s'", dir.c_str());
-    SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &games);
+    DiscoveryWalkCtx ctx{&games, DISCOVERY_MAX_DEPTH - 1};
+    SDL_EnumerateDirectory(dir.c_str(), DirectoryEnumerator, &ctx);
 }
 
 std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
@@ -1173,7 +1361,7 @@ std::vector<FM2K::FM2KGameInfo> FM2KLauncher::DiscoverGames() {
 
     // First, check for KGT files in the root directory itself
     int count = 0;
-    char **list = SDL_GlobDirectory(games_root.c_str(), "*.kgt", /*flags=*/0, &count);
+    char **list = SDL_GlobDirectory(games_root.c_str(), "*.kgt", SDL_GLOB_CASEINSENSITIVE, &count);
     
     if (list) {
         for (int i = 0; i < count; ++i) {
@@ -1382,21 +1570,39 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
     uint16_t local_port = static_cast<uint16_t>(config.local_port);
 
     // Remote address:
-    //   - JOIN: user-pasted "ip:port" is authoritative.
-    //   - HOST: leave empty so the hook learns the peer from the first HELLO.
-    //     (The default "127.0.0.1:7001" from NetworkConfig ctor is a placeholder
-    //     used for the UI copy-button preview; it is NOT a real peer address.)
-    std::string remote_addr;
-    if (!is_host) {
-        remote_addr = config.remote_address;
-        if (remote_addr.find(':') == std::string::npos && !remote_addr.empty()) {
-            remote_addr += ":7500";  // fallback if user pasted a bare IP
-        }
+    //   - HUB-DRIVEN: match_start carries the peer's udp_addr in config
+    //     for BOTH host and guest. Use it directly.
+    //   - JOIN (legacy direct connect): user-pasted "ip:port" in
+    //     config.remote_address.
+    //   - HOST (legacy direct connect): leave empty so the hook
+    //     listens on its socket and learns the peer's address from
+    //     the first inbound HELLO. The default "127.0.0.1:7001" from
+    //     NetworkConfig's ctor is a UI copy-button placeholder, not
+    //     a real peer — clear it for legacy host.
+    std::string remote_addr = config.remote_address;
+    if (is_host && remote_addr == "127.0.0.1:7001") {
+        remote_addr.clear();   // legacy-host placeholder; let hook learn
+    }
+    if (remote_addr.find(':') == std::string::npos && !remote_addr.empty()) {
+        remote_addr += ":7500";  // fallback if user pasted a bare IP
     }
 
     game_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX", std::to_string(player_index));
     game_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT", std::to_string(local_port));
     game_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR", remote_addr);
+
+    // Auto-enable parity recorder for spectator-desync diagnosis. Each
+    // process writes per-frame state snapshots (RNG, game_timer, render_fc,
+    // etc.) to a .pty file. Diff host vs spectator post-run with
+    // tools/kgt_diff_pty to find the first divergent frame. Skip the env
+    // override if the user already set one (manual diagnostic flow).
+    if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
+        const std::string pty_path = "c:/games/2dfm/wanwan/parity_p"
+            + std::to_string(player_index + 1) + ".pty";
+        game_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH", pty_path);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Online session: parity recorder -> %s", pty_path.c_str());
+    }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Online session: P%d port=%d remote=%s",
@@ -1416,6 +1622,14 @@ void FM2KLauncher::StartOnlineSession(const NetworkConfig& config, bool is_host)
 void FM2KLauncher::StopSession() {
     // DLL handles GekkoNet directly - no launcher-side session needed
     std::cout << "? Session stopped\n";
+    // Tell the hub the match ended BEFORE we tear the local instance
+    // down. Hub flips both peers' status back to "idle" and
+    // broadcasts user_status to the rest of the room — without this
+    // the lobby sticks at "in_match" and Challenge stays disabled
+    // until the user reconnects.
+    if (ui_) {
+        ui_->NotifyHubMatchEnded();
+    }
     if (game_instance_) {
         game_instance_->Terminate();
         game_instance_.reset();
@@ -1519,6 +1733,155 @@ bool FM2KLauncher::LaunchLocalClient(const std::string& game_path, bool is_host,
     return true;
 }
 
+bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
+                                        int spectator_port,
+                                        int host_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching local spectator: %s (port=%d -> host_port=%d)",
+                game_path.c_str(), spectator_port, host_port);
+
+    if (spectator_instance_ && spectator_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
+        return false;
+    }
+
+    spectator_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator_instance_.get());
+
+    // Spectator-mode env vars. The hook reads FM2K_SPECTATOR_MODE=1 to skip
+    // the normal HELLO/HELLO_ACK flow and instead send SPEC_JOIN_REQ to
+    // FM2K_REMOTE_ADDR after the socket is up. Player index 2 is just a
+    // sentinel — spectators don't claim a player slot.
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",   "2");
+    spectator_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",     std::to_string(spectator_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",    "127.0.0.1:" + std::to_string(host_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE", "1");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
+        spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
+            "c:/games/2dfm/wanwan/parity_p3.pty");
+    }
+
+    if (!spectator_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch spectator: %s", game_path.c_str());
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Spectator process terminated immediately!");
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectator launched successfully (PID: %u, port=%d -> host=127.0.0.1:%d)",
+                spectator_instance_->GetProcessId(), spectator_port, host_port);
+    return true;
+}
+
+bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
+                                         int spectator_port,
+                                         const std::string& host_ip,
+                                         int host_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching remote spectator: %s (port=%d -> %s:%d)",
+                game_path.c_str(), spectator_port, host_ip.c_str(), host_port);
+
+    if (spectator_instance_ && spectator_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
+        return false;
+    }
+
+    spectator_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator_instance_.get());
+
+    const std::string remote_addr = host_ip + ":" + std::to_string(host_port);
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",    "2");
+    spectator_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",      std::to_string(spectator_port));
+    spectator_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",     remote_addr);
+    spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE",  "1");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
+        "c:/games/2dfm/wanwan/parity_p3.pty");
+
+    if (!spectator_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch remote spectator: %s",
+                     game_path.c_str());
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Remote spectator process terminated immediately!");
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Remote spectator launched (PID: %u, port=%d -> host=%s)",
+                spectator_instance_->GetProcessId(), spectator_port, remote_addr.c_str());
+    return true;
+}
+
+bool FM2KLauncher::LaunchLocalSpectator2(const std::string& game_path,
+                                         int spectator_port,
+                                         int upstream_port)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching local spectator 2 (chain): %s (port=%d -> upstream_port=%d)",
+                game_path.c_str(), spectator_port, upstream_port);
+
+    if (spectator2_instance_ && spectator2_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator 2 already running");
+        return false;
+    }
+
+    spectator2_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator2_instance_.get());
+
+    // Same env-var shape as the first spectator. The only difference is
+    // FM2K_REMOTE_ADDR points at spectator 1's port (7002) instead of the
+    // host's (7000). Spectator 1 acts as upstream; on JOIN_REQ it accepts
+    // and starts shipping its session_history (which it has been
+    // accumulating from its OWN relay path) to spectator 2.
+    spectator2_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",   "3");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",     std::to_string(spectator_port));
+    spectator2_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",    "127.0.0.1:" + std::to_string(upstream_port));
+    spectator2_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE", "1");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+    spectator2_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+
+    if (!spectator2_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Failed to launch spectator 2: %s", game_path.c_str());
+        spectator2_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator2_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Spectator 2 process terminated immediately!");
+        spectator2_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectator 2 launched (PID: %u, port=%d -> upstream=127.0.0.1:%d)",
+                spectator2_instance_->GetProcessId(), spectator_port, upstream_port);
+    return true;
+}
+
 bool FM2KLauncher::TerminateAllClients() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating all local clients");
     
@@ -1539,7 +1902,21 @@ bool FM2KLauncher::TerminateAllClients() {
         client2_instance_.reset();
         client2_process_id_ = 0;
     }
-    
+
+    // Terminate spectator
+    if (spectator_instance_) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating Spectator (PID: %u)", spectator_instance_->GetProcessId());
+        spectator_instance_->Terminate();
+        spectator_instance_.reset();
+    }
+
+    // Terminate spectator 2 (daisy-chain)
+    if (spectator2_instance_) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Terminating Spectator 2 (PID: %u)", spectator2_instance_->GetProcessId());
+        spectator2_instance_->Terminate();
+        spectator2_instance_.reset();
+    }
+
     return success;
 }
 

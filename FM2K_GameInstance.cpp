@@ -298,10 +298,48 @@ bool FM2KGameInstance::SetupProcessForHooking(const std::string& dll_path) {
         return false;
     }
 
-    // Wait for the DLL to load
-    DWORD wait_result = WaitForSingleObject(remote_thread, 5000); // 5 second timeout
+    // Wait for the LoadLibrary remote-thread to return. Poll in 250ms
+    // increments instead of one big WaitForSingleObject so we can give
+    // a richer error message on timeout (the most common bug-report
+    // we get is "DLL injection timeout or failed: 258" with no other
+    // detail). On timeout we still TerminateThread to free the slot.
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Inject: waiting up to 5s for LoadLibrary in target (pid=%lu)…",
+        (unsigned long)::GetProcessId(process_handle_));
+    DWORD wait_result = WAIT_TIMEOUT;
+    for (int slept_ms = 0; slept_ms < 5000; slept_ms += 250) {
+        wait_result = WaitForSingleObject(remote_thread, 250);
+        if (wait_result == WAIT_OBJECT_0) break;
+        // Process still alive?
+        if (WaitForSingleObject(process_handle_, 0) == WAIT_OBJECT_0) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "Inject: target process exited mid-injection (after %dms). "
+                "Game crashed during start-up — Windows SmartScreen, antivirus "
+                "(Defender, Bitdefender, Kaspersky), or DEP often kills FM2K "
+                "binaries on first run. Right-click the EXE + DLL → Properties "
+                "→ tick Unblock, and add an exclusion for the games folder.",
+                slept_ms);
+            TerminateThread(remote_thread, 1);
+            CloseHandle(remote_thread);
+            VirtualFreeEx(process_handle_, remote_memory, 0, MEM_RELEASE);
+            return false;
+        }
+    }
     if (wait_result != WAIT_OBJECT_0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "DLL injection timeout or failed: %lu", wait_result);
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Inject: LoadLibrary in target hung past 5s (wait_result=%lu). "
+            "DllMain is stuck — most common causes:\n"
+            "  1. FM2KHook.dll is BLOCKED by Windows. Right-click the DLL in "
+            "Explorer → Properties → tick \"Unblock\" → OK. Re-launch.\n"
+            "  2. Antivirus is scanning the DLL (Defender often does this on "
+            "first load). Add an exclusion for the launcher's folder.\n"
+            "  3. Missing VC++ runtime in the target process (rare for FM2K — "
+            "the games are vintage and don't need modern runtimes).\n"
+            "  4. FM2KHook.dll is in a path with non-ASCII characters and the "
+            "ANSI LoadLibraryA we use can't open it. Move the launcher to "
+            "C:\\games\\ or similar.\n"
+            "DLL was: %s",
+            (unsigned long)wait_result, dll_path.c_str());
         TerminateThread(remote_thread, 1);
         CloseHandle(remote_thread);
         VirtualFreeEx(process_handle_, remote_memory, 0, MEM_RELEASE);
@@ -321,11 +359,19 @@ bool FM2KGameInstance::SetupProcessForHooking(const std::string& dll_path) {
     VirtualFreeEx(process_handle_, remote_memory, 0, MEM_RELEASE);
 
     if (exit_code == 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "DLL failed to load (LoadLibrary returned NULL)");
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "Inject: LoadLibraryA returned NULL — the DLL was rejected by "
+            "Windows. Most common cause: the file is BLOCKED (Mark of the "
+            "Web). Right-click FM2KHook.dll → Properties → \"Unblock\" → OK. "
+            "Other possibilities: file corrupted (re-download), wrong "
+            "architecture (FM2K games are 32-bit; FM2KHook.dll must be 32-bit "
+            "too — it is in stock builds), or the path can't be resolved. "
+            "DLL was: %s", dll_path.c_str());
         return false;
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DLL injection successful: %s", dll_path.c_str());
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Inject: DLL loaded (module handle 0x%lx)", exit_code);
     return true;
 }
 

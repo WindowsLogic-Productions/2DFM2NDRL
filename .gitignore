@@ -18,3 +18,13 @@ CLAUDE.local.md
 ExceptionAutoSave_FM-Variables.CT
 FM-Variables.amt
 FM-Variables.CT
+
+# Hub + bot live in their own private repos (armonte/fm2k-hub and
+# armonte/fm2k-bot). They're kept on disk here so the working tree
+# can run them locally during dev, but they don't belong in the
+# wanwan history.
+/hub
+/bot
+
+# Auto-generated at build time by scripts/make_version.sh.
+/version_local.h

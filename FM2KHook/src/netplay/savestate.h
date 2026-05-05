@@ -113,6 +113,28 @@ bool SaveState_Save(int frame);
 bool SaveState_Load(int frame);
 uint32_t SaveState_GetLastChecksum(int frame);
 
+// Back-patch the most-recently-saved slot's rng_seed with the post-render
+// value of g_random_seed. SaveEvent fires BEFORE render in GekkoNet's per-
+// frame event order, so SaveState_Save captures the pre-render rng. Render
+// then advances rng (ProcessShakeEffect mode 4 + ProcessColorInterpolation
+// mode 3 each call game_rand). For rollback determinism the saved slot must
+// reflect post-render rng so that:
+//   (a) rollback replay's Load gives back the same starting rng forward had
+//       at the next frame (forward's pre-sim rng = post-render-of-prev-frame
+//       rng; replay must match), and
+//   (b) the runahead-rewind Load every wall-clock frame does the same thing
+//       as a real rollback would — restoring the post-render rng so live rng
+//       matches across forward and replay.
+// Without this back-patch, render-side rand calls accumulate forever on
+// forward but never on replay, and the two diverge after any rollback —
+// which is what produced the rng-region forward/replay DIFFs in
+// FM2K_P*_desync_f*.log.
+//
+// Call from RenderFrameWithSnapshot AFTER original_render_game returns,
+// passing the current live rng. Cheap (single uint32 write into the slot).
+// No-op if no Save has run yet (e.g. CSS pre-battle).
+void SaveState_PatchPostRenderRng(uint32_t rng);
+
 // Per-region diagnostic checksums for desync investigation
 struct RegionChecksums {
     uint32_t rng;
