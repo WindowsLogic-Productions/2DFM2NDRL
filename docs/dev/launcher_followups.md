@@ -119,32 +119,85 @@ forever for a payoff of "find one or two FM2K_Player.exe instances".
 helper. Pairs naturally with the multiple-folder work above; do them in
 the same session to share the test surface.
 
-### Scoreboard / W-L-D in the lobby
-**Goals:**
-- A scoreboard panel pinned to the top of the launcher (above Rooms),
-  similar to LilithPort's bracket view. Shows recent matches with results.
-- W-L-D record per opponent in the user list (you've played X, won Y, lost Z).
-- W-L-D per game in the room list (you have N matches in this room).
+### Scoreboard / W-L-D in the lobby (in progress — hub side first)
 
-**Hub-side changes needed:**
-- New `match_result` event from peers at end-of-match: `{type:
-  match_result, winner_id, loser_id, game_id, finished_at}`. Hub
-  validates both peers report the same result before persisting.
-- Persistent stats DB (sqlite is fine for our scale; ~thousands of users).
-  Schema: `matches(id, p1_id, p2_id, game_id, winner_id, finished_at)`.
-- New hub message `query_record(opponent_id?, game_id?)` returns
-  match counts the launcher uses to render the W-L-D cells.
+**Storage choice:** flat JSON file `hub/matches.json` instead of sqlite.
+Same shape as `tokens.json`, same persistence pattern, no new
+dependency. Scale ceiling: ~50k matches before linear-scan queries
+matter (each query is O(N) over the match log, but N is small).
+Re-aggregate on hub start; query-time cache by (user, opponent, game).
+
+**Schema:**
+```json
+{
+  "version": 1,
+  "matches": [
+    {
+      "id":           "uuid-hex",
+      "p1_id":        "discord_id_a",
+      "p1_nick":      "Armonté",
+      "p2_id":        "discord_id_b",
+      "p2_nick":      "moko",
+      "game_id":      "wanwan",
+      "winner_id":    "discord_id_a",   // empty string = draw / disconnect
+      "finished_at":  1748905123.456,
+      "report_a":     "p1_won",         // raw report from p1
+      "report_b":     "p1_won"          // raw report from p2
+    }
+  ]
+}
+```
+
+**Reporting protocol:**
+1. Both peers send `match_result` at end-of-match:
+   ```json
+   {"type": "match_result", "match_id": "<token>",
+    "outcome": "self_won" | "peer_won" | "draw" | "disconnect"}
+   ```
+2. Hub correlates by `match_id` (= the same `token` from match_start).
+3. Within 60s of first report, both peers must agree before the match
+   counts. Disagreement → log to `match_disputes.json` for ops review,
+   don't increment stats.
+4. After timeout, if only one report arrived: trust that side IFF the
+   other peer has gone offline (counts as `disconnect`). Otherwise drop.
+
+**Hub messages:**
+- `match_result` → in (peer→hub).
+- `query_record` → in (peer→hub).
+  Args: `{opponent_id?: string, game_id?: string}`.
+  Returns:
+  ```json
+  {"type": "record",
+   "wins": N, "losses": M, "draws": D,
+   "vs_breakdown": [
+     {"opponent_id": "...", "opponent_nick": "...", "wins": x, "losses": y, "draws": z}
+   ],
+   "by_game": [
+     {"game_id": "...", "wins": x, "losses": y, "draws": z}
+   ]
+  }
+  ```
+- `recent_matches` → in (peer→hub).
+  Returns the last 50 matches the user is in (for the scoreboard panel).
 
 **Launcher-side changes:**
-- Scoreboard panel widget with most-recent-N matches, click-to-spectate.
-- W-L-D rendering in the user-list table — extra column hidden when
-  there's no match history with that opponent.
-- Caching layer so re-rendering doesn't spam the hub with `query_record`.
+- HubClient: `MatchResult(match_id, outcome)` send + `QueryRecord` /
+  `RecentMatches` send. Reply events: `K::RecordReceived`,
+  `K::RecentMatchesReceived`.
+- HubUser cache extended with `record_vs_self` (W/L/D) — populated
+  asynchronously on lobby render via `QueryRecord(opponent_id=user_id)`.
+- W-L-D column in user-list table (right of Ping). "—" if no history.
+  Hover tooltip with breakdown.
+- Match-end hook in Netplay: send `match_result` when battle session
+  ends. Outcome derived from final p1_hp vs p2_hp (winner = HP > 0,
+  draw = both 0, disconnect = peer disconnected mid-match).
 
-**Surface-area estimate:** ~400 LOC across hub + launcher + a small
-sqlite migration. Probably 1.5 days. **Blocks on:** match-result agreement
-between peers — both sides need to report the same result. This is
-non-trivial during desync windows.
+**Surface-area estimate:** ~150 LOC hub + ~250 LOC launcher. ~1 day work
+once the data shape is locked in. **Blocks on:** plumbing the match-end
+event from hook → launcher (currently the launcher doesn't get a clean
+"battle ended" notification — the hook just transitions back to CSS or
+exits). Need a new BATTLE_END notification on the control channel that
+carries the final HP / outcome.
 
 ### Long-term: in-game lobby (game proxies launcher)
 We talked about this in an earlier session — the long-term direction is
