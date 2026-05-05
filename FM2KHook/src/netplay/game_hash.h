@@ -33,4 +33,15 @@ const char* DescribeLocal();
 // has never been called.
 const char* ManifestLocal();
 
+// Per-entry iteration: invoke `cb(name, size, content_hash)` for each
+// file that fed the hash, in the canonical sorted order. content_hash
+// is 0 for entries hashed by name+size only (.player). Used by the
+// on-mismatch dump so the rendered output is byte-equivalent to the
+// boot-time per-entry log — avoids parsing the cached manifest string
+// line-by-line, which had a (still-being-investigated) corruption
+// case where one entry rendered with a truncated name+missing size.
+void ForEachManifestEntry(
+    void (*cb)(const char* name, uint64_t size, uint64_t content_hash, void* user),
+    void* user);
+
 }  // namespace fm2k::game_hash

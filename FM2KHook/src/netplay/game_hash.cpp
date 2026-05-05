@@ -28,6 +28,17 @@ char     s_describe[128] = {};
 // to a fix beyond "send each other your install."
 std::string s_manifest;
 
+// Cached entries (name, size, content_hash) so the on-mismatch dump
+// can iterate them directly without re-parsing s_manifest. The
+// string-split path corrupted one entry under conditions we haven't
+// reproduced — bypassing it entirely is the safe move.
+struct ManifestEntry {
+    std::string name;
+    uint64_t    size;
+    uint64_t    content_hash;
+};
+std::vector<ManifestEntry> s_manifest_entries;
+
 std::filesystem::path GameDir() {
     char buf[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -251,6 +262,16 @@ uint32_t Compute() {
     // implicit — if the dir has 200+ files, the log line will be
     // long but each line is still parseable.
     s_manifest = canon;
+    // Cache the per-entry data too so ForEachManifestEntry can dump
+    // identical bytes to the boot-time SDL_LogInfo per-entry loop.
+    // The on-mismatch dump path uses this to avoid re-parsing
+    // s_manifest, which exposed a corruption case in v0.2.1.
+    s_manifest_entries.clear();
+    s_manifest_entries.reserve(entries.size());
+    for (const auto& e : entries) {
+        s_manifest_entries.push_back({e.name_lower, e.size,
+                                      (uint64_t)e.content_hash});
+    }
     // Per-file log as INFO so each peer's hook log records exactly
     // which entries went into the hash. On a mismatch, two peers
     // diff their logs and the offending row jumps out.
@@ -276,6 +297,16 @@ uint32_t Compute() {
 const char* DescribeLocal() { return s_describe; }
 const char* ManifestLocal() {
     return s_manifest.empty() ? "(not computed yet)" : s_manifest.c_str();
+}
+
+void ForEachManifestEntry(
+    void (*cb)(const char* name, uint64_t size, uint64_t content_hash, void* user),
+    void* user)
+{
+    if (!cb) return;
+    for (const auto& e : s_manifest_entries) {
+        cb(e.name.c_str(), e.size, e.content_hash, user);
+    }
 }
 
 }  // namespace fm2k::game_hash
