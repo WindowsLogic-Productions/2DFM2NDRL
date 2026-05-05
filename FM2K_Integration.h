@@ -7,6 +7,8 @@
 
 #include "MinHook.h"
 #include "ISession.h"
+#include "FM2K_CncDDraw.h"   // IniConfig used as a member of LauncherUI
+#include "FM2K_KgtParser.h"  // KgtSummary stored on FM2KGameInfo
 
 #include <string>
 #include <vector>
@@ -75,7 +77,7 @@ namespace FM2K {
     // Core character selection state (similar to CC_P1/P2_CHARACTER_ADDR)
     constexpr uintptr_t P1_CHARACTER_ID_ADDR = 0x470180;    // P1 selected character ID (u32)
     constexpr uintptr_t P2_CHARACTER_ID_ADDR = 0x470184;    // P2 selected character ID (u32)
-    constexpr uintptr_t SELECTED_STAGE_ADDR = 0x470188;     // Selected stage ID (u32)
+    constexpr uintptr_t SELECTED_STAGE_ADDR = 0x43010c;     // Selected stage ID (u32) — IDA-verified WW: vs_round_function reads this as wParam, settings_dialog_proc writes CB_GETCURSEL into it
     
     // Character grid cursor positions (similar to CC_P1/P2_CHARA_SELECTOR_ADDR)
     constexpr uintptr_t P1_CURSOR_X_ADDR = 0x47018C;        // P1 character grid cursor X (u32)
@@ -214,12 +216,58 @@ namespace FM2K {
     constexpr DWORD FRAME_HOOK_ADDR = 0x4146D0;
     constexpr DWORD UPDATE_GAME_STATE_ADDR = 0x404CD0;
     
+    // Engine variant — selects address tables / hook strategy / launch flow.
+    // FM2K (Fighter Maker 2nd) is the default supported engine. FM95 is the
+    // earlier prototype (e.g. CPW.exe — Comic Party Wars). They share the
+    // 256-slot object pool and 11-bit input format but differ in:
+    //   - g_game_mode encoding (FM2K uses 2000/3000 magic; FM95 stays 0/1)
+    //   - frame loop shape (FM2K has RUN_GAME_LOOP; FM95 inlines into WinMain)
+    //   - CSS / battle phase classification (FM95 has no global mode flag)
+    // See FM95_Integration.h for FM95 address tables and CharSelect:: helpers.
+    enum class Engine : uint32_t {
+        FM2K = 0,  // default — Fighter Maker 2nd (most modern 2DFM titles)
+        FM95 = 1,  // prototype — Fighter Maker 95 (CPW.exe, early 2002 builds)
+    };
+
+    inline const char* EngineName(Engine e) {
+        switch (e) {
+            case Engine::FM2K: return "FM2K";
+            case Engine::FM95: return "FM95";
+            default:           return "unknown";
+        }
+    }
+
     // Game instance info
     struct FM2KGameInfo {
         std::string exe_path;
         std::string dll_path;
         uint32_t process_id;
         bool is_host;
+        Engine engine = Engine::FM2K;  // detected at discovery time
+
+        // Identification state, set by discovery:
+        //   - is_clean   : exe hash matched a known-clean entry in the registry.
+        //   - packer_label: non-empty => detected a real packer (Enigma /
+        //                   UPX / MoleBox / etc) by sniffing PE section names.
+        //                   This is what we *actually* warn about in the UI.
+        //   - clean_label: friendly title when is_clean (e.g. "WonderfulWorld v0.946").
+        //   - xxh64      : computed once at discovery, reused for cache + UI.
+        //
+        // Three render states drive from these:
+        //   is_clean=true                       -> "<exe>  [<engine> — <label>]"           normal
+        //   packer_label non-empty              -> "* <exe>  [<engine> — packed: <name>]"  yellow
+        //   else (untested, no packer detected) -> "<exe>  [<engine> — untested]"          normal
+        bool        is_clean = false;
+        std::string clean_label;
+        std::string packer_label;
+        uint64_t    xxh64    = 0;
+
+        // Parsed .kgt summary — player/stage/demo name lists. Populated at
+        // discovery time so the UI can populate dropdowns pre-launch without
+        // having to boot the game once and ReadProcessMemory the in-memory
+        // buffers. `kgt.valid == false` means parse failed or no .kgt was
+        // present (FM95 .player-only directories).
+        fm2k::KgtSummary kgt;
 
         // Helper to get just the filename from the full path
         std::string GetExeName() const {
@@ -502,14 +550,21 @@ public:
     
     std::vector<FM2K::FM2KGameInfo> DiscoverGames();
     const std::vector<FM2K::FM2KGameInfo>& GetDiscoveredGames() const { return discovered_games_; }
+
+    // Resolve a hub-style game_id (exe stem, e.g. "WonderfulWorld_ver_0946")
+    // to its parsed .kgt summary. Returns nullptr if the game isn't
+    // installed locally or its KGT failed to parse — UI callers should
+    // pass the result straight into fm2k::FormatCharLabel /
+    // FormatStageLabel which fall back to "Char #N" / "Stage #N".
+    const fm2k::KgtSummary* FindKgtByGameId(const std::string& game_id) const;
     
     void SetState(LauncherState state);
     bool IsRunning() const { return running_; }
     void SetRunning(bool running) { running_ = running; }
     
     // Games directory management
-    const std::string& GetGamesRootPath() const { return games_root_path_; }
-    void SetGamesRootPath(const std::string& path);
+    const std::vector<std::string>& GetGamesRootPaths() const { return games_root_paths_; }
+    void SetGamesRootPaths(const std::vector<std::string>& paths);
     void SetSelectedGame(const FM2K::FM2KGameInfo& game);
     
     // ----- Asynchronous game discovery -----
@@ -590,8 +645,11 @@ private:
     uint32_t client2_process_id_;
     
     
-    // Games directory (root where FM2K games are located)
-    std::string games_root_path_;
+    // Games directories (one or more roots where FM2K games are located).
+    // Persisted as one path per line in launcher.cfg; the historical
+    // single-string format migrates transparently because that file is
+    // already line-delimited.
+    std::vector<std::string> games_root_paths_;
     
     // Pending configuration (set before instances are created)
     struct PendingConfig {
@@ -635,7 +693,11 @@ public:
     std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
-    std::function<void(const std::string&)> on_games_folder_set;
+    // Fired when the user adds, removes, or otherwise reorders the
+    // configured games-root list. The full new list is passed by value so
+    // the launcher can persist it atomically; the UI keeps its own copy
+    // in games_root_paths_ for rendering.
+    std::function<void(const std::vector<std::string>&)> on_games_folders_set;
     
     // Debug state callbacks
     std::function<bool()> on_debug_save_state;
@@ -732,6 +794,18 @@ public:
     std::function<bool(const std::string&)> on_launch_local_spectator2;  // Launch second spectator subscribing to first (daisy-chain test)
     std::function<bool()> on_terminate_all_clients;                      // Kill all launched clients
     std::function<bool(uint32_t&, uint32_t&)> on_get_client_status;      // Get client process IDs (client1_pid, client2_pid)
+
+    // Resolve a stage_id into a UTF-8 name from the locally-discovered
+    // game's parsed KGT. Returns empty string if game_id isn't installed
+    // locally or the slot is empty / out-of-range. Used at match_result
+    // bake time to ship a human-readable stage name to the hub so other
+    // players viewing recent matches see "公園" not "Stage #2".
+    std::function<std::string(const std::string&, uint32_t)> on_resolve_stage_name;
+    // Same shape, parallel hook for char_id → name lookup. Used by the
+    // live-matches lobby panel for rows where the wire payload didn't
+    // carry char_name (older client / KGT not installed on the sender).
+    // Returns empty string when game isn't installed locally.
+    std::function<std::string(const std::string&, uint32_t)> on_resolve_char_name;
     
     // Network simulation callbacks removed - not connected to LocalNetworkAdapter
     
@@ -745,7 +819,7 @@ public:
     void SetFramesAhead(float frames_ahead);
     // Update scanning progress (0-1). Only meaningful while scanning flag is true.
     void SetScanning(bool scanning);
-    void SetGamesRootPath(const std::string& path);
+    void SetGamesRootPaths(const std::vector<std::string>& paths);
 
 private:
     // Logging
@@ -760,7 +834,7 @@ private:
     LauncherState launcher_state_;
     SDL_Renderer* renderer_;
     SDL_Window* window_;
-    std::string games_root_path_;  // Current games root directory
+    std::vector<std::string> games_root_paths_;  // Configured games root directories
     int selected_game_index_ = -1; // -1 means no selection
     bool scanning_games_ = false;  // True while background discovery is running
 
@@ -797,8 +871,85 @@ private:
     void RenderSlotInspectionWindow();  // Stub
     void RenderHubPanel();              // Fightcade-style lobby
     void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
-    void RenderHubServerWindow();       // Settings → Hub Server… host editor
-    void RenderDiscordAuthWindow();     // Settings → Sign in with Discord…
+    void RenderHubServerWindow();       // Legacy floating window — kept for hot-reload paths; new path is the Settings tab.
+    void RenderDiscordAuthWindow();     // Stays separate — OAuth pairing flow has its own state machine.
+    void RenderGamesFoldersWindow();    // Legacy.
+    void RenderRecentMatchesWindow();   // Legacy.
+
+    // Single consolidated Settings window with tabs. Replaces the
+    // five floating Settings sub-windows. Floats but is non-movable
+    // and non-dockable so it stays a popup-style modal — open it from
+    // Settings → Settings…, do your thing, close it. Tabs: Input P1,
+    // Input P2, Host Config, Hub Server, Games Folders, Recent Matches.
+    void RenderSettingsWindow();
+    // Per-tab body renderers (no Begin/End — caller owns the container).
+    // Reused by both the legacy floating windows and the new Settings tabs.
+    void RenderHubServerBody();
+    void RenderHostConfigBody();
+    void RenderGamesFoldersBody();
+    void RenderRecentMatchesBody();
+    // Hub-panel "Live Matches" — shows every InFlightMatch the hub knows
+    // about. Char/stage names render via fm2k::FormatCharLabel /
+    // FormatStageLabel so names appear when the viewer has the game
+    // installed locally OR when a peer baked the names into the hub
+    // payload. Refreshes from MatchInProgress* events; no per-render hub
+    // round-trip.
+    void RenderInProgressMatchesBody();
+    // Settings → Display tab. Edits <install_dir>\ddraw.ini for the
+    // bundled cnc-ddraw build. State cached in `ddraw_cfg_`; loaded
+    // lazily on first tab render via `LoadDDrawCfgIfNeeded`. Per-widget
+    // changes write back through fm2k::cnc_ddraw::Save* helpers, which
+    // hit the ini through Win32 WritePrivateProfileString — preserves
+    // unknown keys + per-game `[<exe>]` blocks the user might have.
+    void RenderDisplayBody();
+    void LoadDDrawCfgIfNeeded();
+    // Per-player SOCD picker rendered above/below each player's
+    // binding tab. SOCD is a local input filter applied before the
+    // 11-bit mask hits the wire, so different modes on the two peers
+    // do NOT cause desyncs — each peer's slot has its own setting.
+    // Persisted to settings.ini (`socd_mode_p1`, `socd_mode_p2`).
+    void RenderInputBindingsTab(int player_slot);
+    // Per-launcher SOCD state. Loaded from settings.ini on first menu
+    // render; written back when the user changes the picker. Pushed to
+    // the spawned game's hook via FM2K_SOCD_MODE env at launch time.
+    int  socd_mode_[2] = {1, 1};   // tournament-default (Hitbox SOCD)
+    bool socd_state_loaded_ = false;
+    void LoadSocdState();
+    void SaveSocdState();
+    // Random-stage host preference (#56). Persisted in settings.ini
+    // alongside SOCD; consumed at challenge time to populate
+    // MatchSettings::random_seed/min/max.
+    bool random_stage_enable_   = false;
+    int  random_stage_min_      = 0;
+    int  random_stage_max_      = 7;
+    bool random_state_loaded_   = false;
+    void LoadRandomStageState();
+    void SaveRandomStageState();
+
+    // Refresh the SDL window title to "FM2K Rollback Launcher — <nick> (W-L-D)"
+    // any time the user's record changes. No-op if we don't have a record
+    // yet (record-fetch races with first lobby render). Called from the
+    // K::RecordReceived handler.
+    void UpdateWindowTitleWithRecord();
+
+    // Push the current overall + vs-peer W/L/D and the peer/my nick into
+    // the running game's FM2KSharedMemData. The hook reads these to
+    // render the in-game titlebar (and eventually the in-game overlay)
+    // so the player sees their record without alt-tabbing. Called any
+    // time the cached record or current peer changes (K::RecordReceived,
+    // K::MatchStart). Cheap no-op when there is no active game process.
+    void PushStatsToHook();
+
+    // Append one row to %APPDATA%\FM2K_Rollback\results.csv (#42). Writes
+    // a UTF-8 BOM on first creation so Excel renders JP/accented names
+    // correctly. Invoked from PollMatchOutcome alongside the hub send so
+    // the local log captures the match even when the hub roundtrip fails.
+    // outcome_str is the same string we send to the hub (self_won /
+    // peer_won / draw / disconnect).
+    void AppendResultsCsvRow(const char* outcome_str,
+                             uint32_t p1_char_id, uint32_t p2_char_id,
+                             const std::string& p1_char_name,
+                             const std::string& p2_char_name);
     void LoadAudioMuteState();          // Read %APPDATA%\FM2K_Rollback\audio.ini
     void SaveAudioMuteState();          // Write same file (hook re-reads it)
     void LoadNotifyState();             // Read notify_* keys from settings.ini
@@ -807,6 +958,24 @@ private:
     // + Windows toast. Each piece is independently togglable in Settings.
     // Called from the K::ChallengeReceived event handler.
     void FireChallengeNotification(const std::string& from_nick);
+
+    // Fire a generic notification (taskbar flash + sound + toast) with a
+    // caller-provided title and body. Used for the peer-disconnect path
+    // where the challenge-specific copy doesn't apply, but we still want
+    // the user to notice the launcher is taking back focus + closing the
+    // match. UTF-8 strings (converted to UTF-16 for Shell_NotifyIconW).
+    void FireSystemNotification(const std::string& title_utf8,
+                                const std::string& body_utf8);
+
+    // Poll FM2KSharedMemData on every running game PID. When the hook
+    // bumps `match_outcome_seq`, read the new outcome enum, map it to a
+    // hub `match_result` string, and send. Idempotent across frames —
+    // a per-PID last-seen-seq prevents re-sends of the same bump. No-op
+    // when no hub match is active or the launcher isn't connected. Also
+    // detects the FM2K_MATCH_OUTCOME_DISCONNECT case and asks the local
+    // game to close so the surviving instance doesn't stay open after
+    // the peer drops.
+    void PollMatchOutcome();
 
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
@@ -817,12 +986,24 @@ private:
     // Settings windows toggled from the menu bar. input_binder_initialized_
     // gates Init() to a single call (gamepad subsystem startup) the first
     // time the user opens either binder window.
+    bool show_settings_        = false;     // Single tabbed Settings window
+    bool show_discord_auth_    = false;     // Sign in with Discord — OAuth flow is its own window
+    // Legacy per-section flags kept for any path that still toggles them.
+    // The unified Settings window is the user-facing surface now.
     bool show_input_binder_p1_ = false;
     bool show_input_binder_p2_ = false;
     bool show_host_config_     = false;
-    bool show_hub_server_      = false;     // Settings → Hub Server… window
-    bool show_discord_auth_    = false;     // Settings → Sign in with Discord… window
+    bool show_hub_server_      = false;
+    bool show_games_folders_   = false;
+    bool show_recent_matches_  = false;
     bool input_binder_initialized_ = false;
+
+    // Settings → Display state. `ddraw_cfg_` is loaded once on first
+    // open of the Display tab; subsequent edits save back per-key
+    // through fm2k::cnc_ddraw::Save* and refresh the cached value
+    // immediately so the widget reflects the new state.
+    fm2k::cnc_ddraw::IniConfig ddraw_cfg_{};
+    bool ddraw_cfg_loaded_ = false;
 
     // Audio mute toggles (Settings menu). Persisted to
     // %APPDATA%\FM2K_Rollback\audio.ini; the hook DLL re-reads that file
