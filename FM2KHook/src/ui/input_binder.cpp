@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,6 +96,12 @@ void ApplyDefaults(int player) {
 
 void RefreshGamepadList() {
     g_gamepad_ids.clear();
+    // Pump events first — a freshly-plugged stick may not show up in
+    // SDL_GetGamepads / SDL_GetJoysticks until SDL has processed its
+    // own JOYSTICK_ADDED event.
+    SDL_PumpEvents();
+
+    // Pass 1: SDL-known gamepads (have a built-in mapping).
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     if (ids) {
@@ -103,11 +110,68 @@ void RefreshGamepadList() {
             g_gamepad_ids.push_back(jid);
             if (g_gamepad_handles.find(jid) == g_gamepad_handles.end()) {
                 SDL_Gamepad* gp = SDL_OpenGamepad(jid);
-                if (gp) g_gamepad_handles[jid] = gp;
+                if (gp) {
+                    g_gamepad_handles[jid] = gp;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "InputBinder: opened gamepad jid=%u name='%s'",
+                        (unsigned)jid,
+                        SDL_GetGamepadName(gp) ? SDL_GetGamepadName(gp) : "?");
+                }
             }
         }
         SDL_free(ids);
     }
+
+    // Pass 2: walk ALL joysticks. Some sticks (Qanba Obsidian in
+    // generic-HID modes, third-party PS3 clones, etc.) don't appear
+    // in SDL_GetGamepads but CAN be opened as gamepads via SDL3's
+    // synthetic mapping. Mirroring revolve_input_sdl3's pattern
+    // here — without it, only XInput-recognized devices showed up
+    // in our binder UI.
+    int joy_count = 0;
+    SDL_JoystickID* joys = SDL_GetJoysticks(&joy_count);
+    if (joys) {
+        for (int i = 0; i < joy_count; ++i) {
+            SDL_JoystickID jid = joys[i];
+            // Skip if pass 1 already opened it.
+            if (g_gamepad_handles.find(jid) != g_gamepad_handles.end()) continue;
+            // SDL_IsGamepad sometimes returns false right after a
+            // joystick-added event before SDL loads the device's
+            // mapping. Pump + retry once before giving up.
+            bool is_gp = SDL_IsGamepad(jid);
+            if (!is_gp) { SDL_PumpEvents(); is_gp = SDL_IsGamepad(jid); }
+            if (!is_gp) {
+                // Diagnostic — name + GUID for sticks we couldn't
+                // promote to a gamepad. Helps the user paste this
+                // info if they need a custom mapping added.
+                SDL_Joystick* j = SDL_OpenJoystick(jid);
+                if (j) {
+                    char guid[64] = {};
+                    SDL_GUIDToString(SDL_GetJoystickGUID(j), guid, sizeof(guid));
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "InputBinder: joystick jid=%u name='%s' guid=%s "
+                        "(no SDL gamepad mapping — won't appear in binder)",
+                        (unsigned)jid,
+                        SDL_GetJoystickName(j) ? SDL_GetJoystickName(j) : "?",
+                        guid);
+                    SDL_CloseJoystick(j);
+                }
+                continue;
+            }
+            SDL_Gamepad* gp = SDL_OpenGamepad(jid);
+            if (!gp) { SDL_PumpEvents(); gp = SDL_OpenGamepad(jid); }
+            if (gp) {
+                g_gamepad_ids.push_back(jid);
+                g_gamepad_handles[jid] = gp;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "InputBinder: promoted joystick jid=%u to gamepad — name='%s'",
+                    (unsigned)jid,
+                    SDL_GetGamepadName(gp) ? SDL_GetGamepadName(gp) : "?");
+            }
+        }
+        SDL_free(joys);
+    }
+
     // Drop any handles that disappeared.
     for (auto it = g_gamepad_handles.begin(); it != g_gamepad_handles.end();) {
         bool still_present = std::find(g_gamepad_ids.begin(), g_gamepad_ids.end(),
@@ -195,11 +259,22 @@ bool BindingsConflict(const Binding& a, const Binding& b) {
 // ---------------------------------------------------------------------------
 
 bool AnyInputHeld() {
+    SDL_PumpEvents();  // refresh polled state
     int nkeys = 0;
     const bool* ks = SDL_GetKeyboardState(&nkeys);
     if (ks) {
         for (int i = 0; i < nkeys; ++i) if (ks[i]) return true;
     }
+    // Tighter threshold for the "is something held?" check than for
+    // the actual capture: PS3 / Qanba sticks frequently park an axis
+    // at full +/- 32767 on plug-in (A3 reported as 32767 on cold
+    // boot per user repro). With the capture threshold (16384/50%),
+    // those stuck axes pin AnyInputHeld() to true forever and the
+    // bind state machine never arms. Use 90% threshold for the held-
+    // check — only a deliberately-pushed stick passes — and the
+    // tighter 50% threshold still applies for capture itself, so
+    // sloppy stick presses still bind cleanly.
+    constexpr int kAxisHeldThreshold = 28000;  // ~85% of int16 range
     for (auto& kv : g_gamepad_handles) {
         SDL_Gamepad* gp = kv.second;
         if (!gp) continue;
@@ -208,28 +283,26 @@ bool AnyInputHeld() {
         }
         for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; ++a) {
             Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)a);
-            if (v > kAxisSampleThreshold || v < -kAxisSampleThreshold) return true;
+            if (v > kAxisHeldThreshold || v < -kAxisHeldThreshold) return true;
         }
     }
     return false;
 }
 
 // Returns true and fills `out` if a fresh press was captured.
-// Returns true with `cancelled = true` if ESC was hit.
+// Returns true when a binding was captured. `cancelled` is kept in
+// the API for the caller's switch but we no longer treat any specific
+// key as a built-in cancel — ESC is bindable now (Pokemon CC and other
+// 2DFM games map it to pause). The Cancel button next to the row is
+// the explicit out-of-capture path.
 bool PollCapture(Binding& out, bool& cancelled) {
     cancelled = false;
+    SDL_PumpEvents();  // refresh polled state before reading
     int nkeys = 0;
     const bool* ks = SDL_GetKeyboardState(&nkeys);
 
-    // ESC always cancels.
-    if (ks && SDL_SCANCODE_ESCAPE < nkeys && ks[SDL_SCANCODE_ESCAPE]) {
-        cancelled = true;
-        return true;
-    }
-
     if (ks) {
         for (int sc = 0; sc < nkeys; ++sc) {
-            if (sc == SDL_SCANCODE_ESCAPE) continue;
             if (ks[sc]) {
                 out.source = Binding::Source::KEYBOARD;
                 out.code = sc;
@@ -240,12 +313,23 @@ bool PollCapture(Binding& out, bool& cancelled) {
         }
     }
 
-    // Gamepads.
+    // Gamepads. Diagnostic-first: dump every non-zero button/axis
+    // we see from any opened gamepad on each poll. If the user clicks
+    // Bind and reports "no input registered", the launcher log will
+    // tell us whether SDL is seeing the press at all (gamepad isn't
+    // really opened) or if our threshold logic is the gate.
+    static uint32_t s_diag_emitted = 0;
     for (size_t i = 0; i < g_gamepad_ids.size(); ++i) {
         SDL_Gamepad* gp = GamepadAt((int)i);
         if (!gp) continue;
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; ++b) {
             if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b)) {
+                if (s_diag_emitted < 60) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "InputBinder: poll saw gamepad %zu button %d held",
+                        i, b);
+                    ++s_diag_emitted;
+                }
                 out.source = Binding::Source::GAMEPAD_BUTTON;
                 out.code = b;
                 out.axis_dir = 0;
@@ -256,6 +340,13 @@ bool PollCapture(Binding& out, bool& cancelled) {
         for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; ++a) {
             Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)a);
             if (v > kAxisSampleThreshold || v < -kAxisSampleThreshold) {
+                if (s_diag_emitted < 60) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "InputBinder: poll saw gamepad %zu axis %d v=%d "
+                        "(threshold=%d)",
+                        i, a, (int)v, (int)kAxisSampleThreshold);
+                    ++s_diag_emitted;
+                }
                 out.source = Binding::Source::GAMEPAD_AXIS;
                 out.code = a;
                 out.axis_dir = (v > 0) ? 1 : -1;
@@ -271,25 +362,92 @@ bool PollCapture(Binding& out, bool& cancelled) {
 // INI persistence
 // ---------------------------------------------------------------------------
 
-std::string DefaultConfigPath() {
+// Per-game profile state. When set, Load() and Save() route to
+// fm2k_inputs_<game>.ini under %APPDATA%\FM2K_Rollback\; otherwise the
+// default fm2k_inputs.ini.
+static std::string g_active_game = "";
+
+std::string DefaultProfileBaseDir() {
     if (const char* env = std::getenv("FM2K_INPUT_CONFIG_PATH")) {
-        if (env[0]) return env;
+        if (env[0]) {
+            // env override — derive the base dir by stripping the filename.
+            std::string s = env;
+            size_t slash = s.find_last_of("/\\");
+            return (slash == std::string::npos) ? "." : s.substr(0, slash);
+        }
     }
 #ifdef _WIN32
+    if (const char* appdata = std::getenv("APPDATA")) {
+        if (appdata[0]) {
+            std::string dir = std::string(appdata) + "\\FM2K_Rollback";
+            CreateDirectoryA(dir.c_str(), nullptr);
+            return dir;
+        }
+    }
+#endif
+    return ".";
+}
+
+std::string SanitizeProfileName(const char* name) {
+    // Filenames go on disk — strip path separators / control chars.
+    // Allow alnum, '_', '-', '.' and ' '. Anything else becomes '_'.
+    std::string out;
+    if (!name) return out;
+    for (const char* p = name; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == ' ') {
+            out.push_back((char)c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    // Trim trailing dots/spaces that Windows doesn't tolerate in filenames.
+    while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+std::string DefaultProfilePath() {
     // Anchor in %APPDATA%\FM2K_Rollback so the launcher EXE and the
     // injected hook DLL — which live in different working directories
     // — resolve to THE SAME path. CWD-relative was bugged: launcher
     // saved at e.g. C:\games\fm2k_inputs.ini, hook stat'd
     // C:\games\2dfm\wanwan\fm2k_inputs.ini. File never found in-game.
-    if (const char* appdata = std::getenv("APPDATA")) {
-        if (appdata[0]) {
-            std::string dir = std::string(appdata) + "\\FM2K_Rollback";
-            CreateDirectoryA(dir.c_str(), nullptr);  // ok if it already exists
-            return dir + "\\fm2k_inputs.ini";
-        }
-    }
+    return DefaultProfileBaseDir() +
+#ifdef _WIN32
+           std::string("\\")
+#else
+           std::string("/")
 #endif
-    return "fm2k_inputs.ini";
+           + "fm2k_inputs.ini";
+}
+
+std::string GameProfilePath() {
+    if (g_active_game.empty()) return DefaultProfilePath();
+    return DefaultProfileBaseDir() +
+#ifdef _WIN32
+           std::string("\\")
+#else
+           std::string("/")
+#endif
+           + "fm2k_inputs_" + g_active_game + ".ini";
+}
+
+bool FileExists(const std::string& p) {
+    if (p.empty()) return false;
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (!f) return false;
+    std::fclose(f);
+    return true;
+}
+
+// Resolve which file to read/write right now. Per-game wins if both the
+// game profile is set AND the file exists on disk; otherwise default.
+std::string DefaultConfigPath() {
+    if (!g_active_game.empty()) {
+        const std::string p = GameProfilePath();
+        if (FileExists(p)) return p;
+    }
+    return DefaultProfilePath();
 }
 
 void Trim(std::string& s) {
@@ -365,8 +523,47 @@ void Init() {
     if (g_initialized) return;
     g_initialized = true;
     g_config_path = DefaultConfigPath();
+
+    // Hints — must be set BEFORE SDL_InitSubSystem(GAMEPAD).
+    // HIDAPI brings the first-party DS4/DS3/Switch-Pro drivers in
+    // SDL3, which handle PS4 sticks (Qanba Obsidian in PS4 mode is a
+    // re-labelled DS4) and PS3 sticks correctly. RAWINPUT gives us
+    // XInput-style controllers (Qanba Obsidian in PC mode shows up as
+    // an XInput device). Without these, sticks fall back to platform-
+    // generic joystick paths that often don't ship with a SDL gamepad
+    // mapping → SDL_GetGamepads() returns nothing and the binder UI
+    // shows zero devices.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI,         "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS3,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH,  "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT,       "1");
+
     // Make sure SDL gamepad subsystem is up. No-op if already initialized.
     if (!SDL_WasInit(SDL_INIT_GAMEPAD)) SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+
+    // Critical: without this the polled state behind SDL_GetGamepadButton
+    // never refreshes — clicking Bind and pressing a button looked like
+    // the binder was ignoring controller inputs entirely. Enabled
+    // unconditionally; mirrors revolve_input_sdl3 (sdl3_gamepad_manager
+    // line 128).
+    SDL_SetGamepadEventsEnabled(true);
+
+    // Built-in mapping fallbacks for sticks SDL3 doesn't ship a
+    // mapping for. PS3 controllers in particular: HIDAPI driver can't
+    // always identify the controller flavor (Sony first-party vs
+    // clone) and falls through to a generic HID joystick — which has
+    // axes/buttons but no gamepad mapping, so SDL_GetGamepads()
+    // doesn't list it. Adding mappings ahead of time covers that.
+    // Lifted verbatim from revolve_input_sdl3 (BBBR's input layer).
+    static const char* kBuiltinMappings[] = {
+        "030000004c0500006802000000010000,PS3 Controller,a:b14,b:b13,y:b12,x:b15,back:b0,guide:b16,start:b3,leftstick:b1,rightstick:b2,leftshoulder:b10,rightshoulder:b11,lefttrigger:b8,righttrigger:b9,leftx:a0,lefty:a1,rightx:a2,righty:a3,dpdown:b6,dpleft:b7,dpright:b5,dpup:b4,",
+        "030000004c0500006802000000000000,PS3 Controller,a:b14,b:b13,y:b12,x:b15,back:b0,guide:b16,start:b3,leftstick:b1,rightstick:b2,leftshoulder:b10,rightshoulder:b11,lefttrigger:b8,righttrigger:b9,leftx:a0,lefty:a1,rightx:a2,righty:a3,dpdown:b6,dpleft:b7,dpright:b5,dpup:b4,",
+        "030000004c0500006802000000020000,PS3 Controller,a:b14,b:b13,y:b12,x:b15,back:b0,guide:b16,start:b3,leftstick:b1,rightstick:b2,leftshoulder:b10,rightshoulder:b11,lefttrigger:b8,righttrigger:b9,leftx:a0,lefty:a1,rightx:a2,righty:a3,dpdown:b6,dpleft:b7,dpright:b5,dpup:b4,",
+    };
+    for (const char* m : kBuiltinMappings) SDL_AddGamepadMapping(m);
+
     RefreshGamepadList();
     // Defaults first, then overlay with file contents if present.
     for (int p = 0; p < kPlayers; ++p) ApplyDefaults(p);
@@ -382,9 +579,28 @@ void Shutdown() {
     g_initialized = false;
 }
 
+// Refresh the cached config path against the current per-game profile
+// state. Called whenever SetGameProfile / fork / delete changes which
+// file should be active.
+static void RefreshActivePath() {
+    g_config_path = DefaultConfigPath();
+}
+
 bool Save() {
-    if (g_config_path.empty()) g_config_path = DefaultConfigPath();
-    FILE* f = std::fopen(g_config_path.c_str(), "w");
+    // Per-game profile routing rule: write to <game>.ini ONLY if that
+    // file already exists on disk (user explicitly forked it via the
+    // "Use override for X" checkbox). Otherwise write to the default
+    // profile. Without this gate, every Save() while a game is
+    // selected silently re-creates the per-game file even after the
+    // user unchecked override — the checkbox would auto-re-check
+    // itself on the next render after any binding tweak.
+    const bool route_to_game =
+        !g_active_game.empty() && FileExists(GameProfilePath());
+    const std::string path = route_to_game
+        ? GameProfilePath()
+        : DefaultProfilePath();
+    g_config_path = path;
+    FILE* f = std::fopen(path.c_str(), "w");
     if (!f) return false;
     std::fprintf(f, "; FM2K input bindings\n");
     for (int p = 0; p < kPlayers; ++p) {
@@ -399,7 +615,7 @@ bool Save() {
 }
 
 bool Load() {
-    if (g_config_path.empty()) g_config_path = DefaultConfigPath();
+    RefreshActivePath();  // resolves per-game vs default based on disk state
     FILE* f = std::fopen(g_config_path.c_str(), "r");
     if (!f) return false;
 
@@ -588,6 +804,27 @@ uint16_t Sample_Win32(int player_slot) {
     if (player_slot < 0 || player_slot >= kPlayers) return 0;
     const PlayerBindings& pb = g_players[player_slot];
 
+    // SDL3 gamepad polling for DInput / HIDAPI sticks (PS3, PS4 in
+    // PS3 mode, Qanba in PS3/PS4 modes, generic HID controllers).
+    // XInput-only sticks fall through to the XInput path below.
+    // Init() opens the devices; we just need to pump events here so
+    // the polled state behind SDL_GetGamepadButton stays fresh inside
+    // the hooked game process (the game's main loop doesn't call
+    // SDL_PollEvent on our behalf).
+    if (g_initialized && !g_gamepad_handles.empty()) {
+        SDL_PumpEvents();
+    }
+    auto sdl_gp = [&](int idx) -> SDL_Gamepad* {
+        if (idx < 0 || idx >= (int)g_gamepad_ids.size()) {
+            return g_gamepad_ids.empty()
+                ? nullptr
+                : g_gamepad_handles.count(g_gamepad_ids.front())
+                  ? g_gamepad_handles[g_gamepad_ids.front()] : nullptr;
+        }
+        auto it = g_gamepad_handles.find(g_gamepad_ids[idx]);
+        return it == g_gamepad_handles.end() ? nullptr : it->second;
+    };
+
     // XInput is checked once per call; fetched lazily by gamepad index.
     // Most players use a single controller so this is one XInputGetState
     // call per frame in practice.
@@ -617,26 +854,45 @@ uint16_t Sample_Win32(int player_slot) {
                 break;
             }
             case Binding::Source::GAMEPAD_BUTTON: {
-                if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
-                    WORD xbit = SdlGamepadButtonToXInputBit(b.code);
-                    pressed = xbit != 0 && (st->Gamepad.wButtons & xbit) != 0;
+                // Try SDL3 first — covers DInput / HIDAPI sticks.
+                // The launcher's binder captures via SDL3 too, so the
+                // saved button code is the SDL_GamepadButton enum
+                // (b.code is the SDL value, not an XInput bit).
+                if (SDL_Gamepad* gp = sdl_gp(b.gamepad_index)) {
+                    pressed = SDL_GetGamepadButton(
+                        gp, (SDL_GamepadButton)b.code) != 0;
+                }
+                // Fallback: XInput, for sticks SDL doesn't see (rare
+                // — shouldn't happen now, but cheap to keep).
+                if (!pressed) {
+                    if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
+                        WORD xbit = SdlGamepadButtonToXInputBit(b.code);
+                        pressed = xbit != 0 && (st->Gamepad.wButtons & xbit) != 0;
+                    }
                 }
                 break;
             }
             case Binding::Source::GAMEPAD_AXIS: {
-                if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
-                    SHORT v = 0;
-                    switch (b.code) {
-                        case SDL_GAMEPAD_AXIS_LEFTX:        v = st->Gamepad.sThumbLX; break;
-                        case SDL_GAMEPAD_AXIS_LEFTY:        v = (SHORT)-st->Gamepad.sThumbLY; break;  // invert Y to match SDL3 sign
-                        case SDL_GAMEPAD_AXIS_RIGHTX:       v = st->Gamepad.sThumbRX; break;
-                        case SDL_GAMEPAD_AXIS_RIGHTY:       v = (SHORT)-st->Gamepad.sThumbRY; break;
-                        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = (SHORT)(st->Gamepad.bLeftTrigger * 128); break;
-                        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = (SHORT)(st->Gamepad.bRightTrigger * 128); break;
-                        default: break;
-                    }
+                if (SDL_Gamepad* gp = sdl_gp(b.gamepad_index)) {
+                    Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)b.code);
                     if (b.axis_dir < 0) pressed = (v < -kAxisSampleThreshold);
                     else                pressed = (v >  kAxisSampleThreshold);
+                }
+                if (!pressed) {
+                    if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
+                        SHORT v = 0;
+                        switch (b.code) {
+                            case SDL_GAMEPAD_AXIS_LEFTX:        v = st->Gamepad.sThumbLX; break;
+                            case SDL_GAMEPAD_AXIS_LEFTY:        v = (SHORT)-st->Gamepad.sThumbLY; break;
+                            case SDL_GAMEPAD_AXIS_RIGHTX:       v = st->Gamepad.sThumbRX; break;
+                            case SDL_GAMEPAD_AXIS_RIGHTY:       v = (SHORT)-st->Gamepad.sThumbRY; break;
+                            case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = (SHORT)(st->Gamepad.bLeftTrigger * 128); break;
+                            case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = (SHORT)(st->Gamepad.bRightTrigger * 128); break;
+                            default: break;
+                        }
+                        if (b.axis_dir < 0) pressed = (v < -kAxisSampleThreshold);
+                        else                pressed = (v >  kAxisSampleThreshold);
+                    }
                 }
                 break;
             }
@@ -676,6 +932,27 @@ bool RenderWindow(int player_slot, bool* p_open) {
         ImGui::Unindent();
     }
 
+    // Per-game profile toggle. Shows the active game name (if a game is
+    // selected in the launcher) and lets the user fork/delete a per-game
+    // override without leaving the binder. With no game selected the
+    // checkbox is disabled and we silently edit the default profile.
+    if (!g_active_game.empty()) {
+        bool override_active = HasGameProfile();
+        const std::string label = "Use override for \"" + g_active_game + "\"";
+        if (ImGui::Checkbox(label.c_str(), &override_active)) {
+            if (override_active) {
+                ForkDefaultToGameProfile();
+            } else {
+                DeleteGameProfile();
+            }
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(override_active ? "(per-game)" : "(default)");
+    } else {
+        ImGui::TextDisabled("Editing default profile (no game selected)");
+    }
+
     if (ImGui::Button("Save")) {
         if (Save()) changed = true;
     }
@@ -689,6 +966,72 @@ bool RenderWindow(int player_slot, bool* p_open) {
     if (ImGui::Button("Reset Defaults")) {
         ApplyDefaults(player_slot);
         changed = true;
+    }
+
+    // Live gamepad-state debug panel. Shows per-frame what SDL is
+    // reporting from each opened device. If you press a button and
+    // it doesn't change here, SDL isn't seeing the input at all
+    // (HIDAPI driver issue, controller in wrong mode, etc.) — vs.
+    // if it DOES change here but Bind doesn't catch it, the bug is
+    // in the binder's capture state machine.
+    SDL_PumpEvents();
+    if (ImGui::CollapsingHeader("Live gamepad state (debug)",
+                                ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        if (g_gamepad_handles.empty()) {
+            ImGui::TextDisabled("(no gamepads opened)");
+        }
+        size_t idx = 0;
+        for (auto& kv : g_gamepad_handles) {
+            SDL_Gamepad* gp = kv.second;
+            if (!gp) continue;
+            const char* name = SDL_GetGamepadName(gp);
+            ImGui::Text("[%zu] jid=%u %s",
+                idx, (unsigned)kv.first, name ? name : "?");
+            // Buttons — print the pressed-button names compactly.
+            std::string pressed;
+            for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; ++b) {
+                if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b)) {
+                    if (!pressed.empty()) pressed += " ";
+                    pressed += "B" + std::to_string(b);
+                }
+            }
+            ImGui::Text("  buttons: %s",
+                pressed.empty() ? "(none)" : pressed.c_str());
+            // Axes — show all six even when zero so you can watch
+            // them move in real time.
+            char axline[256] = {};
+            char* p = axline;
+            char* end = axline + sizeof(axline);
+            for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && p < end - 16; ++a) {
+                Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)a);
+                int n = std::snprintf(p, end - p, "A%d=%6d ", a, (int)v);
+                if (n > 0) p += n;
+            }
+            ImGui::Text("  axes: %s", axline);
+            ++idx;
+        }
+        ImGui::TextDisabled(
+            "If buttons stay (none) when you press: SDL isn't seeing "
+            "input. Wrong controller mode or HIDAPI driver issue.");
+
+        // Capture-state diagnostics. Tells us which gate the bind
+        // state machine is stuck behind when a press isn't being
+        // captured.
+        const bool any_held = AnyInputHeld();
+        ImGui::Text("Capture state: active=%d armed=%d player=%d bit=%d",
+            g_capture.active ? 1 : 0,
+            g_capture.armed  ? 1 : 0,
+            g_capture.player,
+            g_capture.bit);
+        ImGui::Text("AnyInputHeld() = %d", any_held ? 1 : 0);
+        if (g_capture.active && !g_capture.armed && any_held) {
+            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.20f, 1.0f),
+                "Waiting for full release before sampling — release "
+                "ALL keys/sticks/buttons. If a stick axis is sitting "
+                "past 50%% threshold at idle (deadzone drift), arm "
+                "will never trigger.");
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Refresh Pads")) {
@@ -712,11 +1055,21 @@ bool RenderWindow(int player_slot, bool* p_open) {
         if (!g_capture.armed) {
             // Wait for full release before sampling so the click that
             // started the capture isn't read back.
-            if (!AnyInputHeld()) g_capture.armed = true;
+            if (!AnyInputHeld()) {
+                g_capture.armed = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "InputBinder: armed for player=%d bit=%d — waiting for press",
+                    g_capture.player, g_capture.bit);
+            }
         } else {
             Binding cap{};
             bool cancel = false;
             if (PollCapture(cap, cancel)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "InputBinder: captured src=%d code=%d axis_dir=%d gp=%d "
+                    "for player=%d bit=%d",
+                    (int)cap.source, cap.code, cap.axis_dir, cap.gamepad_index,
+                    g_capture.player, g_capture.bit);
                 if (!cancel) {
                     pb.bits[g_capture.bit] = cap;
                     changed = true;
@@ -751,7 +1104,7 @@ bool RenderWindow(int player_slot, bool* p_open) {
                                  g_capture.bit == (int)i;
             if (waiting) {
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-                                   "Press a key/button (ESC to cancel)...");
+                                   "Press a key/button... (click Cancel to abort)");
             } else if (conflict[i]) {
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
                                    BindingLabel(pb.bits[i]).c_str());
@@ -790,6 +1143,81 @@ bool RenderWindow(int player_slot, bool* p_open) {
 
     ImGui::End();
     return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Per-game profile management
+// ---------------------------------------------------------------------------
+
+void SetGameProfile(const char* exe_basename) {
+    const std::string sanitized = SanitizeProfileName(exe_basename);
+    if (g_active_game == sanitized) return;
+    g_active_game = sanitized;
+    RefreshActivePath();
+}
+
+bool HasGameProfile() {
+    if (g_active_game.empty()) return false;
+    return FileExists(GameProfilePath());
+}
+
+bool ForkDefaultToGameProfile() {
+    if (g_active_game.empty()) return false;
+    const std::string dst = GameProfilePath();
+    if (FileExists(dst)) {
+        // Already exists — caller can choose to overwrite via Save().
+        // Treat fork-of-already-existing as a no-op success so the UI
+        // checkbox toggle works idempotently.
+        RefreshActivePath();
+        return true;
+    }
+    const std::string src = DefaultProfilePath();
+    FILE* in = std::fopen(src.c_str(), "rb");
+    FILE* out = std::fopen(dst.c_str(), "wb");
+    if (!out) {
+        if (in) std::fclose(in);
+        return false;
+    }
+    if (in) {
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) {
+            std::fwrite(buf, 1, n, out);
+        }
+        std::fclose(in);
+    } else {
+        // No default file yet — write the current in-memory bindings as the
+        // seed of the per-game profile. Otherwise the per-game file would
+        // be empty and Load() would silently leave defaults in place.
+        std::fclose(out);
+        const std::string saved_active = g_active_game;
+        g_config_path = dst;  // route Save() to the per-game file
+        const bool ok = Save();
+        g_active_game = saved_active;
+        RefreshActivePath();
+        return ok;
+    }
+    std::fclose(out);
+    RefreshActivePath();
+    return true;
+}
+
+bool DeleteGameProfile() {
+    if (g_active_game.empty()) return false;
+    const std::string p = GameProfilePath();
+    if (!FileExists(p)) {
+        RefreshActivePath();
+        return false;
+    }
+    std::remove(p.c_str());
+    RefreshActivePath();
+    Load();  // pull bindings back from default
+    return true;
+}
+
+const char* CurrentConfigPath() {
+    if (g_config_path.empty()) g_config_path = DefaultConfigPath();
+    return g_config_path.c_str();
 }
 
 }  // namespace FM2KInputBinder

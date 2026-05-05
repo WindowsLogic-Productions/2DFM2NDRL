@@ -65,9 +65,41 @@ bool RenderWindow(int player_slot, bool* p_open = nullptr);
 uint16_t Sample(int player_slot);
 uint16_t Sample_Win32(int player_slot);
 
-// Persistence. Save() writes to "fm2k_inputs.ini" (or the path used by Load).
+// Persistence.
+// - Save() writes to the currently-active profile (default or per-game).
+// - Load() reads the per-game profile if SetGameProfile() has been called
+//   AND a per-game .ini exists; otherwise falls back to the default file.
 bool Save();
 bool Load();
+
+// Per-game overrides. Pass the exe basename (e.g. "WonderfulWorld_ver_0946")
+// to switch the active profile to fm2k_inputs_<basename>.ini under
+// %APPDATA%\FM2K_Rollback\. Pass nullptr or "" to revert to the default
+// profile (fm2k_inputs.ini). The new profile takes effect on the next
+// Load(); current in-memory bindings stay until the caller chooses to
+// reload. Idempotent — re-setting the same name is a no-op.
+void SetGameProfile(const char* exe_basename);
+
+// Returns true if a per-game override is currently active (i.e.
+// SetGameProfile was called with a non-empty name AND that file exists
+// on disk). Useful for "Use default for this game" toggle UI.
+bool HasGameProfile();
+
+// Forks the default profile into the current per-game profile so the
+// user can edit them independently. Requires SetGameProfile() to have
+// already routed to a per-game name. Returns false if no per-game name
+// is active (or copy failed). On success the per-game .ini exists on
+// disk and HasGameProfile() returns true.
+bool ForkDefaultToGameProfile();
+
+// Deletes the per-game profile file and reverts the active profile to
+// default. Use case: user clicks "Use default for this game" — drops
+// the per-game file and re-Loads from default. Returns false if no
+// per-game profile was active.
+bool DeleteGameProfile();
+
+// Path of the currently-active profile (for diagnostic UI / logging).
+const char* CurrentConfigPath();
 
 // Direct access (for diagnostic UI, etc.).
 PlayerBindings& Bindings(int player_slot);

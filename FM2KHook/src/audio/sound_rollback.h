@@ -51,6 +51,33 @@ void OnBattleEnd();
 typedef int(__cdecl* OriginalDispatcherFn)(int script_item);
 void SetOriginalDispatcher(OriginalDispatcherFn fn);
 
+// Mute gates. Set by the launcher via SetMuteState() at hook init
+// (reads %APPDATA%\FM2K_Rollback\audio.ini once). When set, the
+// dispatcher hook drops the corresponding command type before
+// calling MCI / DirectSound.
+//
+// LilithPort attaches as a debugger and overrides the EDX value
+// pushed into IDirectSoundBuffer::SetVolume at addresses 0x40347E
+// (BGM) / 0x40348C (SE), which gives a 21-step centibel slider
+// (-10000 = silent, log-spaced up to 0). We don't need a slider;
+// "off" is enough for now, and an early-return in the dispatcher
+// covers MCI music + WAV SFX without needing the debugger /
+// centibel-table machinery.
+struct MuteState {
+    bool bgm = false;
+    bool se  = false;
+};
+void      SetMuteState(const MuteState& m);
+MuteState GetMuteState();
+bool      IsMusicMuted();   // BGM (MIDI / CD)
+bool      IsSfxMuted();     // SFX (WAV)
+
+// Re-read %APPDATA%\FM2K_Rollback\audio.ini and apply. Cheap (one
+// stat + ~50-byte read). Hook calls this lazily, ~once per second,
+// from Hook_DispatchScriptSoundCommand so the launcher's toggle
+// reaches the running game without IPC.
+void RefreshMuteFromDisk();
+
 // Called from Hook_DispatchScriptSoundCommand on the SFX branch.
 // `arr` is the SoundBufferArray pointer (script_item + 36).
 // `script_item` is the 42-byte script item — stored in desired[] so the sync

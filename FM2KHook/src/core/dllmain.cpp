@@ -19,6 +19,26 @@ extern void PatchVsRoundCase200T4FalsePositive();
 #include <ctime>
 
 // =============================================================================
+// LOG-FILE PATH HELPER
+// =============================================================================
+// All hook-side log files (FM2K_P*_Debug.log + EB diag + rng trace + parity
+// recorder + replay diffs) route through here so they land in
+// `<cwd>/logs/<filename>` instead of cluttering the game folder. Lazily
+// creates the logs directory.
+bool Fm2k_BuildLogPath(char* out, size_t out_size, const char* filename) {
+    if (!out || out_size == 0 || !filename) return false;
+    static bool s_dir_created = false;
+    if (!s_dir_created) {
+        // CreateDirectoryA returns FALSE + ERROR_ALREADY_EXISTS if it's
+        // already there; either way the dir is usable afterwards.
+        CreateDirectoryA("logs", nullptr);
+        s_dir_created = true;
+    }
+    int n = std::snprintf(out, out_size, "logs\\%s", filename);
+    return n > 0 && (size_t)n < out_size;
+}
+
+// =============================================================================
 // FILE LOGGING
 // =============================================================================
 static FILE* g_log_file = nullptr;
@@ -60,8 +80,15 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
 }
 
 static void InitFileLogging() {
-    char filename[256];
-    snprintf(filename, sizeof(filename), "FM2K_P%d_Debug.log", g_player_index + 1);
+    char base_name[64];
+    snprintf(base_name, sizeof(base_name), "FM2K_P%d_Debug.log", g_player_index + 1);
+    char filename[MAX_PATH];
+    if (!Fm2k_BuildLogPath(filename, sizeof(filename), base_name)) {
+        // Fallback to cwd if the helper failed (extremely unlikely — only
+        // CreateDirectoryA would have to fail with something other than
+        // ERROR_ALREADY_EXISTS, e.g. permission denied).
+        snprintf(filename, sizeof(filename), "%s", base_name);
+    }
 
     g_log_file = fopen(filename, "w");
     if (g_log_file) {

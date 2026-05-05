@@ -24,7 +24,10 @@
 #include "../parity/parity_recorder.h"
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <windows.h>
 
 // Game-side symbols we call directly (bypassing the hooks that wrap them).
 extern RunGameLoopFunc        original_run_game_loop;
@@ -68,6 +71,113 @@ constexpr uintptr_t SHAKE_EFFECTS_ADDR  = 0x447DA9;
 constexpr size_t    SHAKE_EFFECTS_SZ    = 40;
 constexpr size_t    SHAKE_OFFSET_IN_AI  = SHAKE_EFFECTS_ADDR - WaveCAddrs::AFTERIMAGE_POOL;  // 0x479
 
+// EFFECT_SYS1 (palette flash 1 struct) sits inside the afterimage_pool slice
+// at 0x447D7D, 42 B, immediately BEFORE the shake block. Render-side carve-
+// out must skip this region too — ProcessColorInterpolation writes
+// per-frame interpolation values into g_object_data_ptr from inputs read out
+// of EFFECT_SYS1, and the [EB] handler in update_game writes the struct's
+// timer/duration. If the render-side restore stomps these every render, the
+// palette flash either snaps back to its pre-render state (visible flicker)
+// or never reflects the current sim's progress.
+constexpr uintptr_t PFLASH1_ADDR        = 0x447D7D;
+constexpr size_t    PFLASH1_SZ          = 42;
+constexpr size_t    PFLASH1_OFFSET_IN_AI = PFLASH1_ADDR - WaveCAddrs::AFTERIMAGE_POOL;
+static_assert(PFLASH1_OFFSET_IN_AI + PFLASH1_SZ <= SHAKE_OFFSET_IN_AI,
+              "EFFECT_SYS1 must end before shake block");
+
+// [EB] diagnostic — see header for full doc. Defined here so both the
+// trampoline path and Hook_RenderGame share state (frame counter, log fp,
+// post-shake window). Only one of those two paths fires per frame depending
+// on FM2K_BYPASS_TRAMPOLINE: trampoline mode → RenderFrameWithSnapshot calls
+// us; bypass mode → Hook_RenderGame (the MinHook detour) calls us.
+void EbDiag_Dump(const char* tag) {
+    static const bool s_eb_diag = []() {
+        const char* v = std::getenv("FM2K_EB_DIAG");
+        return v && v[0] == '1';
+    }();
+    if (!s_eb_diag) return;
+
+    static FILE* s_eb_diag_fp = nullptr;
+    static uint32_t s_eb_frame = 0;
+    static int s_eb_post_window = 0;
+
+    const uint32_t s1_mode  = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 0);
+    const uint32_t s1_off   = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 4);
+    const uint32_t s1_amp   = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 8);
+    const uint32_t s1_timer = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 12);
+    const uint32_t s1_dur   = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 16);
+    const uint32_t s2_off   = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 4 + 20);
+    const uint32_t s2_timer = *(uint32_t*)(SHAKE_EFFECTS_ADDR + 12 + 20);
+    // Palette flash state — same [EB] opcode handler, separate timers.
+    // p1: g_effect_id_1 @ 0x447D7D; timer (a1[5]) @ +0x14 (g_timer_countdown2 0x447D91)
+    // p2: g_effect_id_2 @ 0x4456D0; timer (a1[5]) @ +0x14 (g_timer_countdown1 0x4456E4)
+    // dur (a1[10]) @ +0x28
+    const uint32_t p1_mode  = *(uint32_t*)0x447D7D;
+    const uint32_t p1_timer = *(uint32_t*)0x447D91;
+    const uint32_t p1_dur   = *(uint32_t*)0x447DA5;  // 0x447D7D + 0x28
+    const uint32_t p2_mode  = *(uint32_t*)0x4456D0;
+    const uint32_t p2_timer = *(uint32_t*)0x4456E4;
+    const uint32_t p2_dur   = *(uint32_t*)0x4456F8;  // 0x4456D0 + 0x28
+    // Global RNG seed — ProcessColorInterpolation mode 3 calls game_rand()
+    // each render. Comparing rng across vanilla (FM2K_BYPASS_TRAMPOLINE=1)
+    // vs our trampoline path tells us whether render-time RNG matches
+    // vanilla. If rng differs, palette colors will visibly differ even
+    // when timer/duration are identical.
+    const uint32_t rng_seed = *(uint32_t*)0x41FB1C;
+    const bool active = (s1_timer != 0 || s2_timer != 0
+                         || p1_timer != 0 || p2_timer != 0);
+
+    // Bump the per-render-boundary frame counter on PRE-SAVE only so all four
+    // tags in a single render cycle share the same `f=` value.
+    const bool is_pre_save = (tag[0] == 'P' && tag[1] == 'R' && tag[2] == 'E'
+                              && tag[4] == 'S');
+    if (is_pre_save) ++s_eb_frame;
+
+    if (active) s_eb_post_window = 60;  // ~0.6s of post-shake camera tracking
+    else if (s_eb_post_window > 0 && is_pre_save) --s_eb_post_window;
+    else if (s_eb_post_window == 0 && !active) return;
+
+    // g_screen_x/y at 0x447F2C/30 — sprite_rendering_engine reads these for
+    // every sprite (stage AND characters). If they drift after shake ends,
+    // that's the stage-offset bug.
+    const int32_t scr_x = *(int32_t*)0x447F2C;
+    const int32_t scr_y = *(int32_t*)0x447F30;
+    if (!s_eb_diag_fp) {
+        char base[64];
+        std::snprintf(base, sizeof(base),
+                      "FM2K_eb_diag_pid%lu.log",
+                      (unsigned long)GetCurrentProcessId());
+        char path[MAX_PATH];
+        if (!Fm2k_BuildLogPath(path, sizeof(path), base)) {
+            std::snprintf(path, sizeof(path), "%s", base);
+        }
+        s_eb_diag_fp = std::fopen(path, "w");
+        if (s_eb_diag_fp) {
+            std::fprintf(s_eb_diag_fp,
+                "# tag, frame, shake_s1{mode,off,amp,tmr,dur}, shake_s2{off,tmr}, "
+                "palette_p1{m,tmr,dur}, palette_p2{m,tmr,dur}, rng, scr_x, scr_y\n");
+            std::fflush(s_eb_diag_fp);
+        }
+    }
+    if (s_eb_diag_fp) {
+        std::fprintf(s_eb_diag_fp,
+            "%-12s f=%u s1{m=%u o=%d amp=%u tmr=%u dur=%u} s2{o=%d tmr=%u} "
+            "p1{m=%u tmr=%u dur=%u} p2{m=%u tmr=%u dur=%u} rng=%08x scr=(%d,%d)%s\n",
+            tag, s_eb_frame,
+            s1_mode, (int32_t)s1_off, s1_amp, s1_timer, s1_dur,
+            (int32_t)s2_off, s2_timer,
+            p1_mode, p1_timer, p1_dur,
+            p2_mode, p2_timer, p2_dur,
+            rng_seed, scr_x, scr_y,
+            active ? "" : " [post-shake]");
+        // Flush only on POST-RESTORE so a crash mid-frame leaves the log
+        // readable. One fflush per frame instead of four.
+        if (tag[0] == 'P' && tag[1] == 'O' && tag[5] == 'R' && tag[6] == 'E') {
+            std::fflush(s_eb_diag_fp);
+        }
+    }
+}
+
 static void RenderFrameWithSnapshot() {
     if (!original_render_game) return;
 
@@ -87,37 +197,82 @@ static void RenderFrameWithSnapshot() {
     // sim memory, and the spectator's evolution diverges from the host's
     // (which IS protected). One frame is enough to desync RNG.
     const bool protect = Netplay_IsActive() || SpectatorNode_IsPlayingBack();
-    uint32_t saved_rng = 0;
+    EbDiag_Dump("PRE-SAVE");
     if (protect) {
-        saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-        memcpy(s_render_saved_object_pool,    (void*)FM2K::ADDR_OBJECT_POOL,       FM2K::SIZE_OBJECT_POOL);
-        // Afterimage save: two halves skipping the shake block so render's
-        // decrement of the shake timer propagates into sim memory and the
-        // KGT-scripted duration actually plays out.
+        // RNG is intentionally NOT save+restored across render anymore.
+        // Render-side game_rand() calls (ProcessColorInterpolation mode 3,
+        // ProcessShakeEffect mode 4, sprite effects) need to propagate to
+        // sim memory or palette flash visuals freeze on a single static
+        // interpolation factor instead of the animated random gradient
+        // vanilla shows. Both peers run render once per wall-clock frame
+        // and consume identical RNG amounts, so they stay in lockstep
+        // without explicit RNG restore. Verified via offline/bypass diff —
+        // offline (no protection) matches vanilla; online (with protection)
+        // showed RNG frozen at the pre-render value across 20+ frames.
+        //
+        // Object pool is also intentionally NOT saved/restored. The render
+        // path writes per-object color override values via
+        // ProcessColorInterpolation (g_object_data_ptr + 68/72/76/80) AND
+        // various sprite/animation timers. Reverting those after render
+        // makes palette flash mode 1 (Tyrogue fade-to-black) visually
+        // "undone" — sim-side timer keeps decrementing, but the persistent
+        // color state needed across frames gets wiped. Both peers run the
+        // same renders, so object pool drift stays symmetric.
+        (void)s_render_saved_object_pool; // (kept allocated for backward compat)
+        // Afterimage save: three slices skipping both EFFECT_SYS1 (palette
+        // flash 1) and SHAKE_EFFECTS so render-side state evolution for
+        // each propagates back into sim memory:
+        //   [0                     .. PFLASH1_OFFSET)   — save (head)
+        //   [PFLASH1_OFFSET        .. PFLASH1_END)      — SKIP (palette flash 1)
+        //   [PFLASH1_END           .. SHAKE_OFFSET)     — save (gap, currently 0 B)
+        //   [SHAKE_OFFSET          .. SHAKE_END)        — SKIP (shake block)
+        //   [SHAKE_END             .. POOL_END)         — save (tail)
+        constexpr size_t PFLASH1_END_IN_AI = PFLASH1_OFFSET_IN_AI + PFLASH1_SZ;
+        constexpr size_t SHAKE_END_IN_AI   = SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ;
         memcpy(s_render_saved_afterimage,
                (void*)WaveCAddrs::AFTERIMAGE_POOL,
-               SHAKE_OFFSET_IN_AI);
-        memcpy(s_render_saved_afterimage + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ,
-               (void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ),
-               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_OFFSET_IN_AI - SHAKE_EFFECTS_SZ);
+               PFLASH1_OFFSET_IN_AI);
+        memcpy(s_render_saved_afterimage + PFLASH1_END_IN_AI,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + PFLASH1_END_IN_AI),
+               SHAKE_OFFSET_IN_AI - PFLASH1_END_IN_AI);
+        memcpy(s_render_saved_afterimage + SHAKE_END_IN_AI,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_END_IN_AI),
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_END_IN_AI);
         memcpy(s_render_saved_input_tracking, (void*)0x447EE0,                     0xA0);
     }
 
+    EbDiag_Dump("PRE-RENDER");
     original_render_game();
+    EbDiag_Dump("POST-RENDER");
 
     if (protect) {
-        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
-        memcpy((void*)FM2K::ADDR_OBJECT_POOL,      s_render_saved_object_pool,    FM2K::SIZE_OBJECT_POOL);
-        // Afterimage restore: mirror of the split save — shake block in
-        // live memory keeps whatever ProcessShakeEffect just wrote.
+        // (RNG restore removed — see PRE-RENDER comment above.)
+        // (Object pool restore removed too — see PRE-RENDER comment.
+        // Tyrogue's mode-1 fade-to-black depends on the last per-frame
+        // ProcessColorInterpolation write to g_object_data_ptr+68/72/76/80
+        // PERSISTING into the next frame's object_pool. When the timer
+        // hits 0, ProcessColorInterpolation skips the write — and the
+        // sprite render reads the persisted last-frame value (mostly
+        // black) so the screen stays black. With object_pool restore,
+        // that persistence is wiped each frame and the visual snaps back
+        // to the default palette.)
+        // Afterimage restore: mirror of the 3-slice split save.
+        // EFFECT_SYS1 + shake_effects regions in live memory keep whatever
+        // ProcessColorInterpolation / ProcessShakeEffect just wrote.
+        constexpr size_t PFLASH1_END_IN_AI = PFLASH1_OFFSET_IN_AI + PFLASH1_SZ;
+        constexpr size_t SHAKE_END_IN_AI   = SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ;
         memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
                s_render_saved_afterimage,
-               SHAKE_OFFSET_IN_AI);
-        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ),
-               s_render_saved_afterimage + SHAKE_OFFSET_IN_AI + SHAKE_EFFECTS_SZ,
-               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_OFFSET_IN_AI - SHAKE_EFFECTS_SZ);
+               PFLASH1_OFFSET_IN_AI);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + PFLASH1_END_IN_AI),
+               s_render_saved_afterimage + PFLASH1_END_IN_AI,
+               SHAKE_OFFSET_IN_AI - PFLASH1_END_IN_AI);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_END_IN_AI),
+               s_render_saved_afterimage + SHAKE_END_IN_AI,
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - SHAKE_END_IN_AI);
         memcpy((void*)0x447EE0,                    s_render_saved_input_tracking, 0xA0);
     }
+    EbDiag_Dump("POST-RESTORE");
 
     SharedMem_Update();
 }
@@ -158,7 +313,20 @@ static LoopPhase ClassifyPhase() {
 static bool PumpMessages() {
     MSG msg;
     while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) return false;
+        if (msg.message == WM_QUIT) {
+            // Surface the wParam (exit code from PostQuitMessage) AND
+            // who the message was for. wParam=0 is normal close;
+            // anything else is "something inside the game asked to
+            // quit immediately." A user reporting WM_QUIT 4 ms after
+            // 'main loop ACTIVE' means the game window self-destructed
+            // during creation — usually DirectDraw/DirectInput init
+            // failure on the user's machine (driver, fullscreen, or
+            // antivirus interference).
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "PumpMessages: WM_QUIT received (wParam=%u hwnd=%p) — main loop will exit",
+                (unsigned)msg.wParam, (void*)msg.hwnd);
+            return false;
+        }
         // Diagnostic: dump every key/cheat-relevant message coming through.
         // FM2K's WindowProc maps F1-F12 to debug cheats (F1 hit-boxes, F5/F6
         // instant-KO, F12 force round-end). StudioS games are mysteriously

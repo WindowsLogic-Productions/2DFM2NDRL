@@ -178,7 +178,19 @@ static uint32_t Fletcher32(const uint8_t* data, size_t len) {
 // Single replay-diff log per battle session. Truncated in SaveState_Init,
 // then appended every time a replay save diverges from its forward save.
 // Replaces the old one-file-per-frame scheme that flooded the disk.
-constexpr const char* REPLAY_DIFF_LOG = "FM2K_replay_diffs.log";
+// Resolved through Fm2k_BuildLogPath at first use so it lands in
+// `<game_dir>/logs/`.
+constexpr const char* REPLAY_DIFF_LOG_NAME = "FM2K_replay_diffs.log";
+
+static const char* ReplayDiffLogPath() {
+    static char s_path[MAX_PATH] = {0};
+    if (s_path[0] == 0) {
+        if (!Fm2k_BuildLogPath(s_path, sizeof(s_path), REPLAY_DIFF_LOG_NAME)) {
+            std::snprintf(s_path, sizeof(s_path), "%s", REPLAY_DIFF_LOG_NAME);
+        }
+    }
+    return s_path;
+}
 
 // Forward decls — definitions appear after SaveState_Save for readability.
 uint32_t SaveState_CalculateFingerprint();
@@ -194,7 +206,7 @@ void SaveState_Init() {
     }
     // Truncate the consolidated replay-diff log so each battle session starts
     // with a fresh file.
-    if (FILE* f = fopen(REPLAY_DIFF_LOG, "w")) {
+    if (FILE* f = fopen(ReplayDiffLogPath(), "w")) {
         fprintf(f, "# replay-diff log — appends one block per replay save that\n"
                    "# diverges from its forward save. fopen+fclose per write.\n");
         fclose(f);
@@ -309,7 +321,7 @@ bool SaveState_Save(int frame) {
 
         FILE* df = nullptr;
         if (any_region_diff) {
-            df = fopen(REPLAY_DIFF_LOG, "a");  // append to the consolidated log
+            df = fopen(ReplayDiffLogPath(), "a");  // append to the consolidated log
             if (df) {
                 fprintf(df, "\n========================================\n");
                 fprintf(df, "REPLAY DIFF for frame %d\n", frame);
@@ -427,11 +439,35 @@ bool SaveState_Save(int frame) {
 
     state->frame_number = frame;
 
-    // Save RNG seed
-    state->rng_seed = *(uint32_t*)ADDR_RNG_SEED;
+    // RNG seed: zero the saved copy (deterministic CRC), DO NOT capture live
+    // state. SaveEvent fires BEFORE the wall-clock frame's render call, so a
+    // captured live rng would always be the pre-render value. Next frame's
+    // runahead-rewind LoadEvent then restores rng to that pre-render value,
+    // wiping render-side game_rand consumption every frame.
+    // ProcessColorInterpolation mode 3 and ProcessShakeEffect mode 4 call
+    // game_rand each render — without those calls propagating, palette mode
+    // 3 (used by Bewear 214B) interpolates with the same constant random
+    // factor every frame, showing one static color instead of the animated
+    // gradient vanilla shows.
+    // Both peers run render once per wall-clock frame and consume identical
+    // rng (deterministic protocol), so live rng stays in lockstep without
+    // explicit save/restore. Real-rollback replays don't re-run render, so
+    // post-replay rng will skip the render-side delta of the replayed
+    // frames — visible as palette/shake desync during the brief rollback
+    // window only. Sim decisions don't depend on these render-side rng
+    // calls.
+    state->rng_seed = 0;
 
-    // Save render frame counter - prevents divergence during rollback replay
-    state->render_frame_counter = *(uint32_t*)ADDR_RENDER_FRAME_COUNTER;
+    // Render frame counter: ZERO the saved copy (deterministic CRC), DO NOT
+    // capture live state. Rationale identical to the shake_effects carve-out
+    // — render_frame_counter is incremented at the end of every render_game
+    // call and is the basis for ProcessShakeEffect's per-frame parity-flip
+    // (negate offset on odd renders). If we save+restore the live counter,
+    // GekkoNet's per-frame Save+Load cycle freezes it at whatever value Save
+    // captured, the parity stops alternating, and screen shake only shifts
+    // one direction — making the stage look permanently offset. See the
+    // matching carve-outs for shake_effects below.
+    state->render_frame_counter = 0;
 
     // Save input buffer index - CRITICAL for rollback!
     state->input_buffer_index = *(uint32_t*)ADDR_INPUT_BUFFER_INDEX;
@@ -491,8 +527,39 @@ bool SaveState_Save(int frame) {
     // Save effect/shake state - affects animation script execution during rollback
     memcpy(state->effect_sys1, (void*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
     memcpy(state->effect_sys2, (void*)EffectAddrs::EFFECT_SYS2, EffectAddrs::EFFECT_SYS2_SZ);
+    // EFFECT_SYS1 (palette-flash-1 struct, 42 B at 0x447D7D): zero the saved
+    // buffer. Same rationale as shake_effects — ProcessColorInterpolation +
+    // update_game_state's timer decrement need to evolve uninterrupted.
+    // GekkoNet's per-frame Save+Load otherwise re-injects the post-advance
+    // timer every tick and palette flash never progresses.
+    std::memset(state->effect_sys1, 0, EffectAddrs::EFFECT_SYS1_SZ);
+    // EFFECT_SYS2 carve-outs:
+    //   - 0x00..0x20 (sysvars): KEEP saved
+    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at 0x4456D0): zero
+    //   - 0x4C..0x50 (g_render_frame_counter, 4 B): zero (covered earlier)
+    //   - 0x50..0x58 (tail): KEEP saved
+    constexpr size_t PFLASH2_OFFSET_IN_SYS2 =
+        0x4456D0 - EffectAddrs::EFFECT_SYS2;  // 0x20
+    constexpr size_t PFLASH2_SIZE           = 44;  // a1[0]..a1[10] inclusive
+    constexpr size_t RENDER_FRAME_COUNTER_OFFSET_IN_SYS2 =
+        ADDR_RENDER_FRAME_COUNTER - EffectAddrs::EFFECT_SYS2;  // 0x4C
+    static_assert(PFLASH2_OFFSET_IN_SYS2 + PFLASH2_SIZE == RENDER_FRAME_COUNTER_OFFSET_IN_SYS2,
+                  "palette flash 2 struct must end exactly at render_frame_counter");
+    std::memset(state->effect_sys2 + PFLASH2_OFFSET_IN_SYS2, 0, PFLASH2_SIZE);
+    *(uint32_t*)(state->effect_sys2 + RENDER_FRAME_COUNTER_OFFSET_IN_SYS2) = 0;
+    // Afterimage_pool overlap: EFFECT_SYS1 (0x447D7D, 42 B) is INSIDE the
+    // afterimage_pool save range. Zero it in the saved afterimage_pool too
+    // so the load doesn't re-inject palette state via that back-door.
     state->round_end_flag = *(uint32_t*)0x424718;
-    memcpy(state->shake_effects, (void*)EffectAddrs::SHAKE_EFFECTS, EffectAddrs::SHAKE_EFFECTS_SZ);
+    // Shake effects: zero the saved copy (so CRC is deterministic peer-to-peer)
+    // but DO NOT copy live state in. ProcessShakeEffect (called from render) is
+    // the only place that decrements g_shake_effect_*.timer. If we save+restore
+    // the live timer here, GekkoNet's per-frame Save+Load cycle resets it back
+    // to its post-[EB] value every tick, undoing render's decrement. The shake
+    // then plays for one render then ends — which is exactly the bug we were
+    // chasing. Live memory keeps decrementing forever; saved buffer is fixed
+    // zeros so fingerprints don't diverge.
+    memset(state->shake_effects, 0, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     // Wave C additions: afterimage pool + object list topology.
     //
@@ -511,6 +578,20 @@ bool SaveState_Save(int frame) {
     memcpy(state->afterimage_pool,         (void*)WaveCAddrs::AFTERIMAGE_POOL,      WaveCAddrs::AFTERIMAGE_POOL_SZ);
     constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
     *(uint32_t*)(state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET) = 0;
+    // Shake region overlap: g_shake_effect_1/_2 (40 bytes at 0x447DA9) live
+    // INSIDE the afterimage_pool slice. Zero them in the saved copy too —
+    // mirror of the dedicated state->shake_effects treatment above. Without
+    // this, the next Restore would re-inject the post-[EB] timer values via
+    // the afterimage_pool path (defeating the dedicated-slot fix).
+    constexpr size_t SHAKE_OFFSET_IN_AI = EffectAddrs::SHAKE_EFFECTS - WaveCAddrs::AFTERIMAGE_POOL;
+    memset(state->afterimage_pool + SHAKE_OFFSET_IN_AI, 0, EffectAddrs::SHAKE_EFFECTS_SZ);
+    // EFFECT_SYS1 overlap: palette-flash-1 struct @ 0x447D7D (42 B) ALSO
+    // sits inside the afterimage_pool slice (just before the shake block).
+    // Zero it on save for the same reason.
+    constexpr size_t PFLASH1_OFFSET_IN_AI = EffectAddrs::EFFECT_SYS1 - WaveCAddrs::AFTERIMAGE_POOL;
+    static_assert(PFLASH1_OFFSET_IN_AI + EffectAddrs::EFFECT_SYS1_SZ <= SHAKE_OFFSET_IN_AI,
+                  "EFFECT_SYS1 must end before shake region in afterimage_pool");
+    memset(state->afterimage_pool + PFLASH1_OFFSET_IN_AI, 0, EffectAddrs::EFFECT_SYS1_SZ);
     state->current_object_ptr            = *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR;
     memcpy(state->object_list_heads_tails, (void*)WaveCAddrs::OBJECT_LIST_HEADS,    WaveCAddrs::OBJECT_LIST_HEADS_SZ);
     memcpy(state->object_node_pool,        (void*)WaveCAddrs::OBJECT_NODE_POOL,     WaveCAddrs::OBJECT_NODE_POOL_SZ);
@@ -648,11 +729,14 @@ bool SaveState_Load(int frame) {
         return false;
     }
 
-    // Restore RNG seed
-    *(uint32_t*)ADDR_RNG_SEED = state->rng_seed;
+    // RNG seed: SKIP restore. Save zeros the buffer for fingerprint
+    // determinism; restoring would clobber render's game_rand progression
+    // (see Save() comment for why). Live rng keeps evolving.
 
-    // Restore render frame counter - prevents divergence during rollback replay
-    *(uint32_t*)ADDR_RENDER_FRAME_COUNTER = state->render_frame_counter;
+    // Render frame counter: SKIP restore. Live counter is the only reliable
+    // source — restoring would freeze it at the saved value and break shake
+    // parity-flip (see Save() comment). Live memory keeps incrementing from
+    // wherever it is, so ProcessShakeEffect's odd/even check actually toggles.
 
     // Restore input buffer index - CRITICAL for rollback!
     *(uint32_t*)ADDR_INPUT_BUFFER_INDEX = state->input_buffer_index;
@@ -677,20 +761,43 @@ bool SaveState_Load(int frame) {
     // first byte is 0 the slot was inactive at save time — zero the live
     // slot to match (and prevent stale active data from bleeding through
     // if the slot is currently live but was dead at the saved frame).
+    //
+    // Carve-out: per-object color override fields at +68/72/76/80 (16 B at
+    // offset 0x44 within each 382-byte object struct). These are written
+    // by ProcessColorInterpolation during render and read by
+    // sprite_rendering_engine (`mov edi, [ecx+44h]` @ 0x40D5C7) — sim
+    // never reads them. They need to PERSIST across frames so palette mode
+    // 1 (Tyrogue's "fade-to-black-and-stay") can keep showing the last
+    // interpolated value after the timer hits 0 and ProcessColorInterpolation
+    // skips writing. Restoring them on Load wipes that persistence and the
+    // visual snaps back to default palette every frame. Three-slice
+    // restore: pre-override, [SKIP] override, post-override. Same per-slot
+    // logic for the inactive-slot case (zero the slot but skip the override
+    // bytes — though "inactive" objects shouldn't have meaningful overrides
+    // anyway).
     {
         constexpr size_t OBJ_SZ = 382;
         constexpr size_t OBJ_COUNT = SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT;
+        constexpr size_t OVERRIDE_OFFSET = 68;   // *(obj + 68) etc
+        constexpr size_t OVERRIDE_SIZE   = 16;   // 4 dwords: +68, +72, +76, +80
+        constexpr size_t OVERRIDE_END    = OVERRIDE_OFFSET + OVERRIDE_SIZE;  // 84
         const uint8_t* src_base = state->object_pool;
         uint8_t* dst_base = (uint8_t*)ADDR_OBJECT_POOL;
         for (size_t i = 0; i < OBJ_COUNT; i++) {
             const uint8_t* src = src_base + i * OBJ_SZ;
             uint8_t* dst = dst_base + i * OBJ_SZ;
             if (src[0] != 0) {
-                memcpy(dst, src, OBJ_SZ);  // active: full restore
+                // Active: restore everything except the color override
+                // fields at +68..+84.
+                memcpy(dst, src, OVERRIDE_OFFSET);
+                memcpy(dst + OVERRIDE_END, src + OVERRIDE_END,
+                       OBJ_SZ - OVERRIDE_END);
             } else if (dst[0] != 0) {
                 // Currently live-active but save says dead — zero to match.
-                // Skip the memset when live is already inactive.
-                memset(dst, 0, OBJ_SZ);
+                // Skip the override window so any persistent color state
+                // from prior render passes survives.
+                memset(dst, 0, OVERRIDE_OFFSET);
+                memset(dst + OVERRIDE_END, 0, OBJ_SZ - OVERRIDE_END);
             }
         }
     }
@@ -701,11 +808,33 @@ bool SaveState_Load(int frame) {
     // Restore game state
     memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
 
-    // Restore effect/shake state
-    memcpy((void*)EffectAddrs::EFFECT_SYS1, state->effect_sys1, EffectAddrs::EFFECT_SYS1_SZ);
-    memcpy((void*)EffectAddrs::EFFECT_SYS2, state->effect_sys2, EffectAddrs::EFFECT_SYS2_SZ);
+    // EFFECT_SYS1 restore: SKIP — entire 42 B is the palette-flash-1 struct
+    // (g_effect_id_1 + timer + colors), and update_game_state's per-tick
+    // timer decrement at 0x447D91 is what we need to preserve. Live memory
+    // keeps decrementing; saved buffer is zeros (fingerprint deterministic).
+    //
+    // EFFECT_SYS2 restore: three carved-out regions:
+    //   - 0x00..0x20 (sysvars, 32 B): RESTORE
+    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at g_effect_id_2): SKIP
+    //   - 0x4C..0x50 (g_render_frame_counter, 4 B): SKIP
+    //   - 0x50..0x58 (tail, 8 B): RESTORE
+    constexpr size_t PFLASH2_OFFSET = 0x4456D0 - EffectAddrs::EFFECT_SYS2;       // 0x20
+    constexpr size_t RFC_OFFSET     = ADDR_RENDER_FRAME_COUNTER - EffectAddrs::EFFECT_SYS2;  // 0x4C
+    constexpr size_t RFC_END        = RFC_OFFSET + 4;                             // 0x50
+    memcpy((void*)EffectAddrs::EFFECT_SYS2,
+           state->effect_sys2,
+           PFLASH2_OFFSET);
+    memcpy((void*)(EffectAddrs::EFFECT_SYS2 + RFC_END),
+           state->effect_sys2 + RFC_END,
+           EffectAddrs::EFFECT_SYS2_SZ - RFC_END);
     *(uint32_t*)0x424718 = state->round_end_flag;
-    memcpy((void*)EffectAddrs::SHAKE_EFFECTS, state->shake_effects, EffectAddrs::SHAKE_EFFECTS_SZ);
+    // Shake effects: SKIP restore. Save zeros the buffer for fingerprint
+    // determinism; restoring would clobber the live decrementing timer that
+    // ProcessShakeEffect maintains via render. Leaving live memory alone
+    // means [EB] fires once (script PC then advances), the timer then
+    // counts down naturally render-by-render, and the shake plays out for
+    // its full scripted duration even under GekkoNet's per-frame Save+Load
+    // runahead cycle.
 
     // Wave C additions: afterimage pool + object list topology.
     // Restore afterimage_pool EXCEPT the 4 bytes at 0x447DD4 (g_last_frame_time).
@@ -717,9 +846,31 @@ bool SaveState_Load(int frame) {
     //   [0x4A8 .. end)            <- from save
     constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
     constexpr size_t G_LAST_FRAME_TIME_SIZE   = 4;
+    // Carve-outs inside afterimage_pool, in address order:
+    //   [0           .. PFLASH1_OFFSET)        — restore (afterimage start)
+    //   [PFLASH1_OFFSET .. PFLASH1_END)        — SKIP (palette-flash-1 struct, EFFECT_SYS1)
+    //   [PFLASH1_END    .. SHAKE_OFFSET)       — restore (gap)
+    //   [SHAKE_OFFSET   .. SHAKE_END)          — SKIP (shake state)
+    //   [SHAKE_END      .. G_LAST_FRAME_TIME)  — restore (gap)
+    //   [G_LAST_FRAME_TIME .. +4)              — SKIP (pacing anchor)
+    //   [G_LAST_FRAME_TIME+4 .. end)           — restore
+    constexpr size_t PFLASH1_OFFSET_IN_AI = EffectAddrs::EFFECT_SYS1 - WaveCAddrs::AFTERIMAGE_POOL;
+    constexpr size_t PFLASH1_END_IN_AI    = PFLASH1_OFFSET_IN_AI + EffectAddrs::EFFECT_SYS1_SZ;
+    constexpr size_t SHAKE_OFFSET_IN_AI = EffectAddrs::SHAKE_EFFECTS - WaveCAddrs::AFTERIMAGE_POOL;
+    constexpr size_t SHAKE_END_IN_AI    = SHAKE_OFFSET_IN_AI + EffectAddrs::SHAKE_EFFECTS_SZ;
+    static_assert(PFLASH1_END_IN_AI <= SHAKE_OFFSET_IN_AI,
+                  "EFFECT_SYS1 must end before shake region");
+    static_assert(SHAKE_END_IN_AI <= G_LAST_FRAME_TIME_OFFSET,
+                  "shake region must end before g_last_frame_time");
     memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
            state->afterimage_pool,
-           G_LAST_FRAME_TIME_OFFSET);
+           PFLASH1_OFFSET_IN_AI);
+    memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + PFLASH1_END_IN_AI),
+           state->afterimage_pool + PFLASH1_END_IN_AI,
+           SHAKE_OFFSET_IN_AI - PFLASH1_END_IN_AI);
+    memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + SHAKE_END_IN_AI),
+           state->afterimage_pool + SHAKE_END_IN_AI,
+           G_LAST_FRAME_TIME_OFFSET - SHAKE_END_IN_AI);
     memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE),
            state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE,
            WaveCAddrs::AFTERIMAGE_POOL_SZ - G_LAST_FRAME_TIME_OFFSET - G_LAST_FRAME_TIME_SIZE);

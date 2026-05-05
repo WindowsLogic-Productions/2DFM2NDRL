@@ -1310,6 +1310,39 @@ typedef int(__cdecl* DispatchScriptSoundFunc)(int);
 static DispatchScriptSoundFunc original_dispatch_script_sound = nullptr;
 
 int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
+    // Mute gates — applied UNCONDITIONALLY (offline + online + spectator).
+    // Re-checks the audio.ini file ~once per second so the launcher's
+    // toggle reaches the running game without a separate IPC channel.
+    {
+        static uint32_t s_last_check = 0;
+        const uint32_t now_ms = GetTickCount();
+        if (now_ms - s_last_check > 1000) {
+            s_last_check = now_ms;
+            SoundRollback::RefreshMuteFromDisk();
+        }
+    }
+    if (script_item != 0) {
+        const uint8_t cmd_byte = *reinterpret_cast<uint8_t*>(script_item + 40);
+        const uint8_t cmd_low  = cmd_byte & 0xF;
+        const bool    looping  = (cmd_byte & 0x10) != 0;
+
+        // Audio classification — verified against WonderfulWorld disasm
+        // (0x403430 dispatcher) + LilithPort's BGM_VOLUME / SE_VOLUME
+        // hook sites (stdafx.h:152-159, MainForm.cpp:2719-2733):
+        //   cmd_low 0           → stop everything (never muted)
+        //   cmd_low 1, loop=0   → SFX (one-shot WAV, vtable Play(..., 0))
+        //   cmd_low 1, loop=1   → BGM as looping WAV (Play(..., 1))
+        //   cmd_low 2           → BGM via MIDI (WriteTempMIDIAndPlay)
+        //   cmd_low 3           → BGM via CD audio (InitializeCDAudio)
+        // Most 2DFM games play BGM via case 1 + loop; case 2/3 are rare.
+        const bool is_bgm = (cmd_low == 2) ||
+                            (cmd_low == 3) ||
+                            (cmd_low == 1 && looping);
+        const bool is_sfx = (cmd_low == 1 && !looping);
+        if (is_bgm && SoundRollback::IsMusicMuted()) return 0;
+        if (is_sfx && SoundRollback::IsSfxMuted())   return 0;
+    }
+
     if (!Netplay_IsActive() || script_item == 0) {
         return original_dispatch_script_sound(script_item);
     }
@@ -1364,7 +1397,11 @@ void __cdecl Hook_RenderGame() {
     // In trampoline mode, render goes through RenderFrameWithSnapshot in
     // main_loop_trampoline.cpp. This hook still catches direct calls from
     // the game (e.g. init/menu paths) — run diagnostics and pass through.
+    // Also fires under FM2K_BYPASS_TRAMPOLINE=1 (vanilla main_game_loop)
+    // so [EB] diag works for A/B testing the trampoline against the
+    // vanilla render path.
     Hook_RenderDiagnostics_Tick();
+    EbDiag_Dump("PRE-SAVE");
 
     // CRITICAL: Save/restore RNG around render to prevent render-path RNG
     // consumption from breaking determinism. ProcessShakeEffect and
@@ -1398,15 +1435,46 @@ void __cdecl Hook_RenderGame() {
     // sim state matching (HP/timer/pos/input identical, only RNG differed).
     bool protect_regions = Netplay_IsActive() || SpectatorNode_IsPlayingBack();
 
-    uint32_t saved_rng = 0;
     static uint8_t s_saved_object_pool[0x5F800];
     static uint8_t s_saved_afterimage_pool[WaveCAddrs::AFTERIMAGE_POOL_SZ];
     static uint8_t s_saved_input_tracking[0xA0];
 
+    // Carve-outs: SHAKE_EFFECTS @ 0x447DA9 (40 B) and EFFECT_SYS1 @
+    // 0x447D7D (42 B, palette flash 1) MUST NOT be restored, or render's
+    // per-frame mutations to those regions get reverted every render.
+    // Mirrors the carve-outs in main_loop_trampoline.cpp::
+    // RenderFrameWithSnapshot. Both regions sit inside the afterimage_pool
+    // slice; EFFECT_SYS1 is just before the shake block.
+    constexpr uintptr_t kPflash1Addr   = 0x447D7D;
+    constexpr size_t    kPflash1Size   = 42;
+    constexpr size_t    kPflash1Offset = kPflash1Addr - WaveCAddrs::AFTERIMAGE_POOL;
+    constexpr size_t    kPflash1End    = kPflash1Offset + kPflash1Size;
+    constexpr uintptr_t kShakeAddr     = 0x447DA9;
+    constexpr size_t    kShakeSize     = 40;
+    constexpr size_t    kShakeOffset   = kShakeAddr - WaveCAddrs::AFTERIMAGE_POOL;  // 0x479
+    constexpr size_t    kShakeEnd      = kShakeOffset + kShakeSize;
+    static_assert(kPflash1End <= kShakeOffset, "EFFECT_SYS1 must end before shake block");
     if (protect_regions) {
-        saved_rng = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
-        memcpy(s_saved_object_pool,     (void*)FM2K::ADDR_OBJECT_POOL,       FM2K::SIZE_OBJECT_POOL);
-        memcpy(s_saved_afterimage_pool, (void*)WaveCAddrs::AFTERIMAGE_POOL,  WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // RNG intentionally NOT saved/restored — render's game_rand calls
+        // need to propagate so palette mode 3 / shake mode 4 produce
+        // animated random values matching vanilla. See trampoline comment.
+        //
+        // Object pool also NOT saved/restored — palette mode 1
+        // (Tyrogue fade-to-black) needs ProcessColorInterpolation's per-frame
+        // writes to g_object_data_ptr+68/72/76/80 to PERSIST into the next
+        // frame's object pool, otherwise the fade visually undoes itself
+        // when the timer reaches 0.
+        (void)s_saved_object_pool;
+        // Afterimage save: three slices skipping both EFFECT_SYS1 and shake.
+        memcpy(s_saved_afterimage_pool,
+               (void*)WaveCAddrs::AFTERIMAGE_POOL,
+               kPflash1Offset);
+        memcpy(s_saved_afterimage_pool + kPflash1End,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + kPflash1End),
+               kShakeOffset - kPflash1End);
+        memcpy(s_saved_afterimage_pool + kShakeEnd,
+               (void*)(WaveCAddrs::AFTERIMAGE_POOL + kShakeEnd),
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - kShakeEnd);
         memcpy(s_saved_input_tracking,  (void*)0x447EE0,                     0xA0);
     }
 
@@ -1415,17 +1483,30 @@ void __cdecl Hook_RenderGame() {
     // object-pool animation state on wall-clock cadence and desyncs peers.
     bool gate_render = Netplay_IsActive();
     bool do_render = !gate_render || g_frame_pending_render;
+    EbDiag_Dump("PRE-RENDER");
     if (do_render && original_render_game) {
         original_render_game();
         g_frame_pending_render = false;
     }
+    EbDiag_Dump("POST-RENDER");
 
     if (protect_regions) {
-        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = saved_rng;
-        memcpy((void*)FM2K::ADDR_OBJECT_POOL,      s_saved_object_pool,     FM2K::SIZE_OBJECT_POOL);
-        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL, s_saved_afterimage_pool, WaveCAddrs::AFTERIMAGE_POOL_SZ);
+        // (RNG and object_pool restores removed — see save block.)
+        // Afterimage restore: mirror of the 3-slice split save — both
+        // EFFECT_SYS1 and shake regions in live memory keep whatever
+        // render-side code just wrote.
+        memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
+               s_saved_afterimage_pool,
+               kPflash1Offset);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + kPflash1End),
+               s_saved_afterimage_pool + kPflash1End,
+               kShakeOffset - kPflash1End);
+        memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + kShakeEnd),
+               s_saved_afterimage_pool + kShakeEnd,
+               WaveCAddrs::AFTERIMAGE_POOL_SZ - kShakeEnd);
         memcpy((void*)0x447EE0,                    s_saved_input_tracking,  0xA0);
     }
+    EbDiag_Dump("POST-RESTORE");
 
     // Update shared memory with current stats for launcher
     SharedMem_Update();
@@ -1474,9 +1555,80 @@ BOOL __cdecl Hook_RunGameLoop() {
     return TrampolineMainLoop();
 }
 
-// Hook: GameRand - pass through
+// RNG-call trace — gated on FM2K_RNG_TRACE=1 env var. Each call records
+// (call_index, caller_pc, rng_pre, rng_post) as 16-byte little-endian
+// records to FM2K_rng_trace_pid<PID>.bin in cwd. Used to diff host vs
+// spectator processes and find the first divergent rng call site.
+//
+// Off-by-default (no env var): trampoline branch is just two predictable
+// loads + a never-taken branch, single-digit nanoseconds added to the hook.
+namespace {
+static FILE*    g_rng_trace_fp        = nullptr;
+static uint64_t g_rng_call_index      = 0;
+static bool     g_rng_trace_resolved  = false;
+static bool     g_rng_trace_enabled   = false;
+static uint32_t g_rng_trace_max_calls = 0;  // 0 = unlimited
+
+static void RngTrace_ResolveOnce() {
+    if (g_rng_trace_resolved) return;
+    g_rng_trace_resolved = true;
+    const char* env = std::getenv("FM2K_RNG_TRACE");
+    g_rng_trace_enabled = (env && std::strcmp(env, "1") == 0);
+    const char* env_max = std::getenv("FM2K_RNG_TRACE_MAX");
+    if (env_max) {
+        g_rng_trace_max_calls = (uint32_t)std::strtoul(env_max, nullptr, 10);
+    } else {
+        g_rng_trace_max_calls = 2'000'000;  // ~32 MB cap default
+    }
+    if (g_rng_trace_enabled) {
+        char base[64];
+        std::snprintf(base, sizeof(base),
+                      "FM2K_rng_trace_pid%lu.bin",
+                      (unsigned long)GetCurrentProcessId());
+        char path[MAX_PATH];
+        if (!Fm2k_BuildLogPath(path, sizeof(path), base)) {
+            std::snprintf(path, sizeof(path), "%s", base);
+        }
+        g_rng_trace_fp = std::fopen(path, "wb");
+        if (g_rng_trace_fp) {
+            // Larger buffer keeps the per-call overhead amortized.
+            std::setvbuf(g_rng_trace_fp, nullptr, _IOFBF, 1 << 20);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "RngTrace: enabled — writing to %s (max=%u calls)",
+                        path, g_rng_trace_max_calls);
+        } else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "RngTrace: failed to open %s for write", path);
+            g_rng_trace_enabled = false;
+        }
+    }
+}
+}
+
+// Hook: GameRand
+// Records the call to the trace file (if enabled) then forwards.
 uint32_t __cdecl Hook_GameRand() {
-    return original_game_rand ? original_game_rand() : 0;
+    RngTrace_ResolveOnce();
+    if (!g_rng_trace_enabled) {
+        return original_game_rand ? original_game_rand() : 0;
+    }
+    const uint32_t ret_addr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    const uint32_t pre  = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    const uint32_t r    = original_game_rand ? original_game_rand() : 0;
+    const uint32_t post = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    if (g_rng_trace_fp &&
+        (g_rng_trace_max_calls == 0 || g_rng_call_index < g_rng_trace_max_calls))
+    {
+        uint32_t rec[4] = {
+            (uint32_t)g_rng_call_index, ret_addr, pre, post
+        };
+        std::fwrite(rec, 1, sizeof(rec), g_rng_trace_fp);
+        // Flush every 10k calls (~100 frames at ~100 calls/frame) so a
+        // process kill loses at most ~1 sec of trace.
+        if ((g_rng_call_index & 0x1FFFu) == 0) std::fflush(g_rng_trace_fp);
+    }
+    ++g_rng_call_index;
+    return r;
 }
 
 // Hook: ProcessGameInputs

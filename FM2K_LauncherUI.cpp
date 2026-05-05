@@ -1,5 +1,8 @@
 #include "FM2K_Integration.h"
 #include "FM2K_HubClient.h"
+#include "FM2K_DiscordAuth.h"
+#include "FM2K_Updater.h"
+#include "version_local.h"
 #include "FM2KHook/src/ui/input_binder.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -19,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <memory>
 #include <unordered_map>
 
 // Local-only state owned by LauncherUI for the Hub panel. Defined here
@@ -38,6 +42,14 @@ struct LauncherUI::HubState {
     std::string pending_challenge_from_nick;
     std::string status_line;
     bool show_challenge_modal = false;
+
+    // Outbound challenge state — populated when WE click Challenge on
+    // somebody, cleared when the hub tells us the outcome (declined,
+    // cancelled, failed, or match_start). Drives the "Waiting for X..."
+    // modal so the challenger gets feedback instead of a silent UI.
+    std::string outgoing_challenge_to_id;
+    std::string outgoing_challenge_to_nick;
+    bool        show_outgoing_challenge_modal = false;
 };
 
 // Case-insensitive match of `room_id` against installed games. A
@@ -303,6 +315,11 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
 }
 
 void LauncherUI::Shutdown() {
+    // Tear down the updater's background worker so we don't leak the
+    // thread on exit (and so a mid-flight download is cancelled cleanly
+    // rather than racing with shutdown).
+    fm2k::updater::Shutdown();
+
     // Restore original logger
     SDL_SetLogOutputFunction(original_log_function_, original_log_userdata_);
 
@@ -330,6 +347,23 @@ void LauncherUI::NewFrame() {
 }
 
 void LauncherUI::Render() {
+    // First-run nudge: if no cached Discord session and we haven't
+    // shown the prompt yet this run, auto-open the sign-in window.
+    // Hub auth is mandatory for online play during testing; users
+    // landing on the launcher should see the path forward right away
+    // rather than discovering it via "auth_required" after a failed
+    // Connect.
+    {
+        static bool s_did_first_run_nudge = false;
+        if (!s_did_first_run_nudge) {
+            s_did_first_run_nudge = true;
+            const auto a = fm2k::discord_auth::LoadCached();
+            if (!a.valid) {
+                show_discord_auth_ = true;
+            }
+        }
+    }
+
     // Render menu bar at application level first
     RenderMenuBar();
     
@@ -353,8 +387,34 @@ void LauncherUI::Render() {
     ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
+    // First-launch default layout. ImGui persists user-edited layout into
+    // imgui.ini on quit, so this only fires on a fresh install (or after
+    // the user deletes imgui.ini). DockBuilder gates on whether the node
+    // already has children — if any prior layout exists, we leave it
+    // alone so users keep their customizations across versions.
+    {
+        static bool s_layout_built = false;
+        if (!s_layout_built) {
+            s_layout_built = true;
+            ImGuiDockNode* root = ImGui::DockBuilderGetNode(dockspace_id);
+            if (!root || (root->Windows.Size == 0 && !root->IsSplitNode())) {
+                ImGui::DockBuilderRemoveNode(dockspace_id);
+                ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+                ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+                // Single tab group containing both the Hub and Games &
+                // Configuration. They live in the same dock so the user
+                // sees them as tabs by default; drag-out to undock if
+                // they want side-by-side.
+                ImGui::DockBuilderDockWindow("Hub",                    dockspace_id);
+                ImGui::DockBuilderDockWindow("Games & Configuration",  dockspace_id);
+                ImGui::DockBuilderDockWindow("Debug & Diagnostics",    dockspace_id);
+                ImGui::DockBuilderFinish(dockspace_id);
+            }
+        }
+    }
+
     ImGuiWindowFlags panel_flags = ImGuiWindowFlags_NoCollapse;
-    
+
     if (ImGui::Begin("Games & Configuration", nullptr, panel_flags)) {
         RenderGameSelection();
         ImGui::Separator();
@@ -431,8 +491,184 @@ void LauncherUI::RenderMenuBar() {
             if (ImGui::MenuItem("Host Config", nullptr, show_host_config_)) {
                 show_host_config_ = !show_host_config_;
             }
+            if (ImGui::MenuItem("Hub Server...", nullptr, show_hub_server_)) {
+                show_hub_server_ = !show_hub_server_;
+            }
+            if (ImGui::MenuItem("Sign in with Discord...", nullptr, show_discord_auth_)) {
+                show_discord_auth_ = !show_discord_auth_;
+            }
+            ImGui::Separator();
+            // Audio mutes — write to %APPDATA%\FM2K_Rollback\audio.ini.
+            // The hook DLL re-reads it every ~1s from inside the audio
+            // dispatcher, so the toggle takes effect within a second
+            // without needing the game to restart.
+            if (!mute_state_loaded_) {
+                mute_state_loaded_ = true;
+                LoadAudioMuteState();
+            }
+            if (ImGui::MenuItem("Mute Music", nullptr, mute_bgm_)) {
+                mute_bgm_ = !mute_bgm_;
+                SaveAudioMuteState();
+            }
+            if (ImGui::MenuItem("Mute Sound Effects", nullptr, mute_se_)) {
+                mute_se_ = !mute_se_;
+                SaveAudioMuteState();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Check for Updates")) {
+                fm2k::updater::CheckForUpdates();
+            }
+            ImGui::TextDisabled("  v%s (rev %s)", fm2k::kAppVersion, fm2k::kAppRevision);
             ImGui::EndMenu();
         }
+
+        // Lazy-load auth state on first menu-bar render. File is only
+        // touched when the auth window saves/clears, so the read is
+        // cheap and we don't need to refresh per-frame.
+        if (!discord_state_loaded_) {
+            discord_state_loaded_ = true;
+            const auto a = fm2k::discord_auth::LoadCached();
+            discord_signed_in_ = a.valid;
+            discord_nick_      = a.nick;
+        }
+
+        // Kick off the version check exactly once on first menu-bar
+        // render. Async; pill below shows the result whenever it lands.
+        static bool s_did_update_check = false;
+        if (!s_did_update_check) {
+            s_did_update_check = true;
+            fm2k::updater::CheckForUpdates();
+        }
+
+        // Build BOTH pills (update + Discord) and right-align them
+        // together so they don't drift around as state changes.
+        const auto upd = fm2k::updater::Get();
+
+        char update_pill[80] = {};
+        bool show_update_pill = false;
+        ImVec4 update_col{};
+        switch (upd.state) {
+            case fm2k::updater::State::UpdateAvailable:
+                std::snprintf(update_pill, sizeof(update_pill),
+                              "  Update %s -> %s  ",
+                              fm2k::kAppVersion, upd.remote_version.c_str());
+                update_col      = ImVec4(0.40f, 0.65f, 0.95f, 1.0f);
+                show_update_pill = true;
+                break;
+            case fm2k::updater::State::Downloading: {
+                int pct = (upd.total_bytes > 0)
+                    ? (int)(((uint64_t)upd.downloaded_bytes * 100) / upd.total_bytes)
+                    : 0;
+                std::snprintf(update_pill, sizeof(update_pill),
+                              "  Downloading %d%%  ", pct);
+                update_col      = ImVec4(0.40f, 0.65f, 0.95f, 1.0f);
+                show_update_pill = true;
+                break;
+            }
+            case fm2k::updater::State::Ready:
+                std::snprintf(update_pill, sizeof(update_pill),
+                              "  Apply %s — Restart  ", upd.remote_version.c_str());
+                update_col      = ImVec4(0.40f, 0.85f, 0.50f, 1.0f);
+                show_update_pill = true;
+                break;
+            case fm2k::updater::State::Failed:
+                // Surface the failure quietly — clickable so the user
+                // can re-trigger via the menu, but not blinking. Most
+                // common failure is "fm2ktest repo doesn't exist yet";
+                // logging will say so too.
+                std::snprintf(update_pill, sizeof(update_pill),
+                              "  Update check failed  ");
+                update_col      = ImVec4(0.95f, 0.40f, 0.40f, 0.85f);
+                show_update_pill = true;
+                break;
+            default:
+                show_update_pill = false;
+                break;
+        }
+
+        char discord_pill[64];
+        if (discord_signed_in_) {
+            std::snprintf(discord_pill, sizeof(discord_pill), "  Discord: %s  ",
+                          discord_nick_.empty() ? "signed in" : discord_nick_.c_str());
+        } else {
+            std::snprintf(discord_pill, sizeof(discord_pill), "  Sign in with Discord  ");
+        }
+
+        const float discord_w = ImGui::CalcTextSize(discord_pill).x +
+                                ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        const float update_w  = show_update_pill
+            ? ImGui::CalcTextSize(update_pill).x +
+              ImGui::GetStyle().ItemSpacing.x * 2.0f
+            : 0.0f;
+        const float total_w   = discord_w + update_w;
+        const float bar_w     = ImGui::GetContentRegionAvail().x;
+        if (total_w < bar_w) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (bar_w - total_w));
+        }
+
+        // Update pill (left of the Discord one) — clickable, advances
+        // through the state machine: UpdateAvailable → start download
+        // → Ready → spawn FM2KUpdater.exe and exit.
+        if (show_update_pill) {
+            ImGui::PushStyleColor(ImGuiCol_Text, update_col);
+            if (ImGui::MenuItem(update_pill)) {
+                switch (upd.state) {
+                    case fm2k::updater::State::UpdateAvailable:
+                        fm2k::updater::StartDownload();
+                        break;
+                    case fm2k::updater::State::Ready:
+                        fm2k::updater::ApplyUpdateAndExit();
+                        break;
+                    case fm2k::updater::State::Failed:
+                        fm2k::updater::CheckForUpdates();
+                        break;
+                    default:
+                        break;
+                }
+            }
+            // Tooltip carries the actual error / status detail. Pill
+            // text is intentionally short so it fits in the menu bar;
+            // hovering reveals the diagnostic.
+            if (ImGui::IsItemHovered()) {
+                if (upd.state == fm2k::updater::State::Failed) {
+                    ImGui::SetTooltip("%s\nClick to retry.",
+                        upd.error_detail.empty()
+                            ? "Update check failed."
+                            : upd.error_detail.c_str());
+                } else if (upd.state == fm2k::updater::State::UpdateAvailable) {
+                    ImGui::SetTooltip("Click to download v%s.",
+                        upd.remote_version.c_str());
+                } else if (upd.state == fm2k::updater::State::Ready) {
+                    ImGui::SetTooltip("Click to apply v%s — launcher will restart.",
+                        upd.remote_version.c_str());
+                } else if (upd.state == fm2k::updater::State::Downloading) {
+                    if (upd.total_bytes > 0) {
+                        ImGui::SetTooltip("Downloading %u / %u bytes.",
+                            (unsigned)upd.downloaded_bytes,
+                            (unsigned)upd.total_bytes);
+                    } else {
+                        ImGui::SetTooltip("Downloading %u bytes.",
+                            (unsigned)upd.downloaded_bytes);
+                    }
+                }
+            }
+            ImGui::PopStyleColor();
+        }
+
+        // Discord pill (right edge).
+        ImVec4 col;
+        if (discord_signed_in_) {
+            col = ImVec4(0.3f, 0.85f, 0.45f, 1.0f);  // green = good to go
+        } else {
+            const float t = (float)ImGui::GetTime();
+            const float a = 0.55f + 0.35f * (float)std::sin(t * 3.0f);
+            col = ImVec4(0.95f, 0.65f, 0.20f, a);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        if (ImGui::MenuItem(discord_pill)) {
+            show_discord_auth_ = !show_discord_auth_;
+        }
+        ImGui::PopStyleColor();
         ImGui::EndMainMenuBar();
     }
 
@@ -450,6 +686,236 @@ void LauncherUI::RenderMenuBar() {
     if (show_host_config_) {
         RenderHostConfigWindow();
     }
+    if (show_hub_server_) {
+        RenderHubServerWindow();
+    }
+    if (show_discord_auth_) {
+        RenderDiscordAuthWindow();
+    }
+}
+
+// Settings → Hub Server… window. Lets the user point the launcher at a
+// custom hub (their own hub.py instance, a friend's box, etc.) without
+// cluttering the main Hub panel for casual users who just want the
+// default 2dfm.sytes.net.
+void LauncherUI::RenderHubServerWindow() {
+    if (!hub_host_initialized_) {
+        hub_host_initialized_ = true;
+        const char* env_h = std::getenv("FM2K_HUB_HOST");
+        const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
+        std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
+    }
+    if (!ImGui::Begin("Hub Server", &show_hub_server_, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::PushItemWidth(280);
+    ImGui::InputText("Host", hub_host_, sizeof(hub_host_));
+    ImGui::PopItemWidth();
+    ImGui::TextWrapped(
+        "Hub server hostname or IP. Default 2dfm.sytes.net for public play. "
+        "Use 127.0.0.1 (or localhost) when running your own hub.py on the same "
+        "machine — NAT routers rarely hairpin so the public DNS won't loop back. "
+        "Takes effect on next Connect.");
+    ImGui::End();
+}
+
+// Audio-mute persistence. Same file the hook DLL reads from inside
+// Hook_DispatchScriptSoundCommand. We deliberately use a tiny flat
+// key=value format so a textedit-the-ini fallback works for users
+// without a launcher rebuild.
+static std::string AudioIniPath() {
+    const char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    std::string dir = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\audio.ini";
+}
+
+// Dev-flag persistence. Same flat key=value format as audio.ini. Currently
+// just stores `eb_diag=` so the [EB] palette/shake diagnostic toggle
+// survives launcher restarts.
+static std::string DevFlagsIniPath() {
+    const char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    std::string dir = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\dev_flags.ini";
+}
+
+static bool LoadDevFlag(const char* key, bool default_val) {
+    const std::string path = DevFlagsIniPath();
+    if (path.empty()) return default_val;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return default_val;
+    char line[128];
+    bool result = default_val;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t')) s.pop_back();
+        const size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        if (s.substr(0, eq) != key) continue;
+        const std::string v = s.substr(eq + 1);
+        result = (v == "1" || v == "true" || v == "yes" || v == "on");
+    }
+    std::fclose(f);
+    return result;
+}
+
+static void SaveDevFlag(const char* key, bool value) {
+    const std::string path = DevFlagsIniPath();
+    if (path.empty()) return;
+    // Read all existing keys, replace this one, write back. Tiny file —
+    // a few keys at most — so brute-force rewrite is fine.
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof(line), f)) {
+            std::string s = line;
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
+            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+            const size_t eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
+        }
+        std::fclose(f);
+    }
+    bool found = false;
+    for (auto& p : kv) if (p.first == key) { p.second = value ? "1" : "0"; found = true; }
+    if (!found) kv.emplace_back(key, value ? "1" : "0");
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
+        std::fclose(f);
+    }
+}
+
+void LauncherUI::LoadAudioMuteState() {
+    const std::string path = AudioIniPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return;
+    char line[128];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t')) s.pop_back();
+        if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+        const size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = s.substr(0, eq);
+        const std::string v = s.substr(eq + 1);
+        const bool truthy = (v == "1" || v == "true" || v == "yes" || v == "on");
+        if      (k == "bgm_muted") mute_bgm_ = truthy;
+        else if (k == "se_muted")  mute_se_  = truthy;
+    }
+    std::fclose(f);
+}
+
+void LauncherUI::SaveAudioMuteState() {
+    const std::string path = AudioIniPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "; FM2K Rollback audio mute state\n");
+    std::fprintf(f, "; rewritten on each toggle from the launcher's Settings menu.\n");
+    std::fprintf(f, "; the hook DLL re-reads this file ~once per second from inside\n");
+    std::fprintf(f, "; the audio dispatcher, so changes propagate without restarting.\n");
+    std::fprintf(f, "bgm_muted=%d\n", mute_bgm_ ? 1 : 0);
+    std::fprintf(f, "se_muted=%d\n",  mute_se_  ? 1 : 0);
+    std::fclose(f);
+}
+
+// Settings → Sign in with Discord… window. Drives the OAuth pairing
+// flow in FM2K_DiscordAuth: kicks off /pair/begin, opens the browser,
+// polls /pair/<code> until success/fail. The hub_token is cached in
+// %APPDATA%\FM2K_Rollback\discord_auth.json and read by RenderHubPanel
+// at Connect time. Patron-only access — Tester ($5+) tier required
+// during testing, mapped via Patreon→Discord role automation.
+void LauncherUI::RenderDiscordAuthWindow() {
+    using namespace fm2k::discord_auth;
+    static std::unique_ptr<Pairing> s_pairing;
+    static std::string              s_status;
+    static fm2k::discord_auth::CachedAuth s_cached = LoadCached();
+
+    if (!ImGui::Begin("Sign in with Discord", &show_discord_auth_,
+                      ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+
+    if (s_cached.valid) {
+        ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
+                           "Signed in as %s", s_cached.nick.c_str());
+        ImGui::TextDisabled("discord id: %s", s_cached.discord_user_id.c_str());
+        if (ImGui::Button("Sign out")) {
+            ClearCached();
+            s_cached = CachedAuth{};
+            // Tell the menu-bar pill to flip back to the orange
+            // "Sign in with Discord" state on the next render.
+            discord_signed_in_ = false;
+            discord_nick_.clear();
+        }
+        ImGui::SameLine();
+    }
+
+    const bool busy = s_pairing && s_pairing->status() == Pairing::Status::Pending;
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::Button(s_cached.valid ? "Re-sign in" : "Sign in with Discord")) {
+        // Build hub HTTP base URL from the configured Hub Server host.
+        // Note: separate port from the WebSocket. The hub's HUB_HTTP_PORT
+        // (default 7700) handles the OAuth callback; WS stays on 7711.
+        std::string base = "http://";
+        base += hub_host_[0] ? hub_host_ : "2dfm.sytes.net";
+        base += ":7700";
+        s_pairing.reset(Begin(base));
+        s_status = "Browser opened. Click Authorize on Discord and come back.";
+    }
+    if (busy) ImGui::EndDisabled();
+
+    if (s_pairing) {
+        switch (s_pairing->status()) {
+            case Pairing::Status::Pending:
+                ImGui::TextWrapped("%s", s_status.c_str());
+                break;
+            case Pairing::Status::Ok: {
+                auto a = s_pairing->result();
+                if (SaveCached(a)) s_cached = a;
+                s_status = "Signed in as " + a.nick + ". You can connect to the hub now.";
+                s_pairing.reset();
+                // Refresh the menu-bar pill so it flips green this frame.
+                discord_signed_in_ = true;
+                discord_nick_      = a.nick;
+                // Auto-close after a brief moment so the user sees the
+                // success message but isn't stuck on a modal-feeling
+                // window. Closing here is immediate; the
+                // confirmation lives on the menu-bar pill which now
+                // shows the green "Discord: <nick>" state.
+                show_discord_auth_ = false;
+                break;
+            }
+            case Pairing::Status::Expired:
+                ImGui::TextColored(ImVec4(0.85f, 0.6f, 0.3f, 1.0f),
+                                   "%s", s_pairing->error_detail().c_str());
+                if (ImGui::Button("Dismiss")) s_pairing.reset();
+                break;
+            case Pairing::Status::Error:
+                ImGui::TextColored(ImVec4(0.95f, 0.32f, 0.32f, 1.0f),
+                                   "%s", s_pairing->error_detail().c_str());
+                if (ImGui::Button("Dismiss")) s_pairing.reset();
+                break;
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextWrapped(
+        "Tester ($5+) tier on Patreon required during testing. Pledge on "
+        "Patreon, link your Discord on the Patreon Connections page, then "
+        "click Sign in here. Patreon assigns the Discord role automatically; "
+        "the hub checks your roles when you sign in.");
+    ImGui::End();
 }
 
 // Host-side match settings UI. SOCD mode + stage selection for now;
@@ -572,6 +1038,15 @@ void LauncherUI::RenderGameSelection() {
                 selected_game_index_ = static_cast<int>(i);
                 if (on_game_selected) {
                     on_game_selected(game);
+                }
+                // Route the input binder to this game's per-game profile
+                // (creates fm2k_inputs_<basename>.ini lookup; reads
+                // default if no override exists). Strip .exe suffix.
+                std::filesystem::path p(game.exe_path);
+                std::string stem = p.stem().string();
+                FM2KInputBinder::SetGameProfile(stem.c_str());
+                if (input_binder_initialized_) {
+                    FM2KInputBinder::Load();
                 }
             }
             
@@ -799,19 +1274,41 @@ void LauncherUI::RenderSessionControls() {
         static bool s_force_t4_patch    = false;
         static bool s_skip_vs_mode_patch= false;
         static bool s_t4_probe          = false;
+        // Persisted across launcher restarts via %APPDATA%\FM2K_Rollback\dev_flags.ini.
+        // First-frame init reads the saved value; toggling the checkbox writes back.
+        static bool s_eb_diag = []() {
+            bool v = LoadDevFlag("eb_diag", false);
+            // Apply immediately on launcher start so any auto-launched session
+            // (offline / online / hub) inherits the env var.
+            ::SetEnvironmentVariableA("FM2K_EB_DIAG", v ? "1" : nullptr);
+            return v;
+        }();
 
         // ---------- USER-FACING SECTION ----------
         ImGui::Text("Play:");
         ImGui::Separator();
 
         if (ImGui::Button("Online (Hub)", ImVec2(-1, 0))) {
-            // Hub flow not yet wired to backend — placeholder routes
-            // through Online Session for now until HubClient lands.
-            if (on_online_session_start) {
-                on_online_session_start(network_config_);
+            // Move the user to the Hub panel and, if they've already
+            // got a game selected and a hub connection, drop them into
+            // a per-game lobby on demand. Hub creates rooms lazily on
+            // join_room — no master room list needed; the room id is
+            // the exe stem so two players on the same game converge.
+            ImGui::SetWindowFocus("Hub");
+            const bool game_selected =
+                selected_game_index_ >= 0 &&
+                selected_game_index_ < (int)games_.size();
+            if (game_selected && hub_state_ && hub_state_->client.IsConnected()) {
+                std::filesystem::path exe(games_[selected_game_index_].exe_path);
+                const std::string game_id = exe.stem().string();
+                if (hub_state_->current_room_id != game_id) {
+                    hub_state_->client.JoinRoom(game_id, game_id);
+                }
             }
         }
-        ImGui::SetItemTooltip("Connect to the FM2K hub to find players (placeholder — opens room list).");
+        ImGui::SetItemTooltip(
+            "Switch to the Hub panel. If a game is selected and you're "
+            "connected, joins (or creates) a lobby for that game.");
 
         if (ImGui::Button("Offline (Single Player)", ImVec2(-1, 0))) {
             ::SetEnvironmentVariableA("FM2K_BOOT_TO_CSS_DIRECT",
@@ -826,6 +1323,8 @@ void LauncherUI::RenderSessionControls() {
                                       s_skip_vs_mode_patch ? "1" : nullptr);
             ::SetEnvironmentVariableA("FM2K_T4_PROBE",
                                       s_t4_probe ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_EB_DIAG",
+                                      s_eb_diag ? "1" : nullptr);
             if (on_offline_session_start) {
                 on_offline_session_start();
             }
@@ -871,6 +1370,26 @@ void LauncherUI::RenderSessionControls() {
 
             ImGui::Checkbox("T4 probe (log fighter pool conditions)", &s_t4_probe);
             ImGui::SetItemTooltip("Pre-update pool walk; logs when count<2.");
+
+            if (ImGui::Checkbox("EB diag (palette flash / screen shake)", &s_eb_diag)) {
+                // Apply immediately so EVERY launch path (offline, online,
+                // hub, dual-clients, spectator) inherits the env var.
+                // Persist to dev_flags.ini so the toggle survives launcher
+                // restarts — otherwise the static-bool default loses your
+                // setting every time you close the launcher.
+                ::SetEnvironmentVariableA("FM2K_EB_DIAG",
+                                          s_eb_diag ? "1" : nullptr);
+                SaveDevFlag("eb_diag", s_eb_diag);
+            }
+            ImGui::SetItemTooltip(
+                "Logs shake-effect timer values at PRE-SAVE / PRE-RENDER / "
+                "POST-RENDER / POST-RESTORE around the trampoline render "
+                "boundary. Use to track [EB] palette-flash and screen-shake "
+                "duration loss. Output goes to FM2K_eb_diag_pid<PID>.log "
+                "in the game folder (NOT the main launcher log). Repro: "
+                "pkmncc Bewear 624B, slither wing 6A landing, URORFG Loader "
+                "5B / walking, Breloom 6a6a6b. Persists across launcher "
+                "restarts.");
 
             ImGui::Spacing();
             if (ImGui::Button("Online Session (legacy)", ImVec2(-1, 0))) {
@@ -1078,16 +1597,36 @@ void LauncherUI::RenderHubPanel() {
                 break;
             case K::ChallengeFailed:
                 hs.status_line = "challenge failed: " + ev.error;
+                hs.show_outgoing_challenge_modal = false;
+                hs.outgoing_challenge_to_id.clear();
+                hs.outgoing_challenge_to_nick.clear();
                 break;
             case K::ChallengeCancelled:
+                // Server tells US our outbound challenge was cancelled
+                // (e.g., target went offline) OR an inbound challenge
+                // was cancelled by the sender. Same handling for both:
+                // close any open modal that referenced it.
                 hs.show_challenge_modal = false;
                 hs.pending_challenge_from_id.clear();
+                hs.show_outgoing_challenge_modal = false;
+                hs.outgoing_challenge_to_id.clear();
+                hs.outgoing_challenge_to_nick.clear();
                 hs.status_line = "challenge cancelled";
                 break;
             case K::ChallengeDeclined:
-                hs.status_line = "challenge declined";
+                hs.status_line = "challenge declined by " +
+                    (hs.outgoing_challenge_to_nick.empty()
+                        ? std::string("opponent")
+                        : hs.outgoing_challenge_to_nick);
+                hs.show_outgoing_challenge_modal = false;
+                hs.outgoing_challenge_to_id.clear();
+                hs.outgoing_challenge_to_nick.clear();
                 break;
             case K::MatchStart: {
+                // Match is on — drop the waiting modal.
+                hs.show_outgoing_challenge_modal = false;
+                hs.outgoing_challenge_to_id.clear();
+                hs.outgoing_challenge_to_nick.clear();
                 hs.status_line = "match_start: " + ev.match.role +
                     " peer=" + ev.match.peer.nick +
                     " udp=" + ev.match.peer_udp_ip + ":" +
@@ -1109,62 +1648,61 @@ void LauncherUI::RenderHubPanel() {
                        && (on_online_session_start != nullptr);
 
                 if (ok) {
-                    // Preflight punch — confirm peer reachability on
-                    // the same UDP port the game's hook will bind,
-                    // BEFORE spawning the game. If we can't reach
-                    // each other, neither side launches; the user
-                    // sees a clear "couldn't connect to peer" status
-                    // instead of two stalled CSS screens.
-                    // Candidate ladder for preflight:
-                    //   1. peer's public addr (hub-supplied) — works
-                    //      cross-internet for cone NATs.
-                    //   2. 127.0.0.1 — same-machine fallback. When
-                    //      both clients run behind the same NAT and
-                    //      the router doesn't hairpin (typical), each
-                    //      sending punches to its own public IP fails;
-                    //      loopback always works for same-box tests
-                    //      and is the right path. If loopback succeeds
-                    //      we override the peer addr so the spawned
-                    //      game's FM2K_REMOTE_ADDR is 127.0.0.1 too.
-                    // TODO: gather LAN candidates and try them between
-                    // public and loopback so same-LAN/different-box
-                    // setups also work without relay.
-                    hs.status_line = "preflight: punching peer...";
+                    // Preflight punch — purely informational. We send
+                    // a quick burst of UDP probes to the peer to wake
+                    // up the NAT mappings so the in-game GekkoNet
+                    // handshake has a head start, then ALWAYS proceed
+                    // to spawn the game. The previous "abort if probe
+                    // doesn't reply" gate killed legitimate matches
+                    // because home-router NATs frequently take longer
+                    // than 2 seconds to punch (or never punch directly
+                    // and need relay), and the loopback fallback only
+                    // works for same-box tests. The in-game NAT layer
+                    // (nat_traversal.cpp) handles STUN, multiple punch
+                    // rounds, and relay engagement properly — let it
+                    // do its job instead of failing fast here.
+                    //
+                    // We still TRY the probe so cone-NAT pairs benefit
+                    // from a few packets in-flight before launch, and
+                    // we still detect the same-box loopback case so the
+                    // game gets FM2K_REMOTE_ADDR=127.0.0.1 for that
+                    // setup specifically.
+                    hs.status_line = "preflight: punching peer (best-effort)...";
                     std::string peer_ip   = ev.match.peer_udp_ip;
                     int         peer_port = ev.match.peer_udp_port;
-                    bool reachable = HubPreflightPunch(
+                    const bool public_reachable = HubPreflightPunch(
                         static_cast<uint16_t>(network_config_.local_port),
                         peer_ip,
                         static_cast<uint16_t>(peer_port),
                         ev.match.token,
                         2000);
-                    if (!reachable && peer_ip != "127.0.0.1") {
+                    if (!public_reachable) {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Hub: public preflight timed out, retrying via 127.0.0.1");
-                        hs.status_line = "preflight: trying 127.0.0.1...";
+                            "Hub: public probe timed out — trying 127.0.0.1 "
+                            "in case this is a same-box test");
                         if (HubPreflightPunch(
                                 static_cast<uint16_t>(network_config_.local_port),
                                 "127.0.0.1",
                                 static_cast<uint16_t>(peer_port),
                                 ev.match.token,
                                 1000)) {
-                            reachable = true;
                             peer_ip = "127.0.0.1";
                             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Hub: loopback preflight succeeded — same-box match");
+                                "Hub: loopback responded — same-box match, "
+                                "using 127.0.0.1 as remote");
+                        } else {
+                            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Hub: probe didn't get a reply on either path. "
+                                "Spawning game anyway — in-game NAT traversal "
+                                "(STUN + punch + relay) will retry on its own. "
+                                "If you stall in 'Connecting...' for >10s, your "
+                                "NAT probably needs the relay path.");
                         }
+                    } else {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: public probe succeeded — direct path looks good");
                     }
-                    if (!reachable) {
-                        // Could try relay here as a final fallback,
-                        // but for now we treat preflight failure as
-                        // hard-stop. Symmetric NAT story is Phase-3
-                        // relay-engaged-from-start; not yet wired.
-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Hub: preflight failed — aborting match (no game spawn)");
-                        hs.status_line = "preflight failed: peer unreachable";
-                        hs.client.MatchEnded();
-                        break;
-                    }
+                    hs.status_line = "match starting...";
 
                     // Make sure the launcher's selected_game_ record is
                     // up to date even if RoomJoined fired before games
@@ -1243,6 +1781,14 @@ void LauncherUI::RenderHubPanel() {
                 break;
             case K::Error:
                 hs.status_line = "error: " + ev.error;
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: %s", hs.status_line.c_str());
+                // Auth-required error: pop the Discord sign-in window so
+                // the user knows what to do. Matches "auth_required"
+                // reason from hub/hub.py.
+                if (ev.error.find("auth_required") != std::string::npos) {
+                    show_discord_auth_ = true;
+                }
                 break;
         }
     });
@@ -1251,35 +1797,36 @@ void LauncherUI::RenderHubPanel() {
     ImGui::SeparatorText("Hub");
 
     static char s_nick[32] = "";
-    static char s_hub_host[128] = "";
-    static bool s_hub_host_initialized = false;
-    if (!s_hub_host_initialized) {
-        s_hub_host_initialized = true;
+    // Hub host string lives on the LauncherUI (member hub_host_) and is
+    // edited from Settings → Hub Server… The Hub panel is read-only here.
+    if (!hub_host_initialized_) {
+        hub_host_initialized_ = true;
         const char* env_h = std::getenv("FM2K_HUB_HOST");
         const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
-        std::snprintf(s_hub_host, sizeof(s_hub_host), "%s", def);
+        std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
     }
-    // Delay override is panel-wide so the user can change it after
-    // connecting too — they often want to bump delay between matches
-    // without reconnecting. Sits above the rooms section regardless
-    // of connection state. Cached into FM2K_LOCAL_DELAY every frame
-    // so the next match_start spawn inherits the latest value.
-    static int s_delay_override = 0;
+    // Delay override panel. Default is "computed" (CCCaster-style auto-
+    // pick at match session creation from the worst measured RTT — see
+    // Netplay_StartBattleSession). Combo lets the user pin a manual
+    // value if they want to eat a fixed delay rather than rely on the
+    // computed pick. Manual override persists across matches via the
+    // FM2K_LOCAL_DELAY env var; "computed" clears the var so the hook
+    // falls back to the auto path.
+    static int s_delay_override = 0;  // 0 = computed, 1..8 = manual frames
     {
         const char* delay_items[] = {
-            "Auto", "1", "2", "3", "4", "5", "6", "7", "8"
+            "computed", "1", "2", "3", "4", "5", "6", "7", "8"
         };
         ImGui::PushItemWidth(-120);
         ImGui::Combo("Delay", &s_delay_override, delay_items,
                      IM_ARRAYSIZE(delay_items));
         ImGui::PopItemWidth();
         ImGui::SetItemTooltip(
-            "Input delay in frames. Auto picks from measured RTT "
-            "(loopback 2, LAN 2-3, internet 4-6). Manual override "
-            "applies on the next match — useful when Auto picks too "
-            "low for your connection and you'd rather eat a fixed "
-            "delay than constant rollbacks. Changing this between "
-            "matches takes effect on the next challenge accept.");
+            "Input delay (frames at 100 Hz). \"computed\" applies a "
+            "CCCaster-style pick at match start: ceil(worst_one_way_ms "
+            "/ 10) + 1, clamped [2, 15] — covers the worst spike since "
+            "the prior match. Pin 1..8 to override and ride a fixed "
+            "delay instead.");
         if (s_delay_override > 0) {
             char buf[8];
             std::snprintf(buf, sizeof(buf), "%d", s_delay_override);
@@ -1292,16 +1839,23 @@ void LauncherUI::RenderHubPanel() {
     if (!hs.client.IsConnected()) {
         ImGui::PushItemWidth(-120);
         ImGui::InputText("Nick", s_nick, sizeof(s_nick));
-        ImGui::InputText("Host", s_hub_host, sizeof(s_hub_host));
-        ImGui::SetItemTooltip(
-            "Hub server hostname or IP. Default 2dfm.sytes.net for "
-            "public play. Use 127.0.0.1 (or localhost) when running "
-            "your own hub.py on the same machine — NAT routers "
-            "rarely hairpin so the public DNS won't loop back.");
         ImGui::PopItemWidth();
-        const bool can_connect = s_nick[0] != '\0';
+        // Show the configured hub host as read-only context. Edit from
+        // Settings → Hub Server…
+        ImGui::TextDisabled("Server: %s", hub_host_[0] ? hub_host_ : "2dfm.sytes.net");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("change")) {
+            show_hub_server_ = true;
+        }
+        const auto cached_auth_check = fm2k::discord_auth::LoadCached();
+        const bool nick_ok    = s_nick[0] != '\0';
+        const bool signed_in  = cached_auth_check.valid;
+        const bool can_connect = nick_ok && signed_in;
+        const char* button_label =
+            !signed_in ? "(sign in with Discord first)" :
+            !nick_ok   ? "(set a nick first)" : "Connect";
         if (!can_connect) ImGui::BeginDisabled();
-        if (ImGui::Button(can_connect ? "Connect" : "(set a nick first)", ImVec2(-1, 0))) {
+        if (ImGui::Button(button_label, ImVec2(-1, 0))) {
             hs.my_nick = s_nick;
             // Auto-pick a free UDP port: bind a socket to port 0
             // (OS-assigned ephemeral), read back the chosen port via
@@ -1346,11 +1900,17 @@ void LauncherUI::RenderHubPanel() {
             // gets persisted into the FM2K_HUB_HOST env so the spawned
             // game's nat_traversal STUN probe / relay endpoint uses
             // the same host.
-            const std::string hub_host = (s_hub_host[0] != '\0') ? s_hub_host : "2dfm.sytes.net";
+            const std::string hub_host = (hub_host_[0] != '\0') ? hub_host_ : "2dfm.sytes.net";
             ::SetEnvironmentVariableA("FM2K_HUB_HOST", hub_host.c_str());
+            // Pull the cached Discord hub_token. Hub will reject the
+            // hello with `auth_required` if missing/expired and the
+            // launcher will surface the error in status_line.
+            const auto cached = fm2k::discord_auth::LoadCached();
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Hub: connecting to %s:7711 (WS)", hub_host.c_str());
-            hs.client.Connect(hub_host, 7711, "/", hs.my_nick);
+                        "Hub: connecting to %s:7711 (WS) auth=%s",
+                        hub_host.c_str(),
+                        cached.valid ? "present" : "missing");
+            hs.client.Connect(hub_host, 7711, "/", hs.my_nick, cached.hub_token);
             hs.status_line = "connecting to " + hub_host + " ...";
         }
         if (!can_connect) ImGui::EndDisabled();
@@ -1457,13 +2017,17 @@ void LauncherUI::RenderHubPanel() {
 
                 ImGui::TableSetColumnIndex(2);
                 ImGui::PushID(a->id.c_str());
-                if (ImGui::SmallButton("Spectate")) {
-                    // Always request against the lower-id half (a). Hub
-                    // returns that user's UDP addr; if both halves were
-                    // valid hosts the choice is arbitrary anyway.
-                    hs.client.RequestSpectate(a->id);
-                    hs.status_line = "spectate request sent for " + a->nick + " vs " + b->nick;
-                }
+                // Spectate is currently broken (sim-determinism leak under
+                // active investigation — host vs spectator diverge after
+                // ~bf=8000 with ALL inputs/RNG/scripts identical, only one
+                // pos field drifts; root-cause is a hook that touches
+                // sim state on host but not on spectator). Show the
+                // button greyed so users see the feature is intentional
+                // but disabled, not missing.
+                ImGui::BeginDisabled(true);
+                ImGui::SmallButton("Spectate");
+                ImGui::EndDisabled();
+                ImGui::SetItemTooltip("Disabled — spectator desyncs under investigation.");
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -1487,11 +2051,28 @@ void LauncherUI::RenderHubPanel() {
             ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 100.0f);
             ImGui::TableHeadersRow();
 
+            // Tier → color mapping. Tester ($5) gets blue (0x2C7BDB,
+            // matching Patreon's hub branding); Special Thanks ($10) gets
+            // gold (0xFFBF03); monte (operator) gets red (0xE53935, Material
+            // red 600 — distinct from gold without being garish). Anything
+            // else (legacy hub, missing field) renders in the default text
+            // color so stale clients don't turn invisible.
+            const ImVec4 kTierTester(0x2C / 255.0f, 0x7B / 255.0f, 0xDB / 255.0f, 1.0f);
+            const ImVec4 kTierThanks(0xFF / 255.0f, 0xBF / 255.0f, 0x03 / 255.0f, 1.0f);
+            const ImVec4 kTierMonte (0xE5 / 255.0f, 0x39 / 255.0f, 0x35 / 255.0f, 1.0f);
             for (auto& [uid, u] : hs.users) {
                 if (uid == hs.my_id) continue;  // don't list self
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(u.nick.c_str());
+                if (u.tier == "monte") {
+                    ImGui::TextColored(kTierMonte, "%s", u.nick.c_str());
+                } else if (u.tier == "thanks") {
+                    ImGui::TextColored(kTierThanks, "%s", u.nick.c_str());
+                } else if (u.tier == "tester") {
+                    ImGui::TextColored(kTierTester, "%s", u.nick.c_str());
+                } else {
+                    ImGui::TextUnformatted(u.nick.c_str());
+                }
 
                 ImGui::TableSetColumnIndex(1);
                 ImVec4 c(0.6f, 0.6f, 0.6f, 1.0f);
@@ -1509,6 +2090,13 @@ void LauncherUI::RenderHubPanel() {
                 if (!can_challenge) ImGui::BeginDisabled();
                 if (ImGui::SmallButton("Challenge")) {
                     hs.client.Challenge(uid);
+                    // Populate outbound state so the next frame
+                    // renders the "Waiting for X..." modal. Cleared
+                    // by the hub-event handler on any outcome.
+                    hs.outgoing_challenge_to_id   = uid;
+                    hs.outgoing_challenge_to_nick = u.nick;
+                    hs.show_outgoing_challenge_modal = true;
+                    hs.status_line = "challenged " + u.nick + " — waiting for response";
                 }
                 if (!can_challenge) ImGui::EndDisabled();
                 ImGui::PopID();
@@ -1534,6 +2122,47 @@ void LauncherUI::RenderHubPanel() {
         if (ImGui::Button("Decline", ImVec2(120, 0))) {
             hs.client.DeclineChallenge(hs.pending_challenge_from_id);
             hs.pending_challenge_from_id.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // ---- Outgoing-challenge modal ----
+    // Renders for the challenger after they click Challenge so they
+    // get visible feedback that the request went out. The hub-event
+    // handler clears show_outgoing_challenge_modal on any terminal
+    // outcome (declined / failed / cancelled / match_start).
+    if (hs.show_outgoing_challenge_modal) {
+        ImGui::OpenPopup("Challenge sent");
+    }
+    if (ImGui::BeginPopupModal("Challenge sent", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::Text("Waiting for %s to accept...",
+                    hs.outgoing_challenge_to_nick.empty()
+                        ? "opponent"
+                        : hs.outgoing_challenge_to_nick.c_str());
+        // Animated pip so the user sees the modal is alive (ImGui's
+        // own spinner widget doesn't exist; a string of dots cycling
+        // is enough for the "we're waiting" signal).
+        const int dots = (int)(ImGui::GetTime() * 2.0) % 4;
+        char dot_str[5] = {0};
+        for (int i = 0; i < dots; ++i) dot_str[i] = '.';
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", dot_str);
+        ImGui::Spacing();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            hs.client.CancelChallenge(hs.outgoing_challenge_to_id);
+            hs.show_outgoing_challenge_modal = false;
+            hs.outgoing_challenge_to_id.clear();
+            hs.outgoing_challenge_to_nick.clear();
+            hs.status_line = "challenge cancelled";
+            ImGui::CloseCurrentPopup();
+        }
+        // Auto-close popup if the event handler dropped the flag (e.g.
+        // we got match_start). BeginPopupModal returns true only while
+        // the popup is open, so just stop reopening it: the next frame
+        // sees show_outgoing_challenge_modal=false and skips OpenPopup.
+        if (!hs.show_outgoing_challenge_modal) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

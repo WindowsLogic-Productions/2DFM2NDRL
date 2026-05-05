@@ -1,6 +1,8 @@
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL_main.h>
 #include "SDL3/SDL.h"
+#include <SDL3_image/SDL_image.h>
+#include "app_icon_data.h"
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
@@ -980,13 +982,33 @@ void FM2KLauncher::Render() {
 }
 
 bool FM2KLauncher::InitializeSDL() {
+    // Hints MUST be set before the gamepad subsystem starts. SDL3
+    // reads HIDAPI/RawInput hints when it stands up the joystick
+    // backend, NOT lazily — setting them later (e.g. inside the
+    // input binder's Init()) is a no-op. Without HIDAPI_PS3 the
+    // PS3 controller (and Qanba sticks in PS3 mode) fall through to
+    // a generic HID joystick path that has no SDL gamepad mapping,
+    // so SDL_GetGamepadButton sees nothing and the binder ignores
+    // every press. Mirrors revolve_input_sdl3's setup order.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI,         "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS3,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5,     "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH,  "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT,       "1");
+
     // Initialize SDL with all necessary subsystems
     SDL_InitFlags init_flags = SDL_INIT_VIDEO | SDL_INIT_GAMEPAD;
-    
+
     if (!SDL_Init(init_flags)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_Init failed: %s", SDL_GetError());
         return false;
     }
+
+    // Gamepad events flow into SDL's event queue and update polled
+    // state; the binder reads the polled state via SDL_GetGamepadButton.
+    // Without this enabled, polled state never refreshes on Windows.
+    SDL_SetGamepadEventsEnabled(true);
     
     // Create window with SDL_Renderer graphics context
     float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
@@ -1011,7 +1033,11 @@ bool FM2KLauncher::InitializeSDL() {
         return false;
     }
 
-    // Create a default icon if none exists
+    // App icon. We try paths first (so a future assets/icon.bmp drop-in
+    // overrides without a rebuild), then fall back to an embedded
+    // base64-decoded PNG (placeholder smiley). If both fail, draw a
+    // 32×32 blue square. SDL3_image is statically linked so IMG_Load_IO
+    // handles the PNG without an external SDL_image.dll.
     SDL_Surface* icon = nullptr;
     const char* icon_paths[] = {
         "assets/icon.bmp",
@@ -1027,7 +1053,55 @@ bool FM2KLauncher::InitializeSDL() {
         }
     }
 
-    // If no icon file found, create a simple colored square as icon
+    if (!icon) {
+        // Decode the embedded base64 PNG. Decoder is short and self-
+        // contained — pulling SDL_base64 would mean wiring another
+        // header path, not worth it for a one-shot at startup.
+        const char* b64 = fm2k::kAppIconBase64;
+        const size_t b64_len = std::strlen(b64);
+        std::vector<uint8_t> png_bytes;
+        png_bytes.reserve((b64_len * 3) / 4 + 4);
+        auto val = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        uint32_t buf = 0;
+        int      bits = 0;
+        for (size_t i = 0; i < b64_len; ++i) {
+            const char c = b64[i];
+            if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                if (c == '=') break;
+                continue;
+            }
+            const int v = val(c);
+            if (v < 0) continue;
+            buf = (buf << 6) | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                png_bytes.push_back((uint8_t)((buf >> bits) & 0xFFu));
+            }
+        }
+        SDL_IOStream* io = SDL_IOFromConstMem(png_bytes.data(), png_bytes.size());
+        if (io) {
+            icon = IMG_Load_IO(io, /*closeio=*/true);
+            if (icon) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Loaded embedded smiley icon (%zu bytes PNG)",
+                            png_bytes.size());
+            } else {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "IMG_Load_IO failed for embedded icon: %s",
+                            SDL_GetError());
+            }
+        }
+    }
+
+    // If still no icon, draw a 32×32 blue square as final fallback.
     if (!icon) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "No icon file found, creating default icon");
         icon = SDL_CreateSurface(32, 32, SDL_PIXELFORMAT_RGBA32);
@@ -1049,6 +1123,62 @@ bool FM2KLauncher::InitializeSDL() {
     // Set window icon if we have one
     if (icon) {
         SDL_SetWindowIcon(window_, icon);
+
+        // Console window (conhost) inherits a generic icon when we attach
+        // via AllocConsole / parent inheritance. Convert the SDL surface
+        // to an HICON and SendMessage(WM_SETICON) to the console window
+        // so the smiley shows up in the title bar + Alt-Tab. Skipped if
+        // there's no console (launcher started without one — then
+        // GetConsoleWindow returns NULL).
+        if (HWND console_hwnd = GetConsoleWindow()) {
+            // Normalize to RGBA32 — DIB section we hand to CreateIconIndirect
+            // expects 32-bit BGRA top-down. ConvertSurface returns NULL on
+            // mismatch but a fresh copy on success; we own it.
+            SDL_Surface* rgba = SDL_ConvertSurface(icon, SDL_PIXELFORMAT_BGRA32);
+            if (rgba) {
+                SDL_LockSurface(rgba);
+                BITMAPV5HEADER bi = {};
+                bi.bV5Size        = sizeof(bi);
+                bi.bV5Width       = rgba->w;
+                bi.bV5Height      = -rgba->h;          // top-down
+                bi.bV5Planes      = 1;
+                bi.bV5BitCount    = 32;
+                bi.bV5Compression = BI_BITFIELDS;
+                bi.bV5RedMask     = 0x00FF0000;
+                bi.bV5GreenMask   = 0x0000FF00;
+                bi.bV5BlueMask    = 0x000000FF;
+                bi.bV5AlphaMask   = 0xFF000000;
+                HDC screen_dc = GetDC(nullptr);
+                void* dib_pixels = nullptr;
+                HBITMAP color_bmp = CreateDIBSection(
+                    screen_dc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+                    &dib_pixels, nullptr, 0);
+                ReleaseDC(nullptr, screen_dc);
+                if (color_bmp && dib_pixels) {
+                    std::memcpy(dib_pixels, rgba->pixels,
+                                (size_t)rgba->w * rgba->h * 4u);
+                    HBITMAP mask_bmp = CreateBitmap(rgba->w, rgba->h, 1, 1, nullptr);
+                    ICONINFO info = {};
+                    info.fIcon    = TRUE;
+                    info.hbmMask  = mask_bmp;
+                    info.hbmColor = color_bmp;
+                    HICON hicon = CreateIconIndirect(&info);
+                    if (hicon) {
+                        SendMessageW(console_hwnd, WM_SETICON,
+                                     ICON_SMALL, (LPARAM)hicon);
+                        SendMessageW(console_hwnd, WM_SETICON,
+                                     ICON_BIG,   (LPARAM)hicon);
+                        // Don't DestroyIcon — the console keeps a reference
+                        // for the lifetime of the window. Leaks one icon
+                        // handle on launcher exit, which is fine.
+                    }
+                    if (mask_bmp) DeleteObject(mask_bmp);
+                    DeleteObject(color_bmp);
+                }
+                SDL_UnlockSurface(rgba);
+                SDL_DestroySurface(rgba);
+            }
+        }
     }
 
     // No tray icon - just a normal window application
