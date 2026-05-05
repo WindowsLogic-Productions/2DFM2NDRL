@@ -3,6 +3,7 @@
 #include "globals.h"
 #include "gekkonet.h"
 #include "spectator_node.h"
+#include "spectator_tcp.h"
 #include "nat_traversal.h"
 #include <SDL3/SDL_log.h>
 #include <vector>
@@ -29,6 +30,13 @@ static uint32_t g_last_recv_time = 0;
 static uint32_t g_last_ping_time = 0;
 static uint32_t g_rtt_ms = 0;
 static uint32_t g_ping_send_time = 0;
+
+// Worst-RTT accumulator (CCCaster-style). Tracks the maximum RTT observed
+// over a rolling window so Netplay_StartBattleSession can pick a delay
+// that covers the spike, not just the mean. Reset by ResetWorstRttMs()
+// at the start of each session-config measurement window.
+static uint32_t g_rtt_worst_ms = 0;
+static uint32_t g_rtt_sample_count = 0;
 
 // Player ID (set from globals)
 static uint8_t g_local_player_id = 0;
@@ -183,6 +191,11 @@ SOCKET NetSocket_GetHandle() {
     return g_socket;
 }
 
+uint16_t NetSocket_GetLocalPort() {
+    if (!g_socket_initialized) return 0;
+    return ntohs(g_local_sockaddr.sin_port);
+}
+
 const sockaddr_in* NetSocket_GetRemoteAddr() {
     return &g_remote_sockaddr;
 }
@@ -334,9 +347,6 @@ static void RawReceive() {
             // Defined in nat_traversal.h. Returning here keeps the byte
             // out of GekkoNet's queue and the spectator path.
             ::fm2k::nat::HandleDatagram(eff_data, eff_len, from_addr);
-        } else if (eff_len >= 1 && first == SPEC_DATA_MAGIC) {
-            // Spectator-tree datagram (0xCE) — variable-length payload.
-            SpectatorNode_HandleSpecData(eff_data, eff_len, from_addr);
         } else {
             // GekkoNet packet - queue for adapter
             std::vector<char> pkt_data(
@@ -373,6 +383,22 @@ void ControlChannel_Poll() {
 
     // Receive all pending packets
     RawReceive();
+
+    // TCP path for the spectator INPUT_BATCH stream. Host-side: drain
+    // the listener accept queue + read-discard from connected subs.
+    // Spectator-side: drive the upstream connect to completion + drain
+    // inbound bytes through the SpecDataHeader parser. Each call is
+    // non-blocking and cheap when nothing is pending; safe to run on
+    // both host and spectator processes (no-op when not applicable).
+    SpectatorTCP::PollAccepts();
+    SpectatorTCP::PollIncoming();
+    SpectatorTCP::PollUpstream();
+
+    // Pair freshly-accepted TCP clients to known subscriber slots and ship
+    // deferred INITIAL_MATCH/backfill. Runs on host (which doesn't go
+    // through SpectatorNode_TickHealth's spectator path); idempotent and
+    // cheap when there are no subscribers.
+    SpectatorNode_TickHostMaintenance();
 
     // Check for timeout
     uint32_t now = GetTimeMs();
@@ -426,6 +452,21 @@ uint32_t ControlChannel_GetLastRecvMs() {
 
 uint32_t ControlChannel_GetRttMs() {
     return g_rtt_ms;
+}
+
+uint32_t ControlChannel_GetWorstRttMs() {
+    return g_rtt_worst_ms;
+}
+
+uint32_t ControlChannel_GetRttSampleCount() {
+    return g_rtt_sample_count;
+}
+
+void ControlChannel_ResetWorstRttMs() {
+    g_rtt_worst_ms     = g_rtt_ms;  // seed with the most recent sample so
+                                    // we never report 0 if no PONGs land
+                                    // in the next window
+    g_rtt_sample_count = (g_rtt_ms > 0) ? 1 : 0;
 }
 
 void ControlChannel_SetCallback(ControlMsgCallback callback) {
@@ -728,6 +769,8 @@ void DestroyMultiplexAdapter() {
 // Handle incoming PONG to calculate RTT
 void ControlChannel_HandlePong(uint32_t sent_time) {
     g_rtt_ms = GetTimeMs() - sent_time;
+    if (g_rtt_ms > g_rtt_worst_ms) g_rtt_worst_ms = g_rtt_ms;
+    ++g_rtt_sample_count;
 }
 
 // Mark connection as established (called when HELLO_ACK received)

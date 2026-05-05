@@ -164,7 +164,8 @@ void SpectatorNode_SetRootAddr(const sockaddr_in& root);
 // Handle inbound SPEC_JOIN_ACK — upstream accepted us. host_session_kind
 // from the ACK payload (1=CSS, 2=BATTLE, 0=unknown/between-matches) is
 // used to create a matching GekkoSpectateSession.
-void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind);
+void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
+                                 uint16_t host_tcp_port);
 
 // Handle inbound SPEC_JOIN_REDIRECT — retry against redirect target.
 void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,
@@ -187,6 +188,13 @@ bool SpectatorNode_IsSubscribedUpstream();
 //   * silence detection → failover to root after SILENCE_FAILOVER_MS
 //   * upstream-side subscriber sweep (expire silent subscribers)
 void SpectatorNode_TickHealth();
+
+// Host-side maintenance only — bind newly-accepted TCP clients to subscriber
+// slots, ship deferred INITIAL_MATCH/backfill on first bind, and expire silent
+// subscribers. Driven from ControlChannel_Poll so it runs on the host path
+// (which doesn't go through SpectatorNode_TickHealth) every poll iteration.
+// Idempotent and short-circuiting when there are no subscribers.
+void SpectatorNode_TickHostMaintenance();
 
 // Clean disconnect from upstream.
 void SpectatorNode_LeaveUpstream();

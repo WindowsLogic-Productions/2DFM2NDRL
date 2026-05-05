@@ -1,4 +1,5 @@
 #include "spectator_node.h"
+#include "spectator_tcp.h"        // TCP transport for INPUT_BATCH stream
 #include "control_channel.h"
 #include "netplay.h"
 #include "replay.h"
@@ -40,6 +41,10 @@ struct Subscriber {
     sockaddr_in addr;
     uint64_t    last_seen_ms;
     uint32_t    ack_frame;    // Last frame we know this subscriber has. TODO: fill on SPEC_ACK.
+    bool        tcp_bound;    // True once SpectatorTCP::RegisterAcceptedClient(addr)
+                              // has paired this sub with an accepted TCP socket.
+                              // Until then, INITIAL_MATCH + backfill are deferred —
+                              // any send before binding silently drops on the floor.
 };
 
 // Cached initial-match metadata so new joiners get a consistent handoff.
@@ -81,10 +86,10 @@ struct State {
     sockaddr_in               upstream_addr       = {};
     // Failover support. root_addr is the originally-configured upstream
     // (the actual match host). If our current upstream goes silent we
-    // fall back to root, which always-on by design. last_upstream_recv_ms
-    // tracks any inbound traffic; >SILENCE_THRESHOLD_MS triggers failover.
+    // fall back to root, which always-on by design. Liveness is tracked
+    // via SpectatorTCP::LastUpstreamRecvMs() (TCP-side) — this struct
+    // owns only handshake / heartbeat send-cadence state.
     sockaddr_in               root_addr           = {};
-    uint64_t                  last_upstream_recv_ms = 0;
     uint64_t                  last_heartbeat_send_ms = 0;
     uint64_t                  last_reconnect_attempt_ms = 0;
     // De-dup gate. Backfill from a reconnected upstream replays history
@@ -164,49 +169,47 @@ void FlushBatch() {
     const uint32_t new_frame_count = static_cast<uint32_t>(
         g_state.pending.p1_inputs.size());
 
-    // Always advance start_frame, even with no subscribers. Otherwise a
-    // future late joiner backfilled to session_history.size() N would
-    // see live batches with frames < N (because pending.start_frame
-    // never advanced while host ran solo) and drop them all on the
-    // dedup gate, starving the queue.
+    // Always advance start_frame, even with no subscribers. Late joiners
+    // get the full backfill via SendSessionBackfillTo, but live frames
+    // emitted afterward are numbered relative to session_history; the
+    // start_frame counter has to keep walking even when nobody's
+    // listening.
     g_state.pending.start_frame += new_frame_count;
     g_state.pending.p1_inputs.clear();
     g_state.pending.p2_inputs.clear();
 
     if (g_state.subscribers.empty()) return;
 
-    // Slice the redundancy window from session_history. session_history
-    // last index = pending.start_frame - 1 (the just-pushed frames).
-    // Window covers [start, end) inclusive of the most recent frame.
+    // TCP transport — emit ONLY the new frames just appended to
+    // session_history. No redundancy window: TCP delivers each byte
+    // exactly once, in order. The old REDUNDANCY_WINDOW=32 retransmit
+    // hack existed to tolerate UDP packet loss; under TCP it's pure
+    // bandwidth waste.
     const size_t total = g_state.session_history.size();
-    if (total == 0) return;
-    const size_t window_size = std::min<size_t>(REDUNDANCY_WINDOW, total);
-    const size_t window_end_idx = total;                 // exclusive
-    const size_t window_start_idx = total - window_size;
-    const uint32_t window_start_frame =
-        g_state.session_start_frame + (uint32_t)window_start_idx;
+    if (total == 0 || new_frame_count == 0) return;
+    const size_t emit_start_idx = total - new_frame_count;
+    const uint32_t emit_start_frame =
+        g_state.session_start_frame + (uint32_t)emit_start_idx;
 
-    const size_t payload_bytes = window_size * 4;
+    const size_t payload_bytes = (size_t)new_frame_count * 4;
     const size_t dgram_bytes   = sizeof(SpecDataHeader) + payload_bytes;
 
     std::vector<uint8_t> buf(dgram_bytes);
     SpecDataHeader hdr = {};
     hdr.magic       = SPEC_DATA_MAGIC;
     hdr.type        = SpecDataType::INPUT_BATCH;
-    hdr.start_frame = window_start_frame;
-    hdr.frame_count = static_cast<uint16_t>(window_size);
+    hdr.start_frame = emit_start_frame;
+    hdr.frame_count = static_cast<uint16_t>(new_frame_count);
     std::memcpy(buf.data(), &hdr, sizeof(hdr));
 
     uint8_t* out = buf.data() + sizeof(hdr);
-    for (size_t i = 0; i < window_size; i++) {
-        const PlaybackFrame& f = g_state.session_history[window_start_idx + i];
+    for (size_t i = 0; i < new_frame_count; i++) {
+        const PlaybackFrame& f = g_state.session_history[emit_start_idx + i];
         std::memcpy(out + i * 4 + 0, &f.p1_input, 2);
         std::memcpy(out + i * 4 + 2, &f.p2_input, 2);
     }
 
-    for (const auto& sub : g_state.subscribers) {
-        SendRaw(buf.data(), buf.size(), sub.addr);
-    }
+    SpectatorTCP::BroadcastToAll(buf.data(), buf.size());
 }
 
 void SendInitialMatchTo(const sockaddr_in& to) {
@@ -222,7 +225,7 @@ void SendInitialMatchTo(const sockaddr_in& to) {
     std::memcpy(buf.data() + sizeof(hdr),
                 g_state.initial_match.header_bytes,
                 sizeof(g_state.initial_match.header_bytes));
-    SendRaw(buf.data(), buf.size(), to);
+    SpectatorTCP::SendTo(to, buf.data(), buf.size());
 }
 
 // Send the full session input history to a specific subscriber, chunked at
@@ -260,7 +263,7 @@ void SendSessionBackfillTo(const sockaddr_in& to) {
             std::memcpy(out + i * 4 + 0, &f.p1_input, 2);
             std::memcpy(out + i * 4 + 2, &f.p2_input, 2);
         }
-        SendRaw(buf.data(), buf.size(), to);
+        SpectatorTCP::SendTo(to, buf.data(), buf.size());
     }
 }
 
@@ -268,79 +271,14 @@ void SendMatchEndToAll() {
     SpecDataHeader hdr = {};
     hdr.magic = SPEC_DATA_MAGIC;
     hdr.type  = SpecDataType::MATCH_END;
-    for (const auto& sub : g_state.subscribers) {
-        SendRaw(&hdr, sizeof(hdr), sub.addr);
-    }
+    SpectatorTCP::BroadcastToAll(&hdr, sizeof(hdr));
 }
 
-// Spectator-side: send INPUT_REQUEST to upstream asking for frames starting
-// at start_frame. Host replies with an INPUT_BATCH covering up to
-// REDUNDANCY_WINDOW frames from session_history.
-void SendInputRequest(uint32_t start_frame) {
-    if (!g_state.subscribed_upstream) return;
-    SpecDataHeader hdr = {};
-    hdr.magic       = SPEC_DATA_MAGIC;
-    hdr.type        = SpecDataType::INPUT_REQUEST;
-    hdr.start_frame = start_frame;
-    hdr.frame_count = 0;
-    hdr.flags       = 0;
-    SendRaw(&hdr, sizeof(hdr), g_state.upstream_addr);
-    g_state.last_input_request_send_ms = (uint64_t)GetTickCount64();
-}
-
-// Host-side: respond to a spectator's INPUT_REQUEST with an INPUT_BATCH
-// containing up to REDUNDANCY_WINDOW frames from session_history starting
-// at requested_frame. If session_history hasn't reached requested_frame
-// yet, send an empty batch (header only) so the spectator knows we got
-// the request but have nothing newer.
-void RespondToInputRequest(const sockaddr_in& from, uint32_t requested_frame) {
-    const size_t total = g_state.session_history.size();
-    const uint32_t hist_first = g_state.session_start_frame;
-    const uint32_t hist_end   = hist_first + (uint32_t)total;
-
-    // Spectator wants something we don't have yet (or never will). Reply
-    // with an empty batch from hist_end so the dedup gate ignores this
-    // round-trip cleanly.
-    if (requested_frame >= hist_end) {
-        SpecDataHeader hdr = {};
-        hdr.magic       = SPEC_DATA_MAGIC;
-        hdr.type        = SpecDataType::INPUT_BATCH;
-        hdr.start_frame = hist_end;
-        hdr.frame_count = 0;
-        SendRaw(&hdr, sizeof(hdr), from);
-        return;
-    }
-
-    // Clamp requested start to within session_history. If spectator asks
-    // for frames older than we still have (extreme catch-up after a long
-    // disconnection), bump up to the oldest available — they'll have to
-    // re-key from there.
-    const uint32_t req_clamped = (requested_frame < hist_first)
-        ? hist_first : requested_frame;
-    const uint32_t off    = req_clamped - hist_first;
-    const uint32_t avail  = (uint32_t)total - off;
-    const uint32_t count  = (avail < REDUNDANCY_WINDOW)
-        ? avail : (uint32_t)REDUNDANCY_WINDOW;
-
-    const size_t payload_bytes = count * 4;
-    const size_t dgram_bytes   = sizeof(SpecDataHeader) + payload_bytes;
-
-    std::vector<uint8_t> buf(dgram_bytes);
-    SpecDataHeader hdr = {};
-    hdr.magic       = SPEC_DATA_MAGIC;
-    hdr.type        = SpecDataType::INPUT_BATCH;
-    hdr.start_frame = req_clamped;
-    hdr.frame_count = (uint16_t)count;
-    std::memcpy(buf.data(), &hdr, sizeof(hdr));
-
-    uint8_t* out = buf.data() + sizeof(hdr);
-    for (uint32_t i = 0; i < count; i++) {
-        const PlaybackFrame& f = g_state.session_history[off + i];
-        std::memcpy(out + i * 4 + 0, &f.p1_input, 2);
-        std::memcpy(out + i * 4 + 2, &f.p2_input, 2);
-    }
-    SendRaw(buf.data(), buf.size(), from);
-}
+// (SendInputRequest + RespondToInputRequest deleted: TCP guarantees in-order
+// delivery exactly once, so the spectator-side gap-recovery handshake is
+// dead code. The whole class of UDP-loss recovery — REDUNDANCY_WINDOW,
+// INPUT_REQUEST_POLL_MS in TickHealth, the on-gap immediate request inside
+// HandleSpecData — has been removed.)
 
 } // namespace
 
@@ -351,9 +289,24 @@ void RespondToInputRequest(const sockaddr_in& from, uint32_t requested_frame) {
 void SpectatorNode_Init() {
     g_state = State{};
     g_state.capacity = SPECTATOR_DEFAULT_CAPACITY;
+
+    // Bring up the TCP listener for the host→spectator INPUT_BATCH stream.
+    // We bind TCP to the same port as the UDP control socket — TCP and UDP
+    // share the same port-number space without conflict, and reusing the
+    // UDP port means spectators already know it (they connected over UDP
+    // there) so the host_tcp_port field in JOIN_ACK is redundant but kept
+    // for explicitness. Idempotent — re-Init won't double-bind.
+    const uint16_t udp_port = NetSocket_GetLocalPort();
+    if (!SpectatorTCP::StartListener(udp_port)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: Init — TCP listener failed to bind on port %u; "
+            "spectator subscriptions will fail", (unsigned)udp_port);
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: Init (capacity=%zu, batch=%zu frames)",
-                g_state.capacity, BROADCAST_BATCH_FRAMES);
+                "SpectatorNode: Init (capacity=%zu, batch=%zu frames, "
+                "tcp_port=%u)",
+                g_state.capacity, BROADCAST_BATCH_FRAMES,
+                (unsigned)SpectatorTCP::GetListenPort());
 }
 
 void SpectatorNode_Shutdown() {
@@ -378,6 +331,7 @@ void SpectatorNode_Shutdown() {
     g_state.broadcasting = false;
     g_state.subscribed_upstream = false;
     g_state.playing_back = false;
+    SpectatorTCP::Shutdown();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SpectatorNode: Shutdown");
 }
 
@@ -399,6 +353,14 @@ void SpectatorNode_OnMatchStart(
     uint8_t p2_char, uint8_t p2_color)
 {
     g_state.broadcasting = true;
+    // Flush any unbatched CSS frames before clearing — they were already
+    // appended to session_history and the spectator's next_expected_frame
+    // sits at session_history.size() - pending.size(). If we drop pending
+    // here without flushing, the next live battle batch will start at
+    // session_history.size() and leave a 1..7-frame gap below
+    // next_expected_frame that the spectator's strict-contiguous ingest
+    // gate will reject forever, freezing playback at the CSS→battle seam.
+    if (!g_state.pending.p1_inputs.empty()) FlushBatch();
     // Don't reset pending.start_frame — keep it monotonic across matches so
     // INPUT_BATCH start_frame is the session-history index, matching the
     // numbering SendSessionBackfillTo uses. Required for de-dup on
@@ -480,6 +442,10 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
         ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
         ack.data.spec_join_ack.host_session_kind =
             static_cast<uint8_t>(Netplay_GetSessionKind());
+        // Tell the spectator which TCP port to dial for the INPUT_BATCH
+        // stream. Zero would mean the listener failed at startup, in which
+        // case the spectator refuses the subscription.
+        ack.data.spec_join_ack.host_tcp_port = SpectatorTCP::GetListenPort();
         return ack;
     };
 
@@ -512,7 +478,8 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
             addr_str);
     };
 
-    // Already subscribed? Idempotent ACK.
+    // Already subscribed? Idempotent ACK. INITIAL_MATCH/backfill are
+    // deferred until the spectator's TCP socket binds (see TickHealth).
     for (const auto& sub : g_state.subscribers) {
         if (AddrEqual(sub.addr, from)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -520,7 +487,6 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
                         addr_buf);
             CtrlPacket ack = BuildJoinAck();
             ControlChannel_SendTo(ack, from);
-            SendInitialMatchTo(from);
             return;
         }
     }
@@ -530,22 +496,23 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
         sub.addr         = from;
         sub.last_seen_ms = GetTickCount64();
         sub.ack_frame    = 0;
+        sub.tcp_bound    = false;
         g_state.subscribers.push_back(sub);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: Accepted subscriber %s (%zu/%zu)",
+                    "SpectatorNode: Accepted subscriber %s (%zu/%zu) — "
+                    "deferring INITIAL_MATCH until TCP binds",
                     addr_buf, g_state.subscribers.size(), g_state.capacity);
 
         CtrlPacket ack = BuildJoinAck();
         ControlChannel_SendTo(ack, from);
-        SendInitialMatchTo(from);
 
         // If we already have a live GekkoNet session, add this late joiner
         // as a GekkoSpectator actor so the input stream reaches them.
         AddSpectatorToSession(from);
 
-        // Fast-forward backfill: ship the entire session input history so the
-        // late joiner can drain it locally at >100 Hz and catch up to live.
-        SendSessionBackfillTo(from);
+        // INITIAL_MATCH + SendSessionBackfillTo are sent by TickHealth's
+        // TryBindPendingTCP path the first time the spectator's accepted
+        // TCP connection gets paired with this subscriber slot.
         return;
     }
 
@@ -598,6 +565,7 @@ void SpectatorNode_HandleLeave(const sockaddr_in& from) {
             char buf[48] = {}; FormatAddr(from, buf, sizeof(buf));
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: Subscriber %s left", buf);
+            SpectatorTCP::DisconnectSubscriber(it->addr);
             g_state.subscribers.erase(it);
             return;
         }
@@ -646,10 +614,11 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream) {
     return true;
 }
 
-void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind) {
+void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
+                                 uint16_t host_tcp_port) {
     // SPEC_JOIN_ACK is dual-purpose:
     //   1. First-time arrival (initial subscribe): completes the JOIN_REQ
-    //      handshake, pins RNG, marks subscribed_upstream.
+    //      handshake, pins RNG, marks subscribed_upstream, opens TCP up.
     //   2. Re-broadcast on host session-kind change (host crosses a
     //      session boundary like CSS->battle or first-CSS-create): the
     //      payload's host_session_kind tells the spectator which kind to
@@ -670,18 +639,12 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     g_state.join_req_pending      = false;
     g_state.upstream_addr         = from;
     g_state.subscribed_upstream   = true;
-    g_state.last_upstream_recv_ms = (uint64_t)GetTickCount64();
 
     // RNG sync + queue clear: ONLY apply on FIRST-TIME subscribe (spectator
     // is still at title/pre-CSS, no game state to lose). On reconnect-after-
-    // silence-failover or on re-broadcast ACK from
-    // AddSubscribedSpectatorsToSession, the spectator's local sim is
-    // mid-match — clobbering RNG to 0x12345678 and wiping pb_queue would
-    // ERASE the in-progress game state and any inputs already buffered for
-    // the next few frames. The user's "spectator desyncs under packet loss"
-    // symptom is exactly this: silence-failover fires under sustained loss,
-    // ACK arrives, RNG gets stomped to seed-pin, sim diverges from host
-    // permanently. Gate both behaviors on first-time only.
+    // silence-failover or on re-broadcast ACK, spectator's local sim is
+    // mid-match — clobbering RNG / wiping the queue would erase in-progress
+    // state. Gate both on first-time only.
     if (first_time) {
         *(uint32_t*)0x41FB1C = 0x12345678;
         g_state.pb_queue.clear();
@@ -690,10 +653,32 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     }
     g_state.playing_back = true;
 
+    // Dial the host's TCP port. Bulk INPUT_BATCH / INITIAL_MATCH /
+    // MATCH_END flow over TCP exclusively; if the host didn't advertise
+    // a port, this peer has nothing to listen to and the subscription
+    // is unusable. Bail.
+    if (host_tcp_port == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: JOIN_ACK from host has no TCP port — refusing");
+        g_state.subscribed_upstream = false;
+        return;
+    }
+    {
+        char host_ip[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, (void*)&from.sin_addr, host_ip, sizeof(host_ip));
+        if (!SpectatorTCP::ConnectUpstream(host_ip, host_tcp_port)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: SpectatorTCP::ConnectUpstream(%s:%u) failed",
+                host_ip, (unsigned)host_tcp_port);
+            g_state.subscribed_upstream = false;
+            return;
+        }
+    }
+
     char buf[48] = {}; FormatAddr(from, buf, sizeof(buf));
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: JOIN_ACK from %s (host_kind=%u) — subscribed, RNG pinned",
-                buf, (unsigned)host_session_kind);
+                "SpectatorNode: JOIN_ACK from %s (host_kind=%u, tcp_port=%u) — subscribed",
+                buf, (unsigned)host_session_kind, (unsigned)host_tcp_port);
 
     // host_session_kind == 0 (NONE): host has no session active yet
     // (e.g. JOIN_REQ landed during host's title-skip phase before its
@@ -827,24 +812,17 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             const size_t expected = (size_t)hdr.frame_count * 4;
             if (payload_len < expected) return;
 
-            // Refresh upstream liveness — any inbound 0xCE counts.
-            g_state.last_upstream_recv_ms = (uint64_t)GetTickCount64();
+            // Liveness is tracked at the TCP layer (SpectatorTCP::LastUpstreamRecvMs).
 
-            // Gap-strict ingest. Each batch carries up to REDUNDANCY_WINDOW
-            // frames where most are re-sends of recent history; we use the
-            // redundancy to fill in for dropped packets. ONLY push frames
-            // contiguous with next_expected_frame; gaps stall the push and
-            // wait for the redundant copy in the next batch to deliver
-            // missing frames. Without this, a single packet loss permanently
-            // misaligns pb_queue from session_history (frames pushed in pop
-            // order against a spectator-local frame counter that no longer
-            // matches the input frame numbers).
+            // Gap-strict ingest: TCP delivers each frame exactly once, in
+            // order. ONLY push frames contiguous with next_expected_frame;
+            // anything earlier is a benign retransmit during reconnect,
+            // anything later is a protocol bug (TCP shouldn't reorder).
             g_state.pb_queue.reserve(g_state.pb_queue.size() + hdr.frame_count);
             const uint32_t expected_at_entry = g_state.have_frame_baseline
                 ? g_state.next_expected_frame : 0xFFFFFFFFu;
             const size_t   queue_at_entry    = g_state.pb_queue.size();
             uint32_t       gap_first_seen    = 0xFFFFFFFFu;
-            bool           gap_request_sent  = false;
             uint32_t       pushed_this_batch = 0;
             for (uint16_t i = 0; i < hdr.frame_count; i++) {
                 const uint32_t global_frame = hdr.start_frame + (uint32_t)i;
@@ -861,20 +839,10 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                     continue;
                 }
 
-                // Future-frame past the contiguous edge: gap detected.
-                // Don't push (would misalign pb_queue); instead fire ONE
-                // INPUT_REQUEST asking host to re-send from next_expected
-                // onward. Without this single-shot guard the same dropped
-                // packet would fire up to REDUNDANCY_WINDOW (=32) requests
-                // back-to-back as we see each gap-frame in the batch,
-                // hammering the host pointlessly. The 200 ms periodic poll
-                // in TickHealth covers persistent gaps.
+                // Future-frame past the contiguous edge: TCP guarantees
+                // in-order delivery, so this is a protocol bug — log + drop.
                 if (global_frame > g_state.next_expected_frame) {
                     if (gap_first_seen == 0xFFFFFFFFu) gap_first_seen = global_frame;
-                    if (!gap_request_sent) {
-                        SendInputRequest(g_state.next_expected_frame);
-                        gap_request_sent = true;
-                    }
                     continue;
                 }
 
@@ -892,10 +860,10 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 // broadcast queue so its 1-hop downstreams keep streaming.
                 SpectatorNode_OnFrameConfirmed(f.p1_input, f.p2_input);
             }
-            if (gap_request_sent) {
+            if (gap_first_seen != 0xFFFFFFFFu) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: GAP at frame %u (batch start=%u count=%u, "
-                    "expected=%u at entry, pushed=%u, queue=%zu->%zu) — INPUT_REQUEST sent",
+                    "SpectatorNode: out-of-order frame %u in batch (start=%u count=%u, "
+                    "expected=%u, pushed=%u, queue=%zu->%zu) — dropped",
                     gap_first_seen, hdr.start_frame, hdr.frame_count,
                     expected_at_entry, pushed_this_batch,
                     queue_at_entry, g_state.pb_queue.size());
@@ -924,12 +892,9 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             break;
         }
         case SpecDataType::INPUT_REQUEST: {
-            // Host-side: a downstream subscriber is asking us to re-send
-            // frames from hdr.start_frame onward. Reply with up to one
-            // REDUNDANCY_WINDOW worth from session_history. This is the
-            // bulletproof recovery path — any packet loss leaves a gap
-            // the spectator detects and re-requests until filled.
-            RespondToInputRequest(from, hdr.start_frame);
+            // Dead path under TCP — we keep the enum value for wire-format
+            // backward compat with old peers, but our host no longer needs
+            // to respond. Silently ignore.
             break;
         }
     }
@@ -1013,39 +978,26 @@ void SpectatorNode_TickHealth() {
             g_state.last_heartbeat_send_ms = now;
         }
 
-        // Bulletproof input delivery: every INPUT_REQUEST_POLL_MS, ask
-        // upstream to re-send from next_expected_frame. Even with no
-        // packet loss this is dedup'd cheaply on the receive side
-        // (frames < next_expected_frame are dropped). With loss, this
-        // guarantees eventual delivery — gap stalls cap at the poll
-        // interval. Combines with the on-gap-immediate request in the
-        // INPUT_BATCH receive handler for fast recovery.
-        constexpr uint64_t INPUT_REQUEST_POLL_MS = 200;
-        if (g_state.have_frame_baseline &&
-            now - g_state.last_input_request_send_ms >= INPUT_REQUEST_POLL_MS) {
-            SendInputRequest(g_state.next_expected_frame);
-        }
+        // (Removed: periodic INPUT_REQUEST poll — under TCP the kernel
+        // handles retransmit transparently, and there's no host-side
+        // RespondToInputRequest anymore.)
 
-        // Silence-based failover. Liveness signal used to be the 0xCE
-        // INPUT_BATCH stream, but that's gone — input forwarding moved
-        // to GekkoSpectateSession. When the spectator session is alive,
-        // skip the silence check entirely (GekkoNet is the liveness
-        // signal). Otherwise fall back to the legacy timer for the
-        // brief window between JOIN_ACK and SpectateSession creation.
-        const bool gekko_spec_alive = (Netplay_GetSessionKind() == NetplaySessionKind::SPECTATE);
-        if (!gekko_spec_alive &&
-            g_state.last_upstream_recv_ms > 0 &&
-            now - g_state.last_upstream_recv_ms >= SPECTATOR_SILENCE_FAILOVER_MS)
+        // Silence-based failover. TCP receive activity is the only
+        // liveness signal — the bulk stream lives entirely there.
+        const uint64_t recv_ms = SpectatorTCP::LastUpstreamRecvMs();
+        if (recv_ms > 0 &&
+            now - recv_ms >= SPECTATOR_SILENCE_FAILOVER_MS)
         {
             char buf[48] = {}; FormatAddr(g_state.upstream_addr, buf, sizeof(buf));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: upstream %s silent for %llu ms — failing over",
                         buf,
-                        (unsigned long long)(now - g_state.last_upstream_recv_ms));
+                        (unsigned long long)(now - recv_ms));
             CtrlPacket leave = {};
             leave.header.type = CtrlMsg::SPEC_LEAVE;
             ControlChannel_SendTo(leave, g_state.upstream_addr);
             g_state.subscribed_upstream = false;
+            SpectatorTCP::DisconnectUpstream();
         }
     }
 
@@ -1062,6 +1014,31 @@ void SpectatorNode_TickHealth() {
         SpectatorNode_RequestJoin(g_state.root_addr);
     }
 
+    SpectatorNode_TickHostMaintenance();
+}
+
+void SpectatorNode_TickHostMaintenance() {
+    const uint64_t now = (uint64_t)GetTickCount64();
+
+    // ---- Upstream-side: bind newly-arrived TCP clients to subscribers ----
+    // Spectator's async TCP dial completes some frames after JOIN_ACK; the
+    // accept queue carries a fresh socket waiting to be paired by IP. On
+    // first successful pair, ship INITIAL_MATCH + backfill — those bytes
+    // were deferred at JOIN_REQ accept time because the socket didn't
+    // exist yet.
+    for (auto& sub : g_state.subscribers) {
+        if (sub.tcp_bound) continue;
+        if (SpectatorTCP::RegisterAcceptedClient(sub.addr)) {
+            sub.tcp_bound = true;
+            char buf[48] = {}; FormatAddr(sub.addr, buf, sizeof(buf));
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: TCP bound for %s — sending INITIAL_MATCH + backfill",
+                        buf);
+            SendInitialMatchTo(sub.addr);
+            SendSessionBackfillTo(sub.addr);
+        }
+    }
+
     // ---- Upstream-side: expire silent subscribers -----------------------
     for (auto it = g_state.subscribers.begin(); it != g_state.subscribers.end(); ) {
         if (now - it->last_seen_ms >= SPECTATOR_SUBSCRIBER_EXPIRY_MS) {
@@ -1073,6 +1050,7 @@ void SpectatorNode_TickHealth() {
             CtrlPacket leave = {};
             leave.header.type = CtrlMsg::SPEC_LEAVE;
             ControlChannel_SendTo(leave, it->addr);
+            SpectatorTCP::DisconnectSubscriber(it->addr);
             it = g_state.subscribers.erase(it);
         } else {
             ++it;
