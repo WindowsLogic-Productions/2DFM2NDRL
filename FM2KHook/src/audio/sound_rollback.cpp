@@ -1,5 +1,8 @@
 #include "sound_rollback.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <SDL3/SDL_log.h>
 #include <windows.h>  // GetTickCount
@@ -46,6 +49,12 @@ uint32_t g_last_music_cmd = 0xFFFFFFFFu;
 uint32_t g_last_music_payload = 0;
 bool     g_last_music_valid = false;
 
+// Mute state — atomic so launcher-driven toggles are visible without
+// locks. The launcher writes %APPDATA%\FM2K_Rollback\audio.ini and the
+// dispatcher refreshes from it ~once per second.
+SoundRollback::MuteState g_mute = {};
+uint32_t                 g_mute_last_check_tick = 0;
+
 bool StatesEqual(const SoundRollback::DesiredState& a,
                  const SoundRollback::DesiredState& b) {
     // Channel identity is (wave_ptr, play_frame, stopped). seq_in_frame is
@@ -84,6 +93,56 @@ namespace SoundRollback {
 
 void SetOriginalDispatcher(OriginalDispatcherFn fn) {
     g_original_dispatcher = fn;
+}
+
+// ----- Mute API ------------------------------------------------------------
+
+void SetMuteState(const MuteState& m) {
+    g_mute = m;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SoundRollback: mute bgm=%d se=%d", m.bgm ? 1 : 0, m.se ? 1 : 0);
+}
+
+MuteState GetMuteState() { return g_mute; }
+bool IsMusicMuted() { return g_mute.bgm; }
+bool IsSfxMuted()   { return g_mute.se;  }
+
+namespace {
+std::string MuteIniPath() {
+    char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    std::string dir = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\audio.ini";
+}
+}
+
+void RefreshMuteFromDisk() {
+    const std::string path = MuteIniPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return;  // file doesn't exist yet — keep current state
+    MuteState m{};
+    char line[128];
+    while (std::fgets(line, sizeof(line), f)) {
+        // tolerant key=value parser; skip whitespace + comments
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p || *p == '#' || *p == ';' || *p == '\n' || *p == '\r') continue;
+        const char* eq = std::strchr(p, '=');
+        if (!eq) continue;
+        std::string k(p, eq);
+        std::string v(eq + 1);
+        while (!v.empty() && (v.back()=='\n' || v.back()=='\r' ||
+                              v.back()==' ' || v.back()=='\t')) v.pop_back();
+        const bool truthy = (v == "1" || v == "true" || v == "yes" || v == "on");
+        if (k == "bgm_muted") m.bgm = truthy;
+        else if (k == "se_muted") m.se = truthy;
+    }
+    std::fclose(f);
+    if (m.bgm != g_mute.bgm || m.se != g_mute.se) {
+        SetMuteState(m);
+    }
 }
 
 bool IsRedundantMusicDispatch(uint8_t cmd, uint32_t payload) {

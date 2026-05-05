@@ -1,0 +1,428 @@
+// SpectatorTCP — TCP transport for the spectator INPUT_BATCH stream.
+//
+// See spectator_tcp.h for full design rationale. This file is the SDL3_net
+// implementation: a single listener on the host, a per-subscriber stream
+// socket, and one upstream client socket on the spectator.
+
+#include "spectator_tcp.h"
+#include "spectator_node.h"
+
+#include <SDL3_net/SDL_net.h>
+#include <SDL3/SDL_log.h>
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <vector>
+
+// Forward declaration — defined in spectator_node.cpp. The `from` field is
+// unused for TCP-sourced frames (dispatch logic doesn't depend on it for
+// upstream-INPUT_BATCH/INITIAL_MATCH/MATCH_END), so we pass a zeroed sockaddr.
+extern void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
+                                         const sockaddr_in& from);
+
+namespace SpectatorTCP {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+struct SubConn {
+    sockaddr_in           addr;       // (ip, source-port) tuple from JOIN_REQ
+    NET_StreamSocket*     sock;
+    std::vector<uint8_t>  read_buf;   // partial-frame staging (currently
+                                      // unused — host doesn't read structured
+                                      // data from subscribers post-INPUT_REQUEST
+                                      // removal; we just discard inbound bytes).
+};
+
+bool                              g_net_inited        = false;
+NET_Server*                       g_listener          = nullptr;
+uint16_t                          g_listen_port       = 0;
+std::vector<NET_StreamSocket*>    g_pending_clients;
+std::vector<SubConn>              g_subs;
+
+NET_StreamSocket*                 g_upstream_sock     = nullptr;
+std::vector<uint8_t>              g_upstream_read_buf;
+uint64_t                          g_last_upstream_recv_ms = 0;
+
+// Throttled-log helper: rate-limit a tagged log site to once per second.
+struct LogThrottle { uint64_t last_ms; };
+LogThrottle g_throttle_accept_err     = {0};
+LogThrottle g_throttle_read_err       = {0};
+LogThrottle g_throttle_corrupt_stream = {0};
+
+bool ShouldLog(LogThrottle& t) {
+    const uint64_t now = GetTickCount64();
+    if (now - t.last_ms >= 1000) { t.last_ms = now; return true; }
+    return false;
+}
+
+bool EnsureNetInit() {
+    if (g_net_inited) return true;
+    if (!NET_Init()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SpectatorTCP: NET_Init failed: %s", SDL_GetError());
+        return false;
+    }
+    g_net_inited = true;
+    return true;
+}
+
+bool AddrEquals(const sockaddr_in& a, const sockaddr_in& b) {
+    return a.sin_family == b.sin_family
+        && a.sin_port   == b.sin_port
+        && a.sin_addr.s_addr == b.sin_addr.s_addr;
+}
+
+// IP-only match (used by RegisterAcceptedClient — TCP source port differs
+// from the UDP source port, so we can't full-tuple match here).
+bool AddrIpEquals(const sockaddr_in& a, const sockaddr_in& b) {
+    return a.sin_family == b.sin_family
+        && a.sin_addr.s_addr == b.sin_addr.s_addr;
+}
+
+// Resolve a NET_StreamSocket's peer IP into dotted-quad form. Returns false
+// if the socket isn't connected or the address isn't yet resolved.
+bool GetPeerIpString(NET_StreamSocket* sock, char* out, size_t out_sz) {
+    NET_Address* a = NET_GetStreamSocketAddress(sock);
+    if (!a) return false;
+    const char* s = NET_GetAddressString(a);
+    bool ok = false;
+    if (s && out_sz) {
+        std::strncpy(out, s, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        ok = true;
+    }
+    NET_UnrefAddress(a);
+    return ok;
+}
+
+size_t PayloadLenForType(SpecDataType t, uint16_t frame_count) {
+    switch (t) {
+        case SpecDataType::INITIAL_MATCH: return 96;
+        case SpecDataType::INPUT_BATCH:   return static_cast<size_t>(frame_count) * 4u;
+        case SpecDataType::MATCH_END:     return 0;
+        case SpecDataType::INPUT_REQUEST: return 0; // shouldn't appear upstream
+        default:                          return SIZE_MAX; // sentinel for "bad"
+    }
+}
+
+}  // namespace
+
+// ===========================================================================
+// HOST-SIDE
+// ===========================================================================
+
+bool StartListener(uint16_t bind_port) {
+    if (g_listener) return true;
+    if (!EnsureNetInit()) return false;
+
+    // Bind to all interfaces (NULL → "any address available").
+    g_listener = NET_CreateServer(nullptr, bind_port);
+    if (!g_listener) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SpectatorTCP: NET_CreateServer(port=%u) failed: %s",
+                     bind_port, SDL_GetError());
+        return false;
+    }
+    g_listen_port = bind_port;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorTCP: listening on TCP port %u", bind_port);
+    return true;
+}
+
+uint16_t GetListenPort() {
+    return g_listen_port;
+}
+
+void PollAccepts() {
+    if (!g_listener) return;
+    for (;;) {
+        NET_StreamSocket* incoming = nullptr;
+        if (!NET_AcceptClient(g_listener, &incoming)) {
+            if (ShouldLog(g_throttle_accept_err)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "SpectatorTCP: NET_AcceptClient failed: %s",
+                            SDL_GetError());
+            }
+            break;
+        }
+        if (!incoming) break; // no more pending
+        g_pending_clients.push_back(incoming);
+        char ip[64] = {0};
+        GetPeerIpString(incoming, ip, sizeof(ip));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorTCP: accepted pending client from %s", ip);
+    }
+}
+
+void PollIncoming() {
+    if (g_subs.empty()) return;
+    uint8_t scratch[4096];
+    std::vector<size_t> doomed;
+    for (size_t i = 0; i < g_subs.size(); ++i) {
+        NET_StreamSocket* s = g_subs[i].sock;
+        if (!s) { doomed.push_back(i); continue; }
+        const int n = NET_ReadFromStreamSocket(s, scratch, sizeof(scratch));
+        if (n < 0) {
+            if (ShouldLog(g_throttle_read_err)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "SpectatorTCP: subscriber read error: %s",
+                            SDL_GetError());
+            }
+            doomed.push_back(i);
+        }
+        // n == 0: nothing pending. n > 0: spectator → host TCP messages
+        // don't exist (post-INPUT_REQUEST removal) — discard.
+    }
+    // Erase in reverse-index order so earlier indices remain valid.
+    for (size_t k = doomed.size(); k-- > 0; ) {
+        const size_t idx = doomed[k];
+        if (g_subs[idx].sock) NET_DestroyStreamSocket(g_subs[idx].sock);
+        g_subs.erase(g_subs.begin() + idx);
+    }
+}
+
+// Normalize an SDL_net peer-address string for IP comparison: strips the
+// IPv4-mapped-IPv6 prefix ("::ffff:127.0.0.1" → "127.0.0.1") so we can
+// match against inet_ntop's plain v4 form.
+static const char* NormalizeIp(const char* s) {
+    if (!s) return "";
+    if (std::strncmp(s, "::ffff:", 7) == 0) return s + 7;
+    return s;
+}
+
+bool RegisterAcceptedClient(const sockaddr_in& sub_addr) {
+    // Idempotent: if this subscriber already has a TCP socket bound, do
+    // nothing and report success. Lets callers (e.g. TickHealth) safely
+    // call this every frame for every subscriber without worrying about
+    // double-binding.
+    for (const auto& sc : g_subs) {
+        if (sc.addr.sin_family == sub_addr.sin_family &&
+            sc.addr.sin_port   == sub_addr.sin_port &&
+            sc.addr.sin_addr.s_addr == sub_addr.sin_addr.s_addr &&
+            sc.sock != nullptr) {
+            return true;
+        }
+    }
+    if (g_pending_clients.empty()) return false;
+    char want_ip[64] = {0};
+    inet_ntop(AF_INET, (void*)&sub_addr.sin_addr, want_ip, sizeof(want_ip));
+
+    for (size_t i = 0; i < g_pending_clients.size(); ++i) {
+        NET_StreamSocket* sock = g_pending_clients[i];
+        char peer_ip[64] = {0};
+        if (!GetPeerIpString(sock, peer_ip, sizeof(peer_ip))) continue;
+        if (std::strcmp(NormalizeIp(peer_ip), want_ip) != 0) continue;
+
+        SubConn sc{};
+        sc.addr = sub_addr;
+        sc.sock = sock;
+        g_subs.push_back(std::move(sc));
+        g_pending_clients.erase(g_pending_clients.begin() + i);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorTCP: bound TCP client %s to subscriber slot",
+                    peer_ip);
+        return true;
+    }
+    return false;
+}
+
+void BroadcastToAll(const void* buf, size_t len) {
+    if (!buf || len == 0) return;
+    for (auto& sc : g_subs) {
+        if (!sc.sock) continue;
+        if (!NET_WriteToStreamSocket(sc.sock, buf, static_cast<int>(len))) {
+            // Mark broken; next PollIncoming will reap on read error.
+            // We don't tear down here to keep the call non-failing.
+        }
+    }
+}
+
+void SendTo(const sockaddr_in& sub_addr, const void* buf, size_t len) {
+    if (!buf || len == 0) return;
+    for (auto& sc : g_subs) {
+        if (AddrEquals(sc.addr, sub_addr)) {
+            if (sc.sock) {
+                NET_WriteToStreamSocket(sc.sock, buf, static_cast<int>(len));
+            }
+            return;
+        }
+    }
+}
+
+void DisconnectSubscriber(const sockaddr_in& sub_addr) {
+    for (size_t i = 0; i < g_subs.size(); ++i) {
+        if (AddrEquals(g_subs[i].addr, sub_addr)) {
+            if (g_subs[i].sock) NET_DestroyStreamSocket(g_subs[i].sock);
+            g_subs.erase(g_subs.begin() + i);
+            return;
+        }
+    }
+}
+
+// ===========================================================================
+// SPECTATOR-SIDE
+// ===========================================================================
+
+bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port) {
+    if (g_upstream_sock) return false;
+    if (!host_ip || !*host_ip) return false;
+    if (!EnsureNetInit()) return false;
+
+    NET_Address* addr = NET_ResolveHostname(host_ip);
+    if (!addr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SpectatorTCP: NET_ResolveHostname(%s) failed: %s",
+                     host_ip, SDL_GetError());
+        return false;
+    }
+    // 200ms is plenty for a literal-IP "resolve" — the SDL_net path turns
+    // dotted-quad strings into addresses without a DNS round-trip.
+    const int rc = NET_WaitUntilResolved(addr, 200);
+    if (rc != 1) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SpectatorTCP: resolve %s status=%d: %s",
+                     host_ip, rc, SDL_GetError());
+        NET_UnrefAddress(addr);
+        return false;
+    }
+    g_upstream_sock = NET_CreateClient(addr, host_tcp_port);
+    NET_UnrefAddress(addr);
+    if (!g_upstream_sock) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SpectatorTCP: NET_CreateClient(%s:%u) failed: %s",
+                     host_ip, host_tcp_port, SDL_GetError());
+        return false;
+    }
+    g_upstream_read_buf.clear();
+    g_last_upstream_recv_ms = GetTickCount64();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorTCP: dialing %s:%u (async)", host_ip, host_tcp_port);
+    return true;
+}
+
+void PollUpstream() {
+    if (!g_upstream_sock) return;
+    const int conn = NET_GetConnectionStatus(g_upstream_sock);
+    if (conn == 0) return; // still pending
+    if (conn < 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorTCP: upstream connect failed: %s", SDL_GetError());
+        NET_DestroyStreamSocket(g_upstream_sock);
+        g_upstream_sock = nullptr;
+        g_upstream_read_buf.clear();
+        return;
+    }
+
+    // Connected. Drain whatever's available.
+    uint8_t scratch[4096];
+    for (;;) {
+        const int n = NET_ReadFromStreamSocket(g_upstream_sock,
+                                               scratch, sizeof(scratch));
+        if (n < 0) {
+            if (ShouldLog(g_throttle_read_err)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "SpectatorTCP: upstream read error: %s",
+                            SDL_GetError());
+            }
+            NET_DestroyStreamSocket(g_upstream_sock);
+            g_upstream_sock = nullptr;
+            g_upstream_read_buf.clear();
+            return;
+        }
+        if (n == 0) break;
+        g_upstream_read_buf.insert(g_upstream_read_buf.end(),
+                                   scratch, scratch + n);
+        g_last_upstream_recv_ms = GetTickCount64();
+        if (n < static_cast<int>(sizeof(scratch))) break;
+    }
+
+    // Frame-extract from g_upstream_read_buf.
+    while (g_upstream_read_buf.size() >= sizeof(SpecDataHeader)) {
+        SpecDataHeader hdr;
+        std::memcpy(&hdr, g_upstream_read_buf.data(), sizeof(hdr));
+        if (hdr.magic != SPEC_DATA_MAGIC) {
+            if (ShouldLog(g_throttle_corrupt_stream)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "SpectatorTCP: corrupt upstream stream "
+                             "(magic=0x%02X) — dropping connection",
+                             hdr.magic);
+            }
+            NET_DestroyStreamSocket(g_upstream_sock);
+            g_upstream_sock = nullptr;
+            g_upstream_read_buf.clear();
+            return;
+        }
+        const size_t payload_len = PayloadLenForType(hdr.type, hdr.frame_count);
+        if (payload_len == SIZE_MAX) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "SpectatorTCP: unknown SpecDataType=%u upstream — "
+                         "dropping connection",
+                         static_cast<unsigned>(hdr.type));
+            NET_DestroyStreamSocket(g_upstream_sock);
+            g_upstream_sock = nullptr;
+            g_upstream_read_buf.clear();
+            return;
+        }
+        const size_t total = sizeof(SpecDataHeader) + payload_len;
+        if (g_upstream_read_buf.size() < total) break; // need more bytes
+
+        sockaddr_in zero_from{};
+        zero_from.sin_family = AF_INET;
+        SpectatorNode_HandleSpecData(g_upstream_read_buf.data(), total,
+                                     zero_from);
+        g_upstream_read_buf.erase(g_upstream_read_buf.begin(),
+                                  g_upstream_read_buf.begin() + total);
+    }
+}
+
+void DisconnectUpstream() {
+    if (g_upstream_sock) {
+        NET_DestroyStreamSocket(g_upstream_sock);
+        g_upstream_sock = nullptr;
+    }
+    g_upstream_read_buf.clear();
+}
+
+uint64_t LastUpstreamRecvMs() {
+    return g_last_upstream_recv_ms;
+}
+
+// ===========================================================================
+// LIFECYCLE
+// ===========================================================================
+
+void Shutdown() {
+    DisconnectUpstream();
+
+    for (auto& sc : g_subs) {
+        if (sc.sock) NET_DestroyStreamSocket(sc.sock);
+    }
+    g_subs.clear();
+
+    for (auto* p : g_pending_clients) {
+        if (p) NET_DestroyStreamSocket(p);
+    }
+    g_pending_clients.clear();
+
+    if (g_listener) {
+        NET_DestroyServer(g_listener);
+        g_listener = nullptr;
+    }
+    g_listen_port = 0;
+
+    if (g_net_inited) {
+        NET_Quit();
+        g_net_inited = false;
+    }
+}
+
+}  // namespace SpectatorTCP

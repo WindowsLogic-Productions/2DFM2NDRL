@@ -4,5 +4,6 @@
 void BypassMultiInstanceCheck();
 void ApplyBootToCharacterSelectPatches();
 void ApplyCharacterSelectModePatches();
+void PatchVsRoundCase200T4FalsePositive();
 
 #endif // GAME_PATCHES_H

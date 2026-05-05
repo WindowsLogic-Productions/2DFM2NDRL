@@ -1,433 +1,299 @@
-# fm2k fighter maker 2nd - rollback netcode implementation
+# FM2K Rollback — Master Specification
 
-## project status: functional but buggy
+Single source of truth for the rollback netcode implementation on Fighter Maker 2nd (FM2K). All other `FM2K_Rollback_*.md` / `rollback_*.md` / `Launcher_Roadmap.md` docs in this directory are historical and may be out of date.
 
-this document describes our current rollback netcode implementation for fm2k. we have a working system using gekkonet library with comprehensive save states and dual-client testing, but we are not production ready - still have a bunch of bugs, need to implement more debug features and do a ton of testing.
-
-**what's working so far:**
-- game runs at 100 fps (10ms per frame)
-- gekkonet rollback networking integration  
-- comprehensive save state system (50kb-850kb profiles)
-- dual-client local testing infrastructure
-- real-time rollback performance monitoring
-- input recording and desync detection
-- production mode toggle to reduce debug spam
-
-**known issues:**
-- still debugging random desyncs during gameplay
-- save state optimization needs more work (currently 850kb, target 50-200kb)
-- network stability issues under poor connections  
-- need more comprehensive testing with different character combinations
-- performance profiling shows occasional frame drops during heavy rollbacks
+**Status (2026-04):** Rollback core works. Determinism pass complete. Trampoline architecture in place. Active testing / feature work.
 
 ---
 
-## architecture overview
+## 1. Architecture
 
-### launcher system (like lilithport)
-our implementation follows a proven launcher-based architecture:
+### 1.1 Process model (LilithPort-style)
 
-1. user runs `FM2K_RollbackLauncher.exe`
-2. launcher displays game selection ui  
-3. user selects fm2k game and network settings
-4. launcher creates fm2k process in suspended state
-5. launcher injects `FM2KHook.dll` into the game process
-6. game resumes with rollback netcode active
+```
+ FM2K_RollbackLauncher.exe                FM2K game process
+ ┌───────────────────────┐    inject    ┌───────────────────────────────────┐
+ │  ImGui / SDL3 UI      │ ───────────► │  FM2KHook.dll                     │
+ │  Game selection       │              │  • MinHook detours on game funcs  │
+ │  Session config       │              │  • Trampoline main loop           │
+ │  Stats / logs viewer  │ ◄──────────► │  • GekkoNet rollback session      │
+ │  Shared-memory IPC    │   shm+mmap   │  • Control-channel (0xCC UDP)     │
+ └───────────────────────┘              └───────────────────────────────────┘
+```
 
-### core components
+Launcher creates FM2K suspended, injects `FM2KHook.dll`, resumes. The hook owns the main loop from the moment the game enters battle.
 
-**launcher (`FM2K_RollbackLauncher.exe`):**
-- imgui-based game selection interface
-- dual-client local testing support
-- real-time rollback performance monitoring
-- gekkonet session management
-- shared memory ipc with hook dll
+### 1.2 Phase-dispatched trampoline
 
-**hook dll (`FM2KHook.dll`):**
-- injected into fm2k game process
-- hooks critical game functions for rollback
-- gekkonet integration for networking
-- save state system with multiple profiles
-- input recording and desync detection
+`main_game_loop` @ `0x405AD0` is replaced wholesale. See `FM2KHook/src/core/main_loop_trampoline.{h,cpp}`.
+
+| Phase | When | Drive model |
+|-------|------|-------------|
+| `NATIVE` | Menus, intro, results | Reproduces original loop structure so gameplay code that depends on `main_game_loop` prologue writes still works |
+| `CSS` | Character select | Control-channel lockstep, **no** GekkoNet session yet |
+| `TRAMPOLINE_BATTLE` | Active match | GekkoNet drives sim + save + load + advance |
+
+Why wholesale replacement vs byte-patching: forward-sim and rollback-replay were hitting subtly different code paths because the native loop had per-iteration writes (buf_idx fan-out, render-frame counter, etc.) that rollback advance wasn't reproducing. Trampoline owns the loop, so there's one code path.
+
+### 1.3 Frame pacing
+
+100 FPS = 10 ms/frame. QPC-based sleep with busy-wait on the last ~1 ms. `SDL_Delay` capped us at ~90 FPS due to Windows scheduler granularity.
 
 ---
 
-## technical implementation
+## 2. Determinism
 
-### memory addresses (verified in ida)
+Forward-sim on peer A must produce byte-identical state to rollback-replay on peer B for a given input sequence. Everything below exists to make that true.
 
-**input system:**
-```
-0x4259C0: g_p1_input               // current p1 input state
-0x4259C4: g_p2_input               // current p2 input state  
-0x4280E0: g_p1_input_history[1024] // p1 input history (4096 bytes)
-0x4290E0: g_p2_input_history[1024] // p2 input history (4096 bytes)
-0x447EE0: g_input_buffer_index     // circular buffer index
-```
+### 2.1 FPU / SSE pinning
 
-**game state:**
-```
-0x470104: g_p1_stage_x             // player 1 x position
-0x470108: g_p1_stage_y             // player 1 y position
-0x47010C: g_p1_hp                  // player 1 health
-0x470110: g_p1_max_hp              // player 1 max health
-0x47030C: g_p2_hp                  // player 2 health
-0x470310: g_p2_max_hp              // player 2 max health
-0x470060: g_round_timer            // round timer
-0x470044: g_game_timer             // game timer
-0x41FB1C: g_random_seed            // rng seed (critical for determinism)
+At hook init: `_controlfp_s` pins x87 control word, `SetMXCSR(0x1F80u)` pins SSE rounding. See `FM2KHook/src/hooks/hooks.cpp::PinFPUControlWord`.
+
+### 2.2 Virtual clock
+
+`timeGetTime` is hooked. During an active session it returns `g_virtual_time_ms = frame * 10`. Rollback `LoadEvent` rewinds this value — otherwise replayed frames see different wall-clock times than forward sim did.
+
+### 2.3 Render isolation
+
+`original_render_game` mutates sim-visible memory (afterimage pool, screen shake). Render runs on display frames, not sim frames, so those mutations mustn't leak into rollback. Solution: snapshot afterimage pool before render, restore after — **with a carve-out for `SHAKE_EFFECTS` @ `0x447DA9` (40 bytes)**. Shake is scripted by the dev (opcode `[EB]`) and its countdown MUST tick through render so it ends on schedule. Without the carve-out it "never ends."
+
+Carve-out (`RenderFrameWithSnapshot`):
+```cpp
+SHAKE_OFFSET_IN_AI = 0x447DA9 - 0x447930 = 0x479
+// Save afterimage [0 .. 0x479), skip 40 B shake block, save [0x479+40 .. end]
+// Restore same range after original_render_game returns
 ```
 
-**timing system:**
-```
-0x447EE0: g_frame_counter          // current frame number
-0x41E2F0: g_frame_time_ms          // frame duration (always 10ms)
-0x447DD4: g_last_frame_time        // last frame timestamp
-```
+### 2.4 Excluded from save/CRC
 
-### hook points
+- `g_last_frame_time` @ `0x447DD4` — touching it in rollback re-triggers main-loop's frame-skip check → hang.
+- Render-only render state (only game-sim state is saved).
 
-we hook these critical addresses for rollback functionality:
+### 2.5 Inputs
 
-**main hook:**
-- `0x4146D0`: `process_game_inputs` - perfect insertion point for rollback logic
+Native FM2K input capture (not `GetAsyncKeyState`). `original_get_player_input(0, 0)` applies facing swap internally; `Input_CaptureLocal` **undoes** the swap using the same predicate as `Hook_GetPlayerInput` so the sim sees unswapped inputs (swap happens once, during sim, not twice).
 
-**input hooks (from lilithport analysis):**
-- `0x41474A`: vs_p1_key - player 1 input in versus mode
-- `0x414764`: vs_p2_key - player 2 input in versus mode
-- `0x414729`: story_key - story mode input processing
-
-**game logic hooks:**
-- `0x404CD0`: update_game_state - main game state update
-- `0x417A22`: rand_func - random number generation
+Unified P1 controls: both local instances use P1 bindings regardless of GekkoNet slot.
 
 ---
 
-## save state system
+## 3. Save state
 
-### profiles
+See `FM2KHook/src/netplay/savestate.{h,cpp}`.
 
-we implemented three save state profiles for different use cases:
+### 3.1 Coverage (Wave C audit)
 
-**minimal profile (~50kb):**
-- core game state + active objects only
-- optimized for performance
-- smart object detection saves only active game entities
+| Region | Addr | Size | Why |
+|--------|------|------|-----|
+| `char_dynamic[8]` | `0x4D1D90` + `i*57407` | 8 × 57407 | Full char slot. **Fix: base was off by 16, dynamic offset was 55000 (missed 95%).** |
+| `object_pool` | `0x4701E0` | ~391 KB | All 1023 game entities. |
+| `afterimage_pool` | `0x447930` | ~163 KB | Dash trails, motion blur — unsaved before Wave C. |
+| `object_list_heads_tails` | `0x430240` | 1024 B | List topology (next-ptrs). Payloads in object_pool but iteration order lived here. |
+| `object_node_pool` | `0x4CFA20` | 8192 B | Same. |
+| `current_object_ptr` | `0x4259A8` | 4 B | Value captured. |
+| `input_history` | `0x4280E0` / `0x4290E0` | ~8 KB | Both players' 1024-frame ring. |
+| `game_state` | — | 544 B | HPs, positions, timers, RNG. |
+| `effect_sys1` | — | 42 B | Effect slot A. |
+| `effect_sys2` | `0x4456B0..0x445708` | 88 B | Covers `g_global_variable_array_FM2K_SYSTEM_VARS` + effect-sys2 + timer_countdown1. **Expanded from 44 B.** |
+| `shake_effects` | `0x447DA9` | 40 B | Saved AND carve-out'd from render snapshot (§2.3). |
+| `round_end_flag` | `0x424718` | 4 B | Drives round transitions — unsaved before audit. |
+| `sound_desired[]` | — | — | Sim's authoritative desired SFX state (rollback-safe sound layer). |
+| `input_tracking_state` | — | 160 B | Tracking block. |
 
-**standard profile (~200kb):**
-- essential runtime state
-- balanced size vs completeness
-- recommended for production
+Total: ~420 KB per save slot.
 
-**complete profile (~850kb):**
-- everything captured
-- used for debugging and research
-- includes all 1023 game objects
+### 3.2 Active-slot optimization
 
-### state structure
+`object_pool` and `char_dynamic` save paths scan active flags and skip dormant slots. Dropped save time significantly during stress-mode.
 
-```c
-struct CoreGameState {
-    // input system
-    uint32_t input_buffer_index;
-    uint32_t p1_input_current;
-    uint32_t p2_input_current;
-    uint32_t p1_input_history[1024];
-    uint32_t p2_input_history[1024];
-    
-    // player state
-    uint32_t p1_stage_x, p1_stage_y;
-    uint32_t p1_hp, p1_max_hp;
-    uint32_t p2_hp, p2_max_hp;
-    
-    // game state
-    uint32_t round_timer;
-    uint32_t game_timer;
-    uint32_t random_seed;
-    
-    // visual effects
-    uint32_t effect_active_flags;
-    uint32_t effect_timers[8];
-    uint32_t effect_colors[8][3];
-    uint32_t effect_targets[8];
-};
-```
+### 3.3 Hash
+
+xxHash3-64 via vendored `vendored/xxhash/xxhash.h` v0.8.2, folded to uint32 for on-wire compat. Replaces Fletcher32 — faster and lower collision rate.
+
+### 3.4 Two-tier desync detection
+
+| Tier | Freq | Cost | Purpose |
+|------|------|------|---------|
+| Gameplay fingerprint | Every save | ~44 B hash | Player-visible state only (HP, pos, RNG, round timer, inputs). Process-independent. |
+| Full CRC | 1 / sec throttled | 420 KB hash | Catches any memory divergence. |
+
+If full CRC diverges but fingerprint matches → false-positive (internal layout drift, no visible effect). If fingerprint diverges → real desync.
+
+### 3.5 Per-region CRCs captured at save time
+
+`SaveStateData::saved_region_crcs` stores per-region hashes of the forward-sim state. On desync, we compare against current (post-replay) region hashes — one log line reveals which region diverged without diffing cross-peer dumps.
+
+Per-object-slot CRCs (1023 × 4 B) let us pin desyncs to exact object slot indices.
+
+### 3.6 Replay-diff tooling
+
+`SaveState_PushRngTrace` writes to a fixed-size ring buffer in memory; flushed to CSV on desync / on demand. Per-frame console logging tanked framerate.
 
 ---
 
-## gekkonet integration
+## 4. Networking
 
-### session management
+### 4.1 Multiplexed UDP
 
-we use gekkonet for ggpo-style rollback networking:
+Single UDP socket shared between GekkoNet packets and our control-channel packets. `0xCC` magic byte prefix marks control-channel; the adapter filters them out and queues for `ControlChannel_Poll`. GekkoNet packets pass through untouched. See `FM2KHook/src/netplay/control_channel.{h,cpp}`.
 
-```c
-// gekko configuration
-GekkoConfig config = {
-    .num_players = 2,
-    .input_size = sizeof(uint8_t),
-    .state_size = sizeof(uint32_t) * 8,  // deterministic state
-    .max_spectators = 0,
-    .input_prediction_window = 10,
-    .desync_detection = true
-};
+### 4.2 Peer address learning
+
+Host binds to the configured local port with `remote_addr` empty. First authenticated HELLO packet received by `RawReceive` latches the peer's source address. Client fills in `remote_addr` from config (host's advertised address). No separate handshake server needed.
+
+### 4.3 Control channel packet types
+
+HELLO / HELLO_ACK, PING / PONG, CSS inputs + cursor + char-select + char-lock + start, BATTLE_READY / BATTLE_ACK / BATTLE_ENTERING / BATTLE_START / BATTLE_END, DISCONNECT.
+
+PING/PONG: RTT sample, used for auto-delay suggestion.
+
+### 4.4 Input delay
+
+**Per-peer local delay via GekkoNet's native per-player delay API.** Each player sets their own preferred delay. A laggy-connection player can add delay to smooth their experience without forcing it on their opponent.
+
+(Earlier design had a `BATTLE_READY proposed_local_delay` max() handshake to enforce symmetric delay — this was redundant and is being removed.)
+
+### 4.5 CSS lockstep
+
+CSS runs **before** GekkoNet session start. Sync via control channel: cursor positions, char/color highlight, char/color lock, start signal. Both peers must hit BATTLE_READY before session starts.
+
+CSS residue divergence fix: initial state sync zeros `buf_idx`, `render_fc`, input state before forward-sim begins so both peers start from a clean frame 0.
+
+### 4.6 GekkoNet config
+
 ```
-
-### event handling
-
-gekkonet provides three main events:
-
-**savevent:** triggered when we need to save game state
-**loadevent:** triggered when we need to rollback to previous state  
-**advanceevent:** triggered to advance frame with confirmed inputs
-
-### input encoding
-
-fm2k uses 11-bit input encoding:
-```c
-#define INPUT_LEFT     0x001
-#define INPUT_RIGHT    0x002  
-#define INPUT_UP       0x004
-#define INPUT_DOWN     0x008
-#define INPUT_BUTTON1  0x010
-#define INPUT_BUTTON2  0x020
-#define INPUT_BUTTON3  0x040
-#define INPUT_BUTTON4  0x080
-#define INPUT_BUTTON5  0x100
-#define INPUT_BUTTON6  0x200
-#define INPUT_BUTTON7  0x400
+num_players = 2
+input_size = sizeof(uint16_t)   // 11-bit FM2K input mask
+state_size = ~420 KB            // full save
+input_prediction_window = 3     // 30 ms @ 100 FPS
+desync_detection = true
 ```
 
 ---
 
-## production features
+## 5. Build
 
-### dual-client testing
+Prereqs: MinGW-w64 (i686-w64-mingw32), CMake 3.20+, Ninja.
 
-our launcher supports local dual-client testing:
-
-- launches two fm2k instances (`wanwan` and `wanwan2` directories)
-- configures gekkonet networking between clients
-- provides separate debug logging per client
-- real-time rollback statistics monitoring
-
-### performance monitoring
-
-we implemented comprehensive rollback performance tracking:
-
-**rollback statistics:**
-- rollbacks per second
-- maximum rollback distance  
-- average rollback frames
-- total rollback count
-- performance counters
-
-**shared memory ipc:**
-```c
-struct SharedPerformanceStats {
-    uint32_t rollback_count;
-    uint32_t max_rollback_frames;
-    uint32_t total_rollback_frames;
-    uint32_t avg_rollback_frames;
-    uint64_t last_rollback_time_us;
-    uint32_t rollbacks_this_second;
-    uint64_t current_second_start;
-};
-```
-
-### input recording
-
-for testing and desync analysis:
-
-- binary input recording to `.dat` files
-- timestamped input capture for both players
-- structured desync reports with game state dumps
-- replay functionality for debugging
-
-### production mode
-
-optimized settings for stable gameplay:
-
-- reduced debug logging (error/warn only)
-- optimized save frequency (32 frames vs 8 frames)
-- production-grade error handling
-- performance optimizations
-
----
-
-## testing infrastructure
-
-### multi-client testing ui
-
-launcher provides comprehensive testing tools:
-
-- game selection with automatic detection
-- dual client launch with automatic configuration
-- real-time log monitoring with syntax highlighting
-- rollback performance visualization
-- input recording management
-- desync detection and reporting
-
-### debug tools
-
-- manual save/load state testing
-- force rollback testing (configurable frame count)
-- save state profile switching
-- performance profiling and analysis
-
-### file-based logging
-
-- separate log files per client (`FM2K_Client1_Debug.log`, `FM2K_Client2_Debug.log`)
-- timestamped entries with player identification
-- color-coded log viewing in launcher ui
-- automatic log rotation and management
-
----
-
-## performance analysis
-
-### frame budget (10ms per frame @ 100fps)
-
-```
-total available: 10ms
-- input processing: ~0.5ms
-- game logic: ~3-4ms  
-- rendering: ~2-3ms
-- rollback overhead: ~2-3ms
-- buffer remaining: ~1ms
-```
-
-### memory usage
-
-```
-per-frame state: 50kb-850kb (profile dependent)
-rollback buffer: ~24-48mb (120 frames)
-input buffers: 8kb (existing)
-network buffers: ~1mb
-total additional: ~50mb
-```
-
-### optimization targets achieved
-
-- state serialization: < 1ms per save/restore
-- rollback execution: < 5ms for 10-frame rollback  
-- memory footprint: < 50mb additional usage
-- network latency: 2-3 frame input delay typical
-
----
-
-## build system
-
-### prerequisites
-- mingw-w64 cross-compiler (i686-w64-mingw32-gcc/g++)
-- cmake 3.20+
-- ninja build system
-
-### build commands
 ```bash
-./make_build.sh  # configure cmake
-./go.sh          # build and copy outputs
+./make_build.sh   # configure
+./go.sh           # build + deploy to C:/games/
 ```
 
-### outputs
-- `FM2K_RollbackLauncher.exe` - main application
-- `FM2KHook.dll` - hook dll for injection
+Outputs: `FM2K_RollbackLauncher.exe`, `FM2KHook.dll` (32-bit, must match FM2K arch).
 
 ---
 
-## network protocol
+## 6. Test plan
 
-### gekkonet messages
+### 6.1 Determinism (regression tests)
 
-our implementation uses gekkonet's built-in message types:
+- [x] Forward-sim + rollback-replay produce byte-identical state on same inputs (stress mode)
+- [x] CSS → battle transition without residue divergence
+- [x] Float determinism across peers (FPU + MXCSR pinning)
+- [x] `timeGetTime` rewinds correctly on `LoadEvent`
+- [x] Render-time mutations stay out of sim (afterimage snapshot)
+- [x] Shake countdown ticks through render (carve-out)
 
-**input message:** player inputs for specific frame
-**input ack:** confirmation of received inputs  
-**quality report:** network quality feedback
-**synchronization:** frame synchronization
+### 6.2 Functional (needs verification with human opponent)
 
-### desync detection
+- [ ] Real P2P LAN test with per-player delay (both sides set own value)
+- [ ] Rematch flow (round end → round start, multiple rounds)
+- [ ] Match end → return to CSS → re-enter battle
+- [ ] Mid-match disconnect → clean teardown (not just HELLO teardown)
+- [ ] Shake behavior sweep across characters (different shake opcode durations)
+- [ ] SFX rollback integration — no double-fire on rollback
+- [ ] Sustained 100 FPS under worst-case rollback depth (8+ frames during effect-heavy sequences)
+- [ ] Alt-tab / focus loss / pause
+- [ ] Game variants beyond WonderfulWorld
 
-automatic desync detection using:
-- fletcher32 checksum validation
-- frame-by-frame state verification
-- structured desync reports with full game state
-- automatic recovery mechanisms
+### 6.3 GekkoNet feature enablement
 
----
-
-## deployment
-
-### requirements
-
-- windows (32-bit fm2k compatibility)
-- administrator privileges (for process injection)
-- fm2k game files in accessible directory
-- network connectivity for online play
-
-### installation
-
-1. place built executables in fm2k game directory
-2. run `FM2K_RollbackLauncher.exe`
-3. select game and configure network settings
-4. launch clients for local testing or online play
-
-### compatibility
-
-- tested with wonderfulworld and other fm2k games
-- works with existing fm2k character and stage files
-- compatible with standard fm2k configurations
-- no modifications to original game files required
+- [ ] Runahead (speculative local sim to hide input delay)
+- [ ] Migrate to GekkoNet native stress session API (replaces our custom stress mode)
+- [ ] Limited Saving — evaluate only if save perf regresses
 
 ---
 
-## future improvements
+## 7. LilithPort feature matrix
 
-### optimization opportunities
+What we have, what we don't, where we exceed.
 
-- differential state saving (only changed objects)
-- compression for network traffic
-- adaptive rollback window based on network conditions
-- visual rollback smoothing
-
-### feature additions
-
-- spectator mode support
-- replay system with rewind/fast-forward
-- tournament bracket integration
-- matchmaking system
-
-### platform expansion
-
-- potential linux support via wine
-- streaming integration for tournaments
-- mobile companion app for match organization
+| Feature | LilithPort | This | Notes |
+|---------|-----------|------|-------|
+| Core netcode | Delay-based | **Rollback (GekkoNet)** | Strict upgrade |
+| UI | WinForms (.NET Framework) | ImGui + SDL3 | Modern, cross-platform-ready |
+| Desync detection | Custom checksum | xxHash3 + gameplay fingerprint + per-region + per-object-slot | Stronger diagnostics |
+| Input delay | Fixed symmetric | Per-player (GekkoNet native) | More flexible |
+| Spectator | ✗ | Transport ✓, playback driver pending | Daisy-chain (CCCaster-style hub-with-redirect), 0xCE batched input stream over multiplexed UDP. Set-scoped (survives CSS between matches), unlike GekkoNet's match-scoped spectator session. See `docs/FM2K_Spectator_Design.md`. |
+| Replays | ✓ (record/playback) | **Recording ✓**, playback wiring pending | `.fm2krep` files written to `replays/` per match. Format includes initial RNG + char selects + per-frame inputs. |
+| Chat | ✓ | Transport ✓, UI pending | In-game overlay (Fightcade-style via DirectX hook), not launcher UI |
+| Lobby / server browser | ✓ (hosted) | ✗ | Planned — NAT design TBD |
+| Rematch flow UI | ✓ | ✗ (manual reconnect) | Planned |
+| Match history / stats | Minimal | ✗ | Planned |
+| NAT traversal | UPnP | **Planned: hole-punch + relay** | UPnP fails on ~50% of routers; hole-punch + relay is more reliable |
+| Training / frame data overlay | Basic | ✗ | Future |
 
 ---
 
-## technical notes
+## 8. Roadmap
 
-### security considerations
+Ordered. Dependencies noted.
 
-- process injection requires administrator privileges
-- hook dll must be 32-bit to match fm2k architecture  
-- windows defender may flag injection tools
-- network traffic is unencrypted (gekkonet limitation)
-
-### cross-platform limitations
-
-- windows-only due to process injection requirements
-- uses windows-specific apis (createprocess, dll injection)
-- could potentially be ported using different integration methods
-
-### research documentation
-
-extensive reverse engineering documentation available:
-- complete engine analysis and function mapping
-- memory layout documentation with verified addresses
-- hook point analysis and lilithport comparison
-- performance benchmarking and optimization guides
+1. **Consolidate master doc** — this document. *(in progress)*
+2. **Revert symmetric delay handshake** → use GekkoNet per-player delay. *Blocks #3.*
+3. **Real P2P LAN test pass** — see §6.2.
+4. **Main-branch merge decision** — main has 3 divergent commits (`9dc4054`, `532f3eb`, `e3f45e2`). Merge commit vs rebase vs leave.
+5. **Enable GekkoNet runahead** — free latency win, expose in launcher UI.
+6. **Migrate to GekkoNet stress session API** — replace custom stress mode.
+7. **NAT traversal design** — hole-punch over control channel + relay fallback. Open: relay hosting, lobby model (hosted matchmaker vs peer-hosted).
+8. **Local replays (record/playback)** — *blocks #9.* Record: char selects, start frame, input history, initial RNG, game hash. Playback: trampoline driven by recorded inputs.
+9. **Spectator mode** — replay streamer that survives across CSS between matches in a set. GekkoNet's native spectator session is match-scoped; ours is set-scoped because we drive viewers through CSS ourselves via CSS_UPDATE packets. Sub-tasks: spectator playback driver (LoopPhase), CSS state mirror, set persistence (heartbeat). See `docs/FM2K_Spectator_Design.md` §8.5.
+10. **Chat (in-game DirectX overlay) + match history.** Transport already in tree; UI lives in the overlay hook.
 
 ---
 
-this document represents our current rollback implementation for fm2k. we have the core functionality working but still debugging issues and need extensive testing before considering it production ready. the dual-client testing infrastructure helps us identify and fix problems but there's still work to do.
+## 9. Known bugs / outstanding
+
+*(None currently blocking — `obj[96]`/`obj[157]` stress-mode desync from earlier was resolved.)*
+
+---
+
+## 10. Files of note
+
+```
+FM2KHook/src/
+  core/
+    main_loop_trampoline.{h,cpp}   — phase-dispatched main loop replacement
+  hooks/
+    hooks.cpp                      — MinHook detours, FPU pin, timeGetTime virtual clock
+    input.cpp                      — native input capture + facing-swap undo
+  netplay/
+    netplay.cpp                    — GekkoNet Save/Load/Advance handlers
+    savestate.{h,cpp}              — save coverage, xxHash3, per-region CRCs
+    control_channel.{h,cpp}        — multiplexed UDP, control packets, peer learning
+    netplay_state.h                — CtrlPacket types
+  audio/
+    sound_rollback.{h,cpp}         — Mike Z-style rollback-safe sound layer
+
+vendored/
+  xxhash/xxhash.h                  — v0.8.2 single-header
+
+FM2K_RollbackClient.cpp            — launcher main controller
+FM2K_LauncherUI.cpp                — ImGui UI
+FM2K_NetworkSession.cpp            — launcher-side session management
+FM2K_Integration.h                 — FM2K memory map
+```
+
+---
+
+## 11. Archived / superseded docs
+
+The following remain in `docs/` for historical reference but should **not** be consulted as current spec:
+
+- `FM2K_Rollback_Plan.md`
+- `FM2K_Rollback_TestPlan.md` (superseded by §6)
+- `rollback_architecture.md`
+- `LilithPort_SDL3_Migration_Strategy.md` (superseded by §7)
+- `Launcher_Roadmap.md`
+- root-level `FM2K_CCCaster_Style_Implementation.md`, `cccaster_*.md`, `pure_gekkonet_implementation.md`, `FM2K_Implementation_Plan.md` (exploration / design history)

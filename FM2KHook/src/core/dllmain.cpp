@@ -5,6 +5,11 @@
 #include "netplay_state.h"
 #include "control_channel.h"
 #include "shared_mem.h"
+
+// Forward-declare just the new patch function. We can't include
+// game_patches.h here because dllmain.cpp keeps static duplicates of
+// the older patch functions and the extern declarations would conflict.
+extern void PatchVsRoundCase200T4FalsePositive();
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -12,6 +17,26 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+
+// =============================================================================
+// LOG-FILE PATH HELPER
+// =============================================================================
+// All hook-side log files (FM2K_P*_Debug.log + EB diag + rng trace + parity
+// recorder + replay diffs) route through here so they land in
+// `<cwd>/logs/<filename>` instead of cluttering the game folder. Lazily
+// creates the logs directory.
+bool Fm2k_BuildLogPath(char* out, size_t out_size, const char* filename) {
+    if (!out || out_size == 0 || !filename) return false;
+    static bool s_dir_created = false;
+    if (!s_dir_created) {
+        // CreateDirectoryA returns FALSE + ERROR_ALREADY_EXISTS if it's
+        // already there; either way the dir is usable afterwards.
+        CreateDirectoryA("logs", nullptr);
+        s_dir_created = true;
+    }
+    int n = std::snprintf(out, out_size, "logs\\%s", filename);
+    return n > 0 && (size_t)n < out_size;
+}
 
 // =============================================================================
 // FILE LOGGING
@@ -40,10 +65,14 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
              g_player_index + 1, priority_str, message);
 
-    // Write to console
-    printf("%s", formatted);
-
-    // Write to file
+    // File-only for player clients (SoundRollback / ROLLBACK stats / BATTLE
+    // STATUS spam too noisy on console). For the spectator instance we DO
+    // mirror to console — its console is otherwise empty and tracing the
+    // spectator-tree protocol live is the whole point of running it locally.
+    if (g_spectator_mode) {
+        fputs(formatted, stdout);
+        fflush(stdout);
+    }
     if (g_log_file) {
         fprintf(g_log_file, "%s", formatted);
         fflush(g_log_file);
@@ -51,8 +80,15 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
 }
 
 static void InitFileLogging() {
-    char filename[256];
-    snprintf(filename, sizeof(filename), "FM2K_P%d_Debug.log", g_player_index + 1);
+    char base_name[64];
+    snprintf(base_name, sizeof(base_name), "FM2K_P%d_Debug.log", g_player_index + 1);
+    char filename[MAX_PATH];
+    if (!Fm2k_BuildLogPath(filename, sizeof(filename), base_name)) {
+        // Fallback to cwd if the helper failed (extremely unlikely — only
+        // CreateDirectoryA would have to fail with something other than
+        // ERROR_ALREADY_EXISTS, e.g. permission denied).
+        snprintf(filename, sizeof(filename), "%s", base_name);
+    }
 
     g_log_file = fopen(filename, "w");
     if (g_log_file) {
@@ -97,20 +133,61 @@ static void BypassMultiInstanceCheck() {
 }
 
 static void ApplyBootToCharacterSelectPatches() {
-    // Change initialization object from 0x11 to 0x0A to boot to character select
-    // At 0x409CD9: push 0x11 -> push 0x0A
-    uint8_t* init_object_ptr = (uint8_t*)0x409CD9;
+    // Three boot strategies, all hit the same patch site at 0x409CD9
+    // (the `push <type>` immediate inside InitializeGameFromCommandLine).
+    //
+    //   no patch (FM2K_SKIP_BOOT_CSS_PATCH=1)
+    //     vanilla path: push 0x11 → ProcessIntroCutscene (3 bitmaps,
+    //     ~300-frame splash) → title_screen_manager → CSS.
+    //
+    //   default (safe boot)
+    //     push 0x0C → title_screen_manager directly. Skips the splash.
+    //     Title runs its init (ResetObjectsAndCalculateSpeed, populates
+    //     g_titleMenu_modeList, etc.). The hook then auto-mashes button
+    //     A while g_game_mode == 1000 and lands on CSS with VS Player
+    //     selected. Universally compatible — every game we've tested
+    //     boots fine through the title path.
+    //
+    //   fast boot (FM2K_BOOT_TO_CSS_DIRECT=1)
+    //     push 0x0A → game_state_manager (CSS) directly. Skips title
+    //     entirely. *NOT SAFE* on every game — StudioS Fighters /
+    //     Strip Fighter Zero characters trip on uninitialized
+    //     g_char_velocity_multiplier and self-execute KGT_OP_THROW_EXECUTE
+    //     (opcode 0x15) on frame 0 of battle. Only enable for games
+    //     verified to behave (WW, etc.).
+    if (const char* e = std::getenv("FM2K_SKIP_BOOT_CSS_PATCH"); e && std::strcmp(e, "1") == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "PATCH: FM2K_SKIP_BOOT_CSS_PATCH=1 — leaving vanilla intro "
+            "path (cutscene + title screen).");
+        return;
+    }
 
+    uint8_t boot_type = 0x0C;  // default: title_screen_manager
+    const char* fast = std::getenv("FM2K_BOOT_TO_CSS_DIRECT");
+    if (fast && std::strcmp(fast, "1") == 0) {
+        boot_type = 0x0A;  // game_state_manager (CSS direct)
+    }
+
+    uint8_t* init_object_ptr = (uint8_t*)0x409CD9;
     DWORD old_protect;
     if (VirtualProtect(init_object_ptr, 2, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        init_object_ptr[0] = 0x6A;  // push instruction
-        init_object_ptr[1] = 0x0A;  // immediate value (character select)
+        init_object_ptr[0] = 0x6A;          // push imm8 (unchanged)
+        init_object_ptr[1] = boot_type;
         VirtualProtect(init_object_ptr, 2, old_protect, &old_protect);
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Patch: Boot to character select enabled");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Patch: Boot to %s (push 0x%02X)",
+            boot_type == 0x0A ? "CSS direct (FAST)" :
+            boot_type == 0x0C ? "title screen (SAFE)" : "?",
+            boot_type);
     }
 }
 
 static void ApplyCharacterSelectModePatches() {
+    if (const char* e = std::getenv("FM2K_SKIP_VS_MODE_PATCH"); e && std::strcmp(e, "1") == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "PATCH: FM2K_SKIP_VS_MODE_PATCH=1 — not forcing VS player mode.");
+        return;
+    }
     // Set character select mode to VS player (1) instead of VS CPU (0)
     uint8_t* char_select_mode_ptr = (uint8_t*)0x470058;  // CHARACTER_SELECT_MODE_ADDR
 
@@ -181,6 +258,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             ApplyBootToCharacterSelectPatches();
             ApplyCharacterSelectModePatches();
             DisableCursorHiding();
+            // [DISABLED] t4-walk patch was a workaround that masked the
+            // real bug — StudioS chars take script-driven damage on the
+            // very first frame of battle (HW write bp on g_p1_hp caught
+            // health_damage_manager+0x85 zeroing HP without input).
+            // Patching the round controller's t4 transition only stops
+            // the bail-to-CSS but lets the underlying damage corruption
+            // continue. Re-enable only behind FM2K_FORCE_T4_PATCH=1
+            // for diagnostic comparisons.
+            if (const char* env_force = std::getenv("FM2K_FORCE_T4_PATCH");
+                env_force && std::strcmp(env_force, "1") == 0)
+            {
+                PatchVsRoundCase200T4FalsePositive();
+            }
 
             // Create our own console
             FreeConsole();
@@ -227,7 +317,36 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                     "single-instance determinism check, no network");
             }
 
-            if (!g_offline_mode && !g_stress_mode) {
+            // Spectator mode: passive viewer subscribing to a remote host.
+            char* env_spectator = getenv("FM2K_SPECTATOR_MODE");
+            g_spectator_mode = (env_spectator && strcmp(env_spectator, "1") == 0);
+            if (g_spectator_mode) {
+                g_offline_mode = false;
+                g_stress_mode  = false;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Spectator mode ENABLED — will SPEC_JOIN_REQ host on startup");
+            }
+
+            if (g_spectator_mode) {
+                // Spectator path: socket + control callback + SpectatorNode.
+                // Skips the player-mode HELLO handshake.
+                char* env_port   = getenv("FM2K_LOCAL_PORT");
+                char* env_remote = getenv("FM2K_REMOTE_ADDR");
+                g_local_port = env_port ? (uint16_t)atoi(env_port) : 7002;
+                if (env_remote) {
+                    strncpy(g_remote_addr, env_remote, sizeof(g_remote_addr) - 1);
+                } else {
+                    snprintf(g_remote_addr, sizeof(g_remote_addr), "127.0.0.1:7000");
+                }
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Spectator config: port=%u host=%s", g_local_port, g_remote_addr);
+                if (!Netplay_InitAsSpectator(g_local_port, g_remote_addr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "Spectator init failed — falling back to offline");
+                    g_spectator_mode = false;
+                    g_offline_mode   = true;
+                }
+            } else if (!g_offline_mode && !g_stress_mode) {
                 char* env_port = getenv("FM2K_LOCAL_PORT");
                 char* env_remote = getenv("FM2K_REMOTE_ADDR");
 
