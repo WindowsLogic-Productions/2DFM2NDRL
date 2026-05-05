@@ -5,6 +5,11 @@
 #include "FM2K_Updater.h"
 #include "version_local.h"
 #include "FM2KHook/src/ui/input_binder.h"
+#include "FM2KHook/src/ui/shared_mem.h"
+#include "FM2K_GameIni.h"
+#include "FM2K_DDrawRedirect.h"
+#include "FM2K_CncDDraw.h"
+#include "FM2K_Utf8Path.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <wininet.h>
@@ -14,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <array>
 #include <filesystem>
 #include "vendored/imgui/imgui.h"
 #include "imgui_internal.h"
@@ -26,6 +32,7 @@
 #include <cctype>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 // Local-only state owned by LauncherUI for the Hub panel. Defined here
 // rather than in the header to keep FM2K_HubClient.h out of the public
@@ -37,11 +44,27 @@ struct LauncherUI::HubState {
     std::string my_id;
     std::string my_nick;
     std::string current_room_id;
+    // Snapshot of the room we were in at the moment the WS dropped.
+    // Used by the Connected handler to auto-rejoin after a hub
+    // restart / network blip; cleared once the rejoin call is sent.
+    std::string last_room_id;
+    std::string last_room_name;
 
     std::vector<fm2k::HubRoom> rooms;                     // discovered rooms
     std::unordered_map<std::string, fm2k::HubUser> users; // users in current room
     std::string pending_challenge_from_id;
     std::string pending_challenge_from_nick;
+    // Match settings the challenger sent us (#54). Rendered in the
+    // accept modal so the user sees what they're agreeing to. Sentinel
+    // -1 across the struct = challenger didn't send any (older client).
+    fm2k::MatchSettings pending_challenge_settings;
+    // Hub-authoritative settings for the active hub-driven match. Set
+    // on K::MatchStart from ev.match.settings; consumed by the launch
+    // path (FM2KLauncher::StartOnlineSession via on_online_session_start
+    // can't see this directly — we expose it via the existing
+    // network_config_ piggyback below). Random-stage env vars are
+    // derived from `random_seed`/`random_stage_*`.
+    fm2k::MatchSettings current_match_settings;
     std::string status_line;
     bool show_challenge_modal = false;
 
@@ -52,6 +75,74 @@ struct LauncherUI::HubState {
     std::string outgoing_challenge_to_id;
     std::string outgoing_challenge_to_nick;
     bool        show_outgoing_challenge_modal = false;
+
+    // Active hub-driven match. Set on K::MatchStart from ev.match.token,
+    // cleared once we publish a match_result to the hub. Used by the
+    // shared-mem poll path so a single bump of `match_outcome_seq` in
+    // the hook turns into exactly one outbound match_result. Empty when
+    // we're not in a hub match (offline / dev / spectator).
+    std::string current_match_token;
+    // Per-match peer + role snapshot — stashed on K::MatchStart so the
+    // local results.csv writer (#42) can render the row from MY
+    // perspective even after the hub modal / users-list state has moved
+    // on. role is "host" (we're P1) or "guest" (we're P2); peer_nick
+    // is the opponent's display name as the hub gave it to us.
+    std::string current_match_role;
+    std::string current_match_peer_id;
+    std::string current_match_peer_nick;
+    std::string current_match_game_id;
+    // Per-process last-seen outcome seq, keyed by PID. The hook starts
+    // seq at 0; first real outcome arrives as 1. We send match_result
+    // when the value we read is greater than what's stored here, then
+    // bump our copy to that value so subsequent identical reads (the
+    // shared mem stays at the last value forever) don't re-send.
+    std::unordered_map<uint32_t, uint32_t> last_outcome_seq;
+
+    // My own overall W/L/D, populated by hub `record` events and used
+    // for the launcher titlebar. (-1, -1, -1) means we haven't received
+    // a record yet — render no titlebar suffix in that case.
+    int my_wins   = -1;
+    int my_losses = -1;
+    int my_draws  = -1;
+    // Per-opponent record from MY perspective ("how I've done vs them").
+    // Keyed by opponent hub user_id; populated from the `vs_breakdown`
+    // attached to the record event when we issue an unfiltered
+    // QueryRecord. Empty until first record arrives or for opponents
+    // we've never played.
+    struct VsCell { int wins = 0, losses = 0, draws = 0; };
+    std::unordered_map<std::string, VsCell> my_vs;
+    // Recent matches (#49). Hub answers RequestRecentMatches with at
+    // most N rows ordered newest-first. Mirrored here so the "Recent
+    // Matches" window can render from cached state without re-hitting
+    // the hub on every render.
+    std::vector<fm2k::HubEvent::MatchRow> recent_matches;
+    bool recent_matches_loaded = false;
+    // Currently-in-flight matches (lobby panel). Snapshot from
+    // RequestCurrentMatches on connect; live updates from
+    // MatchInProgressStarted/Updated/Ended broadcasts. Sorted by
+    // started_at ascending (newest at the bottom) on each render.
+    std::vector<fm2k::HubEvent::MatchInProgress> current_matches;
+    bool current_matches_loaded = false;
+    // Per-PID last-seen match_chars_seq from the hook. The hook bumps
+    // this counter exactly once per Netplay_StartBattleSession (after
+    // chars + stage are published). Launcher fires match_progress only
+    // when this counter advances, so during the inter-battle CSS
+    // window — where shared mem still holds the prev battle's data —
+    // no spurious match_progress is sent and the lobby's "(in CSS)"
+    // row stays clean until the new battle actually starts.
+    std::unordered_map<uint32_t, uint32_t> last_chars_seq;
+    // True once the hook has published an outcome that resolved the
+    // current match (any of self_won/peer_won/draw/disconnect). Reset
+    // on the next K::MatchStart so back-to-back matches don't share a
+    // stale flag.
+    bool        match_result_sent = false;
+    // De-dupe for peer-disconnected toasts. Three independent paths
+    // can fire one for a single dropout: (a) the hook publishes a
+    // DISCONNECT outcome via shared mem, (b) the hub sends a UserUpdate
+    // moving the peer out of "in_match", (c) the hub sends a peer-
+    // disconnected event when the peer's WS closes. Whichever lands
+    // first sets this flag; the other two skip. Reset on MatchStart.
+    bool        disconnect_toast_fired = false;
 };
 
 // Case-insensitive match of `room_id` against installed games. A
@@ -196,8 +287,11 @@ static int FindInstalledGameForRoom(const std::vector<FM2K::FM2KGameInfo>& games
     };
     const std::string target = lower(room_id);
     for (size_t i = 0; i < games.size(); ++i) {
-        std::filesystem::path exe(games[i].exe_path);
-        const std::string stem = lower(exe.stem().string());
+        // Wide-construct so JP-named exes give us their actual UTF-8
+        // bytes back from stem(), not CP1252 mangle. Otherwise rooms
+        // never match games with non-ASCII filenames.
+        std::filesystem::path exe(fm2k::utf8path::Utf8ToWide(games[i].exe_path));
+        const std::string stem = lower(fm2k::utf8path::StemUtf8(exe));
         if (stem == target) return (int)i;
         if (stem.size() > target.size() && stem.compare(0, target.size(), target) == 0) {
             unsigned char next = static_cast<unsigned char>(stem[target.size()]);
@@ -216,7 +310,7 @@ LauncherUI::LauncherUI()
     , renderer_(nullptr)
     , window_(nullptr)
     , scanning_games_(false)
-    , games_root_path_("")
+    , games_root_paths_{}
     , selected_game_index_(-1)
     , current_theme_(UITheme::Dark)
     , scroll_to_bottom_(true)
@@ -240,7 +334,7 @@ LauncherUI::LauncherUI()
     on_stress_session_start = nullptr;
     on_session_stop = nullptr;
     on_exit = nullptr;
-    on_games_folder_set = nullptr;
+    on_games_folders_set = nullptr;
     on_debug_save_state = nullptr;
     on_debug_load_state = nullptr;
     on_debug_force_rollback = nullptr;
@@ -329,10 +423,25 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
         latin_config.OversampleH = 2;
         latin_config.OversampleV = 2;
         latin_config.PixelSnapH = false;
+        // Range: ASCII + Latin-1 Supplement (Armonté etc.) + Halfwidth
+        // and Fullwidth Forms (FM2K games shipped by Japanese authors
+        // commonly have full-width-titled exes like ＣＰＷ.exe). Segoe
+        // UI / Tahoma / Arial all ship with the full-width block in
+        // their CMAPs, so requesting it here pulls those glyphs into
+        // the atlas without needing the MS Gothic merge to backfill.
+        // Belt-and-suspenders: the JP merge below ALSO requests FF00-
+        // FFEF, but ImGui's packed accumulator decompression has been
+        // observed to drop ranges silently — claiming the block from
+        // the Latin font directly is the reliable path.
+        static const ImWchar latin_range[] = {
+            0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
+            0xFF00, 0xFFEF,   // Halfwidth + Fullwidth Forms
+            0,
+        };
         ImFont* latin_font = nullptr;
         for (const char* p : latin_font_paths) {
             latin_font = io.Fonts->AddFontFromFileTTF(p, 16.0f, &latin_config,
-                                                     io.Fonts->GetGlyphRangesDefault());
+                                                     latin_range);
             if (latin_font) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Loaded Latin UI font: %s", p);
@@ -363,14 +472,34 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
             "C:\\Windows\\Fonts\\YuGothM.ttc",
         };
         bool jp_loaded = false;
+        const char* jp_loaded_path = nullptr;
         for (const char* p : jp_font_paths) {
             if (io.Fonts->AddFontFromFileTTF(p, 16.0f, &jp_config,
                                              io.Fonts->GetGlyphRangesJapanese())) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Merged Japanese font: %s", p);
                 jp_loaded = true;
+                jp_loaded_path = p;
                 break;
             }
+        }
+        // Belt-and-suspenders: explicitly request the Halfwidth and
+        // Fullwidth Forms block (U+FF00-FFEF) from the same JP font.
+        // GetGlyphRangesJapanese() *should* include this range, but the
+        // packed accumulator decompression has historically dropped it
+        // on some ImGui revisions. Game directories commonly contain
+        // full-width-titled exes (e.g. ＣＰＷ.exe), so missing glyphs
+        // here render as visible underscores in the Settings panel —
+        // very specifically the bug we just hit. Adding the range
+        // again with MergeMode=true is a no-op when it was already
+        // included; otherwise it backfills the missing glyphs.
+        if (jp_loaded && jp_loaded_path) {
+            static const ImWchar fullwidth_range[] = {
+                0xFF00, 0xFFEF,   // Halfwidth + Fullwidth Forms
+                0,
+            };
+            io.Fonts->AddFontFromFileTTF(jp_loaded_path, 16.0f, &jp_config,
+                                         fullwidth_range);
         }
         if (!jp_loaded) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -403,6 +532,7 @@ void LauncherUI::Shutdown() {
     // thread on exit (and so a mid-flight download is cancelled cleanly
     // rather than racing with shutdown).
     fm2k::updater::Shutdown();
+    fm2k::cnc_ddraw::Shutdown();
 
     // Restore original logger
     SDL_SetLogOutputFunction(original_log_function_, original_log_userdata_);
@@ -448,6 +578,12 @@ void LauncherUI::Render() {
         }
     }
 
+    // Drain any new outcome the hook published into a hub match_result.
+    // Lives at the top of Render so it fires regardless of whether the
+    // user has the Hub panel docked-visible. Idempotent — second call
+    // for the same seq is a no-op.
+    PollMatchOutcome();
+
     // Render menu bar at application level first
     RenderMenuBar();
     
@@ -485,13 +621,30 @@ void LauncherUI::Render() {
                 ImGui::DockBuilderRemoveNode(dockspace_id);
                 ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
-                // Single tab group containing both the Hub and Games &
-                // Configuration. They live in the same dock so the user
-                // sees them as tabs by default; drag-out to undock if
-                // they want side-by-side.
-                ImGui::DockBuilderDockWindow("Hub",                    dockspace_id);
-                ImGui::DockBuilderDockWindow("Games & Configuration",  dockspace_id);
-                ImGui::DockBuilderDockWindow("Debug & Diagnostics",    dockspace_id);
+
+                // Two-pane default — narrow left rail for Games &
+                // Configuration + Debug & Diagnostics (as tabs); wide
+                // right pane holds the Hub. Mirrors the operator's
+                // own working layout (~270 / ~1010 split at 1280×720).
+                // The split ratio is chosen to keep the rail >= 220
+                // even at our 640×480 minimum window size, so the rail
+                // tabs stay clickable on small displays.
+                ImGuiID main_id = dockspace_id;
+                ImGuiID left_id = 0, right_id = 0;
+                // Left rail = ~22% of the dockspace width. Floor at 220
+                // for usability on tiny windows.
+                const float work_w   = viewport->WorkSize.x;
+                const float left_pct = (work_w > 0.0f)
+                    ? std::max(0.18f, std::min(0.30f, 220.0f / work_w))
+                    : 0.21f;
+                ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left,
+                                            left_pct, &left_id, &right_id);
+                ImGui::DockBuilderDockWindow("Games & Configuration", left_id);
+                ImGui::DockBuilderDockWindow("Debug & Diagnostics",   left_id);
+                ImGui::DockBuilderDockWindow("Hub",                   right_id);
+                // Settings windows are popups (NoDocking) — they
+                // intentionally float above the dockspace and aren't
+                // listed here.
                 ImGui::DockBuilderFinish(dockspace_id);
             }
         }
@@ -533,9 +686,10 @@ void LauncherUI::Render() {
 void LauncherUI::RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu(T("menu_file"))) {
-            if (ImGui::MenuItem(T("btn_select_games_folder"))) {
-                // ... folder selection logic ...
-            }
+            // "Select Games Folder" used to live here but it duplicates
+            // Settings → Games Folders, so it's been folded into that
+            // tab. Exit is the only thing left in File since it's the
+            // canonical place users look for "quit the app."
             if (ImGui::MenuItem(T("menu_exit"), "Alt+F4")) {
                 if (on_exit) on_exit();
             }
@@ -558,25 +712,13 @@ void LauncherUI::RenderMenuBar() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu(T("menu_settings"))) {
-            if (ImGui::MenuItem(T("input_bindings_p1"), nullptr, show_input_binder_p1_)) {
-                show_input_binder_p1_ = !show_input_binder_p1_;
-                if (show_input_binder_p1_ && !input_binder_initialized_) {
-                    FM2KInputBinder::Init();
-                    input_binder_initialized_ = true;
-                }
-            }
-            if (ImGui::MenuItem(T("input_bindings_p2"), nullptr, show_input_binder_p2_)) {
-                show_input_binder_p2_ = !show_input_binder_p2_;
-                if (show_input_binder_p2_ && !input_binder_initialized_) {
-                    FM2KInputBinder::Init();
-                    input_binder_initialized_ = true;
-                }
-            }
-            if (ImGui::MenuItem(T("panel_host_config"), nullptr, show_host_config_)) {
-                show_host_config_ = !show_host_config_;
-            }
-            if (ImGui::MenuItem(T("menu_hub_server"), nullptr, show_hub_server_)) {
-                show_hub_server_ = !show_hub_server_;
+            // Single Settings… entry opens a tabbed window; everything
+            // else (bindings, host config, hub server, games folders,
+            // recent matches) lives as tabs inside that window. Discord
+            // sign-in stays separate because its OAuth flow has its own
+            // pending/error/success state machine.
+            if (ImGui::MenuItem(T("menu_settings_window"))) {
+                show_settings_ = true;
             }
             if (ImGui::MenuItem(T("hub_signin_ellipsis"), nullptr, show_discord_auth_)) {
                 show_discord_auth_ = !show_discord_auth_;
@@ -655,7 +797,14 @@ void LauncherUI::RenderMenuBar() {
             discord_state_loaded_ = true;
             const auto a = fm2k::discord_auth::LoadCached();
             discord_signed_in_ = a.valid;
-            discord_nick_      = a.nick;
+            // Show the actual Discord display name in the top-bar pill,
+            // not the launcher's custom in-app nick — those can be
+            // arbitrary strings and confuse users about which account
+            // they're signed in to. Falls back to nick / "signed in" if
+            // the cache is missing the new field (older auth.json).
+            discord_nick_      = a.discord_global_name.empty()
+                                 ? a.nick
+                                 : a.discord_global_name;
         }
 
         // Kick off the version check exactly once on first menu-bar
@@ -664,6 +813,11 @@ void LauncherUI::RenderMenuBar() {
         if (!s_did_update_check) {
             s_did_update_check = true;
             fm2k::updater::CheckForUpdates();
+            // Same first-frame slot also kicks the cnc-ddraw bundled
+            // installer. Idempotent; if the install is up-to-date the
+            // worker bails after one HTTPS round-trip. New installs
+            // get auto-fetched without any user click.
+            fm2k::cnc_ddraw::EnsureInstalled();
         }
 
         // Build BOTH pills (update + Discord) and right-align them
@@ -809,31 +963,34 @@ void LauncherUI::RenderMenuBar() {
             FM2KInputBinder::Save();
         }
     }
-    if (show_host_config_) {
-        RenderHostConfigWindow();
-    }
-    if (show_hub_server_) {
-        RenderHubServerWindow();
-    }
+    // Single tabbed Settings window (replaces the five separate
+    // floating settings sub-windows).
+    RenderSettingsWindow();
+    // Discord auth stays as its own window — OAuth pairing has its
+    // own pending/error/success state machine that doesn't fit in
+    // a tab next to the other static editors.
     if (show_discord_auth_) {
         RenderDiscordAuthWindow();
     }
+    // Legacy floating-window paths kept for any code that still
+    // toggles the per-section flags (none after the menu cleanup,
+    // but defensive — opens nothing unless someone flips a flag).
+    if (show_host_config_)    RenderHostConfigWindow();
+    if (show_hub_server_)     RenderHubServerWindow();
+    if (show_games_folders_)  RenderGamesFoldersWindow();
+    if (show_recent_matches_) RenderRecentMatchesWindow();
 }
 
 // Settings → Hub Server… window. Lets the user point the launcher at a
 // custom hub (their own hub.py instance, a friend's box, etc.) without
 // cluttering the main Hub panel for casual users who just want the
 // default 2dfm.sytes.net.
-void LauncherUI::RenderHubServerWindow() {
+void LauncherUI::RenderHubServerBody() {
     if (!hub_host_initialized_) {
         hub_host_initialized_ = true;
         const char* env_h = std::getenv("FM2K_HUB_HOST");
         const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
         std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
-    }
-    if (!ImGui::Begin("Hub Server", &show_hub_server_, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::End();
-        return;
     }
     ImGui::PushItemWidth(280);
     ImGui::InputText(T("netcfg_host"), hub_host_, sizeof(hub_host_));
@@ -843,7 +1000,467 @@ void LauncherUI::RenderHubServerWindow() {
         "Use 127.0.0.1 (or localhost) when running your own hub.py on the same "
         "machine — NAT routers rarely hairpin so the public DNS won't loop back. "
         "Takes effect on next Connect.");
+}
+
+void LauncherUI::RenderHubServerWindow() {
+    if (!ImGui::Begin("Hub Server", &show_hub_server_, ImGuiWindowFlags_None)) {
+        ImGui::End();
+        return;
+    }
+    RenderHubServerBody();
     ImGui::End();
+}
+
+// One Settings window with TabBar — bindings, host config, hub server,
+// games folders, recent matches. Floats above the dockspace, can't be
+// dragged or resized (popup-style modal feel without actually being a
+// modal — the user can still click around outside it). Replaces the
+// five separate floating sub-windows. Each tab calls a body-only
+// renderer; click the X to close, settings auto-save on edit.
+void LauncherUI::RenderSettingsWindow() {
+    if (!show_settings_) return;
+
+    // Center on the viewport at first open. Re-center on subsequent
+    // opens so the window is always findable; user can still nudge it
+    // via SetWindowPos in their imgui.ini if they really want.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 size(560.0f, 420.0f);
+    ImGui::SetNextWindowPos(
+        ImVec2(vp->WorkPos.x + (vp->WorkSize.x - size.x) * 0.5f,
+               vp->WorkPos.y + (vp->WorkSize.y - size.y) * 0.5f),
+        ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoDocking  |
+        ImGuiWindowFlags_NoResize   |
+        ImGuiWindowFlags_NoMove;
+
+    if (!ImGui::Begin(T("menu_settings"), &show_settings_, flags)) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::BeginTabBar("##settings_tabs",
+                           ImGuiTabBarFlags_Reorderable)) {
+        // Input Bindings — single tab with a nested P1/P2 sub-tabbar so
+        // the player picker doesn't bloat the top-level tabs.
+        if (ImGui::BeginTabItem(T("input_bindings"))) {
+            if (!input_binder_initialized_) {
+                FM2KInputBinder::Init();
+                input_binder_initialized_ = true;
+            }
+            if (ImGui::BeginTabBar("##input_bindings_players")) {
+                if (ImGui::BeginTabItem(T("tab_p1"))) {
+                    RenderInputBindingsTab(0);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(T("tab_p2"))) {
+                    RenderInputBindingsTab(1);
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(T("panel_host_config"))) {
+            RenderHostConfigBody();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(T("menu_hub_server"))) {
+            RenderHubServerBody();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(T("menu_games_folders"))) {
+            RenderGamesFoldersBody();
+            ImGui::EndTabItem();
+        }
+        // Display — every cnc-ddraw [ddraw] setting. Lives here rather
+        // than in the Debug & Diagnostics → Renderer tab because it's a
+        // permanent config surface, not a dev knob.
+        if (ImGui::BeginTabItem("Display")) {
+            RenderDisplayBody();
+            ImGui::EndTabItem();
+        }
+        // Recent Matches lives in the Hub panel (collapsing section
+        // beside the room list), not Settings — match-history isn't a
+        // configuration concern, it's session data.
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
+}
+
+// Settings → Games Folders… window. Multi-root editor for the launcher's
+// games-discovery roots. Lives behind a Settings menu entry so the main
+// panel stays focused on the games list itself; casual users with a
+// single folder almost never need this UI after first-run setup.
+void LauncherUI::RenderGamesFoldersBody() {
+    // Per-row edit buffers persist across frames so users can keep
+    // typing without ImGui resetting their input. Sized to match the
+    // typical launcher.cfg line length; long absolute paths fit fine.
+    static std::vector<std::array<char, 512>> row_bufs;
+    static std::vector<std::string> last_seen;
+    static std::array<char, 512> add_buf{};
+    static bool add_buf_initialized = false;
+
+    auto sync_rows_from_paths = [&]() {
+        row_bufs.assign(games_root_paths_.size(), {});
+        for (size_t i = 0; i < games_root_paths_.size(); ++i) {
+            SDL_strlcpy(row_bufs[i].data(),
+                        games_root_paths_[i].c_str(), row_bufs[i].size());
+        }
+        last_seen = games_root_paths_;
+    };
+
+    if (last_seen != games_root_paths_) sync_rows_from_paths();
+    if (!add_buf_initialized) { add_buf_initialized = true; add_buf[0] = '\0'; }
+
+    auto current_paths = [&]() -> std::vector<std::string> {
+        std::vector<std::string> out;
+        out.reserve(row_bufs.size());
+        for (auto& buf : row_bufs) {
+            if (buf[0] != '\0') out.emplace_back(buf.data());
+        }
+        return out;
+    };
+    auto commit = [&](std::vector<std::string> paths) {
+        games_root_paths_ = paths;
+        last_seen = paths;
+        if (on_games_folders_set) on_games_folders_set(std::move(paths));
+    };
+
+    ImGui::TextWrapped("%s", T("hint_games_folders_window"));
+    ImGui::Separator();
+
+    ImGui::PushID("GamesFoldersWindow");
+    int remove_index = -1;
+    for (size_t i = 0; i < row_bufs.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SetNextItemWidth(380);
+        bool changed = ImGui::InputText("##path", row_bufs[i].data(),
+                                        row_bufs[i].size());
+        ImGui::SameLine();
+        if (ImGui::Button(T("btn_set")) ||
+            (changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+            commit(current_paths());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(T("btn_remove"))) {
+            remove_index = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+    if (remove_index >= 0 && remove_index < (int)row_bufs.size()) {
+        row_bufs.erase(row_bufs.begin() + remove_index);
+        commit(current_paths());
+    }
+
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(380);
+    bool add_changed = ImGui::InputTextWithHint(
+        "##add_path", T("hint_add_games_folder"),
+        add_buf.data(), add_buf.size());
+    ImGui::SameLine();
+    if (ImGui::Button(T("btn_add")) ||
+        (add_changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+        if (add_buf[0] != '\0') {
+            std::array<char, 512> nb{};
+            SDL_strlcpy(nb.data(), add_buf.data(), nb.size());
+            row_bufs.push_back(nb);
+            add_buf[0] = '\0';
+            commit(current_paths());
+        }
+    }
+    ImGui::PopID();
+}
+
+void LauncherUI::RenderGamesFoldersWindow() {
+    if (!ImGui::Begin(T("menu_games_folders"), &show_games_folders_,
+                      ImGuiWindowFlags_None)) {
+        ImGui::End();
+        return;
+    }
+    RenderGamesFoldersBody();
+    ImGui::End();
+}
+
+// Settings → Recent Matches… (#49). Read-only scoreboard fed by
+// HubClient::RequestRecentMatches → K::RecentMatchesReceived. Refreshed
+// on Connected and after every match_result so the just-finished match
+// shows up at the top. The Refresh button forces an out-of-band fetch
+// for users who left the launcher open between hub deployments.
+void LauncherUI::RenderRecentMatchesBody() {
+    auto& hs = *hub_state_;
+
+    if (ImGui::Button(T("btn_refresh"))) {
+        if (hs.client.IsConnected()) hs.client.RequestRecentMatches(50);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%u %s", (unsigned)hs.recent_matches.size(),
+                        T("label_matches"));
+    ImGui::Separator();
+
+    if (!hs.recent_matches_loaded) {
+        ImGui::TextDisabled("%s", T("status_loading"));
+    } else if (hs.recent_matches.empty()) {
+        ImGui::TextDisabled("%s", T("status_no_matches"));
+    } else if (ImGui::BeginTable("##recent_matches", 6,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+            ImVec2(0, 360))) {
+        ImGui::TableSetupColumn(T("col_when"),    ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn(T("col_game"),    ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn(T("col_p1"));
+        ImGui::TableSetupColumn(T("col_p2"));
+        ImGui::TableSetupColumn(T("col_stage"),   ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn(T("col_winner"),  ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        const ImVec4 kWin (0.4f, 0.95f, 0.4f, 1.0f);
+        const ImVec4 kLoss(0.95f, 0.4f, 0.4f, 1.0f);
+        const ImVec4 kDraw(0.7f, 0.7f, 0.7f, 1.0f);
+
+        for (const auto& m : hs.recent_matches) {
+            ImGui::TableNextRow();
+
+            // Localised time. finished_at is unix seconds; format with
+            // strftime so it respects the system locale's date separator.
+            ImGui::TableSetColumnIndex(0);
+            char tbuf[64] = "";
+            if (m.finished_at > 0.0) {
+                std::time_t tt = static_cast<std::time_t>(m.finished_at);
+                std::tm lt{};
+                if (localtime_s(&lt, &tt) == 0) {
+                    std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", &lt);
+                }
+            }
+            ImGui::TextUnformatted(tbuf[0] ? tbuf : "—");
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(m.game_id.empty() ? "—" : m.game_id.c_str());
+
+            // P1 / P2 nick + char. Char fallback chain: wire-baked name
+            // (from MatchResult) wins; else local KGT lookup; else
+            // id-only stub. -1 char_id renders just the nick (the row
+            // simply lacks the char info — happens for older matches
+            // committed before stage/char baking landed).
+            auto draw_player = [&](const std::string& id, const std::string& nick,
+                                   int char_id, const std::string& char_name) {
+                std::string suffix;
+                if (!char_name.empty()) {
+                    suffix = " (" + char_name + ")";
+                } else if (char_id >= 0 && on_resolve_char_name) {
+                    std::string n = on_resolve_char_name(m.game_id,
+                                                         (uint32_t)char_id);
+                    if (!n.empty()) suffix = " (" + n + ")";
+                    else            suffix = " (#" + std::to_string(char_id) + ")";
+                }
+                if (!hs.my_id.empty() && id == hs.my_id) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.3f, 1.0f),
+                                       "%s%s", nick.c_str(), suffix.c_str());
+                } else {
+                    ImGui::Text("%s%s", nick.c_str(), suffix.c_str());
+                }
+            };
+            ImGui::TableSetColumnIndex(2);
+            draw_player(m.p1_id, m.p1_nick, m.p1_char_id, m.p1_char_name);
+            ImGui::TableSetColumnIndex(3);
+            draw_player(m.p2_id, m.p2_nick, m.p2_char_id, m.p2_char_name);
+
+            // Stage column. Same fallback chain as the live-matches
+            // panel: wire-baked > local KGT lookup > id-only > "—".
+            ImGui::TableSetColumnIndex(4);
+            if (!m.stage_name.empty()) {
+                ImGui::TextUnformatted(m.stage_name.c_str());
+            } else if (m.stage_id >= 0) {
+                std::string n;
+                if (on_resolve_stage_name) {
+                    n = on_resolve_stage_name(m.game_id,
+                                              (uint32_t)m.stage_id);
+                }
+                if (!n.empty()) ImGui::TextUnformatted(n.c_str());
+                else            ImGui::Text("Stage #%d", m.stage_id);
+            } else {
+                ImGui::TextDisabled("—");
+            }
+
+            // Winner column: from local user's perspective when they're
+            // in the match (Win / Loss); pure side label otherwise.
+            ImGui::TableSetColumnIndex(5);
+            if (m.winner_id.empty()) {
+                ImGui::TextColored(kDraw, "%s", T("outcome_draw"));
+            } else if (!hs.my_id.empty() && (hs.my_id == m.p1_id || hs.my_id == m.p2_id)) {
+                const bool i_won = (m.winner_id == hs.my_id);
+                ImGui::TextColored(i_won ? kWin : kLoss, "%s",
+                                   i_won ? T("outcome_win") : T("outcome_loss"));
+            } else {
+                const bool p1_won = (m.winner_id == m.p1_id);
+                ImGui::TextUnformatted(p1_won ? "P1" : "P2");
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+void LauncherUI::RenderRecentMatchesWindow() {
+    if (!ImGui::Begin(T("menu_recent_matches"), &show_recent_matches_)) {
+        ImGui::End();
+        return;
+    }
+    RenderRecentMatchesBody();
+    ImGui::End();
+}
+
+// Live-matches lobby panel. Fed by MatchInProgressStarted/Updated/Ended
+// broadcasts + the CurrentMatchesReceived snapshot at connect time. Char
+// + stage cells call fm2k::FormatCharLabel / FormatStageLabel which fall
+// back to "Char #N" / "Stage #N" when the local launcher doesn't have
+// the game installed AND the sender didn't bake the name into the
+// payload (older client).
+void LauncherUI::RenderInProgressMatchesBody() {
+    auto& hs = *hub_state_;
+
+    if (ImGui::CollapsingHeader(T("hub_live_matches_header"),
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::SmallButton(T("btn_refresh"))) {
+            if (hs.client.IsConnected()) hs.client.RequestCurrentMatches();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u %s", (unsigned)hs.current_matches.size(),
+                            T("label_matches"));
+
+        if (!hs.current_matches_loaded) {
+            ImGui::TextDisabled("%s", T("status_loading"));
+            return;
+        }
+        if (hs.current_matches.empty()) {
+            ImGui::TextDisabled("%s", T("status_no_matches"));
+            return;
+        }
+
+        // Sort newest-first on every render — list size stays small
+        // (handful of in-flight matches max) so an in-place sort is
+        // cheaper than maintaining a sorted insert in the dispatcher.
+        std::sort(hs.current_matches.begin(), hs.current_matches.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.started_at > b.started_at;
+                  });
+
+        if (ImGui::BeginTable("##live_matches", 5,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                ImVec2(0, 200))) {
+            ImGui::TableSetupColumn(T("col_game"),
+                ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn(T("col_p1"));
+            ImGui::TableSetupColumn(T("col_p2"));
+            ImGui::TableSetupColumn(T("col_stage"),
+                ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            ImGui::TableSetupColumn(T("col_duration"),
+                ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+
+            const double now = (double)std::time(nullptr);
+            for (const auto& m : hs.current_matches) {
+                ImGui::TableNextRow();
+
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(m.game_id.empty() ? "—" : m.game_id.c_str());
+
+                auto fmt_char = [&](const std::string& nick,
+                                    const std::string& id,
+                                    int char_id,
+                                    const std::string& char_name) {
+                    // Fallback chain:
+                    //   1. wire-baked name   "瑞希君 (#3)"  (sender had it)
+                    //   2. local KGT lookup   ("game installed locally")
+                    //   3. id-only stub      "Char #3"
+                    //   4. unreported (CSS)  "(selecting…)"  dim italic
+                    if (char_id < 0 && char_name.empty()) {
+                        // CSS state: no chars locked in yet. Render the
+                        // nick normally (so the player is still visible)
+                        // and tag the char slot dim so the row reads as
+                        // "in CSS" at a glance.
+                        const ImVec4 self(0.95f, 0.85f, 0.3f, 1.0f);
+                        const bool is_self = (!hs.my_id.empty() && id == hs.my_id);
+                        if (is_self) {
+                            ImGui::TextColored(self, "%s", nick.c_str());
+                        } else {
+                            ImGui::TextUnformatted(nick.c_str());
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("— %s", T("status_in_css"));
+                        return;
+                    }
+                    std::string label;
+                    if (!char_name.empty()) {
+                        label = char_name + " (#" +
+                                std::to_string(char_id) + ")";
+                    } else if (on_resolve_char_name) {
+                        std::string n = on_resolve_char_name(
+                            m.game_id, (uint32_t)char_id);
+                        label = n.empty()
+                            ? ("Char #" + std::to_string(char_id))
+                            : (n + " (#" + std::to_string(char_id) + ")");
+                    } else {
+                        label = "Char #" + std::to_string(char_id);
+                    }
+                    if (!hs.my_id.empty() && id == hs.my_id) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.3f, 1.0f),
+                                           "%s — %s", nick.c_str(),
+                                           label.c_str());
+                    } else {
+                        ImGui::Text("%s — %s", nick.c_str(), label.c_str());
+                    }
+                };
+
+                ImGui::TableSetColumnIndex(1);
+                fmt_char(m.p1_nick, m.p1_id, m.p1_char_id, m.p1_char_name);
+                ImGui::TableSetColumnIndex(2);
+                fmt_char(m.p2_nick, m.p2_id, m.p2_char_id, m.p2_char_name);
+
+                ImGui::TableSetColumnIndex(3);
+                if (!m.stage_name.empty()) {
+                    ImGui::Text("%s (#%d)", m.stage_name.c_str(),
+                                m.stage_id);
+                } else if (m.stage_id >= 0) {
+                    // Best-effort local resolve via the launcher's
+                    // FindKgtByGameId callback. Empty string means the
+                    // game isn't installed locally — fall back to
+                    // id-only stub.
+                    std::string n;
+                    if (on_resolve_stage_name) {
+                        n = on_resolve_stage_name(m.game_id,
+                                                  (uint32_t)m.stage_id);
+                    }
+                    if (!n.empty()) {
+                        ImGui::Text("%s (#%d)", n.c_str(), m.stage_id);
+                    } else {
+                        ImGui::Text("Stage #%d", m.stage_id);
+                    }
+                } else {
+                    // No stage reported yet — same CSS-state visualization
+                    // as the char cells.
+                    ImGui::TextDisabled("%s", T("status_in_css"));
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                if (m.started_at > 0.0 && now > m.started_at) {
+                    int secs = (int)(now - m.started_at);
+                    int mins = secs / 60;
+                    secs %= 60;
+                    ImGui::Text("%d:%02d", mins, secs);
+                } else {
+                    ImGui::TextDisabled("—");
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
 }
 
 // Audio-mute persistence. Same file the hook DLL reads from inside
@@ -999,6 +1616,62 @@ static bool ReadBoolSetting(const std::string& path, const char* key, bool dflt)
     return out;
 }
 
+// Tiny int-keyed setting reader/writer — same flat key=value format as
+// the bool helpers; integers like SOCD mode use this. Default returned
+// when the key is missing or the value isn't a valid int.
+static int ReadIntSetting(const std::string& path, const char* key, int dflt) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return dflt;
+    char line[256];
+    int out = dflt;
+    while (std::fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n') continue;
+        char* eq = std::strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* k = p;
+        size_t klen = std::strlen(k);
+        while (klen > 0 && (k[klen-1] == ' ' || k[klen-1] == '\t')) k[--klen] = '\0';
+        if (std::strcmp(k, key) != 0) continue;
+        char* v = eq + 1;
+        while (*v == ' ' || *v == '\t') ++v;
+        char* endp = nullptr;
+        long parsed = std::strtol(v, &endp, 10);
+        if (endp && endp != v) out = (int)parsed;
+        break;
+    }
+    std::fclose(f);
+    return out;
+}
+
+static void WriteIntSetting(const std::string& path, const char* key, int value) {
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            std::string s = line;
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
+            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+            const size_t eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
+        }
+        std::fclose(f);
+    }
+    bool found = false;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d", value);
+    for (auto& p : kv) if (p.first == key) { p.second = buf; found = true; }
+    if (!found) kv.emplace_back(key, buf);
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
+        std::fclose(f);
+    }
+}
+
 static void WriteBoolSetting(const std::string& path, const char* key, bool value) {
     // Read all keys, replace ours, rewrite. Tiny file, tiny number of keys —
     // brute force is fine and keeps the format stable.
@@ -1122,6 +1795,52 @@ void LauncherUI::FireChallengeNotification(const std::string& from_nick) {
     }
 }
 
+void LauncherUI::FireSystemNotification(const std::string& title_utf8,
+                                        const std::string& body_utf8) {
+    HWND hwnd = nullptr;
+    if (window_) {
+        hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window_),
+                                            SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                            nullptr);
+    }
+    if (notify_flash_ && hwnd && hwnd != GetForegroundWindow()) {
+        FLASHWINFO fi = { sizeof(fi), hwnd,
+                          FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0 };
+        FlashWindowEx(&fi);
+    }
+    if (notify_sound_) {
+        MessageBeep(MB_ICONWARNING);
+    }
+    if (notify_toast_ && hwnd) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd   = hwnd;
+        nid.uID    = 1;
+        nid.hIcon  = LoadIcon(nullptr, IDI_APPLICATION);
+
+        auto utf8_to_wide = [](const char* in, wchar_t* out, int out_len) {
+            if (!in || !out || out_len <= 0) return;
+            int n = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, out_len);
+            if (n <= 0) out[0] = L'\0';
+        };
+        utf8_to_wide("FM2K Rollback Launcher", nid.szTip,
+                     (int)(sizeof(nid.szTip) / sizeof(WCHAR)));
+
+        nid.uFlags = NIF_ICON | NIF_TIP;
+        Shell_NotifyIconW(NIM_ADD, &nid);
+
+        nid.uFlags      = NIF_INFO | NIF_ICON | NIF_TIP;
+        nid.dwInfoFlags = NIIF_WARNING;
+        utf8_to_wide(title_utf8.c_str(), nid.szInfoTitle,
+                     (int)(sizeof(nid.szInfoTitle) / sizeof(WCHAR)));
+        utf8_to_wide(body_utf8.c_str(),  nid.szInfo,
+                     (int)(sizeof(nid.szInfo) / sizeof(WCHAR)));
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
 // Settings → Sign in with Discord… window. Drives the OAuth pairing
 // flow in FM2K_DiscordAuth: kicks off /pair/begin, opens the browser,
 // polls /pair/<code> until success/fail. The hub_token is cached in
@@ -1135,14 +1854,18 @@ void LauncherUI::RenderDiscordAuthWindow() {
     static fm2k::discord_auth::CachedAuth s_cached = LoadCached();
 
     if (!ImGui::Begin(T("hub_signin"), &show_discord_auth_,
-                      ImGuiWindowFlags_AlwaysAutoResize)) {
+                      ImGuiWindowFlags_None)) {
         ImGui::End();
         return;
     }
 
     if (s_cached.valid) {
+        // Display the actual Discord global_name; nick is the launcher-
+        // local custom override which can be anything.
+        const std::string display = s_cached.discord_global_name.empty()
+            ? s_cached.nick : s_cached.discord_global_name;
         ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
-                           "Signed in as %s", s_cached.nick.c_str());
+                           "Signed in as %s", display.c_str());
         ImGui::TextDisabled(T("label_discord_id"), s_cached.discord_user_id.c_str());
         if (ImGui::Button(T("hub_signout"))) {
             ClearCached();
@@ -1177,11 +1900,17 @@ void LauncherUI::RenderDiscordAuthWindow() {
             case Pairing::Status::Ok: {
                 auto a = s_pairing->result();
                 if (SaveCached(a)) s_cached = a;
-                s_status = "Signed in as " + a.nick + ". You can connect to the hub now.";
+                // Surface the Discord display name (global_name) on the
+                // sign-in confirmation, not the launcher's custom nick —
+                // the user is verifying which Discord account they
+                // bound, not what nick they'll appear as in lobbies.
+                const std::string display = a.discord_global_name.empty()
+                    ? a.nick : a.discord_global_name;
+                s_status = "Signed in as " + display + ". You can connect to the hub now.";
                 s_pairing.reset();
                 // Refresh the menu-bar pill so it flips green this frame.
                 discord_signed_in_ = true;
-                discord_nick_      = a.nick;
+                discord_nick_      = display;
                 // Auto-close after a brief moment so the user sees the
                 // success message but isn't stuck on a modal-feeling
                 // window. Closing here is immediate; the
@@ -1217,95 +1946,259 @@ void LauncherUI::RenderDiscordAuthWindow() {
 // addresses aren't mapped per-game yet. Settings are saved to fm2k_host.ini
 // next to the launcher and pushed over the control channel via the hook
 // DLL's Netplay_BroadcastHostConfig.
+void LauncherUI::RenderHostConfigBody() {
+    ImGui::TextWrapped(
+        "Per-game match settings. Edits here override the game's "
+        "default game.ini for THIS launcher; the host's resolved values "
+        "get pushed to the client + spectators on challenge (#54). "
+        "HitJudge / GameInformation are force-zeroed online — saved "
+        "to disk for offline practice but never applied to a hub match.");
+    ImGui::Separator();
+
+    if (selected_game_index_ < 0 ||
+        selected_game_index_ >= (int)games_.size())
+    {
+        ImGui::TextDisabled("%s", T("warn_no_game_selected"));
+        return;
+    }
+    const auto& game = games_[selected_game_index_];
+    // Wide-construct so JP-named exes (ＣＰＷ.exe etc.) keep their
+    // bytes intact through stem()/parent_path() instead of
+    // round-tripping through MinGW's ANSI codepage.
+    const std::filesystem::path exe =
+        fm2k::utf8path::Utf8ToWide(game.exe_path);
+    const std::filesystem::path ini = fm2k::game_ini::PathForExe(exe);
+
+    static int          s_loaded_for = -1;
+    static fm2k::game_ini::GamePlayConfig s_defaults;
+    static fm2k::game_ini::GamePlayConfig s_override;
+    static bool         s_dirty = false;
+    if (s_loaded_for != selected_game_index_) {
+        s_loaded_for = selected_game_index_;
+        s_defaults = {};
+        s_override = {};
+        fm2k::game_ini::Load(ini, s_defaults);
+        fm2k::game_ini::LoadOverride(exe, s_override);
+        s_dirty = false;
+    }
+
+    // Render via TextUnformatted instead of Text("%s", ...). MinGW's
+    // vsnprintf goes through the C locale's narrow conversion and
+    // turns non-CP1252 bytes (full-width forms like ＣＰＷ.exe) into
+    // '_'. The games list above gets away with TextUnformatted +
+    // SameLine; we do the same here for the static prefix and the
+    // dynamic name. ImGui itself decodes UTF-8 just fine — the
+    // mangling is exclusively in printf-style format specifiers.
+    ImGui::TextUnformatted("Game: ");
+    ImGui::SameLine(0.0f, 0.0f);
+    {
+        // One-shot diagnostic: dump the bytes we're handing to ImGui
+        // so we can see whether they survive (vs. games-list which
+        // works) or get mangled by some intermediate layer. Logs once
+        // per game-selection change.
+        static int s_logged_for = -2;
+        if (s_logged_for != selected_game_index_) {
+            s_logged_for = selected_game_index_;
+            const std::string n = game.GetExeName();
+            std::string hex;
+            char buf[8];
+            for (unsigned char c : n) {
+                std::snprintf(buf, sizeof(buf), "%02X ", c);
+                hex += buf;
+            }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "HostConfig: GetExeName='%s' (%zu bytes: %s)",
+                n.c_str(), n.size(), hex.c_str());
+        }
+        ImGui::TextUnformatted(game.GetExeName().c_str());
+    }
+
+    {
+        std::string ini_display = game.GetExeDir();
+        if (!ini_display.empty() && ini_display.back() != '/' &&
+            ini_display.back() != '\\') {
+            ini_display += '/';
+        }
+        ini_display += "game.ini";
+        // TextDisabled has the same printf trap — wrap it manually.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextUnformatted("game.ini: ");
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextUnformatted(ini_display.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+
+    if (ImGui::BeginTable("##gameplay_overrides", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+        ImGui::TableSetupColumn("Setting",   ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Default",   ImGuiTableColumnFlags_WidthFixed,  70.0f);
+        ImGui::TableSetupColumn("Override",  ImGuiTableColumnFlags_WidthFixed,  90.0f);
+        ImGui::TableSetupColumn("Notes");
+        ImGui::TableHeadersRow();
+
+        struct Row {
+            const char* label;
+            int fm2k::game_ini::GamePlayConfig::* member;
+            const char* note;
+            int min;
+            int max;
+        };
+        static const Row rows[] = {
+            {"Round count (1v1)",   &fm2k::game_ini::GamePlayConfig::vs_single_play, "Editor.TestPlay.VSSinglePlay",      1,  9},
+            {"Round count (team)",  &fm2k::game_ini::GamePlayConfig::vs_team_play,   "Editor.TestPlay.VSTeamPlay",        1,  9},
+            {"Round timer (s)",     &fm2k::game_ini::GamePlayConfig::time,           "0 = infinite",                      0, 99},
+            {"Game speed",          &fm2k::game_ini::GamePlayConfig::game_speed,     "default 10",                        1, 16},
+            {"Stage",               &fm2k::game_ini::GamePlayConfig::stage_nb,       "stage index, 0 = first",            0, 99},
+            {"Joystick (0=KB,1=Pad)",&fm2k::game_ini::GamePlayConfig::joystick,      "force 0 unless game lags",          0,  1},
+            {"P0 CPU",              &fm2k::game_ini::GamePlayConfig::player0_cpu,    "force 0 online (anti-cheat)",       0,  1},
+            {"P1 CPU",              &fm2k::game_ini::GamePlayConfig::player1_cpu,    "force 0 online (anti-cheat)",       0,  1},
+            {"Hit-judge overlay",   &fm2k::game_ini::GamePlayConfig::hit_judge,      "FORCED 0 online (anti-cheat)",      0,  1},
+            {"Damage info overlay", &fm2k::game_ini::GamePlayConfig::game_information,"FORCED 0 online (anti-cheat)",     0,  1},
+            {"VS mode",             &fm2k::game_ini::GamePlayConfig::vs_mode,        "Editor.TestPlay.VSMode",            0,  9},
+        };
+
+        for (const auto& r : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(r.label);
+
+            ImGui::TableSetColumnIndex(1);
+            const int def_val = s_defaults.*r.member;
+            if (def_val == fm2k::game_ini::kUnset) {
+                ImGui::TextDisabled("—");
+            } else {
+                ImGui::Text("%d", def_val);
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushID(r.label);
+            int  cur     = s_override.*r.member;
+            bool enabled = (cur != fm2k::game_ini::kUnset);
+            bool prev_enabled = enabled;
+            ImGui::Checkbox("##en", &enabled);
+            if (enabled != prev_enabled) {
+                if (enabled) {
+                    s_override.*r.member = (def_val == fm2k::game_ini::kUnset)
+                        ? r.min : def_val;
+                } else {
+                    s_override.*r.member = fm2k::game_ini::kUnset;
+                }
+                s_dirty = true;
+            }
+            if (enabled) {
+                ImGui::SameLine();
+                int v = s_override.*r.member;
+                ImGui::SetNextItemWidth(60.0f);
+                if (ImGui::InputInt("##v", &v, 0)) {
+                    if (v < r.min) v = r.min;
+                    if (v > r.max) v = r.max;
+                    s_override.*r.member = v;
+                    s_dirty = true;
+                }
+            }
+            ImGui::PopID();
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextDisabled("%s", r.note);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+    if (s_dirty) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                           "Unsaved overrides — apply or reset.");
+    }
+    if (ImGui::Button("Apply overrides")) {
+        if (fm2k::game_ini::SaveOverride(exe, s_override)) {
+            s_dirty = false;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Host config: saved overrides for %s",
+                game.GetExeName().c_str());
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset to defaults")) {
+        s_override = {};
+        fm2k::game_ini::SaveOverride(exe, s_override);
+        s_dirty = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) {
+        s_loaded_for = -1;
+    }
+
+    // ─── Random stage (#56) ──────────────────────────────────────
+    // Per-launcher persistence (settings.ini, not per-game) so the
+    // user toggles once and it follows them across games. Both peers
+    // run the same xorshift sequence from a shared seed so rematches
+    // re-roll deterministically without per-match wire traffic.
+    ImGui::Spacing();
+    ImGui::SeparatorText("Random stage");
+    if (!random_state_loaded_) {
+        random_state_loaded_ = true;
+        LoadRandomStageState();
+    }
+    bool prev_enable = random_stage_enable_;
+    if (ImGui::Checkbox("Enable random stage", &random_stage_enable_)) {
+        SaveRandomStageState();
+    }
+    if (random_stage_enable_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(rolls a fresh stage each match)");
+        ImGui::SetNextItemWidth(80);
+        if (ImGui::InputInt("Min stage", &random_stage_min_, 0)) {
+            if (random_stage_min_ < 0) random_stage_min_ = 0;
+            if (random_stage_min_ > random_stage_max_) random_stage_min_ = random_stage_max_;
+            SaveRandomStageState();
+        }
+        ImGui::SetNextItemWidth(80);
+        if (ImGui::InputInt("Max stage", &random_stage_max_, 0)) {
+            if (random_stage_max_ < random_stage_min_) random_stage_max_ = random_stage_min_;
+            if (random_stage_max_ > 99) random_stage_max_ = 99;
+            SaveRandomStageState();
+        }
+        ImGui::TextWrapped(
+            "Inclusive range. Set to your game's stage count - 1 (FM2K "
+            "indexes from 0). Both peers' hooks seed an xorshift PRNG with "
+            "the host's seed, then advance by one per match — deterministic "
+            "lockstep, no extra wire traffic per rematch.");
+    }
+    (void)prev_enable;
+}
+
 void LauncherUI::RenderHostConfigWindow() {
-    if (!ImGui::Begin("Host Config", &show_host_config_, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (!ImGui::Begin("Host Config", &show_host_config_, ImGuiWindowFlags_None)) {
         ImGui::End();
         return;
     }
-
-    ImGui::TextWrapped(
-        "These settings apply to YOUR game and (when you host) get pushed "
-        "to the connected client + spectators automatically.");
-    ImGui::Separator();
-
-    static const char* kSocdLabels[6] = {
-        "0 — Default        (R wins L+R, U wins U+D)",
-        "1 — Hitbox SOCD    (L+R neutral, U wins U+D)  [tournament default]",
-        "2 — U/D Cancel     (R wins L+R, U+D neutral)",
-        "3 — Both Cancel    (L+R neutral, U+D neutral)",
-        "4 — Up Bias        (R wins L+R, U wins U+D)",
-        "5 — Hitbox + UpBias",
-    };
-    ImGui::Text("%s", T("label_socd_mode"));
-    if (ImGui::Combo("##socd", &host_config_socd_mode_, kSocdLabels, 6)) {
-        host_config_dirty_ = true;
-    }
-
-    ImGui::Spacing();
-    ImGui::Text("%s", T("label_selected_stage"));
-    int stage_int = (int)host_config_stage_;
-    if (ImGui::InputInt("##stage", &stage_int, 1, 1)) {
-        if (stage_int < 0) stage_int = -1;
-        host_config_stage_ = (uint32_t)stage_int;
-        host_config_dirty_ = true;
-    }
-
-    ImGui::Spacing();
-    ImGui::TextDisabled(
-        "Round count / time limit / game speed: not yet mapped to game memory.");
-    ImGui::TextDisabled(
-        "For now both peers must use the same install + game.ini.");
-
-    ImGui::Separator();
-    if (host_config_dirty_) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
-            "Unsaved changes — apply before hosting.");
-    }
-    if (ImGui::Button(T("btn_apply_host_config"))) {
-        FILE* f = fopen("fm2k_host.ini", "w");
-        if (f) {
-            fprintf(f, "[Host]\nSocdMode=%d\nSelectedStage=%u\n",
-                    host_config_socd_mode_, host_config_stage_);
-            fclose(f);
-        }
-        // Set env vars so the freshly-spawned hook DLL picks these up at
-        // its first SOCD-mode read (Hook_GetSOCDMode caches on first call).
-        char socd_buf[8];
-        snprintf(socd_buf, sizeof(socd_buf), "%d", host_config_socd_mode_);
-        _putenv_s("FM2K_SOCD_MODE", socd_buf);
-        host_config_dirty_ = false;
-    }
-
+    RenderHostConfigBody();
     ImGui::End();
 }
 
 void LauncherUI::RenderGameSelection() {
-    ImGui::Text("%s", T("panel_games_folder"));
-    static char path_buf[512] = {0};
-    static bool initialized = false;
-    
-    // Only initialize the buffer once, not every frame
-    if (!initialized) {
-        SDL_strlcpy(path_buf, games_root_path_.c_str(), sizeof(path_buf));
-        initialized = true;
-    }
-    
-    // Create a focus scope for the input group
-    ImGui::PushID("GamesFolder");
-    
-    // Check if input text has changed
-    bool path_changed = ImGui::InputText("##GamesFolder", path_buf, sizeof(path_buf));
-    
-    ImGui::SameLine();
-    if (ImGui::Button(T("btn_set")) || (path_changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-        if (on_games_folder_set) {
-            // Update our internal path to match what user typed
-            games_root_path_ = path_buf;
-            on_games_folder_set(path_buf);
+    // Games-folder list editor lives in Settings → Games Folders… The
+    // main panel just shows the current root count + a button to open
+    // the editor, so the games list itself dominates the panel.
+    {
+        const size_t n = games_root_paths_.size();
+        if (n == 0) {
+            ImGui::TextDisabled("%s", T("status_invalid_games_folder"));
+        } else if (n == 1) {
+            ImGui::TextDisabled("%s: %s", T("panel_games_folder"),
+                                games_root_paths_[0].c_str());
+        } else {
+            ImGui::TextDisabled("%s: %u", T("panel_games_folders"),
+                                static_cast<unsigned>(n));
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(T("btn_edit_games_folders"))) {
+            show_games_folders_ = true;
         }
     }
-    ImGui::PopID();
-    
+
     ImGui::Separator();
     ImGui::Text("%s", T("panel_available_games"));
     ImGui::Separator();
@@ -1324,11 +2217,60 @@ void LauncherUI::RenderGameSelection() {
             }
             
             bool is_selected = (static_cast<int>(i) == selected_game_index_);
-            
+
             // Use PushID with integer to avoid string pointer issues
             ImGui::PushID(static_cast<int>(i));
-            
-            if (ImGui::Selectable(game.GetExeName().c_str(), is_selected)) {
+
+            // Compact two-tone row, engine tag on the LEFT:
+            //   [2K] wanwan.exe       (tag dim gray, name normal)
+            //   [95] CPW.exe          ditto for FM95
+            //   [2K] AOB.exe          (both yellow when packer detected)
+            // The Selectable owns the click + selection highlight; we overlay
+            // the two-color text on top so tag and name carry independent
+            // colors. ImGuiSelectableFlags_AllowItemOverlap lets the text
+            // sit above the click region without blocking it.
+            const bool packed = !game.packer_label.empty();
+            const char* engine_tag = (game.engine == FM2K::Engine::FM95) ? "[95]" : "[2K]";
+
+            ImVec2 cursor = ImGui::GetCursorScreenPos();
+            const float row_h = ImGui::GetTextLineHeightWithSpacing();
+            const float row_w = ImGui::GetContentRegionAvail().x;
+
+            bool clicked = ImGui::Selectable("##row_sel", is_selected,
+                                             ImGuiSelectableFlags_AllowItemOverlap,
+                                             ImVec2(row_w, row_h));
+            const bool hovered = ImGui::IsItemHovered();
+
+            // Overlay the text on top of the (now invisible-labeled) Selectable.
+            ImGui::SetCursorScreenPos(cursor);
+            const ImVec4 yellow = ImVec4(0.92f, 0.78f, 0.30f, 1.0f);
+            const ImVec4 dim    = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, packed ? yellow : dim);
+            ImGui::TextUnformatted(engine_tag);
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+
+            if (packed) ImGui::PushStyleColor(ImGuiCol_Text, yellow);
+            ImGui::TextUnformatted(game.GetExeName().c_str());
+            if (packed) ImGui::PopStyleColor();
+
+            if (hovered) {
+                if (packed) {
+                    ImGui::SetTooltip("Packed with %s — may not run with rollback hooks until unpacked.\n"
+                                      "Hash: 0x%016llx",
+                                      game.packer_label.c_str(),
+                                      (unsigned long long)game.xxh64);
+                } else if (!game.clean_label.empty()) {
+                    ImGui::SetTooltip("%s\nHash: 0x%016llx (registered)",
+                                      game.clean_label.c_str(),
+                                      (unsigned long long)game.xxh64);
+                } else {
+                    ImGui::SetTooltip("Hash: 0x%016llx",
+                                      (unsigned long long)game.xxh64);
+                }
+            }
+            if (clicked) {
                 selected_game_index_ = static_cast<int>(i);
                 if (on_game_selected) {
                     on_game_selected(game);
@@ -1336,8 +2278,10 @@ void LauncherUI::RenderGameSelection() {
                 // Route the input binder to this game's per-game profile
                 // (creates fm2k_inputs_<basename>.ini lookup; reads
                 // default if no override exists). Strip .exe suffix.
-                std::filesystem::path p(game.exe_path);
-                std::string stem = p.stem().string();
+                // Construct path from wide so stem() preserves JP bytes.
+                std::filesystem::path p(
+                    fm2k::utf8path::Utf8ToWide(game.exe_path));
+                std::string stem = fm2k::utf8path::StemUtf8(p);
                 FM2KInputBinder::SetGameProfile(stem.c_str());
                 if (input_binder_initialized_) {
                     FM2KInputBinder::Load();
@@ -1350,7 +2294,19 @@ void LauncherUI::RenderGameSelection() {
             
             // Tooltips restored - font stack issue is fixed
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("EXE: %s\nKGT: %s", game.exe_path.c_str(), game.dll_path.c_str());
+                if (game.kgt.valid) {
+                    int p = 0, s = 0, d = 0;
+                    for (const auto& n : game.kgt.player_names) if (!n.empty()) ++p;
+                    for (const auto& n : game.kgt.stage_names)  if (!n.empty()) ++s;
+                    for (const auto& n : game.kgt.demo_names)   if (!n.empty()) ++d;
+                    ImGui::SetTooltip(
+                        "EXE: %s\nKGT: %s\nProject: %s\n%d chars / %d stages / %d demos",
+                        game.exe_path.c_str(), game.dll_path.c_str(),
+                        game.kgt.project_name.empty() ? "(unnamed)" : game.kgt.project_name.c_str(),
+                        p, s, d);
+                } else {
+                    ImGui::SetTooltip("EXE: %s\nKGT: %s", game.exe_path.c_str(), game.dll_path.c_str());
+                }
             }
             
             ImGui::PopID();
@@ -1541,8 +2497,8 @@ void LauncherUI::SetScanning(bool scanning) {
     scanning_games_ = scanning;
 }
 
-void LauncherUI::SetGamesRootPath(const std::string& path) {
-    games_root_path_ = path;
+void LauncherUI::SetGamesRootPaths(const std::vector<std::string>& paths) {
+    games_root_paths_ = paths;
 }
 
 void LauncherUI::SetFramesAhead(float frames_ahead) {
@@ -1573,6 +2529,10 @@ void LauncherUI::RenderSessionControls() {
         static bool s_force_t4_patch    = false;
         static bool s_skip_vs_mode_patch= false;
         static bool s_t4_probe          = false;
+        // FM95-specific opt-in: drive the trampoline tick from
+        // Hook_UpdateGameState instead of the (skipped) RUN_GAME_LOOP
+        // detour, so FM95 reaches rollback parity with FM2K.
+        static bool s_fm95_trampoline   = false;
         // Persisted across launcher restarts via %APPDATA%\FM2K_Rollback\dev_flags.ini.
         // First-frame init reads the saved value; toggling the checkbox writes back.
         static bool s_eb_diag = []() {
@@ -1598,8 +2558,9 @@ void LauncherUI::RenderSessionControls() {
                 selected_game_index_ >= 0 &&
                 selected_game_index_ < (int)games_.size();
             if (game_selected && hub_state_ && hub_state_->client.IsConnected()) {
-                std::filesystem::path exe(games_[selected_game_index_].exe_path);
-                const std::string game_id = exe.stem().string();
+                std::filesystem::path exe(
+                    fm2k::utf8path::Utf8ToWide(games_[selected_game_index_].exe_path));
+                const std::string game_id = fm2k::utf8path::StemUtf8(exe);
                 if (hub_state_->current_room_id != game_id) {
                     hub_state_->client.JoinRoom(game_id, game_id);
                 }
@@ -1624,6 +2585,8 @@ void LauncherUI::RenderSessionControls() {
                                       s_t4_probe ? "1" : nullptr);
             ::SetEnvironmentVariableA("FM2K_EB_DIAG",
                                       s_eb_diag ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM95_TRAMPOLINE",
+                                      s_fm95_trampoline ? "1" : nullptr);
             if (on_offline_session_start) {
                 on_offline_session_start();
             }
@@ -1654,41 +2617,72 @@ void LauncherUI::RenderSessionControls() {
                 "own inputs.");
 
             ImGui::Spacing();
-            ImGui::Text("%s", T("dev_diagnostics"));
-            ImGui::Checkbox(T("dev_bypass_trampoline"), &s_bypass_trampoline);
-            ImGui::SetItemTooltip(
-                "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
-                "Offline only — netplay/spectator require the trampoline.");
 
-            ImGui::Checkbox(T("dev_skip_vs_mode_patch"), &s_skip_vs_mode_patch);
-            ImGui::SetItemTooltip("%s", T("dev_skip_vs_mode_tooltip"));
+            // ---------- FM2K diagnostics (collapsed by default) ----------
+            // FM2K-engine-specific toggles — most users never touch these
+            // outside of debugging desync repros.
+            if (ImGui::CollapsingHeader("FM2K diagnostics")) {
+                ImGui::Indent();
 
-            ImGui::Checkbox(T("dev_force_t4_patch"), &s_force_t4_patch);
-            ImGui::SetItemTooltip(
-                "Re-enables the case-200 t4-walk neuter patch (0x408EC5).");
+                ImGui::Checkbox(T("dev_bypass_trampoline"), &s_bypass_trampoline);
+                ImGui::SetItemTooltip(
+                    "Routes Hook_RunGameLoop to vanilla. Other hooks still fire. "
+                    "Offline only — netplay/spectator require the trampoline.");
 
-            ImGui::Checkbox(T("dev_t4_probe"), &s_t4_probe);
-            ImGui::SetItemTooltip("%s", T("dev_t4_probe_tooltip"));
+                ImGui::Checkbox(T("dev_skip_vs_mode_patch"), &s_skip_vs_mode_patch);
+                ImGui::SetItemTooltip("%s", T("dev_skip_vs_mode_tooltip"));
 
-            if (ImGui::Checkbox(T("dev_eb_diag"), &s_eb_diag)) {
-                // Apply immediately so EVERY launch path (offline, online,
-                // hub, dual-clients, spectator) inherits the env var.
-                // Persist to dev_flags.ini so the toggle survives launcher
-                // restarts — otherwise the static-bool default loses your
-                // setting every time you close the launcher.
-                ::SetEnvironmentVariableA("FM2K_EB_DIAG",
-                                          s_eb_diag ? "1" : nullptr);
-                SaveDevFlag("eb_diag", s_eb_diag);
+                ImGui::Checkbox(T("dev_force_t4_patch"), &s_force_t4_patch);
+                ImGui::SetItemTooltip(
+                    "Re-enables the case-200 t4-walk neuter patch (0x408EC5).");
+
+                ImGui::Checkbox(T("dev_t4_probe"), &s_t4_probe);
+                ImGui::SetItemTooltip("%s", T("dev_t4_probe_tooltip"));
+
+                if (ImGui::Checkbox(T("dev_eb_diag"), &s_eb_diag)) {
+                    // Apply immediately so EVERY launch path (offline, online,
+                    // hub, dual-clients, spectator) inherits the env var.
+                    // Persist to dev_flags.ini so the toggle survives launcher
+                    // restarts — otherwise the static-bool default loses your
+                    // setting every time you close the launcher.
+                    ::SetEnvironmentVariableA("FM2K_EB_DIAG",
+                                              s_eb_diag ? "1" : nullptr);
+                    SaveDevFlag("eb_diag", s_eb_diag);
+                }
+                ImGui::SetItemTooltip(
+                    "Logs shake-effect timer values at PRE-SAVE / PRE-RENDER / "
+                    "POST-RENDER / POST-RESTORE around the trampoline render "
+                    "boundary. Use to track [EB] palette-flash and screen-shake "
+                    "duration loss. Output goes to FM2K_eb_diag_pid<PID>.log "
+                    "in the game folder (NOT the main launcher log). Repro: "
+                    "pkmncc Bewear 624B, slither wing 6A landing, URORFG Loader "
+                    "5B / walking, Breloom 6a6a6b. Persists across launcher "
+                    "restarts.");
+
+                ImGui::Unindent();
             }
-            ImGui::SetItemTooltip(
-                "Logs shake-effect timer values at PRE-SAVE / PRE-RENDER / "
-                "POST-RENDER / POST-RESTORE around the trampoline render "
-                "boundary. Use to track [EB] palette-flash and screen-shake "
-                "duration loss. Output goes to FM2K_eb_diag_pid<PID>.log "
-                "in the game folder (NOT the main launcher log). Repro: "
-                "pkmncc Bewear 624B, slither wing 6A landing, URORFG Loader "
-                "5B / walking, Breloom 6a6a6b. Persists across launcher "
-                "restarts.");
+
+            // ---------- FM95 / CPW (collapsed by default) ----------
+            // Engine-specific to FM95Hook.dll-injected games. Won't fire
+            // on FM2K builds — environment vars get set anyway, and
+            // FM2KHook just ignores them.
+            if (ImGui::CollapsingHeader("FM95 (CPW etc.)")) {
+                ImGui::Indent();
+
+                ImGui::Checkbox("Trampoline-driven loop (FM95_TRAMPOLINE)",
+                                &s_fm95_trampoline);
+                ImGui::SetItemTooltip(
+                    "FM95's RUN_GAME_LOOP is _WinMain (no separate driver), so the "
+                    "trampoline can't replace it like on FM2K. With this enabled, "
+                    "Hook_UpdateGameState calls TrampolineFrameTick() and Hook_"
+                    "RenderGame skips the host's natural render — the trampoline's "
+                    "RenderFrameWithSnapshot drives one render per frame. Required "
+                    "for FM95 rollback parity. OFF = current working baseline (no "
+                    "rollback driver, host runs CPW natively). Toggle off if you "
+                    "see regressions.");
+
+                ImGui::Unindent();
+            }
 
             ImGui::Spacing();
             if (ImGui::Button(T("dev_online_legacy"), ImVec2(-1, 0))) {
@@ -1813,12 +2807,531 @@ void LauncherUI::RenderSessionControls() {
     }
 }
 
+// Local match log — CCCaster's results.csv with FM2K-specific columns.
+// One row per match end, written from MY perspective (the user running
+// THIS launcher), so each peer keeps its own view. Format:
+//
+//   when_iso, game_id, role, my_nick, my_char, peer_nick, peer_char, result
+//
+// "role" is "P1" or "P2" depending on whether we hosted the match. CCCaster
+// always writes one record per match, but only on `_localPlayer == 1`; we
+// instead write per-perspective so the file is meaningful even if the user
+// switches between hosting and joining.
+//
+// "result" is the same outcome string we send to the hub: self_won /
+// peer_won / draw / disconnect. CCCaster used per-side round counts; we
+// only have final winner so we surface that directly.
+//
+// Lives in the same %APPDATA%\FM2K_Rollback dir as audio.ini / settings.ini.
+// First write emits a UTF-8 BOM so Excel renders Japanese / accented names
+// correctly when the user double-clicks the file.
+static std::string ResultsCsvPath() {
+    const char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    std::string dir = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\results.csv";
+}
+
+// RFC-4180 escape: wrap in quotes if the field contains comma / quote /
+// newline, doubling internal quotes. Empty string → empty (unquoted).
+static std::string CsvEscape(const std::string& in) {
+    bool needs_quote = false;
+    for (char c : in) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) return in;
+    std::string out;
+    out.reserve(in.size() + 2);
+    out.push_back('"');
+    for (char c : in) {
+        if (c == '"') out.push_back('"');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+void LauncherUI::AppendResultsCsvRow(const char* outcome_str,
+                                     uint32_t p1_char_id, uint32_t p2_char_id,
+                                     const std::string& p1_char_name,
+                                     const std::string& p2_char_name) {
+    if (!hub_state_) return;
+    auto& hs = *hub_state_;
+    const std::string path = ResultsCsvPath();
+    if (path.empty()) return;
+
+    // Detect first-write so we can emit BOM + header. GetFileAttributesA
+    // is the cheapest existence check on Win32.
+    const bool fresh =
+        (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+    FILE* f = std::fopen(path.c_str(), "ab");
+    if (!f) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "results.csv: open failed: %s", path.c_str());
+        return;
+    }
+    if (fresh) {
+        // UTF-8 BOM (EF BB BF). Excel needs this to interpret the file
+        // as UTF-8 instead of guessing the system codepage.
+        const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+        std::fwrite(bom, 1, sizeof(bom), f);
+        std::fprintf(f,
+            "when,game_id,role,my_nick,my_char,peer_nick,peer_char,result\r\n");
+    }
+
+    // Map our role to a P1/P2 label: host == P1 by hub convention.
+    const bool i_am_p1 = (hs.current_match_role == "host");
+    const std::string my_char_name   = i_am_p1 ? p1_char_name : p2_char_name;
+    const std::string peer_char_name = i_am_p1 ? p2_char_name : p1_char_name;
+    const uint32_t    my_char_id     = i_am_p1 ? p1_char_id   : p2_char_id;
+    const uint32_t    peer_char_id   = i_am_p1 ? p2_char_id   : p1_char_id;
+
+    // Prefer the resolved .player filename; fall back to "id N" when the
+    // hook didn't manage to resolve (older shared-mem version, char_id
+    // out of roster range, etc).
+    auto fmt_char = [](const std::string& name, uint32_t id) -> std::string {
+        if (!name.empty()) return name;
+        if (id == 0xFFFFFFFFu) return "";
+        return "id " + std::to_string(id);
+    };
+
+    // ISO-8601 timestamp in local time. Sortable + readable; Excel parses
+    // this format as a date out of the box.
+    char when_iso[32] = "";
+    std::time_t now = std::time(nullptr);
+    std::tm lt{};
+    if (localtime_s(&lt, &now) == 0) {
+        std::strftime(when_iso, sizeof(when_iso), "%Y-%m-%dT%H:%M:%S", &lt);
+    }
+
+    std::fprintf(f, "%s,%s,%s,%s,%s,%s,%s,%s\r\n",
+        CsvEscape(when_iso).c_str(),
+        CsvEscape(hs.current_match_game_id).c_str(),
+        i_am_p1 ? "P1" : "P2",
+        CsvEscape(hs.my_nick).c_str(),
+        CsvEscape(fmt_char(my_char_name, my_char_id)).c_str(),
+        CsvEscape(hs.current_match_peer_nick).c_str(),
+        CsvEscape(fmt_char(peer_char_name, peer_char_id)).c_str(),
+        CsvEscape(outcome_str ? outcome_str : "").c_str());
+
+    std::fclose(f);
+}
+
+void LauncherUI::UpdateWindowTitleWithRecord() {
+    if (!window_ || !hub_state_) return;
+    auto& hs = *hub_state_;
+    char title[192];
+    if (hs.my_wins < 0) {
+        // No record yet — keep the bare title.
+        std::snprintf(title, sizeof(title), "FM2K Rollback Launcher");
+    } else if (!hs.my_nick.empty()) {
+        std::snprintf(title, sizeof(title),
+                      "FM2K Rollback Launcher \xe2\x80\x94 %s (%d-%d-%d)",
+                      hs.my_nick.c_str(), hs.my_wins, hs.my_losses, hs.my_draws);
+    } else {
+        std::snprintf(title, sizeof(title),
+                      "FM2K Rollback Launcher \xe2\x80\x94 %d-%d-%d",
+                      hs.my_wins, hs.my_losses, hs.my_draws);
+    }
+    SDL_SetWindowTitle(window_, title);
+}
+
+void LauncherUI::LoadSocdState() {
+    const std::string path = NotifySettingsPath();   // shared settings.ini
+    if (path.empty()) return;
+    socd_mode_[0] = ReadIntSetting(path, "socd_mode_p1", 1);  // 1 = Hitbox SOCD
+    socd_mode_[1] = ReadIntSetting(path, "socd_mode_p2", 1);
+    // Clamp to known range so a hand-edited bad value can't blow up
+    // the hook's switch statement.
+    for (int i = 0; i < 2; ++i) {
+        if (socd_mode_[i] < 0 || socd_mode_[i] > 5) socd_mode_[i] = 1;
+    }
+}
+
+void LauncherUI::SaveSocdState() {
+    const std::string path = NotifySettingsPath();
+    if (path.empty()) return;
+    WriteIntSetting(path, "socd_mode_p1", socd_mode_[0]);
+    WriteIntSetting(path, "socd_mode_p2", socd_mode_[1]);
+}
+
+void LauncherUI::LoadRandomStageState() {
+    const std::string path = NotifySettingsPath();
+    if (path.empty()) return;
+    random_stage_enable_ = (ReadIntSetting(path, "random_stage_enable", 0) != 0);
+    random_stage_min_    = ReadIntSetting(path, "random_stage_min", 0);
+    random_stage_max_    = ReadIntSetting(path, "random_stage_max", 7);
+    if (random_stage_min_ < 0)   random_stage_min_ = 0;
+    if (random_stage_max_ > 99)  random_stage_max_ = 99;
+    if (random_stage_max_ < random_stage_min_) random_stage_max_ = random_stage_min_;
+}
+
+void LauncherUI::SaveRandomStageState() {
+    const std::string path = NotifySettingsPath();
+    if (path.empty()) return;
+    WriteIntSetting(path, "random_stage_enable", random_stage_enable_ ? 1 : 0);
+    WriteIntSetting(path, "random_stage_min",    random_stage_min_);
+    WriteIntSetting(path, "random_stage_max",    random_stage_max_);
+}
+
+void LauncherUI::RenderInputBindingsTab(int player_slot) {
+    if (player_slot < 0 || player_slot > 1) return;
+
+    if (!socd_state_loaded_) {
+        socd_state_loaded_ = true;
+        LoadSocdState();
+    }
+
+    // SOCD picker — purely local. Each P1/P2 slot keeps its own mode
+    // because dual-local dev mode runs both slots from one launcher
+    // and wants each child process configured independently. Online
+    // mode applies socd_mode_[g_player_index] to the spawned game's
+    // FM2K_SOCD_MODE env var at launch.
+    static const char* kSocdLabels[6] = {
+        "0 — Default        (R wins L+R, U wins U+D)",
+        "1 — Hitbox SOCD    (L+R neutral, U wins U+D)  [tournament default]",
+        "2 — U/D Cancel     (R wins L+R, U+D neutral)",
+        "3 — Both Cancel    (L+R neutral, U+D neutral)",
+        "4 — Up Bias        (R wins L+R, U wins U+D)",
+        "5 — Hitbox + UpBias",
+    };
+    ImGui::TextDisabled(
+        "SOCD is local — applied before inputs hit the wire, so peers "
+        "running different modes do NOT desync.");
+    ImGui::SetNextItemWidth(380);
+    char combo_id[32];
+    std::snprintf(combo_id, sizeof(combo_id), "##socd_p%d", player_slot + 1);
+    if (ImGui::Combo(combo_id, &socd_mode_[player_slot], kSocdLabels, 6)) {
+        SaveSocdState();
+        // Live-update the env so a freshly-spawned game picks up the
+        // new mode; running games don't reload (hook caches on first
+        // GetSOCDMode call) — they get the new value next launch.
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%d", socd_mode_[player_slot]);
+        if (player_slot == 0) _putenv_s("FM2K_SOCD_MODE_P1", buf);
+        else                   _putenv_s("FM2K_SOCD_MODE_P2", buf);
+    }
+    ImGui::Separator();
+
+    // Bindings body — inherits the existing per-player binding UI.
+    if (FM2KInputBinder::RenderBody(player_slot)) FM2KInputBinder::Save();
+}
+
+void LauncherUI::PushStatsToHook() {
+    if (!hub_state_ || !on_get_client_status) return;
+    auto& hs = *hub_state_;
+
+    uint32_t pid1 = 0, pid2 = 0;
+    if (!on_get_client_status(pid1, pid2)) return;
+
+    // Resolve vs-peer record from the cached breakdown (filled by the
+    // hub's `record` event with no opponent_id filter — the same data
+    // the lobby's vs column reads).
+    int32_t vs_w = -1, vs_l = -1, vs_d = -1;
+    if (!hs.current_match_peer_id.empty()) {
+        auto it = hs.my_vs.find(hs.current_match_peer_id);
+        if (it != hs.my_vs.end()) {
+            vs_w = it->second.wins;
+            vs_l = it->second.losses;
+            vs_d = it->second.draws;
+        } else {
+            // No prior matches against this peer — explicit zeros so the
+            // titlebar shows "0-0-0" instead of dashes.
+            vs_w = vs_l = vs_d = 0;
+        }
+    }
+
+    auto write = [&](uint32_t pid) {
+        if (pid == 0) return;
+        const std::string name = "FM2K_SharedMem_" + std::to_string(pid);
+        HANDLE h = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE,
+                                    FALSE, name.c_str());
+        if (!h) return;
+        FM2KSharedMemData* data = static_cast<FM2KSharedMemData*>(
+            MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                          sizeof(FM2KSharedMemData)));
+        if (data && data->magic == FM2K_SHARED_MEM_MAGIC &&
+            data->version == FM2K_SHARED_MEM_VERSION)
+        {
+            data->ui_wins      = hs.my_wins;
+            data->ui_losses    = hs.my_losses;
+            data->ui_draws     = hs.my_draws;
+            data->ui_vs_wins   = vs_w;
+            data->ui_vs_losses = vs_l;
+            data->ui_vs_draws  = vs_d;
+            auto stash = [](char* dst, size_t cap, const std::string& src) {
+                if (cap == 0) return;
+                size_t n = std::min<size_t>(src.size(), cap - 1);
+                if (n) memcpy(dst, src.data(), n);
+                dst[n] = '\0';
+            };
+            stash(data->ui_peer_nick, sizeof(data->ui_peer_nick),
+                  hs.current_match_peer_nick);
+            stash(data->ui_my_nick,   sizeof(data->ui_my_nick),
+                  hs.my_nick);
+        }
+        if (data) UnmapViewOfFile(data);
+        CloseHandle(h);
+    };
+    write(pid1);
+    write(pid2);
+}
+
 void LauncherUI::NotifyHubMatchEnded() {
     if (!hub_state_) return;
     if (!hub_state_->client.IsConnected()) return;
     hub_state_->client.MatchEnded();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Hub: signaled match_ended (game terminated)");
+}
+
+void LauncherUI::PollMatchOutcome() {
+    if (!hub_state_) return;
+    auto& hs = *hub_state_;
+
+    // Push the latest stats (peer nick + W-L-D) to the spawned game's
+    // shared mem on every poll. The MatchStart-time push fires BEFORE
+    // the game process has created its FM2K_SharedMem mapping, so that
+    // initial write silently no-ops. Re-pushing here lands the data as
+    // soon as the mapping appears (typically within ~1s of game spawn),
+    // so the in-game titlebar shows "vs <peer> 0-0-0" on the FIRST
+    // match instead of waiting until match #2's K::MatchStart fires.
+    // Cheap when no game is running (on_get_client_status returns 0).
+    if (!hs.current_match_token.empty()) {
+        PushStatsToHook();
+    }
+
+    // Nothing more to report if there's no live hub-driven match or
+    // the hub dropped. NOTE: we DON'T early-return on match_result_sent
+    // anymore — FM2K rematches stay inside the same hub `in_match`
+    // session (no fresh K::MatchStart fires), so the second match's
+    // outcome would be permanently swallowed if we gated on a flag
+    // that's set true after match #1 ends. Per-PID last_outcome_seq
+    // tracking already handles the "have we processed THIS bump"
+    // dedup. match_result_sent is now only used by the K::Peer-
+    // Disconnected handler to skip a redundant send.
+    if (hs.current_match_token.empty()) return;
+    if (!hs.client.IsConnected()) {
+        // One-shot diagnostic: log why we're bailing the FIRST time
+        // we'd otherwise have sent a match_result. Helps surface the
+        // case where the hub WS died mid-match — without this we just
+        // silently drop the result and the hub never commits.
+        static bool s_warned_disconnect = false;
+        if (!s_warned_disconnect) {
+            s_warned_disconnect = true;
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "PollMatchOutcome: hub WS disconnected — match_result will NOT be sent");
+        }
+        return;
+    }
+    if (!on_get_client_status) return;
+
+    uint32_t pid1 = 0, pid2 = 0;
+    if (!on_get_client_status(pid1, pid2)) return;
+
+    auto try_pid = [&](uint32_t pid) {
+        // Don't gate on hs.match_result_sent. Per-PID last_outcome_seq
+        // already dedupes (line below), and after match #1 commits,
+        // match_result_sent stays true through the rematch — which
+        // means the post-match DISCONNECT outcome (peer closed window
+        // mid-CSS) would never get processed → on_session_stop never
+        // fires → survivor's game stays open with no opponent.
+        if (pid == 0) return;
+
+        const std::string name = "FM2K_SharedMem_" + std::to_string(pid);
+        HANDLE h = OpenFileMappingA(FILE_MAP_READ, FALSE, name.c_str());
+        if (!h) return;
+
+        FM2KSharedMemData* data = static_cast<FM2KSharedMemData*>(
+            MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(FM2KSharedMemData)));
+        if (!data) {
+            CloseHandle(h);
+            return;
+        }
+
+        if (data->magic == FM2K_SHARED_MEM_MAGIC &&
+            data->version == FM2K_SHARED_MEM_VERSION)
+        {
+            const uint32_t seq        = data->match_outcome_seq;
+            const uint8_t  outcome_u8 = data->match_outcome;
+            const uint32_t p1_char_id = data->match_p1_char_id;
+            const uint32_t p2_char_id = data->match_p2_char_id;
+            const uint32_t stage_id   = data->match_stage_id;
+            // Resolved .player filenames (UTF-8 already, hook converts
+            // from CP932). Bound the strnlen at the shared-mem buffer
+            // size so a malformed publish (no NUL) can't walk off the
+            // mapping.
+            std::string p1_char_name(
+                data->match_p1_char_name,
+                strnlen(data->match_p1_char_name, FM2K_MATCH_CHAR_NAME_MAX));
+            std::string p2_char_name(
+                data->match_p2_char_name,
+                strnlen(data->match_p2_char_name, FM2K_MATCH_CHAR_NAME_MAX));
+            // Prefer KGT-derived display names over the hook's shared-mem
+            // values. The hook publishes filenames (from g_char_slot_data
+            // / g_player_file_name_array, e.g. "c1.player" → "c1") which
+            // for some games (vanpri) are placeholders, while the actual
+            // display name lives inside each .player file's header. The
+            // launcher's parser already enriches kgt.player_names from
+            // those .player headers, so when local KGT resolves to a
+            // different (non-filename) name, that's the one to ship.
+            if (on_resolve_char_name) {
+                if (p1_char_id != 0xFFFFFFFFu) {
+                    std::string n = on_resolve_char_name(
+                        hs.current_match_game_id, p1_char_id);
+                    if (!n.empty()) p1_char_name = std::move(n);
+                }
+                if (p2_char_id != 0xFFFFFFFFu) {
+                    std::string n = on_resolve_char_name(
+                        hs.current_match_game_id, p2_char_id);
+                    if (!n.empty()) p2_char_name = std::move(n);
+                }
+            }
+            // Stage name resolved from local KGT (FM2K has no in-memory
+            // stage filename table; the launcher already parsed the .kgt
+            // header at discovery). Empty when game isn't installed
+            // locally — hub will store id-only in that case.
+            std::string stage_name;
+            if (stage_id != 0xFFFFFFFFu && on_resolve_stage_name) {
+                stage_name = on_resolve_stage_name(hs.current_match_game_id,
+                                                   stage_id);
+            }
+
+            // Fire match_progress to the hub when the hook bumps its
+            // chars_seq counter (which it does exactly once per
+            // Netplay_StartBattleSession). Gating on seq advance —
+            // not on the chars themselves — sidesteps the rotate-
+            // window race where shared mem still holds the prev
+            // battle's chars at the time we set current_match_token
+            // to the rotated value. During CSS / inter-battle, the
+            // counter doesn't advance, no fire happens, and the
+            // lobby's empty "(in CSS)" row stays put until the new
+            // battle actually starts.
+            const uint32_t chars_seq = data->match_chars_seq;
+            if (!hs.current_match_token.empty() &&
+                chars_seq != 0 &&
+                chars_seq != hs.last_chars_seq[pid])
+            {
+                hs.client.ReportMatchProgress(
+                    hs.current_match_token,
+                    p1_char_id, p2_char_id,
+                    p1_char_name, p2_char_name,
+                    stage_id, stage_name);
+                hs.last_chars_seq[pid] = chars_seq;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hub: match_progress sent token=%.8s... "
+                    "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") "
+                    "chars_seq=%u",
+                    hs.current_match_token.c_str(),
+                    p1_char_id, p1_char_name.c_str(),
+                    p2_char_id, p2_char_name.c_str(),
+                    stage_id, stage_name.c_str(),
+                    (unsigned)chars_seq);
+            }
+            const uint32_t last_seen  = hs.last_outcome_seq[pid];
+
+            if (seq > last_seen && outcome_u8 != FM2K_MATCH_OUTCOME_NONE) {
+                hs.last_outcome_seq[pid] = seq;
+
+                // CSS_ABORT: peer left during char select before battle
+                // started. Close the surviving local game but DON'T
+                // record anything — the match never reached battle, so
+                // there's no W/L/D to commit. No CSV row, no hub
+                // MatchResult, no in-flight commit.
+                if (outcome_u8 == FM2K_MATCH_OUTCOME_CSS_ABORT) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: peer left during CSS — closing local game (no record)");
+                    hs.status_line = "peer left during CSS — match not recorded";
+                    if (on_session_stop) on_session_stop();
+                    // Clear so subsequent broadcasts of the same token
+                    // (e.g. a match_rotated arriving from the hub) don't
+                    // re-trigger this.
+                    hs.current_match_token.clear();
+                    hs.current_match_peer_id.clear();
+                    hs.current_match_peer_nick.clear();
+                    UnmapViewOfFile(data);
+                    CloseHandle(h);
+                    return;
+                }
+
+                const char* outcome_str = nullptr;
+                switch (outcome_u8) {
+                    case FM2K_MATCH_OUTCOME_SELF_WON:   outcome_str = "self_won"; break;
+                    case FM2K_MATCH_OUTCOME_PEER_WON:   outcome_str = "peer_won"; break;
+                    case FM2K_MATCH_OUTCOME_DRAW:       outcome_str = "draw";     break;
+                    case FM2K_MATCH_OUTCOME_DISCONNECT: outcome_str = "disconnect"; break;
+                    default: break;
+                }
+                if (outcome_str) {
+                    // Local CSV mirror first — runs even if the hub
+                    // send queues silently because we're disconnected.
+                    // Same data, written to %APPDATA%\FM2K_Rollback\
+                    // results.csv. CCCaster-equivalent for offline
+                    // history.
+                    AppendResultsCsvRow(outcome_str,
+                                        p1_char_id, p2_char_id,
+                                        p1_char_name, p2_char_name);
+
+                    hs.client.MatchResult(hs.current_match_token, outcome_str,
+                                          p1_char_id, p2_char_id,
+                                          p1_char_name, p2_char_name,
+                                          stage_id, stage_name);
+                    hs.match_result_sent = true;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: match_result sent token=%.8s... outcome=%s "
+                        "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") pid=%lu seq=%u",
+                        hs.current_match_token.c_str(), outcome_str,
+                        p1_char_id, p1_char_name.c_str(),
+                        p2_char_id, p2_char_name.c_str(),
+                        stage_id, stage_name.c_str(),
+                        (unsigned long)pid, (unsigned)seq);
+                    // Refresh our cached W/L/D so the UI updates
+                    // immediately for the next room render. Also
+                    // refresh the recent-matches list so the just-
+                    // committed match shows up at the top.
+                    hs.client.QueryRecord();
+                    hs.client.RequestRecentMatches(50);
+
+                    // Peer-disconnect: tear down the surviving local
+                    // game so the user isn't stuck staring at a frozen
+                    // CSS / battle screen with no opponent. Visible
+                    // toast so the user knows WHY the window is
+                    // closing instead of treating it as a crash.
+                    if (outcome_u8 == FM2K_MATCH_OUTCOME_DISCONNECT) {
+                        const std::string& peer_nick =
+                            hs.current_match_peer_nick.empty()
+                                ? std::string("Opponent")
+                                : hs.current_match_peer_nick;
+                        char body[160];
+                        std::snprintf(body, sizeof(body),
+                                      T("toast_peer_disconnected_body"),
+                                      peer_nick.c_str());
+                        hs.status_line = std::string("peer disconnected — closing match");
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: peer dropped, stopping local session");
+                        if (!hs.disconnect_toast_fired) {
+                            hs.disconnect_toast_fired = true;
+                            FireSystemNotification(
+                                T("toast_peer_disconnected_title"),
+                                body);
+                        }
+                        if (on_session_stop) on_session_stop();
+                    }
+                }
+            }
+        }
+
+        UnmapViewOfFile(data);
+        CloseHandle(h);
+    };
+
+    try_pid(pid1);
+    try_pid(pid2);
 }
 
 void LauncherUI::RenderHubPanel() {
@@ -1838,8 +3351,54 @@ void LauncherUI::RenderHubPanel() {
                 // For LAN/internet, replace "127.0.0.1" with the hub-
                 // observed reflexive IP (Phase 2 — STUN responder).
                 hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port);
+                // Pull our own W/L/D + per-opponent breakdown so the
+                // lobby column and titlebar both have data on first
+                // render. Refreshed after every match end via the same
+                // QueryRecord call in PollMatchOutcome.
+                hs.client.QueryRecord();
+                // Pre-load the recent-matches panel so it isn't blank
+                // the first time the user opens it. 50 rows is the
+                // hub's default cap; anything more is a "history page"
+                // which we don't ship yet.
+                hs.client.RequestRecentMatches(50);
+                // Snapshot current in-flight matches for the lobby
+                // panel. Live updates arrive via MatchInProgress*
+                // broadcasts after this point.
+                hs.client.RequestCurrentMatches();
+                // Auto-rejoin: if we were in a room when the hub
+                // dropped (hub restart, network blip), put us back
+                // in. last_room_id is set by the Disconnected handler
+                // before it clears current_room_id. The hub re-creates
+                // the room on demand if it's not seeded, so the name
+                // we pass is purely cosmetic — fall back to id when we
+                // don't have a separately-cached display name.
+                if (!hs.last_room_id.empty()) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: auto-rejoining room '%s' after reconnect",
+                        hs.last_room_id.c_str());
+                    const std::string& name = hs.last_room_name.empty()
+                        ? hs.last_room_id : hs.last_room_name;
+                    hs.client.JoinRoom(hs.last_room_id, name);
+                    hs.last_room_id.clear();
+                    hs.last_room_name.clear();
+                }
                 break;
             case K::Disconnected:
+                // Stash the room we were in so the next K::Connected
+                // event can auto-rejoin (hub restart shouldn't kick
+                // users back to the game-picker).
+                if (!hs.current_room_id.empty()) {
+                    hs.last_room_id = hs.current_room_id;
+                    // Look up the display name from the cached rooms
+                    // list so the rejoin call carries something
+                    // sensible if the hub doesn't seed this room.
+                    for (const auto& r : hs.rooms) {
+                        if (r.id == hs.current_room_id) {
+                            hs.last_room_name = r.name;
+                            break;
+                        }
+                    }
+                }
                 hs.users.clear();
                 hs.current_room_id.clear();
                 hs.my_id.clear();
@@ -1864,7 +3423,9 @@ void LauncherUI::RenderHubPanel() {
                     selected_game_index_ = idx;
                     if (on_game_selected) on_game_selected(games_[idx]);
                     hs.status_line = "auto-selected installed game: "
-                        + std::filesystem::path(games_[idx].exe_path).stem().string();
+                        + fm2k::utf8path::StemUtf8(
+                            std::filesystem::path(
+                                fm2k::utf8path::Utf8ToWide(games_[idx].exe_path)));
                 } else {
                     hs.status_line = "joined room '" + hs.current_room_id +
                         "' — game not in your library, install it before challenging";
@@ -1873,6 +3434,11 @@ void LauncherUI::RenderHubPanel() {
             }
             case K::RoomLeft:
                 hs.current_room_id.clear();
+                // Explicit leave — clear the auto-rejoin snapshot so a
+                // subsequent hub disconnect doesn't drag us back into
+                // a room we just left.
+                hs.last_room_id.clear();
+                hs.last_room_name.clear();
                 hs.users.clear();
                 break;
             case K::UserJoined:
@@ -1881,9 +3447,79 @@ void LauncherUI::RenderHubPanel() {
             case K::UserLeft:
                 if (ev.room_id == hs.current_room_id) hs.users.erase(ev.user_id);
                 break;
-            case K::UserStatus:
+            case K::UserStatus: {
+                // Fast peer-abort detection: when our match peer's hub
+                // status TRANSITIONS from in_match to idle while we
+                // haven't reported our own match_result yet (i.e. peer
+                // closed window / Alt-F4'd before the match concluded
+                // normally), tear down the local session immediately.
+                // Without this we'd wait for the in-game GekkoNet
+                // timeout (~5s) before the hook publishes DISCONNECT.
+                //
+                // Two guards stop the spam:
+                //   - Compare against the PREVIOUSLY-cached status —
+                //     fire only on the in_match → !in_match edge, not
+                //     on every periodic re-broadcast of "idle".
+                //   - hs.match_result_sent — at normal match end the
+                //     peer also goes idle, but we already sent our own
+                //     outcome, so don't double-handle that as an abort.
+                std::string prev_status;
+                if (auto it = hs.users.find(ev.user.id); it != hs.users.end()) {
+                    prev_status = it->second.status;
+                }
                 hs.users[ev.user.id] = ev.user;
+
+                const bool is_match_peer =
+                    !hs.current_match_peer_id.empty() &&
+                    ev.user.id == hs.current_match_peer_id;
+                const bool transitioned_out =
+                    prev_status == "in_match" &&
+                    ev.user.status != "in_match";
+                const bool peer_aborted =
+                    is_match_peer && transitioned_out &&
+                    !hs.current_match_token.empty() &&
+                    !hs.match_result_sent;
+
+                if (peer_aborted) {
+                    const std::string& peer_nick =
+                        hs.current_match_peer_nick.empty()
+                            ? std::string("Opponent")
+                            : hs.current_match_peer_nick;
+                    char body[160];
+                    std::snprintf(body, sizeof(body),
+                                  T("toast_peer_disconnected_body"),
+                                  peer_nick.c_str());
+                    hs.status_line = "peer left match — closing local game";
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Hub: %s (peer status=%s)",
+                                hs.status_line.c_str(),
+                                ev.user.status.c_str());
+                    if (!hs.disconnect_toast_fired) {
+                        hs.disconnect_toast_fired = true;
+                        FireSystemNotification(
+                            T("toast_peer_disconnected_title"), body);
+                    }
+                    // No MatchResult here. This branch fires when the
+                    // peer's hub status flipped off in_match WITHOUT us
+                    // having sent our own match_result yet — meaning
+                    // battle hadn't ended (we'd have already published
+                    // and recorded otherwise). CSS-phase aborts must not
+                    // count toward W/L/D. The hub's in-flight match
+                    // sweeps cleanly via the "ambiguous, drop" branch
+                    // when both peers go silent without reports.
+                    // match_result_sent stays false; the hook's
+                    // CSS_ABORT path (if it fires before this) already
+                    // cleared current_match_token, and we clear again
+                    // here so re-broadcasts don't re-trigger.
+                    if (on_session_stop) on_session_stop();
+                    // Clear so a re-broadcast of the same idle status
+                    // can't re-trigger this branch.
+                    hs.current_match_token.clear();
+                    hs.current_match_peer_id.clear();
+                    hs.current_match_peer_nick.clear();
+                }
                 break;
+            }
             case K::UserRtt:
                 if (auto it = hs.users.find(ev.user_id); it != hs.users.end()) {
                     it->second.rtt_ms = ev.rtt_ms;
@@ -1892,6 +3528,7 @@ void LauncherUI::RenderHubPanel() {
             case K::ChallengeReceived:
                 hs.pending_challenge_from_id   = ev.challenge.from_id;
                 hs.pending_challenge_from_nick = ev.challenge.from_nick;
+                hs.pending_challenge_settings  = ev.challenge.settings;
                 hs.show_challenge_modal = true;
                 FireChallengeNotification(ev.challenge.from_nick);
                 break;
@@ -1923,10 +3560,60 @@ void LauncherUI::RenderHubPanel() {
                 hs.outgoing_challenge_to_nick.clear();
                 break;
             case K::MatchStart: {
-                // Match is on — drop the waiting modal.
+                // Match is on — drop both modals (incoming and outgoing)
+                // and clear any pending challenge state on both sides.
+                // Without clearing the incoming modal here, the
+                // accepter sees their challenge dialog persist after
+                // accept (it's normally dismissed by the click handler,
+                // but kb-shortcut accepts or hub-side timeouts can
+                // leave it visible).
                 hs.show_outgoing_challenge_modal = false;
                 hs.outgoing_challenge_to_id.clear();
                 hs.outgoing_challenge_to_nick.clear();
+                hs.show_challenge_modal = false;
+                hs.pending_challenge_from_id.clear();
+                hs.pending_challenge_from_nick.clear();
+                // Cancel any pending taskbar flash from a prior
+                // FireChallengeNotification / FireSystemNotification
+                // call. FLASHW_TIMERNOFG only auto-stops when the
+                // window comes to the foreground; if the user accepted
+                // via the modal without focusing the launcher first
+                // (e.g. clicked through Discord's notification toast),
+                // the flash keeps blinking forever. FLASHW_STOP forces
+                // it off explicitly. No-op if nothing was flashing.
+                if (window_) {
+                    HWND hwnd = (HWND)SDL_GetPointerProperty(
+                        SDL_GetWindowProperties(window_),
+                        SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+                    if (hwnd) {
+                        FLASHWINFO fi = { sizeof(fi), hwnd,
+                                          FLASHW_STOP, 0, 0 };
+                        FlashWindowEx(&fi);
+                    }
+                }
+                // Remember the match token so the shared-mem outcome
+                // poll can correlate the hook's report with the hub's
+                // match record. Cleared after we send match_result.
+                hs.current_match_token    = ev.match.token;
+                hs.current_match_role     = ev.match.role;
+                hs.current_match_peer_id  = ev.match.peer.id;
+                hs.current_match_peer_nick= ev.match.peer.nick;
+                hs.current_match_game_id  = hs.current_room_id;
+                hs.current_match_settings = ev.match.settings;
+                hs.match_result_sent      = false;
+                hs.disconnect_toast_fired = false;
+                hs.last_outcome_seq.clear();
+                // Reset chars_seq tracking — fresh game spawn means a
+                // fresh shared-mem mapping with seq=0; first
+                // Netplay_StartBattleSession will bump to 1 and fire
+                // match_progress against this token.
+                hs.last_chars_seq.clear();
+                // Push the freshly-set peer nick + cached vs record into
+                // the spawned game's shared mem. The hook reads from
+                // there to fill the in-game titlebar; without this, the
+                // first time the game window renders post-MatchStart it
+                // would show "vs <empty>" until the next K::RecordReceived.
+                PushStatsToHook();
                 hs.status_line = "match_start: " + ev.match.role +
                     " peer=" + ev.match.peer.nick +
                     " udp=" + ev.match.peer_udp_ip + ":" +
@@ -2027,6 +3714,24 @@ void LauncherUI::RenderHubPanel() {
                     ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   hub_udp.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
+
+                    // Per-player local SOCD mode. The hook reads
+                    // FM2K_SOCD_MODE on first GetSOCDMode() call;
+                    // we pick the local slot's value (host == P1,
+                    // guest == P2) since this game process is the
+                    // local user. Each peer keeps its own mode so
+                    // they don't desync across modes.
+                    if (!socd_state_loaded_) {
+                        socd_state_loaded_ = true;
+                        LoadSocdState();
+                    }
+                    {
+                        const int local_slot = (ev.match.role == "host") ? 0 : 1;
+                        char socd_buf[8];
+                        std::snprintf(socd_buf, sizeof(socd_buf), "%d",
+                                      socd_mode_[local_slot]);
+                        ::SetEnvironmentVariableA("FM2K_SOCD_MODE", socd_buf);
+                    }
                     if (!ev.match.relay_ip.empty() && ev.match.relay_port > 0) {
                         std::string relay_addr = ev.match.relay_ip + ":" +
                                                  std::to_string(ev.match.relay_port);
@@ -2041,13 +3746,56 @@ void LauncherUI::RenderHubPanel() {
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");
-                    // Use the peer addr the preflight actually
-                    // succeeded on (may have been swapped to
-                    // 127.0.0.1 above). The spawned game's
-                    // ControlChannel needs the same path the
-                    // pinhole opened on.
                     cfg.remote_address =
                         peer_ip + ":" + std::to_string(peer_port);
+
+                    // Plumb the hub-authoritative match_settings into
+                    // env vars so the launcher's StartOnlineSession
+                    // path applies them to game.ini before spawn (#54)
+                    // and the hook reads random-stage params from env
+                    // (#56). Both peers see identical values from the
+                    // hub, so they spawn with identical configs and
+                    // run the same xorshift sequence on rematches.
+                    const auto& s = ev.match.settings;
+                    auto set_env = [](const char* k, int v) {
+                        if (v == -1) { ::SetEnvironmentVariableA(k, nullptr); return; }
+                        char buf[32]; std::snprintf(buf, sizeof(buf), "%d", v);
+                        ::SetEnvironmentVariableA(k, buf);
+                    };
+                    set_env("FM2K_GP_PLAYER0_CPU",      s.player0_cpu);
+                    set_env("FM2K_GP_PLAYER1_CPU",      s.player1_cpu);
+                    set_env("FM2K_GP_GAME_SPEED",       s.game_speed);
+                    set_env("FM2K_GP_HIT_JUDGE",        s.hit_judge);
+                    set_env("FM2K_GP_GAME_INFO",        s.game_information);
+                    set_env("FM2K_GP_STAGE_NB",         s.stage_nb);
+                    set_env("FM2K_GP_JOYSTICK",         s.joystick);
+                    set_env("FM2K_GP_TIME",             s.time);
+                    set_env("FM2K_GP_VS_MODE",          s.vs_mode);
+                    set_env("FM2K_GP_VS_SINGLE_PLAY",   s.vs_single_play);
+                    set_env("FM2K_GP_VS_TEAM_PLAY",     s.vs_team_play);
+                    if (s.random_seed != 0) {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "%u",
+                                      (unsigned)s.random_seed);
+                        ::SetEnvironmentVariableA("FM2K_STAGE_RANDOM_SEED", buf);
+                        set_env("FM2K_STAGE_RANDOM_MIN", s.random_stage_min);
+                        set_env("FM2K_STAGE_RANDOM_MAX", s.random_stage_max);
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Random-stage: ENABLED seed=%u range=%d..%d "
+                            "(env vars set on launcher process; child game "
+                            "inherits these on CreateProcess)",
+                            (unsigned)s.random_seed,
+                            s.random_stage_min, s.random_stage_max);
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_STAGE_RANDOM_SEED", nullptr);
+                        ::SetEnvironmentVariableA("FM2K_STAGE_RANDOM_MIN",  nullptr);
+                        ::SetEnvironmentVariableA("FM2K_STAGE_RANDOM_MAX",  nullptr);
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Random-stage: DISABLED (host's match_settings "
+                            "carried random_seed=0 — host hasn't enabled the "
+                            "Random Stage toggle, or the wire dropped it)");
+                    }
+
                     on_online_session_start(cfg);
                 } else {
                     const char* reason =
@@ -2061,9 +3809,75 @@ void LauncherUI::RenderHubPanel() {
                 }
                 break;
             }
-            case K::PeerDisconnected:
-                hs.status_line = "peer disconnected";
+            case K::MatchRotated: {
+                // Hub minted a fresh in-flight token after the previous
+                // match committed. FM2K rematches stay inside the same
+                // hub_session (peers loop CSS → battle → CSS without
+                // respawning the game), so the next outcome publish
+                // would otherwise be sent under the OLD (already-
+                // committed) token and silently dropped by the hub.
+                // Update token + reset match_result_sent. No game spawn —
+                // we're just relabeling the in-flight match.
+                //
+                // Critically: do NOT clear last_outcome_seq. The hook's
+                // match_outcome_seq monotonically increments across all
+                // matches in the same process. Clearing the launcher's
+                // last_seen would re-trigger PollMatchOutcome on the
+                // already-processed seq, sending the previous match's
+                // outcome under the rotated token → infinite commit/
+                // rotate loop. The hook bumps seq on the NEXT match's
+                // outcome publish, which correctly compares > the
+                // preserved last_seen.
+                hs.current_match_token = ev.match.token;
+                hs.match_result_sent   = false;
+                hs.disconnect_toast_fired = false;
+                // Don't touch last_chars_seq — the same hook (same
+                // PID) keeps incrementing the seq across rotates.
+                // The next Netplay_StartBattleSession will bump it,
+                // PollMatchOutcome will see seq advance, and fire
+                // match_progress under the new token. Clearing
+                // here would re-fire the prev battle's chars under
+                // the new token.
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: match rotated, new token=%.8s...",
+                            hs.current_match_token.c_str());
                 break;
+            }
+            case K::PeerDisconnected: {
+                // Hub-side: peer's WebSocket dropped. The hook on the
+                // surviving instance will *usually* notice via GekkoNet
+                // peer-timeout and publish a DISCONNECT outcome, but we
+                // can't always count on that (e.g. peer was idle in CSS
+                // and the GekkoNet session is between matches). Stop
+                // the local session here too so the survivor doesn't
+                // hang on the menu screen waiting for someone who's
+                // gone. Idempotent — second StopSession is a no-op.
+                const std::string& peer_nick =
+                    hs.current_match_peer_nick.empty()
+                        ? std::string("Opponent")
+                        : hs.current_match_peer_nick;
+                char body[160];
+                std::snprintf(body, sizeof(body),
+                              T("toast_peer_disconnected_body"),
+                              peer_nick.c_str());
+                hs.status_line = "peer disconnected — closing match";
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: %s", hs.status_line.c_str());
+                if (!hs.disconnect_toast_fired) {
+                    hs.disconnect_toast_fired = true;
+                    FireSystemNotification(T("toast_peer_disconnected_title"), body);
+                }
+                if (on_session_stop) on_session_stop();
+                // Best-effort match_result so the hub closes its
+                // in-flight record. If we never had a current_match_token
+                // (e.g. peer dropped before MatchStart fired), this is
+                // a no-op on the hub side — match_id won't correlate.
+                if (!hs.current_match_token.empty() && !hs.match_result_sent) {
+                    hs.client.MatchResult(hs.current_match_token, "disconnect");
+                    hs.match_result_sent = true;
+                }
+                break;
+            }
             case K::SpectateGranted: {
                 hs.status_line = "spectate: " + ev.spectate.target_nick +
                                  " vs " + ev.spectate.opponent_nick +
@@ -2079,6 +3893,77 @@ void LauncherUI::RenderHubPanel() {
                 hs.status_line = "spectate denied: " + ev.error;
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
                 break;
+            case K::RecordReceived: {
+                // Only the unfiltered global-record reply (no opponent_id /
+                // game_id filter) carries the per-opponent breakdown that
+                // populates the lobby column. Filtered queries from other
+                // call sites (per-game tab, per-opponent tooltip) overwrite
+                // their own narrower views and shouldn't clobber the
+                // overall numbers.
+                if (ev.record.user_id == hs.my_id &&
+                    ev.record.opponent_id.empty() &&
+                    ev.record.game_id.empty())
+                {
+                    hs.my_wins   = ev.record.wins;
+                    hs.my_losses = ev.record.losses;
+                    hs.my_draws  = ev.record.draws;
+                    hs.my_vs.clear();
+                    for (auto& row : ev.record.vs_breakdown) {
+                        if (row.opponent_id.empty()) continue;
+                        hs.my_vs[row.opponent_id] = {row.wins, row.losses, row.draws};
+                    }
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: record W-L-D = %d-%d-%d (vs %u opponents)",
+                        hs.my_wins, hs.my_losses, hs.my_draws,
+                        (unsigned)hs.my_vs.size());
+                    UpdateWindowTitleWithRecord();
+                    // Push to the in-game shared mem so the game window
+                    // titlebar (and later the overlay) can render the
+                    // updated W/L/D without an alt-tab to the launcher.
+                    PushStatsToHook();
+                }
+                break;
+            }
+            case K::RecentMatchesReceived:
+                hs.recent_matches        = ev.recent_matches;
+                hs.recent_matches_loaded = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: cached %u recent matches",
+                            (unsigned)hs.recent_matches.size());
+                break;
+            case K::CurrentMatchesReceived:
+                hs.current_matches        = ev.current_matches;
+                hs.current_matches_loaded = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: cached %u in-progress matches",
+                            (unsigned)hs.current_matches.size());
+                break;
+            case K::MatchInProgressStarted:
+            case K::MatchInProgressUpdated: {
+                // Replace existing token entry or append. Keeps the list
+                // in last-write-wins state without rebuilding from a
+                // fresh snapshot for every update.
+                const auto& upd = ev.current_match_update;
+                bool replaced = false;
+                for (auto& m : hs.current_matches) {
+                    if (m.token == upd.token) {
+                        m = upd;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) hs.current_matches.push_back(upd);
+                break;
+            }
+            case K::MatchInProgressEnded: {
+                const std::string& tok = ev.current_match_token;
+                hs.current_matches.erase(
+                    std::remove_if(hs.current_matches.begin(),
+                                   hs.current_matches.end(),
+                                   [&](const auto& m) { return m.token == tok; }),
+                    hs.current_matches.end());
+                break;
+            }
             case K::Error:
                 hs.status_line = "error: " + ev.error;
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -2365,8 +4250,8 @@ void LauncherUI::RenderHubPanel() {
         // Use exe path stem as the room/game id so two clients with the
         // same exe land in the same room. Master list will replace this
         // with a stable canonical id.
-        std::filesystem::path exe(g.exe_path);
-        std::string game_id = exe.stem().string();
+        std::filesystem::path exe(fm2k::utf8path::Utf8ToWide(g.exe_path));
+        std::string game_id = fm2k::utf8path::StemUtf8(exe);
         std::string label = "Join room for: " + game_id;
         if (ImGui::Button(label.c_str(), ImVec2(-1, 0))) {
             hs.client.JoinRoom(game_id, game_id);
@@ -2428,6 +4313,9 @@ void LauncherUI::RenderHubPanel() {
         }
     }
 
+    // ---- Live in-progress matches across the hub ----
+    RenderInProgressMatchesBody();
+
     // ---- Users in current room ----
     // Build a localized "Players in <room>" header with snprintf so the
     // translation string can position the room name wherever the language
@@ -2446,11 +4334,14 @@ void LauncherUI::RenderHubPanel() {
     } else if (hs.users.empty()) {
         ImGui::TextDisabled("%s", T("hub_room_empty"));
     } else {
-        if (ImGui::BeginTable("##users", 4,
+        if (ImGui::BeginTable("##users", 5,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
             ImGui::TableSetupColumn(T("col_nick"));
             ImGui::TableSetupColumn(T("col_status"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableSetupColumn(T("col_ping"),   ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            // "vs" column — my W-L-D against this opponent, "—" if we've
+            // never played them. Self-row leaves it blank.
+            ImGui::TableSetupColumn(T("col_vs"),     ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupColumn("",              ImGuiTableColumnFlags_WidthFixed, 100.0f);
             ImGui::TableHeadersRow();
 
@@ -2497,6 +4388,25 @@ void LauncherUI::RenderHubPanel() {
                 ImGui::Text("%dms", u.rtt_ms);
 
                 ImGui::TableSetColumnIndex(3);
+                if (is_self) {
+                    // Self row: show overall global W/L/D in this column
+                    // instead of an "vs me" cell that doesn't make sense.
+                    if (hs.my_wins >= 0) {
+                        ImGui::Text("%d-%d-%d", hs.my_wins, hs.my_losses, hs.my_draws);
+                    } else {
+                        ImGui::TextDisabled("—");
+                    }
+                } else {
+                    auto it = hs.my_vs.find(uid);
+                    if (it != hs.my_vs.end()) {
+                        ImGui::Text("%d-%d-%d",
+                                    it->second.wins, it->second.losses, it->second.draws);
+                    } else {
+                        ImGui::TextDisabled("—");
+                    }
+                }
+
+                ImGui::TableSetColumnIndex(4);
                 ImGui::PushID(uid.c_str());
                 // Self-row shows nothing in the action column — challenging
                 // yourself isn't a thing. Other rows get the Challenge button
@@ -2505,10 +4415,66 @@ void LauncherUI::RenderHubPanel() {
                     bool can_challenge = (u.status == "idle");
                     if (!can_challenge) ImGui::BeginDisabled();
                     if (ImGui::SmallButton(T("btn_challenge"))) {
-                        hs.client.Challenge(uid);
-                        // Populate outbound state so the next frame
-                        // renders the "Waiting for X..." modal. Cleared
-                        // by the hub-event handler on any outcome.
+                        // Build the host's resolved [GamePlay] config
+                        // for THIS challenge so the target sees the
+                        // round count / time / stage / etc. in their
+                        // accept modal (#54). Anti-cheat clamps land
+                        // launcher-side before the wire encode so the
+                        // target can't see un-clamped values.
+                        fm2k::MatchSettings ms;
+                        if (selected_game_index_ >= 0 &&
+                            selected_game_index_ < (int)games_.size())
+                        {
+                            const auto& g = games_[selected_game_index_];
+                            fm2k::game_ini::GamePlayConfig cfg;
+                            fm2k::game_ini::LoadResolved(g.exe_path, cfg);
+                            fm2k::game_ini::ForceOnlineClamps(cfg);
+                            ms.player0_cpu      = cfg.player0_cpu;
+                            ms.player1_cpu      = cfg.player1_cpu;
+                            ms.game_speed       = cfg.game_speed;
+                            ms.hit_judge        = cfg.hit_judge;
+                            ms.game_information = cfg.game_information;
+                            ms.stage_nb         = cfg.stage_nb;
+                            ms.joystick         = cfg.joystick;
+                            ms.time             = cfg.time;
+                            ms.exit_flag        = cfg.exit_flag;
+                            ms.vs_mode          = cfg.vs_mode;
+                            ms.vs_single_play   = cfg.vs_single_play;
+                            ms.vs_team_play     = cfg.vs_team_play;
+                        }
+                        // Random-stage extension (#56). When enabled,
+                        // generate a fresh xorshift seed per challenge
+                        // and ship it to the peer. Both peers re-seed
+                        // their hook PRNG from this same value, then
+                        // run identical sequences on rematches with
+                        // zero per-rematch wire traffic. Seed != 0
+                        // is the wire signal "random is on" — keep
+                        // a tiny rejection loop so we never accidentally
+                        // hand a 0 seed.
+                        if (!random_state_loaded_) {
+                            random_state_loaded_ = true;
+                            LoadRandomStageState();
+                        }
+                        if (random_stage_enable_ &&
+                            random_stage_max_ >= random_stage_min_)
+                        {
+                            uint32_t seed = 0;
+                            while (seed == 0) {
+                                // 32-bit mix of two rand() bursts; not
+                                // cryptographic but plenty random for
+                                // a uniform stage roll.
+                                seed = (uint32_t)((std::rand() & 0xFFFF) |
+                                                  ((std::rand() & 0xFFFF) << 16));
+                            }
+                            ms.random_seed      = seed;
+                            ms.random_stage_min = random_stage_min_;
+                            ms.random_stage_max = random_stage_max_;
+                            // Override any explicit stage_nb so the
+                            // client doesn't apply both. Random takes
+                            // precedence when on.
+                            ms.stage_nb = -1;
+                        }
+                        hs.client.Challenge(uid, ms);
                         hs.outgoing_challenge_to_id   = uid;
                         hs.outgoing_challenge_to_nick = u.nick;
                         hs.show_outgoing_challenge_modal = true;
@@ -2532,6 +4498,42 @@ void LauncherUI::RenderHubPanel() {
     if (ImGui::BeginPopupModal("##incoming_challenge", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text(T("modal_incoming_challenge_body"), hs.pending_challenge_from_nick.c_str());
         ImGui::Spacing();
+
+        // Match settings preview (#54). Only render if the challenger
+        // actually sent any — older clients leave the whole struct at
+        // -1 and we want to keep the modal compact in that case.
+        const auto& s = hs.pending_challenge_settings;
+        const bool any_set =
+            s.player0_cpu != -1 || s.player1_cpu != -1 ||
+            s.game_speed  != -1 || s.hit_judge   != -1 ||
+            s.game_information != -1 || s.stage_nb != -1 ||
+            s.joystick != -1 || s.time != -1 ||
+            s.exit_flag != -1 || s.vs_mode != -1 ||
+            s.vs_single_play != -1 || s.vs_team_play != -1;
+        if (any_set) {
+            ImGui::SeparatorText(T("label_match_settings"));
+            if (ImGui::BeginTable("##match_settings_preview", 2,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                auto row = [](const char* label, int v) {
+                    if (v == -1) return;
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(label);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%d", v);
+                };
+                row("Round count (1v1)",   s.vs_single_play);
+                row("Round count (team)",  s.vs_team_play);
+                row("Round timer (s)",     s.time);
+                row("Game speed",          s.game_speed);
+                row("Stage",               s.stage_nb);
+                row("Joystick",            s.joystick);
+                row("VS mode",             s.vs_mode);
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+        }
+
         if (ImGui::Button(T("btn_accept"), ImVec2(120, 0))) {
             hs.client.AcceptChallenge(hs.pending_challenge_from_id);
             hs.pending_challenge_from_id.clear();
@@ -2586,6 +4588,446 @@ void LauncherUI::RenderHubPanel() {
         }
         ImGui::EndPopup();
     }
+
+    // ---- Recent matches (collapsing) ----
+    // Lives at the bottom of the Hub panel — it's session data, not a
+    // configuration setting, so it doesn't belong in the Settings tabs.
+    // Collapsed by default; users who care about history click to
+    // expand. The body renderer is shared with the legacy floating
+    // window so any styling fixes apply to both.
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(T("menu_recent_matches"))) {
+        RenderRecentMatchesBody();
+    }
+}
+
+void LauncherUI::LoadDDrawCfgIfNeeded() {
+    if (ddraw_cfg_loaded_) return;
+    fm2k::cnc_ddraw::LoadIni(ddraw_cfg_);
+    ddraw_cfg_loaded_ = true;
+}
+
+// Settings → Display. Mirrors every documented cnc-ddraw [ddraw] key
+// from <install_dir>\ddraw.ini. Edits write per-key on change so each
+// flick of a checkbox lands on disk immediately — no Apply button.
+// Changes take effect on the NEXT game launch (cnc-ddraw reads its ini
+// at DLL_PROCESS_ATTACH); the header label calls that out.
+//
+// Sectioning mirrors cnc-ddraw config.exe's tabs for familiarity:
+// Window mode → Renderer → Performance → Hotkeys → Compatibility →
+// Undocumented (collapsing).
+void LauncherUI::RenderDisplayBody() {
+    LoadDDrawCfgIfNeeded();
+
+    namespace cd = fm2k::cnc_ddraw;
+    auto& c = ddraw_cfg_;
+
+    ImGui::TextWrapped(
+        "cnc-ddraw renderer settings. Changes apply on the NEXT game launch.");
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+        "Editing %s", cd::IniPath().c_str());
+    ImGui::Spacing();
+    if (ImGui::Button("Reset to launcher defaults")) {
+        if (cd::ResetIniToDefault()) {
+            ddraw_cfg_ = cd::IniConfig{};   // back to header defaults
+            cd::LoadIni(ddraw_cfg_);        // pull in baked-ini values
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.85f, 0.7f, 0.4f, 1.0f),
+        "Wipes any per-game [<exe>] blocks");
+    ImGui::Separator();
+
+    // ── Window mode ──────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Window mode", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Render mode is the (windowed, fullscreen) tuple. cnc-ddraw
+        // semantics: windowed=true & fullscreen=false → real windowed,
+        // both true → borderless windowed-fullscreen, fullscreen=true
+        // & windowed=false → fullscreen-upscaled. Surface as a 3-way
+        // combo + an "advanced" raw checkbox pair.
+        const char* mode_items[] = {
+            "Windowed",
+            "Borderless (windowed-fullscreen)",
+            "Fullscreen upscaled"
+        };
+        int mode_idx = 0;
+        if      ( c.windowed &&  c.fullscreen) mode_idx = 1;
+        else if (!c.windowed &&  c.fullscreen) mode_idx = 2;
+        else                                    mode_idx = 0;
+        if (ImGui::Combo("Mode", &mode_idx, mode_items, IM_ARRAYSIZE(mode_items))) {
+            switch (mode_idx) {
+                case 0: c.windowed = true;  c.fullscreen = false; break;
+                case 1: c.windowed = true;  c.fullscreen = true;  break;
+                case 2: c.windowed = false; c.fullscreen = true;  break;
+            }
+            cd::SaveBool("windowed",   c.windowed);
+            cd::SaveBool("fullscreen", c.fullscreen);
+        }
+
+        if (ImGui::DragInt("Width  (0 = use game's)",  &c.width,  1, 0, 7680)) {
+            cd::SaveInt("width",  c.width);
+        }
+        if (ImGui::DragInt("Height (0 = use game's)",  &c.height, 1, 0, 4320)) {
+            cd::SaveInt("height", c.height);
+        }
+
+        char ar_buf[32] = {};
+        std::snprintf(ar_buf, sizeof(ar_buf), "%s", c.aspect_ratio.c_str());
+        if (ImGui::InputText("Aspect ratio (e.g. 4:3, 16:9, blank=auto)",
+                             ar_buf, sizeof(ar_buf))) {
+            c.aspect_ratio = ar_buf;
+            cd::SaveString("aspect_ratio", c.aspect_ratio);
+        }
+
+        if (ImGui::Checkbox("Maintain aspect ratio", &c.maintas)) {
+            cd::SaveBool("maintas", c.maintas);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Integer scaling (boxing)", &c.boxing)) {
+            cd::SaveBool("boxing", c.boxing);
+        }
+
+        if (ImGui::Checkbox("Window border (windowed mode)", &c.border)) {
+            cd::SaveBool("border", c.border);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("User resizable", &c.resizable)) {
+            cd::SaveBool("resizable", c.resizable);
+        }
+
+        const char* center_items[] = {
+            "Never center", "Automatic", "Always center"
+        };
+        if (ImGui::Combo("Center on resolution change", &c.center_window,
+                         center_items, IM_ARRAYSIZE(center_items))) {
+            cd::SaveInt("center_window", c.center_window);
+        }
+        if (ImGui::DragInt("Window posX (-32000 = center)", &c.posX, 1, -32000, 32000)) {
+            cd::SaveInt("posX", c.posX);
+        }
+        if (ImGui::DragInt("Window posY (-32000 = center)", &c.posY, 1, -32000, 32000)) {
+            cd::SaveInt("posY", c.posY);
+        }
+        const char* save_items[] = {
+            "Don't save", "Save to [ddraw]", "Save per-game [<exe>]"
+        };
+        if (ImGui::Combo("Save window position/size on exit", &c.savesettings,
+                         save_items, IM_ARRAYSIZE(save_items))) {
+            cd::SaveInt("savesettings", c.savesettings);
+        }
+    }
+
+    // ── Renderer ─────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Renderer", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Renderer is locked to direct3d9: our in-game ImGui overlay
+        // hooks `IDirect3DDevice9::EndScene` (FM2KHook/src/ui/imgui_overlay.cpp)
+        // and would never attach if cnc-ddraw routed through OpenGL or
+        // GDI. Force-write on every render of this tab so a stale
+        // pre-existing ini gets corrected the moment the user opens it.
+        if (c.renderer != "direct3d9") {
+            c.renderer = "direct3d9";
+            cd::SaveString("renderer", c.renderer);
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(ImVec4(0.6f, 0.85f, 0.6f, 1.0f),
+            "Renderer: direct3d9  (locked)");
+        ImGui::TextWrapped(
+            "Locked so the launcher's in-game ImGui overlay can attach via "
+            "IDirect3DDevice9::EndScene. Edit ddraw.ini directly if you "
+            "really need a different backend (opengl / gdi / direct3d9on12).");
+
+        const char* d3d9_items[] = {
+            "Nearest neighbor", "Bilinear", "Bicubic (16/32-bit only)",
+            "Lanczos (16/32-bit only)"
+        };
+        if (ImGui::Combo("Direct3D9 upscale filter", &c.d3d9_filter,
+                         d3d9_items, IM_ARRAYSIZE(d3d9_items))) {
+            cd::SaveInt("d3d9_filter", c.d3d9_filter);
+        }
+
+        char shader_buf[512] = {};
+        std::snprintf(shader_buf, sizeof(shader_buf), "%s", c.shader.c_str());
+        if (ImGui::InputText("Shader (path or name)", shader_buf, sizeof(shader_buf))) {
+            c.shader = shader_buf;
+            cd::SaveString("shader", c.shader);
+        }
+
+        if (ImGui::Checkbox("VSync", &c.vsync)) {
+            cd::SaveBool("vsync", c.vsync);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Disable fullscreen-exclusive mode", &c.nonexclusive)) {
+            cd::SaveBool("nonexclusive", c.nonexclusive);
+        }
+
+        char inj_buf[64] = {};
+        std::snprintf(inj_buf, sizeof(inj_buf), "%s", c.inject_resolution.c_str());
+        if (ImGui::InputText("Inject resolution (e.g. 960x540)",
+                             inj_buf, sizeof(inj_buf))) {
+            c.inject_resolution = inj_buf;
+            cd::SaveString("inject_resolution", c.inject_resolution);
+        }
+
+        if (ImGui::Checkbox("vhack (high-res patches: C&C, RA1, Worms 2, KKND Xtreme)",
+                            &c.vhack)) {
+            cd::SaveBool("vhack", c.vhack);
+        }
+    }
+
+    // ── Performance ──────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Performance / framerate")) {
+        if (ImGui::DragInt("maxfps (-1=screen, 0=unlimited, n=cap)",
+                           &c.maxfps, 1, -1, 1000)) {
+            cd::SaveInt("maxfps", c.maxfps);
+        }
+        if (ImGui::DragInt("maxgameticks (-1=disabled, -2=refresh rate, 0=60Hz vblank)",
+                           &c.maxgameticks, 1, -2, 1000)) {
+            cd::SaveInt("maxgameticks", c.maxgameticks);
+        }
+        if (ImGui::DragInt("minfps (0=disabled, -1=use maxfps, -2=force redraw)",
+                           &c.minfps, 1, -2, 1000)) {
+            cd::SaveInt("minfps", c.minfps);
+        }
+        const char* limiter_items[] = {
+            "Automatic", "TestCooperativeLevel", "BltFast", "Unlock", "PeekMessage"
+        };
+        if (ImGui::Combo("Limiter type", &c.limiter_type,
+                         limiter_items, IM_ARRAYSIZE(limiter_items))) {
+            cd::SaveInt("limiter_type", c.limiter_type);
+        }
+    }
+
+    // ── Input ────────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Input")) {
+        if (ImGui::Checkbox("Auto mouse-sensitivity scaling (adjmouse)", &c.adjmouse)) {
+            cd::SaveBool("adjmouse", c.adjmouse);
+        }
+        if (ImGui::Checkbox("Devmode (don't lock cursor)", &c.devmode)) {
+            cd::SaveBool("devmode", c.devmode);
+        }
+        if (ImGui::Checkbox("hook_peekmessage (cursor-lock fix on upscaling)",
+                            &c.hook_peekmessage)) {
+            cd::SaveBool("hook_peekmessage", c.hook_peekmessage);
+        }
+    }
+
+    // ── Hotkeys ──────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Hotkeys")) {
+        // Press-to-bind UI mirrors the input-binder pattern: click
+        // "Bind", wait for the user to release any keys still held from
+        // the click, then capture the next VK that goes down. Esc =
+        // cancel, Backspace = clear binding to 0 (disabled).
+        //
+        // We poll GetAsyncKeyState across VK 0x07..0xFE (skip mouse
+        // buttons 0x01..0x06 so the click isn't read back). Each
+        // capture stores the resolved VK back into the IniConfig field
+        // and writes through fm2k::cnc_ddraw::SaveHex so the ini
+        // matches the format the cnc-ddraw stock ini ships in (0xNN).
+        static const char* s_capture_key   = nullptr;  // ini key being captured
+        static int*        s_capture_field = nullptr;  // pointer into ddraw_cfg_
+        static bool        s_capture_armed = false;    // released since click?
+
+        auto vk_label = [](int vk) -> std::string {
+            if (vk == 0) return "(disabled)";
+            UINT scan = MapVirtualKeyA((UINT)vk, MAPVK_VK_TO_VSC);
+            char buf[64] = {};
+            if (scan && GetKeyNameTextA((LONG)(scan << 16), buf, sizeof(buf)) > 0) {
+                char out[96];
+                std::snprintf(out, sizeof(out), "%s  (0x%02X)", buf, vk);
+                return out;
+            }
+            char out[32];
+            std::snprintf(out, sizeof(out), "VK 0x%02X", vk);
+            return out;
+        };
+
+        auto any_key_held = []() {
+            for (int vk = 0x01; vk <= 0xFE; ++vk) {
+                if ((GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+            }
+            return false;
+        };
+
+        // Drive the capture state machine — runs once per frame regardless
+        // of which row's Bind button started it. Fires before we render
+        // the rows so a successful capture is reflected this frame.
+        if (s_capture_key && s_capture_field) {
+            if (!s_capture_armed) {
+                if (!any_key_held()) s_capture_armed = true;
+            } else {
+                // Esc cancels without writing.
+                if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) {
+                    s_capture_key = nullptr;
+                    s_capture_field = nullptr;
+                    s_capture_armed = false;
+                } else if ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0) {
+                    // Backspace clears the binding.
+                    *s_capture_field = 0;
+                    cd::SaveHex(s_capture_key, 0);
+                    s_capture_key = nullptr;
+                    s_capture_field = nullptr;
+                    s_capture_armed = false;
+                } else {
+                    // Skip mouse buttons 0x01..0x06 (the click that
+                    // started capture would re-trigger). All other VKs
+                    // are fair game.
+                    for (int vk = 0x07; vk <= 0xFE; ++vk) {
+                        if ((GetAsyncKeyState(vk) & 0x8000) != 0) {
+                            *s_capture_field = vk;
+                            cd::SaveHex(s_capture_key, vk);
+                            s_capture_key = nullptr;
+                            s_capture_field = nullptr;
+                            s_capture_armed = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            "Click Bind, then press the key. Esc = cancel, Backspace = clear.");
+
+        auto hk_row = [&](const char* label, const char* ini_key, int* field) {
+            ImGui::PushID(ini_key);
+            const bool waiting = (s_capture_key == ini_key);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%s", label);
+            ImGui::SameLine(280.0f);
+            if (waiting) {
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                    "%s",
+                    s_capture_armed ? "Press a key..."
+                                    : "Release any held keys...");
+            } else {
+                ImGui::TextUnformatted(vk_label(*field).c_str());
+            }
+            ImGui::SameLine(460.0f);
+            if (waiting) {
+                if (ImGui::Button("Cancel", ImVec2(80, 0))) {
+                    s_capture_key = nullptr;
+                    s_capture_field = nullptr;
+                    s_capture_armed = false;
+                }
+            } else {
+                if (ImGui::Button("Bind", ImVec2(80, 0))) {
+                    s_capture_key = ini_key;
+                    s_capture_field = field;
+                    s_capture_armed = false;  // wait for release
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear", ImVec2(60, 0))) {
+                *field = 0;
+                cd::SaveHex(ini_key, 0);
+                if (waiting) {
+                    s_capture_key = nullptr;
+                    s_capture_field = nullptr;
+                    s_capture_armed = false;
+                }
+            }
+            ImGui::PopID();
+        };
+
+        hk_row("Toggle fullscreen (Alt+...)",  "keytogglefullscreen",  &c.keytogglefullscreen);
+        hk_row("Toggle fullscreen 2 (single)", "keytogglefullscreen2", &c.keytogglefullscreen2);
+        hk_row("Maximize window (Alt+...)",    "keytogglemaximize",    &c.keytogglemaximize);
+        hk_row("Maximize window 2 (single)",   "keytogglemaximize2",   &c.keytogglemaximize2);
+        hk_row("Unlock cursor 1 (Ctrl+...)",   "keyunlockcursor1",     &c.keyunlockcursor1);
+        hk_row("Unlock cursor 2 (RAlt+...)",   "keyunlockcursor2",     &c.keyunlockcursor2);
+        hk_row("Screenshot",                   "keyscreenshot",        &c.keyscreenshot);
+
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Alt+Enter toggles windowed/borderless instead of fullscreen",
+                            &c.toggle_borderless)) {
+            cd::SaveBool("toggle_borderless", c.toggle_borderless);
+        }
+        if (ImGui::Checkbox("Alt+Enter toggles windowed/upscaled instead",
+                            &c.toggle_upscaled)) {
+            cd::SaveBool("toggle_upscaled", c.toggle_upscaled);
+        }
+    }
+
+    // ── Compatibility ────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Compatibility")) {
+        if (ImGui::Checkbox("Hide WM_ACTIVATEAPP/NCACTIVATE on alt-tab (noactivateapp)",
+                            &c.noactivateapp)) {
+            cd::SaveBool("noactivateapp", c.noactivateapp);
+        }
+        if (ImGui::Checkbox("Force CPU0 affinity (singlecpu)", &c.singlecpu)) {
+            cd::SaveBool("singlecpu", c.singlecpu);
+        }
+        const char* res_items[] = {
+            "Small list", "Very small list", "Full list"
+        };
+        if (ImGui::Combo("Available display resolutions", &c.resolutions,
+                         res_items, IM_ARRAYSIZE(res_items))) {
+            cd::SaveInt("resolutions", c.resolutions);
+        }
+        const char* fc_items[] = {
+            "Disabled", "Display top-left", "Display top-left + repaint",
+            "Hide", "Display top-left + hide"
+        };
+        if (ImGui::Combo("fixchilds (child window handling)", &c.fixchilds,
+                         fc_items, IM_ARRAYSIZE(fc_items))) {
+            cd::SaveInt("fixchilds", c.fixchilds);
+        }
+        if (ImGui::DragInt("anti_aliased_fonts_min_size",
+                           &c.anti_aliased_fonts_min_size, 1, 0, 100)) {
+            cd::SaveInt("anti_aliased_fonts_min_size", c.anti_aliased_fonts_min_size);
+        }
+        if (ImGui::DragInt("min_font_size",
+                           &c.min_font_size, 1, 0, 100)) {
+            cd::SaveInt("min_font_size", c.min_font_size);
+        }
+
+        char ssdir_buf[260] = {};
+        std::snprintf(ssdir_buf, sizeof(ssdir_buf), "%s", c.screenshotdir.c_str());
+        if (ImGui::InputText("Screenshot directory", ssdir_buf, sizeof(ssdir_buf))) {
+            c.screenshotdir = ssdir_buf;
+            cd::SaveString("screenshotdir", c.screenshotdir);
+        }
+    }
+
+    // ── Undocumented / advanced ──────────────────────────────────────
+    if (ImGui::CollapsingHeader("Advanced (undocumented — only touch if needed)")) {
+        ImGui::TextColored(ImVec4(0.85f, 0.6f, 0.4f, 1.0f),
+            "Per cnc-ddraw: 'These will probably not solve your problem'.");
+        if (ImGui::Checkbox("fix_alt_key_stuck", &c.fix_alt_key_stuck))
+            cd::SaveBool("fix_alt_key_stuck", c.fix_alt_key_stuck);
+        if (ImGui::Checkbox("game_handles_close", &c.game_handles_close))
+            cd::SaveBool("game_handles_close", c.game_handles_close);
+        if (ImGui::Checkbox("fix_not_responding", &c.fix_not_responding))
+            cd::SaveBool("fix_not_responding", c.fix_not_responding);
+        if (ImGui::Checkbox("no_compat_warning", &c.no_compat_warning))
+            cd::SaveBool("no_compat_warning", c.no_compat_warning);
+        if (ImGui::Checkbox("lock_surfaces", &c.lock_surfaces))
+            cd::SaveBool("lock_surfaces", c.lock_surfaces);
+        if (ImGui::Checkbox("flipclear", &c.flipclear))
+            cd::SaveBool("flipclear", c.flipclear);
+        if (ImGui::Checkbox("rgb555", &c.rgb555))
+            cd::SaveBool("rgb555", c.rgb555);
+        if (ImGui::Checkbox("no_dinput_hook", &c.no_dinput_hook))
+            cd::SaveBool("no_dinput_hook", c.no_dinput_hook);
+        if (ImGui::Checkbox("center_cursor_fix", &c.center_cursor_fix))
+            cd::SaveBool("center_cursor_fix", c.center_cursor_fix);
+        if (ImGui::Checkbox("lock_mouse_top_left", &c.lock_mouse_top_left))
+            cd::SaveBool("lock_mouse_top_left", c.lock_mouse_top_left);
+        if (ImGui::Checkbox("limit_gdi_handles", &c.limit_gdi_handles))
+            cd::SaveBool("limit_gdi_handles", c.limit_gdi_handles);
+        if (ImGui::Checkbox("remove_menu", &c.remove_menu))
+            cd::SaveBool("remove_menu", c.remove_menu);
+
+        if (ImGui::DragInt("guard_lines", &c.guard_lines, 1, 0, 1000))
+            cd::SaveInt("guard_lines", c.guard_lines);
+        if (ImGui::DragInt("max_resolutions", &c.max_resolutions, 1, 0, 100))
+            cd::SaveInt("max_resolutions", c.max_resolutions);
+        if (ImGui::DragInt("hook (mode 1-4; default 4)", &c.hook, 1, 0, 4))
+            cd::SaveInt("hook", c.hook);
+        if (ImGui::DragInt("refresh_rate (0 = monitor default)",
+                           &c.refresh_rate, 1, 0, 360))
+            cd::SaveInt("refresh_rate", c.refresh_rate);
+    }
 }
 
 void LauncherUI::RenderDebugTools() {
@@ -2598,6 +5040,116 @@ void LauncherUI::RenderDebugTools() {
 
         if (ImGui::BeginTabItem("Network")) {
             RenderNetworkTools();
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Renderer")) {
+            // Redirect is on-by-default. Toggle is presented as a
+            // "Disable" knob — when checked, the next launch skips the
+            // IAT patch + PATH prepend and the game loads stock
+            // KnownDlls ddraw.dll. Useful for diagnosing whether a
+            // problem is rendering-related or game-code-related.
+            bool disabled = !FM2K::ddraw_redirect::GetForceRedirect();
+            if (ImGui::Checkbox("Disable cnc-ddraw renderer (debug)", &disabled)) {
+                FM2K::ddraw_redirect::SetForceRedirect(!disabled);
+            }
+            ImGui::TextWrapped(
+                "When unchecked (default): patches DDRAW.dll -> 2DFMD.dll in "
+                "the game's IAT before resume and prepends the cnc-ddraw dir "
+                "onto the child PATH. The cnc-ddraw dir is FM2K_DDRAW_DIR if "
+                "set, otherwise <launcher>\\cnc-ddraw.");
+            std::wstring resolved = FM2K::ddraw_redirect::ResolveCncDdrawDir();
+            std::string resolved_utf8;
+            if (!resolved.empty()) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, resolved.data(),
+                                            (int)resolved.size(),
+                                            nullptr, 0, nullptr, nullptr);
+                if (n > 0) {
+                    resolved_utf8.assign((size_t)n, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, resolved.data(),
+                                        (int)resolved.size(),
+                                        resolved_utf8.data(), n,
+                                        nullptr, nullptr);
+                }
+            }
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                "Resolved cnc-ddraw dir: %s",
+                resolved_utf8.empty() ? "(unresolved)" : resolved_utf8.c_str());
+
+            ImGui::Separator();
+            ImGui::Text("cnc-ddraw install");
+
+            // Phase C: bundled cnc-ddraw downloader/updater. Status
+            // pill mirrors FM2K_Updater's idiom — labels pulled from
+            // a single switch on the snapshot's State.
+            const auto snap = fm2k::cnc_ddraw::Get();
+            const char* state_label = "?";
+            ImVec4 state_color(0.7f, 0.7f, 0.7f, 1.0f);
+            switch (snap.state) {
+                case fm2k::cnc_ddraw::State::Idle:
+                    state_label = "Idle (not checked)"; break;
+                case fm2k::cnc_ddraw::State::Checking:
+                    state_label = "Checking GitHub...";
+                    state_color = ImVec4(0.7f, 0.85f, 1.0f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::NotInstalled:
+                    state_label = "Not installed";
+                    state_color = ImVec4(1.0f, 0.7f, 0.4f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::UpToDate:
+                    state_label = "Up to date";
+                    state_color = ImVec4(0.5f, 0.9f, 0.5f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::UpdateAvailable:
+                    state_label = "Update available";
+                    state_color = ImVec4(1.0f, 0.85f, 0.4f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::Downloading: {
+                    static char dl[64];
+                    if (snap.total_bytes > 0) {
+                        std::snprintf(dl, sizeof(dl),
+                            "Downloading %u / %u KB",
+                            snap.downloaded_bytes / 1024,
+                            snap.total_bytes / 1024);
+                    } else {
+                        std::snprintf(dl, sizeof(dl),
+                            "Downloading %u KB", snap.downloaded_bytes / 1024);
+                    }
+                    state_label = dl;
+                    state_color = ImVec4(0.7f, 0.85f, 1.0f, 1.0f);
+                    break;
+                }
+                case fm2k::cnc_ddraw::State::Extracting:
+                    state_label = "Extracting...";
+                    state_color = ImVec4(0.7f, 0.85f, 1.0f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::Ready:
+                    state_label = "Installed";
+                    state_color = ImVec4(0.5f, 0.9f, 0.5f, 1.0f); break;
+                case fm2k::cnc_ddraw::State::Failed:
+                    state_label = "Failed";
+                    state_color = ImVec4(1.0f, 0.5f, 0.5f, 1.0f); break;
+            }
+            ImGui::TextColored(state_color, "Status: %s", state_label);
+            if (!snap.local_version.empty() || !snap.remote_version.empty()) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                    "Local: %s   Remote: %s",
+                    snap.local_version.empty()  ? "(none)" : snap.local_version.c_str(),
+                    snap.remote_version.empty() ? "(?)"   : snap.remote_version.c_str());
+            }
+            if (snap.state == fm2k::cnc_ddraw::State::Failed && !snap.error_detail.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f),
+                    "Error: %s", snap.error_detail.c_str());
+            }
+
+            const bool busy = snap.state == fm2k::cnc_ddraw::State::Checking
+                           || snap.state == fm2k::cnc_ddraw::State::Downloading
+                           || snap.state == fm2k::cnc_ddraw::State::Extracting;
+            if (busy) ImGui::BeginDisabled();
+            if (ImGui::Button("Check & install")) {
+                fm2k::cnc_ddraw::EnsureInstalled();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Force reinstall")) {
+                fm2k::cnc_ddraw::ForceReinstall();
+            }
+            if (busy) ImGui::EndDisabled();
+
             ImGui::EndTabItem();
         }
 

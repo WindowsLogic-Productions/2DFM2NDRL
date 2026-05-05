@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Not found — FM2K Stats{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>Not found</h1>
+  <p class="lede">{% if detail %}{{ detail }}{% else %}That page isn't here.{% endif %}</p>
+  <p><a href="/">Back to overview</a></p>
+</section>
+{% endblock %}

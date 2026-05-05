@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}{{ c.char }} — {{ c.game_id }} — FM2K Stats{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>{{ c.char }}</h1>
+  <p class="lede">
+    in <a href="/g/{{ c.game_id }}">{{ c.game_id }}</a> —
+    <strong>{{ c.total }}</strong> recorded plays.
+  </p>
+</section>
+
+<section>
+  <h2>Top pilots</h2>
+  <table class="grid">
+    <thead><tr><th>Pilot</th><th class="num">W</th><th class="num">L</th><th class="num">D</th></tr></thead>
+    <tbody>
+      {% for p in c.top_pilots %}
+      <tr>
+        <td><a href="/u/{{ p.user_id }}">{{ p.nick }}</a></td>
+        <td class="num">{{ p.wins }}</td>
+        <td class="num">{{ p.losses }}</td>
+        <td class="num">{{ p.draws }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Matchups vs other characters</h2>
+  <table class="grid">
+    <thead><tr><th>Opposing character</th><th class="num">W</th><th class="num">L</th><th class="num">D</th></tr></thead>
+    <tbody>
+      {% for r in c.matchups %}
+      <tr>
+        <td>
+          <a href="/g/{{ c.game_id }}/c/{{ r.opp_char }}">{{ r.opp_char }}</a>
+        </td>
+        <td class="num">{{ r.wins }}</td>
+        <td class="num">{{ r.losses }}</td>
+        <td class="num">{{ r.draws }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Recent matches</h2>
+  <table class="grid">
+    <thead><tr><th>When</th><th>P1</th><th>P2</th><th>Winner</th></tr></thead>
+    <tbody>
+      {% for m in c.recent %}
+      <tr>
+        <td>{{ format_iso(m.finished_at) }}</td>
+        <td>
+          <a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a>
+          ({{ char_label(m.p1_char_name, m.p1_char_id) }})
+        </td>
+        <td>
+          <a href="/u/{{ m.p2_id }}">{{ m.p2_nick }}</a>
+          ({{ char_label(m.p2_char_name, m.p2_char_id) }})
+        </td>
+        <td>
+          {% if not m.winner_id %}draw
+          {% elif m.winner_id == m.p1_id %}P1
+          {% else %}P2{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

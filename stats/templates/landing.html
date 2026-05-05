@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}FM2K Stats — overview{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>FM2K Rollback Stats</h1>
+  <p class="lede">Public match log for the FM2K Rollback hub.</p>
+  <ul class="totals">
+    <li><strong>{{ total_all }}</strong> matches all time</li>
+    <li><strong>{{ total_week }}</strong> this week</li>
+    <li><strong>{{ total_day }}</strong> in the last 24 hours</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Top players</h2>
+  {% if top_players %}
+  <table class="grid">
+    <thead><tr><th>#</th><th>Nick</th><th class="num">Matches</th></tr></thead>
+    <tbody>
+      {% for p in top_players %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td><a href="/u/{{ p.user_id }}">{{ p.nick }}</a></td>
+        <td class="num">{{ p.matches }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No matches recorded yet.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Top games</h2>
+  {% if top_games %}
+  <table class="grid">
+    <thead><tr><th>#</th><th>Game</th><th class="num">Matches</th></tr></thead>
+    <tbody>
+      {% for game_id, n in top_games %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td><a href="/g/{{ game_id }}">{{ game_id }}</a></td>
+        <td class="num">{{ n }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No games yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

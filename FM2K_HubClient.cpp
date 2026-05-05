@@ -181,6 +181,12 @@ std::string GetStr(const std::string& s, const std::string& key) {
 int GetInt(const std::string& s, const std::string& key, int def = 0) {
     size_t p = FindKey(s, key);
     if (p == std::string::npos) return def;
+    // Treat a literal `null` as "absent" — same as the field being
+    // omitted. Without this, atoi("null") returns 0 and a server
+    // sending null for an unknown char/stage_id would silently parse
+    // as "char/stage 0", which then resolves to the slot-0 entry of
+    // the local KGT and produces a phantom row in the lobby panel.
+    if (p + 4 <= s.size() && s.compare(p, 4, "null") == 0) return def;
     return std::atoi(s.c_str() + p);
 }
 
@@ -366,6 +372,53 @@ void HubClient::Challenge(const std::string& target_id) {
     EnqueueOut("{\"type\":\"challenge\",\"target_id\":\"" + EscapeJsonString(target_id) + "\"}");
 }
 
+void HubClient::Challenge(const std::string& target_id,
+                          const MatchSettings& s) {
+    // Build a flat match_settings object. Skip kUnset (-1) fields so
+    // the wire payload stays compact and the hub forwards a smaller
+    // blob to the target. Older launchers without the optional
+    // fields just see the existing challenge_received shape.
+    std::string m = "{\"type\":\"challenge\",\"target_id\":\"" +
+                    EscapeJsonString(target_id) + "\"";
+    bool any = false;
+    auto add = [&](const char* key, int v) {
+        if (v == -1) return;
+        m += (any ? "," : ",\"match_settings\":{");
+        any = true;
+        m += "\"";
+        m += key;
+        m += "\":";
+        m += std::to_string(v);
+    };
+    add("player0_cpu",      s.player0_cpu);
+    add("player1_cpu",      s.player1_cpu);
+    add("game_speed",       s.game_speed);
+    add("hit_judge",        s.hit_judge);
+    add("game_information", s.game_information);
+    add("stage_nb",         s.stage_nb);
+    add("joystick",         s.joystick);
+    add("time",             s.time);
+    add("exit_flag",        s.exit_flag);
+    add("vs_mode",          s.vs_mode);
+    add("vs_single_play",   s.vs_single_play);
+    add("vs_team_play",     s.vs_team_play);
+    // Random-stage extension (#56). random_seed == 0 means off; we
+    // skip emitting any random_* fields when off so older hubs see
+    // the same payload they did pre-#56.
+    if (s.random_seed != 0) {
+        // Cast to int for the JSON int writer; reinterpret the same
+        // bits on the receiver (uint32_t = static_cast<uint32_t>(int)).
+        m += (any ? "," : ",\"match_settings\":{");
+        any = true;
+        m += "\"random_seed\":" + std::to_string((int)s.random_seed);
+    }
+    add("random_stage_min", s.random_stage_min);
+    add("random_stage_max", s.random_stage_max);
+    if (any) m += "}";
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
 void HubClient::CancelChallenge(const std::string& target_id) {
     EnqueueOut("{\"type\":\"cancel_challenge\",\"target_id\":\"" + EscapeJsonString(target_id) + "\"}");
 }
@@ -380,6 +433,113 @@ void HubClient::DeclineChallenge(const std::string& challenger_id) {
 
 void HubClient::MatchEnded() {
     EnqueueOut("{\"type\":\"match_ended\"}");
+}
+
+void HubClient::MatchResult(const std::string& match_id,
+                            const std::string& outcome) {
+    EnqueueOut("{\"type\":\"match_result\",\"match_id\":\"" +
+               EscapeJsonString(match_id) + "\",\"outcome\":\"" +
+               EscapeJsonString(outcome) + "\"}");
+}
+
+void HubClient::MatchResult(const std::string& match_id,
+                            const std::string& outcome,
+                            uint32_t p1_char_id, uint32_t p2_char_id) {
+    MatchResult(match_id, outcome, p1_char_id, p2_char_id,
+                std::string{}, std::string{});
+}
+
+void HubClient::MatchResult(const std::string& match_id,
+                            const std::string& outcome,
+                            uint32_t p1_char_id, uint32_t p2_char_id,
+                            const std::string& p1_char_name,
+                            const std::string& p2_char_name) {
+    MatchResult(match_id, outcome, p1_char_id, p2_char_id,
+                p1_char_name, p2_char_name,
+                0xFFFFFFFFu, std::string{});
+}
+
+void HubClient::MatchResult(const std::string& match_id,
+                            const std::string& outcome,
+                            uint32_t p1_char_id, uint32_t p2_char_id,
+                            const std::string& p1_char_name,
+                            const std::string& p2_char_name,
+                            uint32_t stage_id,
+                            const std::string& stage_name) {
+    std::string m = "{\"type\":\"match_result\",\"match_id\":\"" +
+                    EscapeJsonString(match_id) + "\",\"outcome\":\"" +
+                    EscapeJsonString(outcome) + "\"";
+    if (p1_char_id != 0xFFFFFFFFu) {
+        m += ",\"p1_char_id\":" + std::to_string(p1_char_id);
+    }
+    if (p2_char_id != 0xFFFFFFFFu) {
+        m += ",\"p2_char_id\":" + std::to_string(p2_char_id);
+    }
+    if (!p1_char_name.empty()) {
+        m += ",\"p1_char_name\":\"" + EscapeJsonString(p1_char_name) + "\"";
+    }
+    if (!p2_char_name.empty()) {
+        m += ",\"p2_char_name\":\"" + EscapeJsonString(p2_char_name) + "\"";
+    }
+    if (stage_id != 0xFFFFFFFFu) {
+        m += ",\"stage_id\":" + std::to_string(stage_id);
+    }
+    if (!stage_name.empty()) {
+        m += ",\"stage_name\":\"" + EscapeJsonString(stage_name) + "\"";
+    }
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
+void HubClient::QueryRecord(const std::string& opponent_id,
+                            const std::string& game_id) {
+    std::string m = "{\"type\":\"query_record\"";
+    if (!opponent_id.empty())
+        m += ",\"opponent_id\":\"" + EscapeJsonString(opponent_id) + "\"";
+    if (!game_id.empty())
+        m += ",\"game_id\":\"" + EscapeJsonString(game_id) + "\"";
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
+void HubClient::RequestRecentMatches(int limit) {
+    if (limit < 1) limit = 50;
+    EnqueueOut("{\"type\":\"recent_matches\",\"limit\":" +
+               std::to_string(limit) + "}");
+}
+
+void HubClient::RequestCurrentMatches() {
+    EnqueueOut("{\"type\":\"current_matches\"}");
+}
+
+void HubClient::ReportMatchProgress(const std::string& match_id,
+                                    uint32_t p1_char_id, uint32_t p2_char_id,
+                                    const std::string& p1_char_name,
+                                    const std::string& p2_char_name,
+                                    uint32_t stage_id,
+                                    const std::string& stage_name) {
+    std::string m = "{\"type\":\"match_progress\",\"match_id\":\"" +
+                    EscapeJsonString(match_id) + "\"";
+    if (p1_char_id != 0xFFFFFFFFu) {
+        m += ",\"p1_char_id\":" + std::to_string(p1_char_id);
+    }
+    if (p2_char_id != 0xFFFFFFFFu) {
+        m += ",\"p2_char_id\":" + std::to_string(p2_char_id);
+    }
+    if (!p1_char_name.empty()) {
+        m += ",\"p1_char_name\":\"" + EscapeJsonString(p1_char_name) + "\"";
+    }
+    if (!p2_char_name.empty()) {
+        m += ",\"p2_char_name\":\"" + EscapeJsonString(p2_char_name) + "\"";
+    }
+    if (stage_id != 0xFFFFFFFFu) {
+        m += ",\"stage_id\":" + std::to_string(stage_id);
+    }
+    if (!stage_name.empty()) {
+        m += ",\"stage_name\":\"" + EscapeJsonString(stage_name) + "\"";
+    }
+    m += "}";
+    EnqueueOut(std::move(m));
 }
 
 void HubClient::RequestSpectate(const std::string& target_id) {
@@ -624,6 +784,30 @@ void HubClient::OnMessage(const std::string& msg) {
         ev.challenge.from_id   = GetStr(msg, "from_id");
         ev.challenge.from_nick = GetStr(msg, "from_nick");
         ev.challenge.room_id   = GetStr(msg, "room_id");
+        // Optional match_settings sub-object (#54). Omitted by older
+        // launchers; sentinel -1 across the struct flags "unknown" so
+        // the accept modal falls back to the existing "this match
+        // will use the host's defaults" wording.
+        std::string ms = GetSub(msg, "match_settings");
+        if (!ms.empty()) {
+            auto& s = ev.challenge.settings;
+            s.player0_cpu      = GetInt(ms, "player0_cpu",      -1);
+            s.player1_cpu      = GetInt(ms, "player1_cpu",      -1);
+            s.game_speed       = GetInt(ms, "game_speed",       -1);
+            s.hit_judge        = GetInt(ms, "hit_judge",        -1);
+            s.game_information = GetInt(ms, "game_information", -1);
+            s.stage_nb         = GetInt(ms, "stage_nb",         -1);
+            s.joystick         = GetInt(ms, "joystick",         -1);
+            s.time             = GetInt(ms, "time",             -1);
+            s.exit_flag        = GetInt(ms, "exit_flag",        -1);
+            s.vs_mode          = GetInt(ms, "vs_mode",          -1);
+            s.vs_single_play   = GetInt(ms, "vs_single_play",   -1);
+            s.vs_team_play     = GetInt(ms, "vs_team_play",     -1);
+            const int seed_signed = GetInt(ms, "random_seed", 0);
+            s.random_seed         = static_cast<uint32_t>(seed_signed);
+            s.random_stage_min    = GetInt(ms, "random_stage_min", -1);
+            s.random_stage_max    = GetInt(ms, "random_stage_max", -1);
+        }
         EmitEvent(std::move(ev));
         return;
     }
@@ -692,6 +876,36 @@ void HubClient::OnMessage(const std::string& msg) {
             }
             ev.match.relay_session_id = GetStr(relay_obj, "session_id");
         }
+
+        // Optional match_settings echoed by hub on match_start so both
+        // peers (host + guest) apply the same authoritative config at
+        // game-spawn time. Empty/absent on legacy hubs.
+        std::string ms = GetSub(msg, "match_settings");
+        if (!ms.empty()) {
+            auto& s = ev.match.settings;
+            s.player0_cpu      = GetInt(ms, "player0_cpu",      -1);
+            s.player1_cpu      = GetInt(ms, "player1_cpu",      -1);
+            s.game_speed       = GetInt(ms, "game_speed",       -1);
+            s.hit_judge        = GetInt(ms, "hit_judge",        -1);
+            s.game_information = GetInt(ms, "game_information", -1);
+            s.stage_nb         = GetInt(ms, "stage_nb",         -1);
+            s.joystick         = GetInt(ms, "joystick",         -1);
+            s.time             = GetInt(ms, "time",             -1);
+            s.exit_flag        = GetInt(ms, "exit_flag",        -1);
+            s.vs_mode          = GetInt(ms, "vs_mode",          -1);
+            s.vs_single_play   = GetInt(ms, "vs_single_play",   -1);
+            s.vs_team_play     = GetInt(ms, "vs_team_play",     -1);
+            // Random-stage fields (#56). random_seed parsed as 64-bit
+            // signed because GetInt returns int; a 32-bit unsigned seed
+            // (high bit set) would otherwise wrap negative. Re-cast to
+            // uint32 on assign so xorshift seeding sees the same value
+            // on both peers.
+            const int seed_signed = GetInt(ms, "random_seed", 0);
+            s.random_seed         = static_cast<uint32_t>(seed_signed);
+            s.random_stage_min    = GetInt(ms, "random_stage_min", -1);
+            s.random_stage_max    = GetInt(ms, "random_stage_max", -1);
+        }
+
         EmitEvent(std::move(ev));
         return;
     }
@@ -718,6 +932,128 @@ void HubClient::OnMessage(const std::string& msg) {
 
     if (type == "peer_disconnected") {
         ev.kind = HubEvent::Kind::PeerDisconnected;
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "match_rotated") {
+        // Hub minted a fresh in-flight match-id for the next FM2K
+        // round in the same hub_session (no re-spawn — peers are
+        // already in CSS). We just forward the new token; the
+        // launcher updates current_match_token + resets per-match
+        // flags so the next outcome publish commits cleanly.
+        ev.kind = HubEvent::Kind::MatchRotated;
+        ev.match.token = GetStr(msg, "new_token");
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "record") {
+        ev.kind = HubEvent::Kind::RecordReceived;
+        ev.record.user_id     = GetStr(msg, "user_id");
+        ev.record.opponent_id = GetStr(msg, "opponent_id");
+        ev.record.game_id     = GetStr(msg, "game_id");
+        ev.record.wins        = GetInt(msg, "wins", 0);
+        ev.record.losses      = GetInt(msg, "losses", 0);
+        ev.record.draws       = GetInt(msg, "draws", 0);
+        std::string vs_arr    = GetSub(msg, "vs_breakdown");
+        if (!vs_arr.empty()) {
+            for (auto& obj : SplitObjectArray(vs_arr)) {
+                HubEvent::VsRow row;
+                row.opponent_id   = GetStr(obj, "opponent_id");
+                row.opponent_nick = GetStr(obj, "opponent_nick");
+                row.wins   = GetInt(obj, "wins", 0);
+                row.losses = GetInt(obj, "losses", 0);
+                row.draws  = GetInt(obj, "draws", 0);
+                ev.record.vs_breakdown.push_back(std::move(row));
+            }
+        }
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "recent_matches") {
+        ev.kind = HubEvent::Kind::RecentMatchesReceived;
+        std::string arr = GetSub(msg, "matches");
+        if (!arr.empty()) {
+            for (auto& obj : SplitObjectArray(arr)) {
+                HubEvent::MatchRow row;
+                row.id        = GetStr(obj, "id");
+                row.p1_id     = GetStr(obj, "p1_id");
+                row.p1_nick   = GetStr(obj, "p1_nick");
+                row.p2_id     = GetStr(obj, "p2_id");
+                row.p2_nick   = GetStr(obj, "p2_nick");
+                row.game_id   = GetStr(obj, "game_id");
+                row.winner_id = GetStr(obj, "winner_id");
+                // finished_at is a float in JSON; GetInt lossy but
+                // sufficient for sorting / display purposes.
+                row.finished_at = (double)GetInt(obj, "finished_at", 0);
+                // Char + stage fields — server sends null when peers
+                // disagreed/omitted; GetInt returns the default (-1)
+                // for null so the row stays clean for UI fallbacks.
+                row.p1_char_id   = GetInt(obj, "p1_char_id", -1);
+                row.p2_char_id   = GetInt(obj, "p2_char_id", -1);
+                row.p1_char_name = GetStr(obj, "p1_char_name");
+                row.p2_char_name = GetStr(obj, "p2_char_name");
+                row.stage_id     = GetInt(obj, "stage_id", -1);
+                row.stage_name   = GetStr(obj, "stage_name");
+                ev.recent_matches.push_back(std::move(row));
+            }
+        }
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    // In-progress match payloads — used by the lobby panel. Snapshot
+    // form (current_matches response, list of objects) and live forms
+    // (match_in_progress_started/updated, single object) parse the
+    // same shape via this helper.
+    auto parse_in_progress = [](const std::string& obj) -> HubEvent::MatchInProgress {
+        HubEvent::MatchInProgress r;
+        r.token        = GetStr(obj, "token");
+        r.p1_id        = GetStr(obj, "p1_id");
+        r.p1_nick      = GetStr(obj, "p1_nick");
+        r.p2_id        = GetStr(obj, "p2_id");
+        r.p2_nick      = GetStr(obj, "p2_nick");
+        r.game_id      = GetStr(obj, "game_id");
+        r.started_at   = (double)GetInt(obj, "started_at", 0);
+        r.p1_char_id   = GetInt(obj, "p1_char_id", -1);
+        r.p2_char_id   = GetInt(obj, "p2_char_id", -1);
+        r.p1_char_name = GetStr(obj, "p1_char_name");
+        r.p2_char_name = GetStr(obj, "p2_char_name");
+        r.stage_id     = GetInt(obj, "stage_id", -1);
+        r.stage_name   = GetStr(obj, "stage_name");
+        return r;
+    };
+
+    if (type == "current_matches") {
+        ev.kind = HubEvent::Kind::CurrentMatchesReceived;
+        std::string arr = GetSub(msg, "matches");
+        if (!arr.empty()) {
+            for (auto& obj : SplitObjectArray(arr)) {
+                ev.current_matches.push_back(parse_in_progress(obj));
+            }
+        }
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "match_in_progress_started" ||
+        type == "match_in_progress_updated") {
+        ev.kind = (type == "match_in_progress_started")
+                  ? HubEvent::Kind::MatchInProgressStarted
+                  : HubEvent::Kind::MatchInProgressUpdated;
+        std::string sub = GetSub(msg, "match");
+        if (!sub.empty()) {
+            ev.current_match_update = parse_in_progress(sub);
+        }
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "match_in_progress_ended") {
+        ev.kind = HubEvent::Kind::MatchInProgressEnded;
+        ev.current_match_token = GetStr(msg, "token");
         EmitEvent(std::move(ev));
         return;
     }
