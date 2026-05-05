@@ -5,8 +5,10 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include "netplay.h"
 #include "control_channel.h"
+#include "../netplay/game_hash.h"
 #include "imgui_overlay.h"
 #include "shared_mem.h"
 #include "savestate.h"  // CHAR_SLOT_BASE, CHAR_SLOT_SIZE (corrected by Wave C audit)
@@ -21,6 +23,7 @@
 #include <cstdio>
 #include <cfloat>   // _controlfp_s, _PC_53, _MCW_PC, _RC_NEAR, _MCW_RC, _MCW_EM
 #include <cstdint>
+#include <string>
 
 // Pin the x87 FPU control word to a fixed precision + rounding mode on the
 // game thread. IDA audit found the binary never calls _controlfp / fldcw and
@@ -114,6 +117,41 @@ static constexpr DWORD kRelaxedShareMode =
 static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share,
                                       LPSECURITY_ATTRIBUTES sa, DWORD disp,
                                       DWORD flags, HANDLE tmpl) {
+    // Log the first ~32 CreateFileA calls so we can trace startup file I/O.
+    // FM95 games (CPW) fail to find their .kgt because Windows resolves
+    // CreateFileA paths via the system codepage (1252 on US Windows), NOT
+    // via GetACP. Even with our GetACP hook, ＣＰＷ.kgt's SJIS bytes get
+    // mangled to a non-existent path. Fix: translate SJIS -> wide via
+    // CP932 ourselves and forward to CreateFileW.
+    static int s_logged = 0;
+    if (s_logged < 32 && name) {
+        // Convert SJIS path -> wide -> UTF-8 for the log so multi-byte
+        // filenames render in any UTF-8-aware viewer instead of garbling.
+        // Falls back to the raw bytes if conversion fails.
+        char utf8[1024] = {0};
+        wchar_t wide[512] = {0};
+        if (MultiByteToWideChar(932, 0, name, -1, wide, 512) > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, sizeof(utf8), nullptr, nullptr);
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "CreateFileA[%d]: '%s'", s_logged,
+                    utf8[0] ? utf8 : name);
+        ++s_logged;
+    }
+    if (FM2K::kIsFM95 && name) {
+        int wlen = MultiByteToWideChar(932, 0, name, -1, nullptr, 0);
+        if (wlen > 1) {
+            std::vector<wchar_t> wide(static_cast<size_t>(wlen));
+            if (MultiByteToWideChar(932, 0, name, -1, wide.data(), wlen) > 0) {
+                HANDLE h = CreateFileW(wide.data(), access,
+                                       share | kRelaxedShareMode,
+                                       sa, disp, flags, tmpl);
+                if (h != INVALID_HANDLE_VALUE) return h;
+                // W path failed — fall through to A so a system-codepage
+                // path (e.g. ASCII like "log.txt") still has a chance.
+            }
+        }
+    }
     return original_CreateFileA(name, access, share | kRelaxedShareMode,
                                 sa, disp, flags, tmpl);
 }
@@ -131,12 +169,59 @@ static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 
 static uint32_t g_last_game_mode = 0;
 
-static bool IsCSSMode(uint32_t mode) {
-    return mode == 2000;
+// Engine-aware phase detection.
+// FM2K encodes phase via g_game_mode magic numbers (2000=CSS, 3000+=Battle).
+// FM95 keeps g_game_mode near 0/1/10 — phase lives inside per-object slots
+// in the 256-entry pool (type==19 sub_state ∈ [0x28,0xC9] = CSS, type==16
+// sub_state ∈ [10,31] = Battle). Walk the pool once per call; could be
+// frame-cached if it shows up hot in profiles.
+//
+// The `mode` argument is preserved so existing call sites keep compiling
+// without change. On FM2K it's still load-bearing; on FM95 it's ignored
+// and we read the object pool directly.
+namespace {
+    enum class FM95Phase { Boot, Title, CSS, PostCSS, Battle, MatchEnd, Other };
+
+    inline FM95Phase Fm95ClassifyPhase() {
+        const uint8_t* pool = (const uint8_t*)FM2K::ADDR_OBJECT_POOL;
+        for (size_t i = 0; i < FM2K::OBJECT_POOL_COUNT; ++i) {
+            const uint8_t* slot = pool + i * FM2K::OBJECT_POOL_STRIDE;
+            uint32_t type = *reinterpret_cast<const uint32_t*>(slot);
+            if (type < 2) continue;            // 0=empty, 1=disabled
+            uint32_t sub  = *reinterpret_cast<const uint32_t*>(slot + 108);
+            if (type == 19) {                  // title_screen_state_machine
+                if (sub >= 0x28 && sub <= 0xC9) return FM95Phase::CSS;
+                return FM95Phase::Title;
+            }
+            if (type == 16) {                  // vs_round_function
+                if (sub >= 10 && sub <= 31)    return FM95Phase::Battle;
+                return FM95Phase::MatchEnd;
+            }
+            if (type == 21) return FM95Phase::PostCSS;
+            if (type == 30 || type == 15) return FM95Phase::Boot;
+        }
+        return FM95Phase::Other;
+    }
 }
 
-static bool IsBattleMode(uint32_t mode) {
-    return mode >= 3000 && mode < 4000;
+// Exported (non-static) so main_loop_trampoline.cpp's ClassifyPhase can use
+// the same engine-aware logic. Forward-declared in hooks.h.
+bool IsCSSMode(uint32_t mode) {
+    if constexpr (FM2K::kIsFM2K) {
+        return mode == 2000;
+    } else {
+        (void)mode;
+        return Fm95ClassifyPhase() == FM95Phase::CSS;
+    }
+}
+
+bool IsBattleMode(uint32_t mode) {
+    if constexpr (FM2K::kIsFM2K) {
+        return mode >= 3000 && mode < 4000;
+    } else {
+        (void)mode;
+        return Fm95ClassifyPhase() == FM95Phase::Battle;
+    }
 }
 
 // Battle sync state - ensures both clients start GekkoNet together.
@@ -529,6 +614,93 @@ static void CheckGameModeTransition() {
 // HOOK IMPLEMENTATIONS
 // ============================================================================
 
+// ============================================================================
+// FM95 INPUT HOOKS
+// FM95 splits the input read into two single-arg functions instead of FM2K's
+// dispatched (player_id, input_type) pair. Each FM95 hook drives the same
+// path the FM2K Hook_GetPlayerInput offline branch does:
+//   1. Sample our binder (FM2KInputBinder::Sample_Win32) for the local
+//      player's slot. Picks up our remappable keyboard + XInput gamepad
+//      bindings — eventually the only input surface the user sees once
+//      we hide CPW's titlebar and wrap it in our UI.
+//   2. Apply facing flip via g_p_facing_snap[25*player_idx] — the SAME
+//      logic CPW's native get_player_input_p1/p2 does, ported here so
+//      we can return the engine-relative bits the input ring expects.
+//   3. Mask START on CSS (matches FM2K's ~0x400 strip on game_mode 2000).
+//   4. Apply SOCD.
+// FM95 doesn't have CSS-magic-mode 2000, so the START mask uses the
+// engine-aware IsCSSMode (object pool walk) instead.
+//
+// Netplay rollback path: same as FM2K — the rollback driver overrides
+// ProcessGameInputs (single-arg, FM95-compat) to write into the input
+// history rings post-poll. Hook_GetPlayerInput_FM95_P*'s job here is the
+// LOCAL input read for both offline and the local input queued into
+// GekkoNet via AddLocalInput.
+// ============================================================================
+//
+// Note on facing flip: FM95's input ring stores engine-relative bits
+// (forward/back), not screen-relative (left/right). The native fn applies
+// L↔R swap when facing is flipped. We do the same so our binder output
+// matches what CPW's downstream (motion table, character_state_machine)
+// expects.
+
+constexpr uintptr_t FM95_FACING_SNAP_BASE = 0x5E98A8;  // g_p_facing_snap
+
+static uint16_t Fm95SampleBinderForPlayer(int binder_slot, int facing_idx) {
+    // binder_slot picks which set of bindings to read (0 = P1 bindings, 1 =
+    // P2 bindings). Earlier this was hardcoded to 0 for both players, which
+    // meant P2 mirrored P1 and any second controller went unused.
+    //
+    // facing_idx is the host's per-player index (1 or 2 on FM95) used as
+    // the multiplier into g_p_facing_snap[25 * idx]. Same fold the native
+    // get_player_input_p1/p2 functions perform.
+    uint16_t bound = FM2KInputBinder::Sample_Win32(binder_slot);
+
+    const uint8_t facing = *(const uint8_t*)
+        (FM95_FACING_SNAP_BASE + (uintptr_t)facing_idx * 25u);
+    if (facing) {
+        const uint16_t left_bit  = (bound & 0x001);
+        const uint16_t right_bit = (bound & 0x002);
+        bound = (bound & ~0x003) | (left_bit << 1) | (right_bit >> 1);
+    }
+
+    if (IsCSSMode(*(uint32_t*)FM2K::ADDR_GAME_MODE)) {
+        bound &= (uint16_t)~0x400u;
+    }
+    return Hook_ApplySOCD(bound);
+}
+
+int __cdecl Hook_GetPlayerInput_FM95_P1(int player_idx) {
+    // First-time binder init mirrors the FM2K path. Done lazily so we don't
+    // race with CPW's window/SDL/etc. init. Cheap once warmed up.
+    static bool s_warmed = false;
+    if (!s_warmed) {
+        char buf[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, buf, sizeof(buf)) > 0) {
+            const char* slash = std::strrchr(buf, '\\');
+            if (!slash) slash = std::strrchr(buf, '/');
+            const char* base = slash ? slash + 1 : buf;
+            std::string stem = base;
+            auto dot = stem.find_last_of('.');
+            if (dot != std::string::npos) stem.resize(dot);
+            FM2KInputBinder::SetGameProfile(stem.c_str());
+        }
+        FM2KInputBinder::Init();
+        FM2KInputBinder::Load();
+        s_warmed = true;
+    }
+    return (int)Fm95SampleBinderForPlayer(/*binder_slot=*/0, player_idx);
+}
+
+int __cdecl Hook_GetPlayerInput_FM95_P2(int player_idx) {
+    // Reads the P2 binder slot (slot 1) so a second device — or fallback
+    // to keyboard P2 bindings — drives the second player. For netplay,
+    // ProcessGameInputs overwrites this post-poll with GekkoNet's synced
+    // remote input, so this only matters on offline / dual-client / stress
+    // tests where both players are local.
+    return (int)Fm95SampleBinderForPlayer(/*binder_slot=*/1, player_idx);
+}
+
 // Hook: GetPlayerInput
 // CSS: return synced input from control channel
 // Battle: return synchronized input from GekkoNet with facing adjustment
@@ -750,8 +922,11 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             if (mode_changed || periodic) {
                 const uint32_t p1_action = *(uint32_t*)0x47019Cu;
                 const uint32_t p2_action = *(uint32_t*)0x4701A0u;
-                const int32_t  p1_pos    = *(int32_t*) 0x470020u;
-                const int32_t  p2_pos    = *(int32_t*) 0x470024u;
+                // Selected character indexes — IDA-renamed to
+                // g_p1_selected_char_idx / g_p2_selected_char_idx
+                // (was misleadingly g_player_stage_positions[]).
+                const int32_t  p1_char   = *(int32_t*)FM2K::ADDR_P1_SELECTED_CHAR;
+                const int32_t  p2_char   = *(int32_t*)FM2K::ADDR_P2_SELECTED_CHAR;
                 const uint32_t timer     = *(uint32_t*)0x424F00u;
                 const uint8_t  char0_act = *(uint8_t*) 0x4DFCD1u;
                 const uint8_t  char1_act = *(uint8_t*)(0x4DFCD1u + 57407u);
@@ -763,11 +938,11 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 const int32_t  cam_y     = *(int32_t*) 0x447F30u;
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "[AUTOPLAY] frame=%u mode=%u p1act=%u p2act=%u "
-                    "p1pos=%d p2pos=%d ctimer=%u "
+                    "p1char=%d p2char=%d ctimer=%u "
                     "char0_act=%u char1_act=%u "
                     "p1_hp=%u/%u p2_hp=%u/%u cam=(%d,%d) out=0x%03X",
                     frame, game_mode, p1_action, p2_action,
-                    p1_pos, p2_pos, timer,
+                    p1_char, p2_char, timer,
                     char0_act, char1_act,
                     p1_hp, p1_max_hp, p2_hp, p2_max_hp,
                     cam_x, cam_y, out);
@@ -918,6 +1093,49 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
 int __cdecl Hook_UpdateGameState() {
     uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
 
+    // FM95 host-driven trampoline activation (opt-in via FM95_TRAMPOLINE=1).
+    // FM2K's main_game_loop is replaced wholesale by TrampolineMainLoop,
+    // but FM95 keeps its natural WinMain pump. Drive the trampoline tick
+    // from inside Hook_UpdateGameState instead. For non-NATIVE phases the
+    // tick handles update + render itself (via AdvanceEvent +
+    // RenderFrameWithSnapshot); set g_fm95_skip_next_render so
+    // Hook_RenderGame suppresses the host's natural render call right
+    // after we return. NATIVE phase falls through to the existing logic.
+    if constexpr (FM2K::kIsFM95) {
+        static const bool s_use_trampoline = []() {
+            const char* e = std::getenv("FM95_TRAMPOLINE");
+            const bool on = (e && std::strcmp(e, "1") == 0);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "FM95 trampoline gate: env=\"%s\" -> %s",
+                        e ? e : "(unset)", on ? "ACTIVE" : "off (host-driven)");
+            return on;
+        }();
+        if (s_use_trampoline) {
+            LoopPhase phase = TrampolineFrameTick();
+            // Log first-seen-per-phase so the log shows the engine-aware
+            // classifier picking up FM95 phase transitions in real time.
+            static LoopPhase s_last_logged_phase = LoopPhase::NATIVE;
+            static bool      s_phase_logged_once = false;
+            if (!s_phase_logged_once || phase != s_last_logged_phase) {
+                const char* name =
+                    phase == LoopPhase::TRAMPOLINE_BATTLE ? "BATTLE" :
+                    phase == LoopPhase::CSS               ? "CSS" :
+                    phase == LoopPhase::SPECTATOR_PLAYBACK? "SPECTATOR" :
+                                                            "NATIVE";
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "FM95 trampoline tick phase = %s", name);
+                s_last_logged_phase = phase;
+                s_phase_logged_once = true;
+            }
+            if (phase != LoopPhase::NATIVE) {
+                g_fm95_skip_next_render = true;
+                return 0;
+            }
+            // NATIVE: fall through to existing logic so original_update_game
+            // gets called via the normal offline / netplay path below.
+        }
+    }
+
     // Offline mode - just pass through
     if (g_offline_mode) {
         // T4 probe: when FM2K_T4_PROBE=1, walk the fighter object pool
@@ -1039,7 +1257,8 @@ int __cdecl Hook_UpdateGameState() {
 
         // Send HELLO periodically until connected
         if (now - last_poll > 500) {
-            ControlChannel_SendHello(static_cast<uint8_t>(g_player_index), 0);
+            ControlChannel_SendHello(static_cast<uint8_t>(g_player_index),
+                                     fm2k::game_hash::Compute());
             last_poll = now;
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1204,65 +1423,107 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
         g_last_fps_time = now;
     }
 
-    // Update window title with BBBR-style stats (throttled to 500ms)
+    // Update window title with BBBR-style stats (throttled to 500ms).
+    // Format follows the layout user-spec'd 2026-05-05:
+    //   <game> | P1 (BATTLE) | 100fps RTT 12ms | D2 FA0.5 RB5 | vs Nick 12-3-1
+    // Game-name prefix is the executable's stem (e.g. "WonderfulWorld_
+    // ver_0946") instead of a literal "FM2K", so multi-game lobbies
+    // are visually distinct in the taskbar. P1/P2 replaces [HOST]/
+    // [CLIENT] for casual readability. W/L/D suffix comes from the
+    // launcher via shared mem (FM2KSharedMemData::ui_*); -1 sentinels
+    // mean "not yet known" → suffix is omitted.
     static DWORD last_title_update = 0;
     DWORD title_now = GetTickCount();
     if (title_now - last_title_update >= 500) {
         last_title_update = title_now;
         HWND game_window = GetOurGameWindow();
         if (game_window) {
-            char title[256];
+            // Cache the game-name prefix once. Use the .exe's stem so it
+            // works for any FM2K game, not just WonderfulWorld. Strips
+            // the directory, drops the ".exe" suffix.
+            static char s_game_prefix[64] = {};
+            if (s_game_prefix[0] == '\0') {
+                char buf[MAX_PATH];
+                DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+                if (n > 0 && n < MAX_PATH) {
+                    char* slash = strrchr(buf, '\\');
+                    if (!slash) slash = strrchr(buf, '/');
+                    const char* stem = slash ? slash + 1 : buf;
+                    char* dot = strrchr((char*)stem, '.');
+                    if (dot) *dot = '\0';
+                    snprintf(s_game_prefix, sizeof(s_game_prefix), "%s", stem);
+                }
+                if (s_game_prefix[0] == '\0') {
+                    snprintf(s_game_prefix, sizeof(s_game_prefix), "FM2K");
+                }
+            }
+
+            // Format spec (user-visible 2026-05-05):
+            //   <game> | P1 vs <peer> 0-0-0 (BATTLE) | 100fps RTT 12ms | D2 FA0.5 RB5
+            //   <game> | P2 vs <peer> 0-0-0 (CSS)    | 100fps RTT 12ms
+            //   <game> | P1 (TITLE)   | 100fps RTT 12ms | 47-30-2
+            //   <game> | Offline | 100fps
+            // The peer + W/L/D moves up to live next to the role tag; the
+            // (STATE) trails. Falls back to overall W-L-D when no active
+            // peer (idle in title / between sessions).
+            char title[384];
             const char* role =
-                g_spectator_mode      ? "SPECTATOR" :
-                (g_player_index == 0) ? "HOST"      : "CLIENT";
+                g_spectator_mode      ? "Spec" :
+                (g_player_index == 0) ? "P1"   : "P2";
             bool active = Netplay_IsActive();
             bool connected = Netplay_IsConnected();
 
-            // Spectator title — queue depth tells you at a glance whether
-            // we're at live edge (~SPECTATOR_LIVE_TARGET buffered),
-            // backfilling (>FF_ENTER), or starved.
+            // Build the role+vs+wld lead chunk that sits between the game
+            // prefix and the STATE / fps section. Three forms:
+            //   (a) "P1 vs Armonté 12-3-1" — active match, peer + record known
+            //   (b) "P1 (overall 47-30-2)" — no active peer, only personal record
+            //   (c) "P1"                   — no record yet (pre-first-query)
+            char lead[160] = {};
+            FM2KSharedMemData* shm = GetSharedMemory();
+            const bool have_peer = shm && shm->ui_peer_nick[0] != '\0' &&
+                                   shm->ui_vs_wins >= 0;
+            const bool have_overall = shm && shm->ui_wins >= 0;
+            if (have_peer) {
+                snprintf(lead, sizeof(lead),
+                    "%s vs %s %d-%d-%d",
+                    role, shm->ui_peer_nick,
+                    shm->ui_vs_wins, shm->ui_vs_losses, shm->ui_vs_draws);
+            } else if (have_overall) {
+                snprintf(lead, sizeof(lead),
+                    "%s (%d-%d-%d)",
+                    role, shm->ui_wins, shm->ui_losses, shm->ui_draws);
+            } else {
+                snprintf(lead, sizeof(lead), "%s", role);
+            }
+
             if (g_spectator_mode) {
                 size_t qd = SpectatorNode_PendingFrameCount();
                 bool sub = SpectatorNode_IsSubscribedUpstream();
                 snprintf(title, sizeof(title),
-                    "FM2K [P3 SPECTATOR] %s | FPS:%d | queue:%zu",
-                    sub ? "Subscribed" : "Connecting...", g_current_fps, qd);
-                SetWindowTextA(game_window, title);
-                return;
-            }
-
-            if (active) {
+                    "%s | %s %s | %dfps | q:%zu",
+                    s_game_prefix, role,
+                    sub ? "Subscribed" : "Connecting...",
+                    g_current_fps, qd);
+            } else if (active) {
                 GekkoNetworkStats stats = Netplay_GetNetworkStats();
                 float ahead = Netplay_GetFramesAhead();
                 int delay = Netplay_GetLocalDelay();
                 uint32_t desyncs = Netplay_GetDesyncCount();
                 uint32_t rollbacks = Netplay_GetRollbackCount();
-                const char* tag = g_stress_mode ? "STRESS" : "Battle";
-
+                const char* tag = g_stress_mode ? "STRESS" : "BATTLE";
                 if (desyncs > 0) {
                     snprintf(title, sizeof(title),
-                        "FM2K [%s] %s | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u | DESYNC x%u",
-                        role, tag, g_current_fps,
-                        stats.last_ping, stats.avg_ping,
-                        delay, ahead, rollbacks, desyncs);
+                        "%s | %s (%s) | %dfps RTT %ums | D%d FA%.1f RB%u | DESYNC x%u",
+                        s_game_prefix, lead, tag, g_current_fps,
+                        stats.last_ping, delay, ahead, rollbacks, desyncs);
                 } else {
                     snprintf(title, sizeof(title),
-                        "FM2K [%s] %s | FPS:%d | P:%ums A:%.1fms | D:%d FA:%.1f | RB:%u",
-                        role, tag, g_current_fps,
-                        stats.last_ping, stats.avg_ping,
-                        delay, ahead, rollbacks);
+                        "%s | %s (%s) | %dfps RTT %ums | D%d FA%.1f RB%u",
+                        s_game_prefix, lead, tag, g_current_fps,
+                        stats.last_ping, delay, ahead, rollbacks);
                 }
             } else if (connected) {
                 uint32_t ping = Netplay_GetPingMs();
-                // Label the actual phase from g_game_mode, not just
-                // "CSS". The title bar previously stuck on "CSS" the
-                // moment handshake completed even though the game was
-                // still in the title state machine.
-                //   0       boot/early init
-                //   1000    title — splash + demo loop + main menu
-                //   2000    CSS (character select)
-                //   3000-3999 battle (handled by `active` branch above)
-                //   anything else → fall through to the numeric value
                 uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
                 const char* phase = nullptr;
                 char phase_buf[16] = {};
@@ -1276,18 +1537,28 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                     phase = phase_buf;
                 }
                 snprintf(title, sizeof(title),
-                    "FM2K [%s] %s | FPS:%d | RTT:%ums",
-                    role, phase, g_current_fps, ping);
+                    "%s | %s (%s) | %dfps RTT %ums",
+                    s_game_prefix, lead, phase, g_current_fps, ping);
             } else if (!g_offline_mode) {
                 snprintf(title, sizeof(title),
-                    "FM2K [%s] Connecting... | FPS:%d",
-                    role, g_current_fps);
+                    "%s | %s | Connecting... | %dfps",
+                    s_game_prefix, lead, g_current_fps);
             } else {
                 snprintf(title, sizeof(title),
-                    "FM2K [Offline] %d FPS", g_current_fps);
+                    "%s | Offline | %dfps", s_game_prefix, g_current_fps);
             }
 
-            SetWindowTextA(game_window, title);
+            // SetWindowTextW + UTF-8 → UTF-16 conversion: SetWindowTextA
+            // interprets the byte stream as the system's ANSI codepage,
+            // turning UTF-8 "é" (C3 A9) into garbled "Ã©" on a CP1252
+            // install. Using the wide path keeps "Armonté" / "ＣＰＷ" /
+            // "テスト" intact regardless of system locale.
+            wchar_t wtitle[384];
+            int wn = MultiByteToWideChar(CP_UTF8, 0, title, -1,
+                                         wtitle,
+                                         (int)(sizeof(wtitle) / sizeof(wtitle[0])));
+            if (wn > 0) SetWindowTextW(game_window, wtitle);
+            else        SetWindowTextA(game_window, title);  // shouldn't happen
         }
     }
 }
@@ -1394,6 +1665,17 @@ int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
 }
 
 void __cdecl Hook_RenderGame() {
+    // FM95 host-driven trampoline: if Hook_UpdateGameState already drove
+    // RenderFrameWithSnapshot inside the tick (non-NATIVE phase), the
+    // host's natural render_game call would render twice. Skip the body
+    // and clear the flag.
+    if constexpr (FM2K::kIsFM95) {
+        if (g_fm95_skip_next_render) {
+            g_fm95_skip_next_render = false;
+            return;
+        }
+    }
+
     // In trampoline mode, render goes through RenderFrameWithSnapshot in
     // main_loop_trampoline.cpp. This hook still catches direct calls from
     // the game (e.g. init/menu paths) — run diagnostics and pass through.
@@ -1524,16 +1806,19 @@ void __cdecl Hook_RenderGame() {
 // point forward. Pre-trampoline side effects (VS-mode patch) fire before the
 // hand-off so CSS behavior is unchanged.
 BOOL __cdecl Hook_RunGameLoop() {
-    // Set VS player mode once
-    static bool vs_mode_set = false;
-    if (!vs_mode_set) {
-        uint8_t* char_select_mode = (uint8_t*)0x470058;
-        DWORD old_protect;
-        if (VirtualProtect(char_select_mode, 1, PAGE_READWRITE, &old_protect)) {
-            *char_select_mode = 1;  // VS player mode
-            VirtualProtect(char_select_mode, 1, old_protect, &old_protect);
-            vs_mode_set = true;
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Set VS player mode");
+    // Set VS player mode once — FM2K-only: 0x470058 is the FM2K char-select
+    // mode flag, not anything meaningful on FM95.
+    if constexpr (FM2K::kIsFM2K) {
+        static bool vs_mode_set = false;
+        if (!vs_mode_set) {
+            uint8_t* char_select_mode = (uint8_t*)0x470058;
+            DWORD old_protect;
+            if (VirtualProtect(char_select_mode, 1, PAGE_READWRITE, &old_protect)) {
+                *char_select_mode = 1;  // VS player mode
+                VirtualProtect(char_select_mode, 1, old_protect, &old_protect);
+                vs_mode_set = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Set VS player mode");
+            }
         }
     }
 
@@ -1718,17 +2003,67 @@ bool InitializeHooks() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Hooks: Pinned x87 FPU control word to _PC_53 | _RC_NEAR");
 
-    if (MH_Initialize() != MH_OK) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: MH_Initialize failed");
-        return false;
+    // The locale spoof (InstallLocaleSpoof) already initializes MinHook on
+    // FM95 builds and on any FM2K build with FM2K_JP_LOCALE=1, so accept
+    // MH_ERROR_ALREADY_INITIALIZED as a no-op success here.
+    {
+        MH_STATUS s = MH_Initialize();
+        if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Hooks: MH_Initialize failed: %d", (int)s);
+            return false;
+        }
     }
 
-    // Hook GetPlayerInput
-    if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT, (void*)Hook_GetPlayerInput,
-                      (void**)&original_get_player_input) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook GetPlayerInput");
-        return false;
+    // Hook GetPlayerInput — FM2K only.
+    //
+    // FM2K's get_player_input is `int __cdecl(int player_id, int input_type)`,
+    // a single function called for both players with input_type selecting
+    // which control mode to use. Our Hook_GetPlayerInput matches that
+    // signature.
+    //
+    // FM95 splits this into two SEPARATE single-arg functions —
+    // get_player_input_p1 (0x408AE0) and get_player_input_p2 (0x408D60),
+    // each `int __cdecl(int player_idx)`. Hooking either with our 2-arg
+    // shape would corrupt the stack on entry and inject the wrong
+    // FM2K-style keybindings into CPW's native input read.
+    //
+    // The right surface for FM95 input injection is Hook_ProcessGameInputs
+    // (0x408FF0, single arg, hooked below) — it writes directly into
+    // g_p1/p2_input_history[buf_idx] AFTER the natural keyboard/joystick
+    // poll, so we can override for netplay without disrupting the host's
+    // ini-driven key bindings or joyGetPosEx gamepad path.
+    if constexpr (FM2K::kIsFM2K) {
+        if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT, (void*)Hook_GetPlayerInput,
+                          (void**)&original_get_player_input) != MH_OK ||
+            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook GetPlayerInput");
+            return false;
+        }
+    } else {
+        // FM95: hook BOTH split single-arg functions so our binder layer
+        // applies to both players. Same effect as FM2K's single hook —
+        // user-rebindable keyboard + XInput gamepad, facing flip applied
+        // engine-relative, START stripped on CSS.
+        if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT,    // 0x408AE0 P1
+                          (void*)Hook_GetPlayerInput_FM95_P1,
+                          (void**)&original_get_player_input_p1) != MH_OK ||
+            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook get_player_input_p1");
+            return false;
+        }
+        if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT_P2, // 0x408D60 P2
+                          (void*)Hook_GetPlayerInput_FM95_P2,
+                          (void**)&original_get_player_input_p2) != MH_OK ||
+            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT_P2) != MH_OK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook get_player_input_p2");
+            return false;
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: Installed FM95 split input hooks (p1=0x%08X, p2=0x%08X) "
+                    "→ FM2KInputBinder + facing flip via g_p_facing_snap",
+                    (unsigned)FM2K::ADDR_GET_PLAYER_INPUT,
+                    (unsigned)FM2K::ADDR_GET_PLAYER_INPUT_P2);
     }
 
     // Hook UpdateGameState
@@ -1747,12 +2082,25 @@ bool InitializeHooks() {
         return false;
     }
 
-    // Hook RunGameLoop
-    if (MH_CreateHook((void*)FM2K::ADDR_RUN_GAME_LOOP, (void*)Hook_RunGameLoop,
-                      (void**)&original_run_game_loop) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_RUN_GAME_LOOP) != MH_OK) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook RunGameLoop");
-        return false;
+    // Hook RunGameLoop — FM2K only. On FM95, ADDR_RUN_GAME_LOOP IS WinMain
+    // (the frame loop is inlined into WinMain); detouring it intercepts the
+    // process entry point BEFORE init runs, so the trampoline takes over
+    // with an uninitialized window/game state and CPW silently dies.
+    // Until the trampoline is taught to coexist with FM95's WinMain-driven
+    // loop, leave the natural WinMain alone — the per-frame hooks
+    // (Hook_UpdateGameState / Hook_RenderGame / Hook_ProcessGameInputs)
+    // still fire from inside FM95's loop and that's enough to drive a
+    // basic boot.
+    if constexpr (FM2K::kIsFM2K) {
+        if (MH_CreateHook((void*)FM2K::ADDR_RUN_GAME_LOOP, (void*)Hook_RunGameLoop,
+                          (void**)&original_run_game_loop) != MH_OK ||
+            MH_EnableHook((void*)FM2K::ADDR_RUN_GAME_LOOP) != MH_OK) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook RunGameLoop");
+            return false;
+        }
+    } else {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: SKIP RunGameLoop hook on FM95 — frame loop is inlined into WinMain");
     }
 
     // Hook GameRand

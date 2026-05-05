@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}{{ u.nick }} — FM2K Stats{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>{{ u.nick }}</h1>
+  <p class="lede">
+    <strong>{{ u.wins }}-{{ u.losses }}-{{ u.draws }}</strong>
+    over <strong>{{ u.total }}</strong> matches.
+  </p>
+</section>
+
+<section>
+  <h2>By game</h2>
+  <table class="grid">
+    <thead><tr><th>Game</th><th class="num">W</th><th class="num">L</th><th class="num">D</th></tr></thead>
+    <tbody>
+      {% for r in u.by_game %}
+      <tr>
+        <td><a href="/g/{{ r.game_id }}">{{ r.game_id }}</a></td>
+        <td class="num">{{ r.wins }}</td>
+        <td class="num">{{ r.losses }}</td>
+        <td class="num">{{ r.draws }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>By character</h2>
+  <table class="grid">
+    <thead><tr><th>Character</th><th class="num">W</th><th class="num">L</th><th class="num">D</th></tr></thead>
+    <tbody>
+      {% for r in u.by_char %}
+      <tr>
+        <td>{{ r.char }}</td>
+        <td class="num">{{ r.wins }}</td>
+        <td class="num">{{ r.losses }}</td>
+        <td class="num">{{ r.draws }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Top opponents</h2>
+  <table class="grid">
+    <thead><tr><th>Opponent</th><th class="num">W</th><th class="num">L</th><th class="num">D</th></tr></thead>
+    <tbody>
+      {% for r in u.vs_opponents %}
+      <tr>
+        <td><a href="/u/{{ r.opp_id }}">{{ r.opp_nick }}</a></td>
+        <td class="num">{{ r.wins }}</td>
+        <td class="num">{{ r.losses }}</td>
+        <td class="num">{{ r.draws }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Recent matches</h2>
+  <table class="grid">
+    <thead><tr><th>When</th><th>Game</th><th>Match</th><th>Result</th></tr></thead>
+    <tbody>
+      {% for m in u.recent %}
+      {% set i_am_p1 = m.p1_id == u.user_id %}
+      {% set my_char = char_label(m.p1_char_name if i_am_p1 else m.p2_char_name,
+                                  m.p1_char_id   if i_am_p1 else m.p2_char_id) %}
+      {% set opp_char = char_label(m.p2_char_name if i_am_p1 else m.p1_char_name,
+                                   m.p2_char_id   if i_am_p1 else m.p1_char_id) %}
+      {% set opp_id = m.p2_id if i_am_p1 else m.p1_id %}
+      {% set opp_nick = m.p2_nick if i_am_p1 else m.p1_nick %}
+      {% set result =
+            'draw' if not m.winner_id
+            else ('win' if m.winner_id == u.user_id else 'loss') %}
+      <tr class="r-{{ result }}">
+        <td>{{ format_iso(m.finished_at) }}</td>
+        <td><a href="/g/{{ m.game_id }}">{{ m.game_id }}</a></td>
+        <td>
+          {{ my_char }} vs <a href="/u/{{ opp_id }}">{{ opp_nick }}</a> ({{ opp_char }})
+        </td>
+        <td>{{ result|capitalize }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

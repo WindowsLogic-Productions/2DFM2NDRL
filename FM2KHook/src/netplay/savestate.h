@@ -2,34 +2,76 @@
 #include <cstdint>
 #include <cstddef>
 #include "../audio/sound_rollback.h"  // DesiredState, MAX_CHANNELS
+#include "../core/globals.h"          // FM2K::kIsFM95, ADDR_*, sizes
 
 // ============================================================================
 // CHARACTER SLOT CONSTANTS
 // Wave C state_manager audit (docs/game/state_manager_audit.md) corrected two
-// P0 bugs here:
+// P0 bugs here on FM2K:
 //   - base was 0x4D1D80 → correct is 0x4D1D90 (off-by-16, we were reading the
 //     tail of an adjacent slot and missing the last 16 B of every slot).
 //   - dynamic offset was 55000 → correct is 0 (we only saved the last 2407 B
 //     of a 57407 B slot; 95% of each slot was unsaved frame-mutable interpreter
 //     state: task vars, the 20-slot box pointer array at +0x125, playerAliveFlag,
 //     hit-junction tables, opponent ptr, throw state, etc.).
+// FM95's char data is ~all static (per FM95_Integration.h: palette + image
+// descriptors + sounds + script payload all loaded once from .player file).
+// FM95 char_dynamic is empty in the FM95 SaveStateData — the per-instance
+// state lives in the object pool, which we DO capture.
 // ============================================================================
+#if defined(ENGINE_FM95)
+constexpr size_t CHAR_SLOT_SIZE         = 229844;
+constexpr size_t CHAR_SLOT_DYNAMIC_OFFSET = 0;
+constexpr size_t CHAR_SLOT_DYNAMIC_SIZE = 0;     // FM95: nothing dynamic to save here
+constexpr size_t NUM_CHAR_SLOTS         = 5;
+constexpr uintptr_t CHAR_SLOT_BASE      = 0x509100;
+#else
 constexpr size_t CHAR_SLOT_SIZE = 57407;           // Full slot size from IDA
 constexpr size_t CHAR_SLOT_DYNAMIC_OFFSET = 0;     // Save full slot (was 55000)
 constexpr size_t CHAR_SLOT_DYNAMIC_SIZE = CHAR_SLOT_SIZE - CHAR_SLOT_DYNAMIC_OFFSET; // 57407 bytes
 constexpr size_t NUM_CHAR_SLOTS = 8;
 constexpr uintptr_t CHAR_SLOT_BASE = 0x4D1D90;    // g_character_data_base (corrected)
+#endif
 
 // ============================================================================
-// SAVE STATE DATA - ~420KB per slot
+// SAVE STATE DATA
+//   FM2K: ~420KB per slot (Wave C audit captures multiple subsystems).
+//   FM95: ~50KB per slot (object pool + input rings + minimal scalars).
+//         FM95 doesn't have FM2K's afterimage_pool / input_tracking_state /
+//         palette flash arithmetic regions — fewer subsystems to mirror.
 // ============================================================================
 struct SaveStateData {
     uint32_t frame_number;
     uint32_t checksum;
     uint32_t rng_seed;
     uint32_t input_buffer_index;
-    uint32_t render_frame_counter;                         // 0x4456FC - diverges during rollback replay
+    uint32_t render_frame_counter;                         // FM2K: 0x4456FC ; FM95: g_game_tick_counter @ 0x4DD7A8
 
+#if defined(ENGINE_FM95)
+    // FM95 lean save layout — fields ordered per docs/FM95_Savestate_Inventory.md.
+    // ~45 KB per slot. char_dynamic is zero-sized (FM95 char data is static
+    // after .player load; per-instance state lives in object_pool).
+    //
+    // Block A: Object pool (256 × 164 = 0xA400).
+    uint8_t  object_pool[FM2K::SIZE_OBJECT_POOL];          // src: 0x426A40
+    // Block B: game-state scalars (frame counter is in render_frame_counter
+    // field above; rng_seed too). Just need game_mode.
+    uint32_t game_mode;                                    // src: 0x425558
+    // Block C: timer subsystems — three contiguous blocks at 0x509080..0x5090B0.
+    uint8_t  timer_blocks[0x30];                           // src: 0x509080
+    // Block D: input ring + edge-detection state.
+    uint8_t  p1_input_history[0x400];                      // src: 0x431720
+    uint8_t  p2_input_history[0x400];                      // src: 0x431B20
+    uint8_t  input_history_extra[0x400];                   // src: 0x431320 — combo replay ring
+    uint32_t p1_input_current;                             // src: 0x437750
+    uint32_t p2_input_current;                             // src: 0x437754
+    uint32_t p1_input_persistent;                          // src: 0x425500
+    uint8_t  input_edge_state[0x10];                       // src: 0x4255A8..B7 — current/pressed for both players
+    // Block E + F merged: per-player arrays + round state form one
+    // contiguous range at 0x5E98A0..0x5E9A40 (416 B). Saving as one
+    // memcpy is simpler than chasing each 25-stride field individually.
+    uint8_t  player_round_state[0x1A0];                    // src: 0x5E98A0
+#else
     uint8_t input_tracking_state[0xA0];                    // 160 bytes
     uint8_t char_dynamic[NUM_CHAR_SLOTS][CHAR_SLOT_DYNAMIC_SIZE]; // ~460 KB (full 57 KB slot × 8)
     uint8_t object_pool[0x5F800];                          // ~391KB
@@ -38,7 +80,9 @@ struct SaveStateData {
     uint8_t effect_sys1[42];                               // Effect system P1
     uint8_t effect_sys2[88];                               // 0x4456B0..0x445708: sysvars + effect-sys2 + timer_countdown1
     uint8_t shake_effects[40];                             // Shake structures
+#endif
 
+#if !defined(ENGINE_FM95)
     // g_round_end_flag — written/read by vs_round_function, drives round
     // transitions. Not previously saved; IDA audit flagged it as unsaved
     // state that rollback must cover for clean round-boundary replay.
@@ -60,6 +104,12 @@ struct SaveStateData {
     uint32_t current_object_ptr;                           // 0x4259A8
     uint8_t  object_list_heads_tails[0x400];               // 0x430240..0x430640 (1024 B)
     uint8_t  object_node_pool[0x2000];                     // 0x4CFA20 (8192 B)
+#else
+    // FM95: Mike Z sound layer (engine-agnostic — applies to any rollback
+    // target with a per-channel sound dispatch). Other Wave C subsystems
+    // don't exist on FM95.
+    SoundRollback::DesiredState sound_desired[SoundRollback::MAX_CHANNELS];
+#endif
 
     // Per-region CRCs captured AT SAVE TIME (the forward-sim state at this
     // frame). On desync, we dump these alongside the CURRENT (post-replay)
@@ -81,21 +131,36 @@ struct SaveStateData {
         uint32_t gameplay_fingerprint;
         uint32_t combined;
 
-        // Per-object-slot CRCs. Object pool is 1023 slots × 382 B at
-        // 0x4701E0..0x4FF9E0. On a desync where ObjectPool(full) diverges,
-        // diffing this array forward-vs-replay tells us the EXACT slot
-        // index that mutated differently — then we hit IDA with that slot's
-        // contents to find the code that wrote it.
+        // Per-object-slot CRCs. Engine-aware sizing: FM2K has 1024 × 382
+        // (~391KB pool) and FM95 has 256 × 164 (~40KB pool). Diffing
+        // forward-vs-replay localizes a desync to the exact slot index.
+#if defined(ENGINE_FM95)
+        static constexpr size_t OBJ_SLOT_SIZE  = FM2K::OBJECT_POOL_STRIDE;  // 164
+        static constexpr size_t OBJ_SLOT_COUNT = FM2K::OBJECT_POOL_COUNT;   // 256
+#else
         static constexpr size_t OBJ_SLOT_SIZE  = 382;
         static constexpr size_t OBJ_SLOT_COUNT = 1023;
+#endif
         uint32_t object_slot_crcs[OBJ_SLOT_COUNT];
 
         bool     valid;
     } saved_region_crcs;
 };
 
-// Addresses for Wave C audit regions — keep in one place.
+// Addresses for Wave C audit regions — FM2K only. FM95 has no equivalent
+// afterimage/object-list/node-pool subsystems (different state-machine
+// architecture per the IDA decomp). Stubbed to zero so any consumer that
+// reads the symbols still compiles on FM95.
 namespace WaveCAddrs {
+#if defined(ENGINE_FM95)
+    constexpr uintptr_t AFTERIMAGE_POOL        = 0;
+    constexpr size_t    AFTERIMAGE_POOL_SZ     = 0;
+    constexpr uintptr_t CURRENT_OBJECT_PTR     = 0;
+    constexpr uintptr_t OBJECT_LIST_HEADS      = 0;
+    constexpr size_t    OBJECT_LIST_HEADS_SZ   = 0;
+    constexpr uintptr_t OBJECT_NODE_POOL       = 0;
+    constexpr size_t    OBJECT_NODE_POOL_SZ    = 0;
+#else
     constexpr uintptr_t AFTERIMAGE_POOL        = 0x447930;
     constexpr size_t    AFTERIMAGE_POOL_SZ     = 0x46F6C0 - 0x447930;
     constexpr uintptr_t CURRENT_OBJECT_PTR     = 0x4259A8;
@@ -103,6 +168,7 @@ namespace WaveCAddrs {
     constexpr size_t    OBJECT_LIST_HEADS_SZ   = 0x400;
     constexpr uintptr_t OBJECT_NODE_POOL       = 0x4CFA20;
     constexpr size_t    OBJECT_NODE_POOL_SZ    = 0x2000;
+#endif
 }
 
 // ============================================================================

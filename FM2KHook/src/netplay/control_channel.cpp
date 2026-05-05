@@ -5,10 +5,14 @@
 #include "spectator_node.h"
 #include "spectator_tcp.h"
 #include "nat_traversal.h"
+#include "../ui/shared_mem.h"  // SharedMem_PublishMatchOutcome on ControlChannel timeout
 #include <SDL3/SDL_log.h>
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <mutex>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 // =============================================================================
 // INTERNAL STATE
@@ -27,6 +31,40 @@ static uint16_t g_recv_ack = 0;
 // Connection state
 static bool g_connected = false;
 static uint32_t g_last_recv_time = 0;
+// When did g_connected go true? Used by ControlChannel_Poll's timeout
+// check to apply a startup grace window — the first ~15s after
+// connect we use a much wider timeout so cnc-ddraw / other slow boot
+// paths don't false-DC on the second peer's late init. Reset to 0
+// when g_connected drops back to false.
+static uint32_t g_connected_at_ms = 0;
+
+// Keepalive heartbeat (#fixes-modal-drag-disconnect 2026-05-05).
+// Multimedia timer that fires on a worker thread, independent of the
+// main loop's Windows message pump. When the user drags the title bar
+// or opens the System menu, DefWindowProc enters a modal loop that
+// blocks DispatchMessage; without this thread the main loop stops
+// pumping pings and the peer's ControlChannel_Poll declares us
+// disconnected after PING_TIMEOUT_MS. The MM timer keeps sending
+// pings during modal mode so peers stay connected through window
+// drags / brief stalls. Receive + state mutation stays on the main
+// thread; only the outbound ping is fired from here.
+static UINT g_keepalive_timer_id = 0;
+
+// Serialises ControlChannel_Poll between the main thread and the
+// MM-timer worker. The MM-timer drives Poll itself when the main
+// thread is blocked (modal window drag / Alt-Tab inactivity / boot
+// stalls), so the handshake + receive path keeps making progress.
+// The lock is fine-grained — RawReceive + dispatch is non-blocking
+// and finishes in microseconds — so contention between threads is a
+// non-issue in practice.
+static std::mutex g_poll_mutex;
+// Tracks the last time the MAIN thread (not the MM timer) ran
+// ControlChannel_Poll. Updated at the top of ControlChannel_Poll. The
+// timeout-detection logic checks this value AGAINST g_last_recv_time
+// to avoid declaring DC after the main thread itself has been frozen
+// (modal drag pause); we extend the recv deadline by however long the
+// main pump was asleep.
+static uint32_t g_last_main_pump_ms = 0;
 static uint32_t g_last_ping_time = 0;
 static uint32_t g_rtt_ms = 0;
 static uint32_t g_ping_send_time = 0;
@@ -64,6 +102,60 @@ static uint32_t GetTimeMs() {
 // =============================================================================
 // SOCKET MANAGEMENT
 // =============================================================================
+
+// MM-timer callback: fires on a worker thread every PING_INTERVAL_MS
+// regardless of the message pump state. Two responsibilities:
+//   1. Send a ping if we're connected and the main thread hasn't
+//      pinged recently — keeps us alive across modal drags.
+//   2. Drive ControlChannel_Poll itself when the main thread is
+//      stuck (modal drag during HANDSHAKE, alt-tab during boot, slow
+//      ddraw init). Without this, a window drag during the
+//      "connecting…" phase leaves the handshake permanently stalled
+//      because the main thread is blocked inside DefWindowProc and
+//      Poll never runs. try_lock so the timer thread never blocks if
+//      the main thread is mid-Poll already; concurrency is serialised
+//      by g_poll_mutex.
+//
+// Forward decl — body is lower in this TU.
+static void PollImplLocked();
+static void CALLBACK KeepaliveTimerProc(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR) {
+    if (!g_socket_initialized) return;
+    // Outbound ping (post-handshake only).
+    if (g_connected) {
+        const uint32_t now_send = (uint32_t)timeGetTime();
+        if (now_send - g_last_ping_time >= PING_INTERVAL_MS / 2) {
+            ControlChannel_SendPing();
+        }
+    }
+    // Inbound poll — runs whether connected or not so the handshake
+    // makes forward progress even when the main thread is parked.
+    std::unique_lock<std::mutex> lock(g_poll_mutex, std::try_to_lock);
+    if (lock.owns_lock()) {
+        PollImplLocked();
+    }
+}
+
+static void KeepaliveTimer_Start() {
+    if (g_keepalive_timer_id != 0) return;
+    // TIME_PERIODIC + TIME_KILL_SYNCHRONOUS: callbacks fire every
+    // PING_INTERVAL_MS, and timeKillEvent() blocks until any in-flight
+    // callback returns (so shutdown doesn't race with sendto).
+    g_keepalive_timer_id = timeSetEvent(
+        PING_INTERVAL_MS, PING_INTERVAL_MS / 2,
+        KeepaliveTimerProc, 0,
+        TIME_PERIODIC | TIME_KILL_SYNCHRONOUS);
+    if (g_keepalive_timer_id == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "ControlChannel: timeSetEvent failed; modal-drag will still DC");
+    }
+}
+
+static void KeepaliveTimer_Stop() {
+    if (g_keepalive_timer_id != 0) {
+        timeKillEvent(g_keepalive_timer_id);
+        g_keepalive_timer_id = 0;
+    }
+}
 
 bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
     if (g_socket_initialized) {
@@ -152,6 +244,13 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
     g_socket_initialized = true;
     g_local_player_id = static_cast<uint8_t>(g_player_index);
     g_last_recv_time = GetTimeMs();
+    // 0 sentinel — the first ControlChannel_Poll call sees this and
+    // skips its pump-stall ride-through. Otherwise the natural gap
+    // between NetSocket_Init and the first main-loop tick (sometimes
+    // hundreds of ms) gets mis-classified as a stall and resets the
+    // recv deadline before HELLO/HELLO_ACK has even completed.
+    g_last_main_pump_ms = 0;
+    KeepaliveTimer_Start();
 
     if (have_remote) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: Initialized on port %d, remote=%s",
@@ -166,6 +265,8 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
 
 void NetSocket_Shutdown() {
     if (!g_socket_initialized) return;
+
+    KeepaliveTimer_Stop();
 
     if (g_socket != INVALID_SOCKET) {
         closesocket(g_socket);
@@ -378,7 +479,11 @@ void ControlChannel_LatchPeerAddr(const sockaddr_in& peer) {
     g_remote_sockaddr = peer;
 }
 
-void ControlChannel_Poll() {
+// Body of ControlChannel_Poll. Called either by the main thread (via
+// ControlChannel_Poll, which acquires the mutex) or by the MM-timer
+// worker (via KeepaliveTimerProc, also under the mutex). Touching this
+// directly without holding g_poll_mutex is a bug.
+static void PollImplLocked() {
     if (!g_socket_initialized) return;
 
     // Receive all pending packets
@@ -400,11 +505,57 @@ void ControlChannel_Poll() {
     // cheap when there are no subscribers.
     SpectatorNode_TickHostMaintenance();
 
-    // Check for timeout
+    // Check for timeout. Pump-stall ride-through: if the main thread
+    // paused longer than half the ping timeout (e.g. Win32 modal
+    // title-drag, scheduler hiccup, init->first-frame gap), the
+    // peer's pings probably arrived but went unread. Reset
+    // g_last_recv_time to `now` so the timeout countdown effectively
+    // restarts — the MM-timer kept OUR pings flowing, so this is
+    // symmetric: neither side false-DCs the other across a stall.
+    //
+    // The first-call sentinel (g_last_main_pump_ms == 0) prevents a
+    // false-stall on the very first Poll after init; otherwise the
+    // gap from NetSocket_Init to the first main-loop iteration would
+    // look like a 300-1000ms "stall" and reset the deadline before
+    // the real timeout window has even started counting.
     uint32_t now = GetTimeMs();
-    if (g_connected && (now - g_last_recv_time) > PING_TIMEOUT_MS) {
+    if (g_last_main_pump_ms != 0) {
+        const uint32_t main_pause = now - g_last_main_pump_ms;
+        if (main_pause > PING_TIMEOUT_MS / 2) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ControlChannel: main pump stalled %ums — resetting recv deadline",
+                (unsigned)main_pause);
+            g_last_recv_time = now;
+        }
+    }
+    g_last_main_pump_ms = now;
+    // Startup grace window: the first ~15s after handshake we use a 10s
+    // timeout instead of 1.5s. cnc-ddraw / other proxy DLLs add measurable
+    // boot latency to the OTHER peer; if their hook hasn't started its
+    // ping cycle by the time our 1.5s window expires we'd false-DC them.
+    // After 15s both peers are in steady state and the tight timeout
+    // catches real disconnects fast.
+    constexpr uint32_t kStartupGraceWindowMs = 15000;
+    constexpr uint32_t kStartupTimeoutMs     = 10000;
+    const uint32_t timeout_ms =
+        (g_connected_at_ms != 0 &&
+         (now - g_connected_at_ms) < kStartupGraceWindowMs)
+            ? kStartupTimeoutMs
+            : (uint32_t)PING_TIMEOUT_MS;
+    if (g_connected && (now - g_last_recv_time) > timeout_ms) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Connection timed out");
         g_connected = false;
+        g_connected_at_ms = 0;
+        // Surface the disconnect to the launcher even when the failure
+        // happens BEFORE we reach the BATTLE GekkoNet session — the user
+        // bug report ("closed client during CSS, host stayed frozen with
+        // music playing") was the CSS phase + GekkoPlayerDisconnected
+        // never firing because we hadn't created the battle session yet.
+        // PublishMatchOutcome with DISCONNECT bumps match_outcome_seq;
+        // the launcher's PollMatchOutcome reads it on the next frame and
+        // calls on_session_stop to terminate the surviving game process.
+        // No-op when shared mem isn't initialised.
+        SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DISCONNECT);
     }
 
     // Send periodic ping
@@ -412,6 +563,15 @@ void ControlChannel_Poll() {
         ControlChannel_SendPing();
         g_last_ping_time = now;
     }
+}
+
+void ControlChannel_Poll() {
+    // Public entry. Lock-then-delegate so the MM-timer's parallel poll
+    // path (which uses try_lock to avoid blocking the timer worker)
+    // can't race with us on RawReceive's dispatch into Netplay_*
+    // handlers.
+    std::lock_guard<std::mutex> lock(g_poll_mutex);
+    PollImplLocked();
 }
 
 void ControlChannel_Send(const CtrlPacket& packet) {
@@ -497,6 +657,7 @@ void ControlChannel_SendHelloAck(uint8_t player_id) {
     ControlChannel_Send(pkt);
 
     g_connected = true;
+    g_connected_at_ms = GetTimeMs();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent HELLO_ACK, connected!");
 }
 

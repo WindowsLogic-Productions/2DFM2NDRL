@@ -55,6 +55,11 @@ void Shutdown();
 // any binding was modified this frame (caller may auto-Save).
 bool RenderWindow(int player_slot, bool* p_open = nullptr);
 
+// Body-only variant — caller owns the ImGui window/tab/child container.
+// Use this to embed the binder inside the launcher's consolidated
+// Settings tab pane. Returns true on any binding change for the frame.
+bool RenderBody(int player_slot);
+
 // Sample current state of all bindings for player_slot, returning the
 // 11-bit FM2K input mask. Call once per frame from your input source.
 //

@@ -22,9 +22,19 @@ enum class LoopPhase {
     SPECTATOR_PLAYBACK  // Inputs sourced from spectator stream queue, no GekkoNet
 };
 
-// Entry point replacing main_game_loop wholesale. Returns the same BOOL the
-// original did: non-zero on normal exit via WM_QUIT, zero on abnormal.
+// Entry point replacing main_game_loop wholesale (FM2K). Returns the same
+// BOOL the original did: non-zero on normal exit via WM_QUIT, zero on
+// abnormal. Pumps messages, calls TrampolineFrameTick, paces with QPC.
 BOOL TrampolineMainLoop();
+
+// Per-frame engine work — extracted body callable from either
+// TrampolineMainLoop (FM2K, host loop replaced) or Hook_UpdateGameState
+// (FM95, where the host's WinMain owns the message pump and timing).
+// Returns the LoopPhase actually executed so callers can decide whether
+// the host's natural render call should still fire (NATIVE) or be skipped
+// (BATTLE / CSS — the tick already drove update + render via AdvanceEvent
+// / RenderFrameWithSnapshot).
+LoopPhase TrampolineFrameTick();
 
 // [EB]-OPCODE DIAGNOSTIC: log shake-effect timer + camera position at the
 // given render-boundary phase (PRE-SAVE / PRE-RENDER / POST-RENDER /
