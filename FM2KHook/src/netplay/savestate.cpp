@@ -66,6 +66,14 @@ namespace EffectAddrs {
 static constexpr int MAX_ROLLBACK_FRAMES = 64;
 static SaveStateData g_state_buffer[MAX_ROLLBACK_FRAMES];
 
+// Tracks the slot most recently filled by SaveState_Save. Used by
+// SaveState_PatchPostRenderRng to back-patch the rng_seed field after the
+// trampoline's render call returns, so the saved slot reflects post-render
+// rng (matching what forward sim sees as the starting rng for the next
+// frame). -1 = no save has happened yet (e.g. CSS).
+static int g_last_saved_slot  = -1;
+static int g_last_saved_frame = -1;
+
 // Initial sync flag - forces deterministic state on first save (like BBBR's m_initialSyncDone)
 static bool g_initial_sync_done = false;
 
@@ -212,9 +220,16 @@ void SaveState_Init() {
         fclose(f);
     }
     g_initial_sync_done = false;  // Reset so next battle re-syncs
+    g_last_saved_slot = -1;
+    g_last_saved_frame = -1;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SaveState: Initialized %d rollback slots (~%zuKB each)",
                 MAX_ROLLBACK_FRAMES, sizeof(SaveStateData) / 1024);
+}
+
+void SaveState_PatchPostRenderRng(uint32_t rng) {
+    if (g_last_saved_slot < 0) return;  // no save has happened yet
+    g_state_buffer[g_last_saved_slot].rng_seed = rng;
 }
 
 bool SaveState_Save(int frame) {
@@ -250,6 +265,12 @@ bool SaveState_Save(int frame) {
 
     int slot = frame % MAX_ROLLBACK_FRAMES;
     SaveStateData* state = &g_state_buffer[slot];
+
+    // Track the slot for SaveState_PatchPostRenderRng. Set BEFORE we mutate
+    // the slot so a same-frame re-save (replay save) still reaches the same
+    // slot — both forward and replay back-patch the same address.
+    g_last_saved_slot  = slot;
+    g_last_saved_frame = frame;
 
     // Detect: is this a re-save of a frame we already saved (= REPLAY save
     // following a Load+Advance), or the first save (= FORWARD-sim save)?
@@ -439,24 +460,13 @@ bool SaveState_Save(int frame) {
 
     state->frame_number = frame;
 
-    // RNG seed: zero the saved copy (deterministic CRC), DO NOT capture live
-    // state. SaveEvent fires BEFORE the wall-clock frame's render call, so a
-    // captured live rng would always be the pre-render value. Next frame's
-    // runahead-rewind LoadEvent then restores rng to that pre-render value,
-    // wiping render-side game_rand consumption every frame.
-    // ProcessColorInterpolation mode 3 and ProcessShakeEffect mode 4 call
-    // game_rand each render — without those calls propagating, palette mode
-    // 3 (used by Bewear 214B) interpolates with the same constant random
-    // factor every frame, showing one static color instead of the animated
-    // gradient vanilla shows.
-    // Both peers run render once per wall-clock frame and consume identical
-    // rng (deterministic protocol), so live rng stays in lockstep without
-    // explicit save/restore. Real-rollback replays don't re-run render, so
-    // post-replay rng will skip the render-side delta of the replayed
-    // frames — visible as palette/shake desync during the brief rollback
-    // window only. Sim decisions don't depend on these render-side rng
-    // calls.
-    state->rng_seed = 0;
+    // RNG seed: capture live (= pre-render value at SaveEvent time). The
+    // trampoline back-patches this slot via SaveState_PatchPostRenderRng
+    // after render returns, so by the time anyone Loads from this slot the
+    // rng_seed reflects post-render rng. That gives both vanilla-matching
+    // visual evolution AND rollback determinism: forward and replay both
+    // start from post-render-of-prev-frame rng for any given frame.
+    state->rng_seed = *(uint32_t*)ADDR_RNG_SEED;
 
     // Render frame counter: ZERO the saved copy (deterministic CRC), DO NOT
     // capture live state. Rationale identical to the shake_effects carve-out
@@ -729,9 +739,14 @@ bool SaveState_Load(int frame) {
         return false;
     }
 
-    // RNG seed: SKIP restore. Save zeros the buffer for fingerprint
-    // determinism; restoring would clobber render's game_rand progression
-    // (see Save() comment for why). Live rng keeps evolving.
+    // RNG seed: RESTORE. SaveState_Save zeros the seed in the slot, then
+    // SaveState_PatchPostRenderRng (called from RenderFrameWithSnapshot
+    // after render returns) writes the post-render rng into the slot. So
+    // the value we restore here is post-render rng of whatever frame the
+    // saved slot represents — exactly what forward sim sees as the
+    // starting rng for the NEXT frame, which is also what we want replay
+    // sim to start with for rollback determinism.
+    *(uint32_t*)ADDR_RNG_SEED = state->rng_seed;
 
     // Render frame counter: SKIP restore. Live counter is the only reliable
     // source — restoring would freeze it at the saved value and break shake

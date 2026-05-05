@@ -274,6 +274,16 @@ static void RenderFrameWithSnapshot() {
     }
     EbDiag_Dump("POST-RESTORE");
 
+    // Back-patch the most-recently-saved slot's rng_seed with the post-
+    // render rng so rollback Load gives replay sim the same starting rng
+    // forward sim sees on the next frame. Without this, forward accumulated
+    // render-side game_rand calls (ProcessShakeEffect mode 4 +
+    // ProcessColorInterpolation mode 3) but replay didn't, and they
+    // diverged on the rng region after any rollback — exactly the
+    // "RNG_Seed forward 0x... replay 0x... DIFF" dump in
+    // FM2K_P*_desync_f*.log. Cheap (single uint32 store).
+    SaveState_PatchPostRenderRng(*(uint32_t*)FM2K::ADDR_RANDOM_SEED);
+
     SharedMem_Update();
 }
 
