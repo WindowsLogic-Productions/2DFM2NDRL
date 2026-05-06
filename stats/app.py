@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -205,11 +206,51 @@ def game_meta(game_id: str) -> dict[str, Any]:
     return load_registry().get(game_id, {})
 
 
+def banner_color(seed: str) -> str:
+    """Generate a deterministic two-stop linear-gradient string for a
+    placeholder banner. Each game_id → fixed accent pair so cards
+    don't look identical, and a refresh keeps the same visual.
+
+    No JS / external CSS lib — output is "linear-gradient(...)" usable
+    inline as a CSS `background:` value. Saturation and lightness
+    pinned to fit the existing dark theme."""
+    if not seed:
+        seed = "fm2k"
+    # FNV-1a hash → two hue values 90° apart so the gradient looks
+    # purposeful instead of muddy.
+    h = 2166136261
+    for c in seed.encode("utf-8"):
+        h ^= c
+        h = (h * 16777619) & 0xFFFFFFFF
+    hue1 = h % 360
+    hue2 = (hue1 + 90) % 360
+    return (f"linear-gradient(135deg, "
+            f"hsl({hue1} 60% 28%) 0%, "
+            f"hsl({hue2} 55% 18%) 100%)")
+
+
+def banner_monogram(name: str) -> str:
+    """First letter of each significant word, max 3 chars. Renders
+    over the gradient when no real banner image exists.
+    'Pokemon: Close Combat' → 'PCC'; '2D Fighter Maker 95' → '2FM'."""
+    if not name:
+        return "?"
+    parts = re.findall(r"[A-Za-z0-9]+", name)
+    if not parts:
+        return name[:1].upper() or "?"
+    out = ""
+    for p in parts[:3]:
+        out += p[0].upper()
+    return out
+
+
 # Make the registry helpers available to every template render
 # without threading them through each handler explicitly. Templates
 # can call {{ friendly_name(m.game_id) }} or {{ game_meta(gid).year }}.
 templates.env.globals["friendly_name"] = game_friendly_name
 templates.env.globals["game_meta"] = game_meta
+templates.env.globals["banner_color"] = banner_color
+templates.env.globals["banner_monogram"] = banner_monogram
 
 
 def char_label(name: Optional[str], cid: Optional[int]) -> str:
@@ -372,6 +413,72 @@ def aggregate_character(game_id: str, char_key: str) -> dict[str, Any]:
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────
+
+def _games_grid_data(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate all known games for the /games grid view.
+
+    Combines:
+      - registry.json entries (every game we've ever cataloged,
+        regardless of whether matches have been played on it)
+      - distinct game_id values from matches.json (for any games that
+        appeared in match logs but aren't in the registry yet —
+        usually means a regular plays a game we haven't curated)
+
+    Returns list of {game_id, name, year, sources, engine,
+    has_kgt, banner_url, thumb_url, match_count, last_played_at}.
+    Sorted by name, case-insensitive.
+    """
+    by_id = load_registry()
+    # Match counts per game_id (only games that show up in real
+    # matches; the grid still shows the full registry but we want to
+    # surface "active" games at the top later).
+    counts: Counter[str] = Counter()
+    last_played: dict[str, float] = {}
+    for m in matches:
+        gid = m.get("game_id") or ""
+        if not gid:
+            continue
+        counts[gid] += 1
+        last_played[gid] = max(last_played.get(gid, 0.0),
+                               float(m.get("started_at") or 0.0))
+
+    # Union of registry game_ids + match-only game_ids.
+    all_ids = set(by_id.keys()) | set(counts.keys())
+    rows: list[dict[str, Any]] = []
+    for gid in all_ids:
+        rec = by_id.get(gid, {})
+        rows.append({
+            "game_id":         gid,
+            "name":            rec.get("name") or gid,
+            "year":            rec.get("year") or "",
+            "engine":          rec.get("engine") or "FM2K",
+            "sources":         rec.get("sources") or [],
+            "has_kgt":         bool(rec.get("kgt_filename")),
+            "banner_url":      rec.get("banner_url") or "",
+            "thumb_url":       rec.get("thumb_url") or "",
+            "homepage":        rec.get("homepage") or "",
+            "developer":       rec.get("developer") or "",
+            "match_count":     counts.get(gid, 0),
+            "last_played_at":  last_played.get(gid, 0.0),
+        })
+    rows.sort(key=lambda r: (r["name"] or r["game_id"]).lower())
+    return rows
+
+
+@app.get("/games", response_class=HTMLResponse)
+def games_grid(request: Request):
+    """Fightcade-style game grid — every catalog entry as a card with
+    name + year + match count, plus a banner placeholder when the
+    registry doesn't (yet) ship a real image."""
+    rows = _games_grid_data(load_matches())
+    total_games   = len(rows)
+    total_active  = sum(1 for r in rows if r["match_count"] > 0)
+    return templates.TemplateResponse(
+        request, "games_grid.html",
+        {"rows": rows,
+         "total_games": total_games,
+         "total_active": total_active})
+
 
 @app.get("/", response_class=HTMLResponse)
 def landing(request: Request):
