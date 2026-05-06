@@ -158,6 +158,17 @@ static bool g_received_hello_ack = false;
 extern "C" int  Hook_GetSOCDModePublic();
 extern "C" void Hook_SetSOCDMode(int mode);
 
+// Random-stage handoff to the FM95 LoadStageFile_alt hook. Set when the
+// xorshift block in Netplay_StartBattleSession produces a fresh roll;
+// read by Hook_LoadStageFileAlt to override the function's arg0. 0xFFFFFFFF
+// means "random not enabled / no override" — hook passes the original
+// arg0 through unchanged. FM2K doesn't read this — its ADDR_SELECTED_STAGE
+// write goes to the canonical 0x43010c which the game reads natively.
+static uint32_t g_pending_random_stage = 0xFFFFFFFFu;
+extern "C" uint32_t Netplay_PeekNextRolledStage() {
+    return g_pending_random_stage;
+}
+
 // Snapshot host's current settings and ship them to the remote peer +
 // any subscribed spectators. Called from CheckFullyConnected (initial
 // rendezvous) and from Netplay_StartBattle (every new match) so settings
@@ -1492,6 +1503,12 @@ bool Netplay_StartBattle() {
             const uint32_t roll = g_xs_d % span;
             const uint32_t stage = (uint32_t)g_stage_min + roll;
             *(uint32_t*)kSelectedStageAddr = stage;
+            // Also stash for FM95's LoadStageFile_alt hook — vs/story
+            // mode reads its stage_id from a per-character table at
+            // call time, so writing to ADDR_SELECTED_STAGE alone only
+            // covers practice mode. The hook reads g_pending_random_stage
+            // and overrides arg0 when non-FFFFFFFF.
+            g_pending_random_stage = stage;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: random stage rolled=%u (range %d..%d)",
                 stage, g_stage_min, g_stage_max);
@@ -1760,23 +1777,48 @@ void Netplay_EndBattle() {
     // GekkoGameSessions (player vs player); spectate sessions and
     // stress runs skip the publish.
     if (g_session && g_session_kind == SessionKind::BATTLE) {
-        const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
-        const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
         FM2KMatchOutcome outcome = FM2K_MATCH_OUTCOME_NONE;
-        if (p1_hp == 0 && p2_hp == 0)              outcome = FM2K_MATCH_OUTCOME_DRAW;
-        else if (p1_hp > 0 && p2_hp == 0)          outcome = (g_player_index == 0)
+        if constexpr (FM2K::kIsFM2K) {
+            // FM2K: HP-based outcome — direct read at the moment the
+            // session ends. KO state has the loser's HP at 0; both at
+            // 0 = double-KO (draw); both >0 = timeout/non-KO end (we
+            // can't decide and log as draw).
+            const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
+            const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
+            if (p1_hp == 0 && p2_hp == 0)        outcome = FM2K_MATCH_OUTCOME_DRAW;
+            else if (p1_hp > 0 && p2_hp == 0)    outcome = (g_player_index == 0)
                                                             ? FM2K_MATCH_OUTCOME_SELF_WON
                                                             : FM2K_MATCH_OUTCOME_PEER_WON;
-        else if (p2_hp > 0 && p1_hp == 0)          outcome = (g_player_index == 1)
+            else if (p2_hp > 0 && p1_hp == 0)    outcome = (g_player_index == 1)
                                                             ? FM2K_MATCH_OUTCOME_SELF_WON
                                                             : FM2K_MATCH_OUTCOME_PEER_WON;
-        // Both HPs > 0: timeout / non-KO end (rematch trigger, return-to-
-        // CSS without final round). We can't tell who won — log as draw.
-        else                                        outcome = FM2K_MATCH_OUTCOME_DRAW;
-
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "Netplay: match outcome p1_hp=%u p2_hp=%u outcome=%d",
-            p1_hp, p2_hp, (int)outcome);
+            else                                  outcome = FM2K_MATCH_OUTCOME_DRAW;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: match outcome p1_hp=%u p2_hp=%u outcome=%d",
+                p1_hp, p2_hp, (int)outcome);
+        } else {
+            // FM95: round-win-counter-based outcome — mirrors the
+            // game's own decision in obj_match_result_state @ 0x410db0
+            // case 4: whoever has more rounds won is the match winner.
+            // These counters reset to 0 only at the START of a new
+            // match (vs_round_function case 1), so by the time we land
+            // here at session-stop they hold the final per-match
+            // values. Doesn't depend on g_p_main_object_ptr being
+            // valid (the per-object struct may have been torn down by
+            // the time we get here on a peer-disconnect path).
+            const uint32_t p1_wins = *(uint32_t*)FM2K::ADDR_P1_WIN_COUNTER;
+            const uint32_t p2_wins = *(uint32_t*)FM2K::ADDR_P2_WIN_COUNTER;
+            if (p1_wins > p2_wins)        outcome = (g_player_index == 0)
+                                                    ? FM2K_MATCH_OUTCOME_SELF_WON
+                                                    : FM2K_MATCH_OUTCOME_PEER_WON;
+            else if (p2_wins > p1_wins)   outcome = (g_player_index == 1)
+                                                    ? FM2K_MATCH_OUTCOME_SELF_WON
+                                                    : FM2K_MATCH_OUTCOME_PEER_WON;
+            else                           outcome = FM2K_MATCH_OUTCOME_DRAW;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: match outcome p1_wins=%u p2_wins=%u outcome=%d",
+                p1_wins, p2_wins, (int)outcome);
+        }
         SharedMem_PublishMatchOutcome(outcome);
     }
 
