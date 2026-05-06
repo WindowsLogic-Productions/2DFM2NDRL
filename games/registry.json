@@ -15154,12 +15154,13 @@
       "pkmncc"
     ],
     "kgt_filename": "pkmncc.kgt",
-    "homepage": "",
+    "homepage": "https://mizuumi.wiki/w/Pokemon:_Close_Combat",
     "download_url": "",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
-      "manual"
+      "manual",
+      "mizuumi.wiki"
     ],
     "characters": [],
     "stages": [],
@@ -19591,12 +19592,13 @@
       "vanpri"
     ],
     "kgt_filename": "vanpri.kgt",
-    "homepage": "https://archive.org/details/vanguard.-princess.v-1.8.7",
+    "homepage": "https://mizuumi.wiki/w/Vanguard_Princess",
     "download_url": "https://archive.org/download/vanguard.-princess.v-1.8.7",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
       "archive.org",
+      "mizuumi.wiki",
       "manual"
     ],
     "characters": [],
@@ -20274,12 +20276,13 @@
       "wonderfulworld_ver_0945"
     ],
     "kgt_filename": "WonderfulWorld_ver_0946.kgt",
-    "homepage": "https://archive.org/details/wonderful-world-ver-0945",
+    "homepage": "https://mizuumi.wiki/w/Wonderful_World",
     "download_url": "",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
       "manual",
+      "mizuumi.wiki",
       "archive.org"
     ],
     "characters": [],
