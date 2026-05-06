@@ -5,6 +5,7 @@
 #include "netplay_state.h"
 #include "control_channel.h"
 #include "shared_mem.h"
+#include "../ui/screenshot.h"
 #include "../locale/locale_spoof.h"
 
 // Forward-declare just the new patch function. We can't include
@@ -395,6 +396,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SharedMem: Init failed (non-fatal)");
             }
 
+            // Auto-capture banner pipeline. No-op unless
+            // FM2K_AUTO_CAPTURE=1 + FM2K_CAPTURE_DIR=<path> are set
+            // in env (= the launcher's banner-capture session). When
+            // active, main_loop_trampoline emits screenshots at
+            // intro / title / CSS / battle phase boundaries.
+            FM2KCapture::Init();
+
             // Parse network config from environment
             char* env_offline = getenv("FM2K_TRUE_OFFLINE");
             g_offline_mode = (env_offline && strcmp(env_offline, "1") == 0);
@@ -497,6 +505,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         // Shutdown in reverse order
         ShutdownHooks();
+
+        // Tear down GDI+ for the auto-capture writer (no-op when
+        // capture wasn't active this run).
+        FM2KCapture::Shutdown();
 
         // Cleanup shared memory
         CleanupSharedMemory();

@@ -1,157 +1,148 @@
 # Banner / screenshot pipeline
 
-## Why we don't scrape mizuumi.wiki for banners
+Goal: every game in the registry gets a clean, in-game-captured set
+of screenshots (intro / title / CSS / battle / per-character) which
+the stats site renders as banners and thumbs, the launcher renders
+in its game picker, and the lobby renders next to active matches.
 
-Mizuumi is operated by a friend of the project. Bulk-downloading
-their image hosting — even for a CC-BY-SA-licensed wiki — is rude
-when we have a clean alternative: capturing screenshots from the
-games themselves. Doing our own captures gives us:
+All bytes are produced by us, by running each game through the hook
+and saving frames the hook already has access to. No third-party
+image hosting, no scraping.
 
-1. **Standardized presentation.** Every card has an in-game frame at
-   the same resolution / aspect ratio.
-2. **No third-party dependency.** Mizuumi can rotate filenames,
-   change CDNs, deduplicate logos — none of that affects us once we
-   own the bytes.
-3. **No copyright / licensing ambiguity.** Game devs uploaded their
-   work to be played; an in-game screenshot of running their game
-   is settled fair-use territory the way a wiki re-host isn't.
-4. **Coverage matches reality.** We get banners for every game in
-   the launcher, not just the ~13 that happen to have wiki entries.
-
-The earlier `tools/cache_banners.py --source mizuumi` path is left
-gated behind `--i-have-permission` for emergency use only; CI never
-runs it.
-
-## Design: hook-driven auto-capture
-
-The hook already has everything we need:
-
-- A frame access point (the parity recorder + replay capture both
-  use the rendered framebuffer at end-of-frame — same hook taps
-  let us write a PNG instead).
-- An input override layer (`AutoTitleSkip` already mashes A through
-  intro / title / menu to reach CSS — we just need to pause it at
-  each interesting state and emit a screenshot).
-- A clean per-game-mode boundary (`game_mode_changed: 0 → 1000 →
-  2000`) so we know exactly when the title or CSS first becomes
-  visible.
-
-State machine the script drives, per game:
+## State machine the hook drives, per game
 
 ```
-spawn game  ─┐
-             │  game_mode = 0  (intro / publisher logos)
-             │     wait 15s, screenshot every 3s        → intro1.png … intro5.png
-             │
-             ▼
-      first time game_mode == 1000 (title)
-             │     hold for 1s, screenshot              → title.png
-             │     then hand back input, mash A
-             │
-             ▼
-      first time game_mode == 2000 (CSS)
-             │     hold for 1s, screenshot              → css.png
-             │     advance cursor through every slot,
-             │     screenshot each portrait position    → char_<id>.png
-             │     pick a stage, advance to battle
-             │
-             ▼
-      first time game_mode >= 3000 (battle)
-             │     screenshot first frame after intro   → battle.png
-             │
-      kill the game process
+spawn game (FM2K_AUTO_CAPTURE=1, FM2K_CAPTURE_DIR=...)
+  │
+  │  game_mode = 0 (publisher / intro logos)
+  │     hold input, take screenshot every 3s for 15s
+  │     → intro1.png … intro5.png
+  │
+  ▼
+  first transition into game_mode == 1000 (title)
+  │     hold for ~1s so any fade-in settles
+  │     → title.png
+  │     resume A-mash to enter VS-mode CSS
+  │
+  ▼
+  first transition into game_mode == 2000 (CSS)
+  │     hold for ~1s for the CSS layout to render
+  │     → css_initial.png
+  │     drive the player-1 cursor through every roster slot,
+  │     screenshot the highlighted portrait at each
+  │     → char_001.png, char_002.png, ...
+  │     pick stage 0, confirm, wait for transition
+  │
+  ▼
+  first transition into game_mode >= 3000 (battle)
+  │     wait until intro fade completes (~120 frames)
+  │     → battle.png
+  │
+  kill the game process, write a per-game manifest.json
 ```
 
-Output layout per game (driven by the launcher's `game_id`):
+## Output layout
 
 ```
 dist/captures/<game_id>/
-  intro1.png    intro2.png    intro3.png  ...
+  manifest.json       # what was captured + frame numbers + game_id
+  intro1.png ... intro5.png
   title.png
-  css.png
-  char_001.png  char_002.png  ...
+  css_initial.png
+  char_001.png ... char_NNN.png
   battle.png
 ```
 
-A separate post-processor script then picks the **canonical banner**
-for each game. Heuristic: title screen is usually the most readable
-"this is what the game is" image; fall back to CSS when title is
-just a logo. Operator can override per-game in
-`games/registry_overrides.json` with a `banner_capture` field
-naming the chosen file.
+Native FM2K render is 320x240. Cnc-ddraw upscaling is OFF for capture
+runs so the saved frames are pixel-accurate (no scaler artifacts);
+the stats site upscales via CSS and the launcher picker uses
+nearest-neighbor scaling.
+
+## A post-processor picks the canonical banner per game
+
+`tools/pick_canonical_banner.py` (post-capture):
+
+- For each `<game_id>` directory, evaluate candidate frames against
+  a quality heuristic — variance + saturation + aspect-ratio fit —
+  and pick the best for **banner** (16:9, used on the stats grid)
+  and **thumb** (square, used in the launcher game picker).
+- Default rank: title.png > css_initial.png > battle.png > intro.
+  Operator can override per-game in
+  `games/registry_overrides.json` with a `banner_capture` field
+  naming the chosen file.
+- Output: `dist/banners/<game_id>.png` + `dist/banners/<game_id>.thumb.png`.
+- Patches `games/registry.json` with the local `/static/banners/...`
+  paths.
 
 ## Implementation surface
 
-Three pieces, all driven from the existing launcher + hook:
+Three pieces, each small on its own.
 
-### 1. New hook command — write framebuffer to PNG
+### 1. Hook screenshot writer — `FM2KHook/src/ui/screenshot.{cpp,h}`
 
-`FM2KHook/src/ui/screenshot.{cpp,h}` (new). Reuses the
-DirectDraw / cnc-ddraw frame access we already have for
-`RenderFrameWithSnapshot`. Writes to a path supplied via env var
-`FM2K_CAPTURE_DIR`. Triggered by:
+Writes the current-frame DirectDraw / cnc-ddraw backbuffer to PNG.
+Reuses the same frame-access point as `RenderFrameWithSnapshot` and
+the parity recorder. Triggered by either:
 
-- A new `0xCC` control message `CAPTURE_REQUEST {filename}` that
-  the launcher can fire over the existing socket.
-- OR a shared-mem flag the launcher polls — same pattern as the
-  match-result publish path.
+- A new shared-mem flag the hook polls (`capture_request_seq`,
+  same pattern as `match_outcome_seq`), OR
+- A new 0xCC control message `CAPTURE_REQUEST {filename}` that the
+  launcher fires over the existing socket.
 
-### 2. New launcher mode — capture-runner
+PNG encoding: stb_image_write (header-only, no new deps), 8-bit RGBA.
 
-`FM2K_LauncherUI` gains a `RunCaptureSession(game)` that:
+### 2. Launcher capture-runner — `FM2K_LauncherUI::RunCaptureSession`
 
-- Spawns the game via the existing `FM2KGameInstance::Launch` path
-  with the new env var `FM2K_CAPTURE_DIR=dist/captures/<game_id>/`.
-- Sets `FM2K_AUTO_CAPTURE=1` so the hook knows to use the capture
-  state machine instead of normal autostart.
-- Polls the hook's published state (`game_mode` + a new
-  `capture_phase` enum in shared mem).
+Orchestrates one game:
+
+- Spawns it via existing `FM2KGameInstance::Launch` with envs:
+  - `FM2K_AUTO_CAPTURE=1` (hook switches to capture state machine)
+  - `FM2K_CAPTURE_DIR=dist/captures/<game_id>/`
+- Polls hook shared-mem `game_mode` + new `capture_phase`
+  enum (INTRO / TITLE / CSS / BATTLE / DONE).
 - Sends `CAPTURE_REQUEST` at each phase boundary.
-- Kills the game when phase reaches BATTLE_DONE.
+- Kills the game when phase reaches DONE.
+- Writes `manifest.json` summarizing what landed.
 
-A "Run captures" menu entry in the launcher invokes this for every
-installed game in sequence. Manual per-game button for one-offs.
+A new "Tools → Capture banners" menu entry runs this for every
+installed game in sequence; right-click on a single game in the
+list runs it for just that game.
 
-### 3. New tool — auto_capture_screenshots.py
+### 3. Orchestrator — `tools/auto_capture_screenshots.py`
 
-Thin orchestrator that:
+The build-time / batch driver:
 
-- Reads `games/registry.json` and the launcher's installed-games
-  list.
-- Spawns the launcher with `--capture-game <game_id>` for each.
-- Waits for completion, validates the output dir has the expected
-  files.
-- Picks canonical banner / thumb (title preferred, css fallback).
-- Resizes via Pillow if available (or copies as-is).
-- Writes outputs to `dist/banners/<game_id>.png` + `.thumb.png`.
-- Patches `games/registry.json` with `banner_url` / `thumb_url`
-  pointing at the local `/static/banners/` paths.
+- Reads installed games (or `games/registry.json` for game_ids only).
+- Spawns the launcher with `--capture-game <game_id>` for each
+  (or one big `--capture-all`).
+- Validates output dir, retries failed runs.
+- Hands off to `pick_canonical_banner.py`.
 
-## Hub upload / CDN flow (later)
+## Distribution
 
-Once `dist/banners/` is populated, the build / release script
-rsyncs it to:
+Built artifacts in `dist/banners/` go three places:
 
-- `stats/static/banners/` (already mirrored automatically by
-  cache_banners.py for dev)
-- A public `/srv/fm2k/banners/` mount on the hub VPS, served behind
-  nginx at `https://2dfm.sytes.net/banners/<game_id>.png`
-- The launcher's local `%APPDATA%\FM2K_Rollback\banner_cache\<game_id>.png`
-  for offline picker thumbnails
+1. **Stats site** — rsync `dist/banners/` → `stats/static/banners/`
+   at deploy time. cache_banners.py already mirrors during dev.
+2. **Hub VPS** — `/srv/fm2k/banners/` mounted at
+   `https://2dfm.sytes.net/banners/<game_id>.png`. The launcher
+   fetches missing images on demand and caches locally.
+3. **Launcher offline cache** —
+   `%APPDATA%\FM2K_Rollback\banner_cache\<game_id>.png`. First-run
+   warms over a few seconds from the hub URL; subsequent launches
+   hit local disk.
 
-The launcher fetches missing banners from the hub URL on demand and
-caches them, so a fresh install warms over a few seconds and stays
-local thereafter.
+## Open questions to settle when implementing
 
-## Open questions
-
-- How many distinct CSS character-portrait captures do we want?
-  Some games have 32 chars (pkmncc), some have 50+. Cropping the
-  individual portraits out of the CSS frame is more efficient than
-  driving the cursor 32 times.
-- Resolution. FM2K's native render is 320x240; cnc-ddraw can
-  upscale to 1280x960. The launcher should pin to native for
-  capture and let the renderer / stats site upscale via CSS.
-- Battle frame — first frame after the intro fade (probably fr=120
-  or similar) gives a clean character pose; first input-able frame
-  shows a more chaotic shot. Both have value; capture both.
+- **Per-character vs cropped portraits.** Driving the cursor 32+
+  times per game is slow; cropping the individual portraits out of
+  one CSS frame is faster but needs per-game CSS-layout coordinates.
+  Start with the cursor approach for v1; revisit cropping if total
+  capture time becomes a problem.
+- **Battle frame timing.** Frame 120 (post-fade, fighters in idle)
+  vs first input-able frame (~150) vs mid-fight. Idle pose is
+  cleanest for a banner; capture multiple and pick.
+- **Capture failure recovery.** Some games hang on intro on certain
+  configs. Each capture run gets a hard timeout (~60s); on timeout
+  the launcher kills + re-spawns + retries up to 3 times before
+  giving up and recording the game as "no banner".
