@@ -47,8 +47,15 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_SOURCE = Path("/mnt/d/games/2dfm/wanwan/"
-                      "WonderfulWorld_ver_0946.exe")
+# After the engine-bucket sort (tools/sort_by_engine.py), the clean
+# baseline lives under fm2k/_NODEV/wanwan/. Fall back to the old
+# pre-sort path so the tool stays runnable on a fresh tree.
+_BASELINE_CANDIDATES = [
+    Path("/mnt/d/games/fm2k/_NODEV/wanwan/WonderfulWorld_ver_0946.exe"),
+    Path("/mnt/d/games/2dfm/wanwan/WonderfulWorld_ver_0946.exe"),
+]
+DEFAULT_SOURCE = next((p for p in _BASELINE_CANDIDATES if p.exists()),
+                     _BASELINE_CANDIDATES[0])
 EXPECTED_SIZE = 1_204_224  # 1.148 MiB
 EXPECTED_SECTIONS = {".text", ".rdata", ".data", ".rsrc"}
 
