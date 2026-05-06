@@ -160,8 +160,9 @@ void TryInstall() {
     g_hwnd         = hwnd;
     g_orig_wndproc = prev;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "WndProcSubclass: installed on hwnd=%p (Alt-mute + modal-pump)",
-                hwnd);
+                "WndProcSubclass: installed on hwnd=%p prev_wndproc=%p "
+                "(Alt-mute + modal-pump)",
+                hwnd, (void*)prev);
 }
 
 void Uninstall() {

@@ -17,6 +17,7 @@
 #include "../netplay/spectator_node.h"      // spectator playback queue accessors
 #include "../ui/input_binder.h"             // FM2KInputBinder::Sample_Win32 + Bindings
 #include "../ui/screenshot.h"               // FM2KCapture::SaveScreenshot for the auto-banner pipeline
+#include "../ui/fc_hud.h"                   // IsChatInputActive — gate local input during typing
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -737,6 +738,12 @@ static uint16_t Fm95SampleBinderForPlayer(int binder_slot, int facing_idx) {
 }
 
 int __cdecl Hook_GetPlayerInput_FM95_P1(int player_idx) {
+    // Slice F: while the chat input box is open the local fighter
+    // shouldn't react to typed keys. Suppressed here for offline /
+    // single-client testing — full netplay correctness needs the
+    // gate at the input-binder Sample call instead so the zero
+    // makes it onto the wire (otherwise the peer sees real inputs).
+    if (fc_hud::IsChatInputActive() && g_player_index == 0) return 0;
     // First-time binder init mirrors the FM2K path. Done lazily so we don't
     // race with CPW's window/SDL/etc. init. Cheap once warmed up.
     static bool s_warmed = false;
@@ -759,6 +766,7 @@ int __cdecl Hook_GetPlayerInput_FM95_P1(int player_idx) {
 }
 
 int __cdecl Hook_GetPlayerInput_FM95_P2(int player_idx) {
+    if (fc_hud::IsChatInputActive() && g_player_index == 1) return 0;
     // Reads the P2 binder slot (slot 1) so a second device — or fallback
     // to keyboard P2 bindings — drives the second player. For netplay,
     // ProcessGameInputs overwrites this post-poll with GekkoNet's synced
@@ -771,6 +779,10 @@ int __cdecl Hook_GetPlayerInput_FM95_P2(int player_idx) {
 // CSS: return synced input from control channel
 // Battle: return synchronized input from GekkoNet with facing adjustment
 int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
+    // Slice F: chat-mode input gate. Same caveat as the FM95 hooks
+    // above — works for offline single-client testing; netplay
+    // correctness wants the gate at the input-binder Sample call.
+    if (fc_hud::IsChatInputActive() && player_id == g_player_index) return 0;
     uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
     // (Removed FM2K_INPUT_DUMP block — calling original_get_player_input
     // for diagnostic purposes had a SIDE EFFECT: it ran FM2K's keyboard-
