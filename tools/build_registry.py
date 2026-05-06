@@ -95,6 +95,33 @@ def safe_game_id(candidate: str) -> str:
     return s
 
 
+# Two-letter and three-letter generic stems collide across games — many
+# devs name their .kgt simply "vs.kgt", "og.kgt", "e.kgt" because their
+# project folder is `<dev>/vs/`. When safe_game_id() lands on one of
+# these we fall back to slugified title or IA identifier instead, since
+# the hub's join_room tracks distinct rooms and `vs` would have all
+# such games clobber one room.
+COLLISION_PRONE_STEMS = {
+    "vs", "vs2", "og", "e", "f", "kfm", "fight", "game", "battle",
+    "demo", "test", "char", "main",
+}
+
+
+def disambiguate_game_id(stem: str, fallback_name: str,
+                         fallback_ident: str) -> str:
+    """Pick the best ASCII-safe game_id given the kgt-derived stem
+    plus title and IA identifier as fallbacks."""
+    sanitized = safe_game_id(stem)
+    if sanitized and sanitized not in COLLISION_PRONE_STEMS \
+            and len(sanitized) >= 4:
+        return sanitized
+    # Stem is too generic → use the title slug or IA identifier instead.
+    name_slug = slugify(fallback_name)
+    if name_slug:
+        return name_slug
+    return safe_game_id(fallback_ident)
+
+
 def derive_exe_stem(zip_path: Path | None, fallback_name: str) -> str | None:
     """Inspect a Win zip if present to pull the executable's stem.
 
@@ -210,22 +237,14 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
              if f.lower().endswith(".kgt")), "")
         kgt_stem = (Path(kgt_in_inner).stem if kgt_in_inner else
                     kgt_in_outer)
+        ident = raw.get("ia_identifier", "")
         if kgt_stem:
             rec["kgt_filename"] = kgt_stem + ".kgt"
-            # Game ID has to be ASCII-safe for HTTP / env vars / file
-            # paths. JP-named kgt files get an empty safe_game_id,
-            # so fall back to slugified title, then to the IA
-            # identifier itself.
-            sanitized = safe_game_id(kgt_stem)
-            if not sanitized:
-                sanitized = slugify(rec["name"])
-            if not sanitized:
-                sanitized = safe_game_id(
-                    rec["_raw"]["archive.org"]["ia_identifier"])
+            sanitized = disambiguate_game_id(kgt_stem, rec["name"], ident)
             rec["exe_stems"] = [sanitized] if sanitized else []
             rec["game_id"] = sanitized
         elif raw.get("exe_stem"):  # set by inspect_ia_zips.py
-            sanitized = safe_game_id(raw["exe_stem"])
+            sanitized = disambiguate_game_id(raw["exe_stem"], rec["name"], ident)
             rec["exe_stems"] = [sanitized] if sanitized else []
             rec["game_id"] = sanitized
         else:
