@@ -75,6 +75,24 @@ ENGINE_BUNDLE_FILE_PATTERNS = [
 ]
 
 
+def unmojibake(s: str) -> str:
+    """Reverse the cp866-stamped CP932 mangle IA's directory-listing
+    HTML applies to Japanese filenames.
+
+    Real chain: original CP932 bytes (e.g. あ=0x82,0xA0) get rendered
+    by IA's HTML pipeline as if they were CP866 (DOS Cyrillic), then
+    served to us as UTF-8. We see characters like В Г ╤ ╡ in place of
+    katakana / kanji. To reverse: encode the string back to CP866
+    bytes, then decode as CP932. Returns the input unchanged if the
+    round-trip fails (so ASCII-only filenames pass through cleanly).
+    """
+    try:
+        cp866_bytes = s.encode("cp866", errors="strict")
+        return cp866_bytes.decode("cp932", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
 def list_zip_contents_via_regex(html: str, zip_name: str) -> list[str]:
     """Pull inner filenames out of an IA zip-contents directory listing.
 
@@ -103,7 +121,9 @@ def list_zip_contents_via_regex(html: str, zip_name: str) -> list[str]:
                 continue
             if decoded.startswith("?"):
                 continue
-            out.add(decoded)
+            # Apply the cp866→cp932 unmojibake. ASCII-only filenames
+            # round-trip cleanly so this is safe to call on every entry.
+            out.add(unmojibake(decoded))
     return sorted(out)
 
 

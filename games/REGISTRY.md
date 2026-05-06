@@ -16,7 +16,7 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | game_id | name | year | exe_stem | kgt | sources | link |
 |---|---|---|---|---|---|---|
 | reshuffle | 120623 ( Eo RR) |  | reshuffle | ReSHUFFLE.kgt | archive.org | [link](https://archive.org/details/120623-eo-rr) |
-| zjhqg | 2 D格闘ツクール 2nd | 2001 | zjhqg | ГZГJГУГhГqБ[Гg.kgt | archive.org | [link](https://archive.org/details/2dFighterMaker2nd) |
+| 2d2nd | 2 D格闘ツクール 2nd | 2001 | 2d2nd | セカンドヒート.kgt | archive.org | [link](https://archive.org/details/2dFighterMaker2nd) |
 | 8-marbles | 8 Marbles |  | 8-marbles | 8 Marbles.kgt | archive.org | [link](https://archive.org/details/8-marbles_202212) |
 | 8-marbles-2 | 8 Marbles 2 |  | 8-marbles-2 | 8 Marbles 2.kgt | archive.org | [link](https://archive.org/details/8-marbles-2_202211) |
 | 8-marbles-2x | 8 Marbles 2X |  | 8-marbles-2x | 8 Marbles 2X.kgt | archive.org | [link](https://archive.org/details/8-marbles-2-x) |
@@ -24,12 +24,12 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | 8-marbles-ura | 8 Marbles Ura |  | 8-marbles-ura | 8 Marbles Ura.kgt | archive.org | [link](https://archive.org/details/8-marbles-ura_202212) |
 | angel-star-road | Angel Star Road |  | angel-star-road | Angel Star Road.kgt | archive.org | [link](https://archive.org/details/angel-star-road) |
 | animetenchoubattlelive | Anime Tenchou Battle Live | 2004 | animetenchoubattlelive | バトルライブ全力亭版.kgt | archive.org | [link](https://archive.org/details/anime-tenchou-battle-live) |
-| vs | Anna Vs. Sentimental Fighter [あんなVSせんちめんたるふぁいたー] | 2006 | vs | ВаВёВ╚VSВ╣ВёВ┐В▀ВёВ╜ВщВ╙ВЯВвВ╜Б… | archive.org | [link](https://archive.org/details/annavssentimental) |
+| annavssentimentalfightervs | Anna Vs. Sentimental Fighter [あんなVSせんちめんたるふぁいたー] | 2006 | annavssentimentalfighte… | あんなVSせんちめんたるふぁいたー.kgt | archive.org | [link](https://archive.org/details/annavssentimental) |
 | another-force | Another Force |  | another-force | Another Force.kgt | archive.org | [link](https://archive.org/details/another-force) |
 | lesmiserables | Arm Joe |  | lesmiserables | LesMiserables.kgt | archive.org | [link](https://archive.org/details/arm-joe-v-14b) |
 | arugan | Arugan |  | arugan | あるガン！.kgt | archive.org | [link](https://archive.org/details/Arugan) |
 | axelcitycomplete | Axel City Complete |  | axelcitycomplete | アクセル.kgt | archive.org | [link](https://archive.org/details/axel-city-complete) |
-| bishibashitouhou14 | Bishi Bashi Touhou 1.4 | 2016 | bishibashitouhou14 | В╤В╡В╬В╡УМХ√.kgt | archive.org | [link](https://archive.org/details/bishi-bashi-touhou) |
+| bishibashitouhou14 | Bishi Bashi Touhou 1.4 | 2016 | bishibashitouhou14 | びしばし東方.kgt | archive.org | [link](https://archive.org/details/bishi-bashi-touhou) |
 | bradercrisis | Blader Crisis |  | bradercrisis | BraderCrisis.kgt | archive.org | [link](https://archive.org/details/blader-crisis) |
 | boobytales | BOOBYTALES | 2003 | boobytales | BOOBYTALES.kgt | archive.org | [link](https://archive.org/details/booby-tales) |
 | breakersspecial | Breakers Special | 2010 | breakersspecial | BreakersSpecial.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/breakers-special-gyx) |
@@ -66,7 +66,7 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | kkombat | Kkombat |  | kkombat | Kkombat.kgt | archive.org | [link](https://archive.org/details/Kkombat) |
 | kyutou | Kyutou | 2002 | kyutou | Kyutou.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/kyutou-rg1) |
 | little-battlersex | Little Battlers EX |  | little-battlersex | Little BattlersEX.kgt | archive.org | [link](https://archive.org/details/little-battlers-ex) |
-| mv | Machners Valkyrie |  | mv | MV.kgt | archive.org | [link](https://archive.org/details/machners-valkyrie) |
+| machnersvalkyrie | Machners Valkyrie |  | machnersvalkyrie | MV.kgt | archive.org | [link](https://archive.org/details/machners-valkyrie) |
 | magical-chaserstardust-of-d… | Magical Chaser ~Stardust of Dreams~ | 2008 | magical-chaserstardust-… | Magical Chaser~Stardust of Drea… | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/magical-chaser-stardust-of-dreams-hxy) |
 | magicalheroinesplus | Magical Heroines Plus |  | magicalheroinesplus | ｈｆ.kgt | archive.org | [link](https://archive.org/details/magical-heroines-plus) |
 | mai-girls-revolution | Mai Girls Revolution |  | mai-girls-revolution | Mai Girls Revolution.kgt | archive.org | [link](https://archive.org/details/mai-girls-revolution) |
@@ -83,7 +83,7 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | perfect | Ninja Hattori 3rd PERFECT | 2003 | perfect | 服部３ｒｄPERFECT.kgt | archive.org | [link](https://archive.org/details/ninja-hattori-3rd-perfect) |
 | ninjahattori3rdstrikedash | Ninja Hattori 3rd Strike Dash |  | ninjahattori3rdstrikeda… | 忍者服部ちゃん.kgt | archive.org | [link](https://archive.org/details/ninja-hattori-3rd-strike-dash) |
 | novaaerial | Nova Aerial |  | novaaerial | あんな.kgt | archive.org | [link](https://archive.org/details/nova-aerial) |
-| kgt | Otepuri |  | kgt | おてんばプリンセスの大冒険.kgt.kgt | archive.org | [link](https://archive.org/details/Otepuri) |
+| otepuri | Otepuri |  | otepuri | おてんばプリンセスの大冒険.kgt.kgt | archive.org | [link](https://archive.org/details/Otepuri) |
 | otokoiii | Otoko III |  | otokoiii | 男列伝Ⅲ.kgt | archive.org | [link](https://archive.org/details/otoko-iii) |
 | parotte-fighters | Parotte Fighters |  | parotte-fighters | Parotte Fighters.kgt | archive.org | [link](https://archive.org/details/parotte-fighters) |
 | pocketazukaku | Pocket Azukaku |  | pocketazukaku | ポケットあず格。.kgt | archive.org | [link](https://archive.org/details/pocket-azukaku) |
@@ -103,10 +103,10 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | thein-ron | Thein-Ron | 2007 | thein-ron | Thein-Ron.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/thein-ron-rg2) |
 | time-and-stopper_ver05 | Time And Stopper Ver 05 |  | time-and-stopper_ver05 | Time and Stopper_ver05.kgt | archive.org | [link](https://archive.org/details/time-and-stopper-ver-05) |
 | tokidoki | Tokidoki |  | tokidoki | ときどきメモリアルバウト.kgt | archive.org | [link](https://archive.org/details/tokidoki_202302) |
-| e | Tomabuyūden | 2009 | e | УмЦВХРЧEУ`.kgt | archive.org | [link](https://archive.org/details/Tomabuyuden) |
-| toushiki | toushiki | 2005 | toushiki | УмОо.kgt | archive.org | [link](https://archive.org/details/toushiki) |
+| tomabuyden | Tomabuyūden | 2009 | tomabuyden | 闘魔武勇伝.kgt | archive.org | [link](https://archive.org/details/Tomabuyuden) |
+| toushiki | toushiki | 2005 | toushiki | 闘式.kgt | archive.org | [link](https://archive.org/details/toushiki) |
 | tpc-vs-hay-2nd | TPC vs HAY 2ND | 2004 | tpc-vs-hay-2nd | TPC vs HAY 2ND.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/tpc-vs-hay-2nd-mtl) |
-| vs2 | Tsuzuki Sono Higurashi no Naku Koro ni vs Touhou … |  | vs2 | 続・そのひぐらしVS東方2.kgt | archive.org | [link](https://archive.org/details/higurashi-vs-touhou-2) |
+| tsuzukisonohigurashinonakuk… | Tsuzuki Sono Higurashi no Naku Koro ni vs Touhou … |  | tsuzukisonohigurashinon… | 続・そのひぐらしVS東方2.kgt | archive.org | [link](https://archive.org/details/higurashi-vs-touhou-2) |
 | lunaport | Ultra Mortal Kombat Vendetta | 2001 | lunaport | Ultra Mortal Kombat Vendetta.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/ultra-mortal-kombat-vendetta-jtl) |
 | urban-battle | Urban Battle |  | urban-battle | Urban Battle.kgt | archive.org | [link](https://archive.org/details/urban-battle_202211) |
 | vanpri | Vanguard Princess (v.1.8.7) (52) | 2009 | vanpri | vanpri.kgt | archive.org | [link](https://archive.org/details/vanguard.-princess.v-1.8.7) |
@@ -115,8 +115,8 @@ These have a `.kgt` file confirmed inside the upload (or a sibling MyAbandonware
 | zangef | Zangefool Fighter 20XX (ザンゲフールファイター20XX) |  | zangef | ZANGEF.kgt | archive.org | [link](https://archive.org/details/Zangefool) |
 | zero-fighters | Zero Fighters | 2004 | zero-fighters | Zero Fighters.kgt | MyAbandonware,archive.org | [link](https://www.myabandonware.com/game/zero-fighters-mtm) |
 | tcuco | ”q@ˆê”­ |  | tcuco | ƒTƒ€ƒ‰ƒCƒuƒŒƒCƒo[.kgt | archive.org | [link](https://archive.org/details/qe-_20210731) |
-| og | ひぐらしバトル頃シアム Higurashi Battle Colosseum (Higubato) |  | og | В╨ВоВчВ╡ГoГgГЛ.kgt | archive.org | [link](https://archive.org/details/higubato) |
-| tcvstkbg | サムチャイvsサガット (Samchay vs Sagat) |  | tcvstkbg | ГTГАГ`ГГГCvsГTГKГbГg.kgt | archive.org | [link](https://archive.org/details/samchay-vs-sagat) |
+| higurashibattlecolosseumhig… | ひぐらしバトル頃シアム Higurashi Battle Colosseum (Higubato) |  | higurashibattlecolosseu… | ひぐらしバトル.kgt | archive.org | [link](https://archive.org/details/higubato) |
+| vssamchayvssagat | サムチャイvsサガット (Samchay vs Sagat) |  | vssamchayvssagat | サムチャイvsサガット.kgt | archive.org | [link](https://archive.org/details/samchay-vs-sagat) |
 
 ## Probable games (need re-scan or manual verify)
 
