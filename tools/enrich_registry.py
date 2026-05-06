@@ -51,9 +51,11 @@ SCRAPE_PATH = REPO_ROOT / "tools" / "ia_scrape.json"
 # Conservative — anchors at start/end where possible so a real game
 # named e.g. "Engine of Destruction" doesn't get false-flagged.
 NON_GAME_TITLE_PATTERNS = [
-    # Engine itself
-    re.compile(r"^\s*2[\s-]*d?\s*fighter\s*maker[\s\d()]*$",       re.I),
-    re.compile(r"^\s*fighter\s*maker(\s*\d{2,4})?\s*$",            re.I),
+    # Engine itself — any title that STARTS with "2D Fighter Maker"
+    # or "Fighter Maker" is definitionally an engine release, not a
+    # game (games may contain those words but never lead with them).
+    re.compile(r"^\s*2[\s-]*d?\s*fighter\s*maker\b",               re.I),
+    re.compile(r"^\s*fighter\s*maker\b",                            re.I),
     re.compile(r"^\s*fm2k\s*(engine|editor)?\s*$",                 re.I),
     re.compile(r"^\s*2dfm(95)?\s*(engine|editor)?\s*$",            re.I),
     re.compile(r"^\s*2[\s-]?d?\s*格闘ツクール[\s\d]*$",              re.I),
