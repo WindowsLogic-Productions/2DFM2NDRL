@@ -93,18 +93,37 @@ def already_extracted(extract_dir: Path) -> bool:
         return False
 
 
-def extract_archive(archive: Path, *, refresh: bool) -> bool:
+def extract_archive(archive: Path, *, refresh: bool,
+                    timeout_s: float = 600.0) -> bool:
     """Use 7z to expand archive into its sibling stem directory.
-    Handles .zip / .7z / .rar uniformly via `7z x`."""
+    Handles .zip / .7z / .rar uniformly via `7z x`.
+
+    Notes:
+      - We pipe stdin from /dev/null so 7z bails immediately on
+        password / multi-volume / overwrite prompts instead of
+        blocking the whole run forever.
+      - `-bb0` keeps logs minimal; `-bsp1` shows progress on stdout
+        so the user can see we're alive.
+      - `-p-` is an empty-password attempt — encrypted archives fail
+        fast with a non-zero exit instead of waiting on tty input.
+      - 10-minute timeout per archive — large game distros can take
+        a few minutes legitimately, but no single archive should
+        block the whole pass."""
     out_dir = extract_dir_for(archive)
     if already_extracted(out_dir) and not refresh:
         return True
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = ["7z", "x", "-y", "-bso0", "-bsp1",
+    cmd = ["7z", "x", "-y", "-bb0", "-bsp1", "-p-",
            f"-o{out_dir}", str(archive)]
     print(f"  extract: {archive.name} → {out_dir.relative_to(out_dir.parent.parent)}/")
-    r = subprocess.run(cmd)
-    return r.returncode == 0
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                           timeout=timeout_s)
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"    timeout after {timeout_s:.0f}s — skipping",
+              file=sys.stderr)
+        return False
 
 
 def find_archives(root: Path) -> list[Path]:
@@ -143,9 +162,14 @@ def main() -> int:
         return 1
 
     # Sanity: refuse to migrate in-place onto the same drive — that
-    # would just double C:'s usage instead of moving to D:.
-    if args.src.resolve() == args.dst.resolve():
-        print(f"error: src and dst are the same path", file=sys.stderr)
+    # would just double C:'s usage instead of moving to D:. Exempt
+    # --skip-copy since "extract archives already at dst" is a
+    # legitimate same-path operation.
+    if (args.src.resolve() == args.dst.resolve()
+            and not args.skip_copy):
+        print(f"error: src and dst are the same path "
+              f"(use --skip-copy if you only want to extract)",
+              file=sys.stderr)
         return 1
     if str(args.dst).startswith(str(args.src.parent.resolve())):
         # dst is under src's parent — likely C:. Bail loudly.
