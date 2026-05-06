@@ -64,10 +64,43 @@ namespace FM2K {
     constexpr uintptr_t ADDR_P1_INPUT = 0x437750;
     constexpr uintptr_t ADDR_P2_INPUT = 0x437754;
 
-    // Per-player HP — FM95 has no global HP; lives in the object pool slot.
-    // Set to 0 so consumer sites must explicitly handle FM95 (read via main_object_ptr).
-    constexpr uintptr_t ADDR_P1_HP = 0;  // FM95: pool[main_obj].pos field 72 — read via g_p_main_object_ptr
+    // Per-player HP — FM95 has no global HP scalar; the value lives at
+    // offset +72 of each player's main-object slot in the pool. The
+    // pointers to those slots are kept in the array below, indexed by
+    // player_idx (0/1). HP read pattern (FM95-specific):
+    //   void* main = *(void**)(ADDR_P_MAIN_OBJECT_PTR + player_idx*4);
+    //   uint32_t hp = *(uint32_t*)((uint8_t*)main + 72);
+    // Static globals stay 0 to force consumer sites to branch on
+    // kIsFM95 and use the indirection.
+    constexpr uintptr_t ADDR_P1_HP = 0;
     constexpr uintptr_t ADDR_P2_HP = 0;
+    // g_p_main_object_ptr — array of pointers to each player's main
+    // object in g_object_pool. IDA-verified in CPW @ 0x430e84
+    // (referenced by process_combo_input, character_state_machine).
+    // Index 0 = P1, 1 = P2. Per-player HP read pattern:
+    //   void* main = *(void**)(ADDR_P_MAIN_OBJECT_PTR + pid*4);
+    //   uint32_t hp = *(uint32_t*)((uint8_t*)main + 72);
+    constexpr uintptr_t ADDR_P_MAIN_OBJECT_PTR = 0x430e84;
+
+    // Round-win counters — IDA-verified canonical fields used by
+    // obj_match_result_state @ 0x410db0 case 4 to decide the match
+    // winner. Per-player struct stride is 100 bytes (25 dwords);
+    // g_p1_win_counter[25*1] == g_p2_win_counter. These are the
+    // safest fields to compare in Netplay_EndBattle (no pointer
+    // indirection, monotonic across rounds, set to 0 only at the
+    // start of a new match in vs_round_function case 1).
+    constexpr uintptr_t ADDR_P1_WIN_COUNTER = 0x5e9914;
+    constexpr uintptr_t ADDR_P2_WIN_COUNTER = 0x5e9978;
+
+    // Damage-taken / HP-loss scalars — IDA shows
+    // vs_round_function case 30 spawning the KO panel when
+    // g_p1_damage_taken[0] == g_char_max_hp_table[0]. Same 100-byte
+    // stride as win_counter; useful for in-match HP queries (e.g.
+    // titlebar live HP%) without going through the main_object_ptr
+    // indirection. (IDA's auto-name "g_p1_total_wins" is misleading —
+    // these aren't win counts; they're cumulative damage taken.)
+    constexpr uintptr_t ADDR_P1_DAMAGE_TAKEN = 0x5e9910;
+    constexpr uintptr_t ADDR_P2_DAMAGE_TAKEN = 0x5e9974;
 
     // CSS state — FM95 layout differs (cursor is single int, not x/y pair).
     // Treat ADDR_P*_CURSOR_POS as the cursor index slot. ACTION_STATE maps to
@@ -115,9 +148,20 @@ namespace FM2K {
     constexpr size_t    CHAR_FILENAME_STRIDE      = 256;
     constexpr size_t    CHAR_FILENAME_COUNT       = 50;
 
-    // Stage selection — no documented in-memory selected-stage scalar yet
-    // for FM95. 0 here means "publish 0xFFFFFFFF / 'unknown'" downstream.
-    constexpr uintptr_t ADDR_SELECTED_STAGE       = 0;
+    // Stage selection on FM95 splits two ways:
+    //   - Practice mode: vs_round_function reads g_practice_stage_id
+    //     (uint8) at 0x43274c — this IS the random-stage write target
+    //     that mirrors FM2K's 0x43010c.
+    //   - VS / Story mode: stage is character-driven, read from
+    //     g_char_stage_per_round[char][round] at 0x540337. There's no
+    //     single "selected stage" scalar; to override in vs-mode the
+    //     hook would need a function-prologue trampoline on
+    //     LoadStageFile_alt @ 0x4054b0 to rewrite its first arg.
+    //     Deferred — random-stage on FM95 currently only takes effect
+    //     in practice mode.
+    constexpr uintptr_t ADDR_SELECTED_STAGE       = 0x43274c;
+    constexpr uintptr_t ADDR_LOAD_STAGE_FILE_ALT  = 0x4054b0;
+    constexpr uintptr_t ADDR_CHAR_STAGE_PER_ROUND = 0x540337;
 
     // Engine tag — runtime check for code that needs to branch on engine.
     constexpr bool kIsFM95 = true;
@@ -211,6 +255,18 @@ namespace FM2K {
     // hub, so both peers always got logged as the slot-0 character.
     constexpr uintptr_t ADDR_P1_SELECTED_CHAR     = 0x470020;
     constexpr uintptr_t ADDR_P2_SELECTED_CHAR     = 0x470024;
+
+    // FM95-only fields (stubbed at 0 on FM2K). Consumers must guard
+    // on `if constexpr (kIsFM95)`; without these stubs the FM2K-side
+    // parse of an `if constexpr (kIsFM95) { FM2K::ADDR_P1_WIN_COUNTER }`
+    // body fails name lookup before the branch is discarded.
+    constexpr uintptr_t ADDR_P_MAIN_OBJECT_PTR  = 0;
+    constexpr uintptr_t ADDR_P1_WIN_COUNTER     = 0;
+    constexpr uintptr_t ADDR_P2_WIN_COUNTER     = 0;
+    constexpr uintptr_t ADDR_P1_DAMAGE_TAKEN    = 0;
+    constexpr uintptr_t ADDR_P2_DAMAGE_TAKEN    = 0;
+    constexpr uintptr_t ADDR_LOAD_STAGE_FILE_ALT  = 0;
+    constexpr uintptr_t ADDR_CHAR_STAGE_PER_ROUND = 0;
     // Character filename table — g_char_slot_data, 256-byte CP932 strings.
     constexpr uintptr_t ADDR_CHAR_FILENAME_TABLE  = 0x435474;
     constexpr size_t    CHAR_FILENAME_STRIDE      = 256;
