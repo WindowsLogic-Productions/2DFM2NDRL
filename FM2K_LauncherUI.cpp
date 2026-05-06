@@ -3202,6 +3202,41 @@ void LauncherUI::PushStatsToHook() {
     write(pid2);
 }
 
+void LauncherUI::PushHudSystemMessage(const char* text_utf8, uint32_t ttl_ms) {
+    if (!on_get_client_status || !text_utf8) return;
+    uint32_t pid1 = 0, pid2 = 0;
+    if (!on_get_client_status(pid1, pid2)) return;
+
+    // Mirrors PushStatsToHook's open-write-close pattern. Bumps the
+    // HUD seq AFTER the buffer + expiry land, so a fc_hud read that
+    // races us only ever sees a coherent {message, expiry, seq}
+    // snapshot.
+    auto write = [&](uint32_t pid) {
+        if (pid == 0) return;
+        const std::string name = "FM2K_SharedMem_" + std::to_string(pid);
+        HANDLE h = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE,
+                                    FALSE, name.c_str());
+        if (!h) return;
+        FM2KSharedMemData* data = static_cast<FM2KSharedMemData*>(
+            MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                          sizeof(FM2KSharedMemData)));
+        if (data && data->magic == FM2K_SHARED_MEM_MAGIC &&
+            data->version == FM2K_SHARED_MEM_VERSION)
+        {
+            const size_t cap = sizeof(data->hud_system_message);
+            const size_t n = std::min<size_t>(std::strlen(text_utf8), cap - 1);
+            if (n) std::memcpy(data->hud_system_message, text_utf8, n);
+            data->hud_system_message[n] = '\0';
+            data->hud_system_message_expiry_tick = GetTickCount() + ttl_ms;
+            data->hud_system_message_seq += 1;
+        }
+        if (data) UnmapViewOfFile(data);
+        CloseHandle(h);
+    };
+    write(pid1);
+    write(pid2);
+}
+
 void LauncherUI::NotifyHubMatchEnded() {
     if (!hub_state_) return;
     if (!hub_state_->client.IsConnected()) return;
@@ -3479,6 +3514,11 @@ void LauncherUI::PollMatchOutcome() {
                             FireSystemNotification(
                                 T("toast_peer_disconnected_title"),
                                 body);
+                            // 5-second in-game centered overlay so the
+                            // user sees why their match ended without
+                            // alt-tabbing to the launcher's toast.
+                            PushHudSystemMessage(
+                                T("toast_peer_disconnected_title"), 5000);
                         }
                         if (on_session_stop) on_session_stop();
                     }
@@ -3658,6 +3698,8 @@ void LauncherUI::RenderHubPanel() {
                         hs.disconnect_toast_fired = true;
                         FireSystemNotification(
                             T("toast_peer_disconnected_title"), body);
+                        PushHudSystemMessage(
+                            T("toast_peer_disconnected_title"), 5000);
                     }
                     // No MatchResult here. This branch fires when the
                     // peer's hub status flipped off in_match WITHOUT us
@@ -4026,6 +4068,8 @@ void LauncherUI::RenderHubPanel() {
                 if (!hs.disconnect_toast_fired) {
                     hs.disconnect_toast_fired = true;
                     FireSystemNotification(T("toast_peer_disconnected_title"), body);
+                    PushHudSystemMessage(
+                        T("toast_peer_disconnected_title"), 5000);
                 }
                 if (on_session_stop) on_session_stop();
                 // Best-effort match_result so the hub closes its
