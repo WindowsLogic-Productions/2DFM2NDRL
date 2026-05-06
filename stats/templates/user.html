@@ -16,7 +16,7 @@
     <tbody>
       {% for r in u.by_game %}
       <tr>
-        <td><a href="/g/{{ r.game_id }}">{{ r.game_id }}</a></td>
+        <td><a href="/g/{{ r.game_id }}">{{ friendly_name(r.game_id) }}</a></td>
         <td class="num">{{ r.wins }}</td>
         <td class="num">{{ r.losses }}</td>
         <td class="num">{{ r.draws }}</td>
@@ -78,7 +78,7 @@
             else ('win' if m.winner_id == u.user_id else 'loss') %}
       <tr class="r-{{ result }}">
         <td>{{ format_iso(m.finished_at) }}</td>
-        <td><a href="/g/{{ m.game_id }}">{{ m.game_id }}</a></td>
+        <td><a href="/g/{{ m.game_id }}">{{ friendly_name(m.game_id) }}</a></td>
         <td>
           {{ my_char }} vs <a href="/u/{{ opp_id }}">{{ opp_nick }}</a> ({{ opp_char }})
         </td>

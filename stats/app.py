@@ -47,6 +47,14 @@ from slowapi.util import get_remote_address
 DEFAULT_MATCHES_PATH = Path(__file__).resolve().parent.parent / "hub" / "matches.json"
 MATCHES_PATH = Path(os.environ.get("FM2K_MATCHES_PATH", str(DEFAULT_MATCHES_PATH)))
 
+# Game registry — pretty names + (eventually) banners + character art.
+# Built by tools/build_registry.py from MyAbandonware + archive.org
+# scrapes. Optional: if absent, the site falls back to rendering the
+# raw game_id string.
+DEFAULT_REGISTRY_PATH = Path(__file__).resolve().parent.parent / "games" / "registry.json"
+REGISTRY_PATH = Path(os.environ.get("FM2K_REGISTRY_PATH",
+                                    str(DEFAULT_REGISTRY_PATH)))
+
 # Mounted under nginx at /stats by default; the path prefix is consumed by
 # the reverse proxy so we serve from "/" internally. If you're running
 # uvicorn directly behind no proxy, the urls in templates still work
@@ -140,6 +148,68 @@ def load_matches() -> list[dict[str, Any]]:
             "finished_at":   r.get("finished_at", r.get("started_at")),
         })
     return out
+
+
+# ─── Game registry loader ────────────────────────────────────────────────
+
+# In-memory cache keyed by mtime. The registry is small (~140 records,
+# <100KB) and reads are fast; we just want to skip re-parsing on every
+# request without locking ourselves out of edits during dev.
+_registry_cache: dict[str, Any] = {"mtime": -1.0, "by_id": {}}
+
+
+def load_registry() -> dict[str, dict[str, Any]]:
+    """Return {game_id: record} for the current registry. Empty dict
+    when the file is absent or corrupt — callers fall back to raw
+    game_id rendering in that case."""
+    try:
+        st = REGISTRY_PATH.stat()
+    except OSError:
+        return {}
+    if st.st_mtime == _registry_cache["mtime"]:
+        return _registry_cache["by_id"]
+    try:
+        with REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            recs = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return _registry_cache["by_id"]
+    by_id: dict[str, dict[str, Any]] = {}
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        gid = r.get("game_id")
+        if not gid:
+            continue
+        by_id[gid] = r
+    _registry_cache["mtime"] = st.st_mtime
+    _registry_cache["by_id"] = by_id
+    return by_id
+
+
+def game_friendly_name(game_id: str) -> str:
+    """Pretty name from the registry. Falls back to the raw game_id so
+    a missing entry still renders as something readable."""
+    if not game_id:
+        return ""
+    rec = load_registry().get(game_id)
+    if rec and rec.get("name"):
+        return rec["name"]
+    return game_id
+
+
+def game_meta(game_id: str) -> dict[str, Any]:
+    """Full registry record for a game_id. Empty dict if not in the
+    registry. Templates use this to render banner / year / source
+    links when available, with .get() defaults so missing fields
+    don't crash the render."""
+    return load_registry().get(game_id, {})
+
+
+# Make the registry helpers available to every template render
+# without threading them through each handler explicitly. Templates
+# can call {{ friendly_name(m.game_id) }} or {{ game_meta(gid).year }}.
+templates.env.globals["friendly_name"] = game_friendly_name
+templates.env.globals["game_meta"] = game_meta
 
 
 def char_label(name: Optional[str], cid: Optional[int]) -> str:

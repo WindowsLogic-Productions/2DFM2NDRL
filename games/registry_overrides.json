@@ -1,0 +1,46 @@
+[
+  {
+    "game_id": "pkmncc",
+    "name": "Pokemon: Close Combat",
+    "alt_names": ["pkmnccv16c", "Pokemon Close Combat"],
+    "engine": "FM2K",
+    "year": "2020",
+    "developer": "",
+    "exe_stems": ["pkmncc"],
+    "kgt_filename": "pkmncc.kgt",
+    "homepage": "",
+    "sources": ["manual"]
+  },
+  {
+    "game_id": "vanpri",
+    "name": "Vanguard Princess",
+    "alt_names": ["Vanguard.Princess"],
+    "engine": "FM2K",
+    "year": "2009",
+    "developer": "Tomoaki Sugeno (suge9)",
+    "exe_stems": ["vanpri"],
+    "kgt_filename": "vanpri.kgt",
+    "sources": ["archive.org", "manual"]
+  },
+  {
+    "game_id": "wonderfulworld_ver_0946",
+    "name": "Wonderful World",
+    "alt_names": ["WonderfulWorld_ver_0945", "WonderfulWorld_ver_0946", "WonderfulWorld"],
+    "engine": "FM2K",
+    "year": "2010",
+    "developer": "RAY",
+    "exe_stems": ["WonderfulWorld_ver_0946", "wonderfulworld_ver_0945"],
+    "kgt_filename": "WonderfulWorld_ver_0946.kgt",
+    "homepage": "https://archive.org/details/wonderful-world-ver-0945",
+    "sources": ["archive.org", "manual"]
+  },
+  {
+    "game_id": "URORFGRelease102",
+    "name": "Untitled Risk of Rain Fighting Game",
+    "alt_names": ["URORFG"],
+    "engine": "FM2K",
+    "exe_stems": ["URORFGRelease102"],
+    "kgt_filename": "URORFGRelease102.kgt",
+    "sources": ["manual"]
+  }
+]

@@ -21,7 +21,7 @@
       {% for m in matches %}
       <tr>
         <td>{{ format_iso(m.finished_at) }}</td>
-        <td><a href="/g/{{ m.game_id }}">{{ m.game_id }}</a></td>
+        <td><a href="/g/{{ m.game_id }}">{{ friendly_name(m.game_id) }}</a></td>
         <td>
           <a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a>
           ({{ char_label(m.p1_char_name, m.p1_char_id) }})
