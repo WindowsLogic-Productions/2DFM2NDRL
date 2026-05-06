@@ -8,8 +8,8 @@
     "developer": "",
     "exe_stems": ["pkmncc"],
     "kgt_filename": "pkmncc.kgt",
-    "homepage": "",
-    "sources": ["manual"]
+    "homepage": "https://mizuumi.wiki/w/Pokemon:_Close_Combat",
+    "sources": ["manual", "mizuumi.wiki"]
   },
   {
     "game_id": "vanpri",
@@ -20,7 +20,8 @@
     "developer": "Tomoaki Sugeno (suge9)",
     "exe_stems": ["vanpri"],
     "kgt_filename": "vanpri.kgt",
-    "sources": ["archive.org", "manual"]
+    "homepage": "https://mizuumi.wiki/w/Vanguard_Princess",
+    "sources": ["archive.org", "mizuumi.wiki", "manual"]
   },
   {
     "game_id": "wonderfulworld_ver_0946",
@@ -31,8 +32,8 @@
     "developer": "RAY",
     "exe_stems": ["WonderfulWorld_ver_0946", "wonderfulworld_ver_0945"],
     "kgt_filename": "WonderfulWorld_ver_0946.kgt",
-    "homepage": "https://archive.org/details/wonderful-world-ver-0945",
-    "sources": ["archive.org", "manual"]
+    "homepage": "https://mizuumi.wiki/w/Wonderful_World",
+    "sources": ["archive.org", "mizuumi.wiki", "manual"]
   },
   {
     "game_id": "URORFGRelease102",
