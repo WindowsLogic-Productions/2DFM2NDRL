@@ -132,13 +132,68 @@ Built artifacts in `dist/banners/` go three places:
    warms over a few seconds from the hub URL; subsequent launches
    hit local disk.
 
+## Per-character captures via direct cursor-RAM writes
+
+Driving the cursor through every roster slot via input mash is slow
+(~0.3 s per slot at 100 fps with the existing AutoTitleSkip pulse).
+The faster path: write the cursor RAM address directly, hold for a
+single frame, screenshot, increment, repeat.
+
+The CSS cursor lives at known per-engine addresses. From the IDA
+work we've already done:
+
+  - 0x470020 / 0x470024 = `g_p1_selected_char_idx` /
+    `g_p2_selected_char_idx` (post-confirm slot — what
+    ProcessCharacterSelectHandler latches when A is pressed)
+  - 0x470180 / 0x470184 = `g_p1_cursor_pos` / `g_p2_cursor_pos`
+    (live cursor index — what the CSS draws while the player is
+    still hovering)
+
+Capture-mode state machine pseudocode:
+
+```
+on game_mode → 2000:
+    save css_initial.png
+    for slot_idx in 0 .. roster_size - 1:
+        *(uint32_t*)0x470180 = slot_idx
+        wait 1 frame (let the highlight + portrait redraw)
+        save char_<slot_idx:03d>.png
+    write desired final cursor + confirm to enter battle
+```
+
+Game-shape variance to watch:
+
+  - FM95 uses 0x4701B0 / 0x4701B4 instead (different binary, same
+    convention).
+  - Roster size differs per game. Pull from the .kgt parser's
+    `NonEmptyPlayerIds` count so we don't capture empty slots that
+    show a "?" placeholder.
+  - Some games gate the cursor with a "ready" flag; writing to the
+    cursor address while ready is set might confirm immediately.
+    Check the per-game CSS state machine before driving.
+
+Registry schema bump for this:
+
+```json
+{
+  "game_id": "pkmncc",
+  "css_cursor": {
+    "p1_addr": "0x470180",
+    "p2_addr": "0x470184",
+    "roster_size": 32
+  }
+}
+```
+
+Default is FM2K-vanilla 0x470180 / 0x470184; per-game overrides
+land in `games/registry_overrides.json` for any binary that drifted.
+
 ## Open questions to settle when implementing
 
-- **Per-character vs cropped portraits.** Driving the cursor 32+
-  times per game is slow; cropping the individual portraits out of
-  one CSS frame is faster but needs per-game CSS-layout coordinates.
-  Start with the cursor approach for v1; revisit cropping if total
-  capture time becomes a problem.
+- **Cursor-write vs input-mash.** Cursor-write is ~30× faster per
+  game but needs per-game RAM-addr verification. Start input-mash
+  for v1 (engine-agnostic), promote to cursor-write once we've
+  walked the IDA on each game's CSS handler.
 - **Battle frame timing.** Frame 120 (post-fade, fighters in idle)
   vs first input-able frame (~150) vs mid-fight. Idle pose is
   cleanest for a banner; capture multiple and pick.
