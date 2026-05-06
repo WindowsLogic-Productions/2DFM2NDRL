@@ -49,6 +49,8 @@ QUERIES = [
     # entirely — it pulled in hundreds of unrelated AlJazeera /
     # automated-uploader items.
     '"2D Fighter Maker"',
+    '"2D Fighter Maker 2nd"',
+    '"2D Fighter Maker 95"',
     '"FM2K"',
     '"FM95"',
     '"2dfm"',
@@ -57,6 +59,9 @@ QUERIES = [
     '"fighter maker 2nd"',
     '"fighter maker 95"',
     '"fighter maker 2002"',
+    '"2D fighting"',            # broad — IA tokenizer matches games
+                                # tagged "2D fighting" without other
+                                # FM2K markers
     # Japanese variants
     '"2D 格闘ツクール"',
     '"格闘ツクール"',           # any "fighting-game maker"
@@ -65,6 +70,18 @@ QUERIES = [
     # Engine internals — high-precision FM2K-only matches
     'KGT2KGAME',                # FM2K window class
     'KGT95GAME',                # FM95 window class
+    # Subject-tag queries. IA's `subject:` field is taxonomy / curator-
+    # set; doujin-fighting-game uploads typically get tagged with one
+    # or more of these. Catches games whose freetext doesn't include
+    # "FM2K" / "fighter maker" but whose curator labeled them right.
+    'subject:"fighting game maker"',
+    'subject:"2D Fighter Maker"',
+    'subject:"2D Fighter Maker 2nd"',
+    'subject:"2D Fighter Maker 95"',
+    'subject:"格闘ツクール"',
+    'subject:"FM2K"',
+    'subject:"doujin fighting"',
+    'subject:"anime doujin fighter"',
 ]
 
 # Identifier patterns that look obviously NOT-a-game-upload — we
