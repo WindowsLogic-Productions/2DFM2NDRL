@@ -78,6 +78,23 @@ def slugify(s: str) -> str:
     return s
 
 
+def safe_game_id(candidate: str) -> str:
+    """Normalize a `game_id` so the hub's join_room / launcher URL
+    handling works on it. Game IDs flow through HTTP, env vars, and
+    file paths — they need to be plain ASCII without spaces.
+
+    Rule: lowercase, replace spaces / dots with hyphens, strip
+    everything outside [a-z0-9_-]. JP / Cyrillic / accent characters
+    get dropped; if that leaves an empty string the caller should
+    fall back to a slugified title or the IA identifier.
+    """
+    s = candidate.strip().lower()
+    s = re.sub(r"[\s.]+", "-", s)
+    s = re.sub(r"[^a-z0-9_-]", "", s)
+    s = re.sub(r"-+", "-", s).strip("-_")
+    return s
+
+
 def derive_exe_stem(zip_path: Path | None, fallback_name: str) -> str | None:
     """Inspect a Win zip if present to pull the executable's stem.
 
@@ -137,8 +154,11 @@ def load_myabandonware_records(games_dir: Path) -> list[dict[str, Any]]:
         rec["download_url"] = raw.get("download", "")
         rec["sources"] = ["MyAbandonware"]
         if exe_stem:
-            rec["exe_stems"] = [exe_stem]
-            rec["game_id"] = exe_stem
+            sanitized = safe_game_id(exe_stem)
+            if not sanitized:
+                sanitized = slugify(rec["name"])
+            rec["exe_stems"] = [sanitized] if sanitized else []
+            rec["game_id"] = sanitized
         else:
             # Fallback: slug as game_id placeholder. Override file
             # can fix this later when someone manually maps the right
@@ -192,11 +212,22 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
                     kgt_in_outer)
         if kgt_stem:
             rec["kgt_filename"] = kgt_stem + ".kgt"
-            rec["exe_stems"] = [kgt_stem.lower()]
-            rec["game_id"] = kgt_stem.lower()
+            # Game ID has to be ASCII-safe for HTTP / env vars / file
+            # paths. JP-named kgt files get an empty safe_game_id,
+            # so fall back to slugified title, then to the IA
+            # identifier itself.
+            sanitized = safe_game_id(kgt_stem)
+            if not sanitized:
+                sanitized = slugify(rec["name"])
+            if not sanitized:
+                sanitized = safe_game_id(
+                    rec["_raw"]["archive.org"]["ia_identifier"])
+            rec["exe_stems"] = [sanitized] if sanitized else []
+            rec["game_id"] = sanitized
         elif raw.get("exe_stem"):  # set by inspect_ia_zips.py
-            rec["exe_stems"] = [raw["exe_stem"]]
-            rec["game_id"] = raw["exe_stem"]
+            sanitized = safe_game_id(raw["exe_stem"])
+            rec["exe_stems"] = [sanitized] if sanitized else []
+            rec["game_id"] = sanitized
         else:
             rec["game_id"] = slugify(rec["name"])
         out.append(rec)

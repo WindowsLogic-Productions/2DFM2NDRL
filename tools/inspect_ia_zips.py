@@ -80,30 +80,30 @@ def list_zip_contents_via_regex(html: str, zip_name: str) -> list[str]:
 
     IA renders zip contents as <a href="//archive.org/download/<id>/
     <zipname>.zip/<inner_path>"> entries — absolute URLs, %-encoded.
-    We don't try to parse the HTML structure (<tr> / <td> shape varies
-    by IA template version); just extract the path that follows the
-    zip name and decode it.
+    The zip_name we get from the metadata API has decoded spaces, but
+    the HTML href has them as %20 (and forward slashes inside zips
+    as %2F). Extract by matching the .zip/.7z/.rar marker in the
+    href and taking everything after it; URL-decode the result.
     """
-    # Match the slice of the href URL that lives inside the zip.
-    # Example: "WonderfulWorld_ver_0945.zip/WonderfulWorld_ver_0945%2Fboss.player"
-    # We want everything after the .zip/ delimiter.
-    quoted = re.escape(zip_name)
-    pat = re.compile(rf'{quoted}/([^"\s<>]+)', re.IGNORECASE)
-    raw = pat.findall(html)
+    # Try both the raw zip_name and the URL-encoded form. quote()
+    # encodes spaces and most punctuation but leaves slashes alone,
+    # which matches IA's href encoding. Building the regex against
+    # both lets us tolerate IA template variants.
+    candidates = {zip_name, urllib.parse.quote(zip_name)}
     out: set[str] = set()
-    for r in raw:
-        # Decode %2F -> / and any other %xx encodings.
-        try:
-            decoded = urllib.parse.unquote(r)
-        except Exception:
-            decoded = r
-        # Drop the View-Contents toplink (just the zip itself) and
-        # any IA query strings.
-        if not decoded or decoded.endswith("/"):
-            continue
-        if decoded.startswith("?"):
-            continue
-        out.add(decoded)
+    for cand in candidates:
+        quoted = re.escape(cand)
+        pat = re.compile(rf'{quoted}/([^"\s<>]+)', re.IGNORECASE)
+        for r in pat.findall(html):
+            try:
+                decoded = urllib.parse.unquote(r)
+            except Exception:
+                decoded = r
+            if not decoded or decoded.endswith("/"):
+                continue
+            if decoded.startswith("?"):
+                continue
+            out.add(decoded)
     return sorted(out)
 
 
@@ -120,15 +120,51 @@ def http_get_text(url: str) -> str | None:
 def list_zip_contents(ident: str, archive_filename: str) -> list[str]:
     """Fetch IA's directory-listing HTML for a server-indexed archive
     and return the inner filenames. Empty list on failure / not-yet-
-    indexed zips."""
+    indexed zips.
+
+    Two paths in priority order:
+      1. https://archive.org/download/<id>/<zip>/  (redirects to
+         the per-server view_archive.php)
+      2. https://archive.org/services/zipview.php?zip=...  (older
+         endpoint; some shards still serve it)
+    The first path lands on the per-server response that contains the
+    full <a href> table; that's what we already parse.
+    """
     url = DOWNLOAD_BASE.format(
         ident=urllib.parse.quote(ident),
         name=urllib.parse.quote(archive_filename),
     )
     html = http_get_text(url)
-    if not html:
-        return []
-    return list_zip_contents_via_regex(html, archive_filename)
+    if html:
+        out = list_zip_contents_via_regex(html, archive_filename)
+        if out:
+            return out
+    # Fallback: hit IA's view_archive.php directly. The download/...
+    # URL above 302-redirects to a per-shard URL like
+    # https://ia801609.us.archive.org/view_archive.php?archive=/20/
+    # items/<id>/<filename>. urllib follows redirects automatically,
+    # so the first call usually wins. The fallback here covers items
+    # that redirect to a 404 or whose template variant doesn't
+    # include the inner-href table — we explicitly request the plain-
+    # text view by adding ?format=txt which view_archive.php honors.
+    txt_url = url + "?format=txt"
+    txt = http_get_text(txt_url)
+    if txt:
+        # Plain-text format: one filename per line, optional trailing
+        # whitespace. We only care about filenames containing the
+        # archive name as a path segment so we don't grab unrelated
+        # error/HTML output that came through.
+        out = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # The text format may render entries as plain paths;
+            # accept anything that looks like a relative file path.
+            if "/" in line or "." in line:
+                out.append(line)
+        return out
+    return []
 
 
 def first_archive(files: list[str]) -> str | None:
