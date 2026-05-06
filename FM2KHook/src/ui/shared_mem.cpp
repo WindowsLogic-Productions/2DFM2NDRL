@@ -148,3 +148,42 @@ void SharedMem_PublishMatchStage(uint32_t stage_id) {
     // would otherwise fire under the rotated token with stale data.
     g_shared_mem->match_chars_seq += 1;
 }
+
+void SharedMem_PublishHudScores(uint16_t p1, uint16_t p2) {
+    if (!g_shared_mem) return;
+    g_shared_mem->hud_score_p1 = p1;
+    g_shared_mem->hud_score_p2 = p2;
+    // Bump AFTER the values land so a fc_hud read that races us only
+    // ever sees a fully-coherent {p1, p2, seq} triple.
+    g_shared_mem->hud_score_seq += 1;
+}
+
+void SharedMem_PublishHudSystemMessage(const char* text_utf8, uint32_t ttl_ms) {
+    if (!g_shared_mem) return;
+    if (!text_utf8 || ttl_ms == 0) {
+        g_shared_mem->hud_system_message[0] = '\0';
+        g_shared_mem->hud_system_message_expiry_tick = 0;
+        // Bump anyway so fc_hud notices the clear.
+        g_shared_mem->hud_system_message_seq += 1;
+        return;
+    }
+    // Truncate-with-null on overflow rather than refusing to publish.
+    char* dst = g_shared_mem->hud_system_message;
+    const size_t cap = sizeof(g_shared_mem->hud_system_message);
+    const size_t n = strnlen(text_utf8, cap - 1);
+    memcpy(dst, text_utf8, n);
+    dst[n] = '\0';
+    // Expiry is computed off `GetTickCount()` because both writers
+    // (launcher and hook) need the same wall-clock-ish reference and
+    // Windows ticks are universally available without a syscall.
+    g_shared_mem->hud_system_message_expiry_tick = GetTickCount() + ttl_ms;
+    g_shared_mem->hud_system_message_seq += 1;
+}
+
+void SharedMem_PublishHudSpectatorCount(uint16_t n) {
+    if (!g_shared_mem) return;
+    g_shared_mem->hud_spectator_count = n;
+    // No seq for spectator count — fc_hud reads the raw value every
+    // frame and renders if non-zero. No coherency concern: the value
+    // is a 16-bit aligned write, atomic on x86.
+}

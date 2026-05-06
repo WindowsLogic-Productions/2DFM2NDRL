@@ -9,7 +9,10 @@
 // ============================================================================
 
 constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 8;
+// v9 (2026-05-06): adds the in-game HUD state block (scores,
+// spectator count, system-message slot). Slice E will append chat
+// state on top under v10.
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 9;
 
 // Maximum bytes for a UTF-8-encoded character name in the shared mem
 // outcome payload. FM2K stores .player filenames as 256-byte CP932
@@ -119,11 +122,41 @@ struct FM2KSharedMemData {
     int32_t  ui_vs_draws;
     char     ui_peer_nick[64];    // current peer's display name (UTF-8)
     char     ui_my_nick[64];      // own display name (UTF-8)
+
+    // ─── In-game HUD (fc_hud reads, launcher and hook write) ─────────
+    //
+    // Wholly bidirectional: the launcher pushes for netplay events
+    // (peer disconnected, round timer alert, hub-side score updates),
+    // the hook pushes for in-game events (round-end Win/Loss/Draw
+    // detection, "Round 1, Fight!" trigger). Both writers bump the
+    // associated `_seq` field; fc_hud tracks the seq it last consumed
+    // so the bar refreshes on any change.
+    //
+    // The `_seq == 0` sentinel means "never written" — fc_hud uses it
+    // to suppress UI elements that haven't been populated yet (the
+    // score box stays hidden offline, system-message overlay stays
+    // hidden until something fires).
+
+    uint32_t hud_score_seq;       // bumped on hud_score_p1/p2 change
+    uint16_t hud_score_p1;        // round wins for the P1 side
+    uint16_t hud_score_p2;        // round wins for the P2 side
+    uint16_t hud_spectator_count; // hub-pushed; 0 when offline
+    uint16_t hud_pad0;
+
+    // System message: short notice rendered centered inside the game
+    // rect with a fade-out near expiry. Use cases: "Round 1, Fight",
+    // "Peer disconnected", "Slow CPU detected — switching to gdi
+    // renderer", etc. Writer order: fill the buffer, set the expiry
+    // tick (= GetTickCount() at which the message disappears), THEN
+    // bump the seq. fc_hud reads in seq → buffer → expiry order.
+    uint32_t hud_system_message_seq;
+    uint32_t hud_system_message_expiry_tick;  // GetTickCount() value
+    char     hud_system_message[160];         // UTF-8, NUL-terminated
 };
 
-// Bumped to 512 to fit the launcher → hook stats feed added in
-// version 6 (W-L-D + peer nick + my nick). Still well under 4 KB.
-static_assert(sizeof(FM2KSharedMemData) <= 512, "Keep shared mem small");
+// Bumped to 1024 to fit the v9 HUD block. Still under 4 KB which is
+// the practical ceiling we agreed on for the shared-mem mapping.
+static_assert(sizeof(FM2KSharedMemData) <= 1024, "Keep shared mem small");
 
 // Shared memory lifecycle
 bool InitializeSharedMemory();
@@ -175,3 +208,23 @@ void SharedMem_PublishUiStats(int32_t wins, int32_t losses, int32_t draws,
                               int32_t vs_wins, int32_t vs_losses, int32_t vs_draws,
                               const char* peer_nick_utf8,
                               const char* my_nick_utf8);
+
+// ─── HUD publishers (Slices B/C/D) ────────────────────────────────────
+//
+// Each one updates the relevant fields, then bumps the `*_seq` so
+// fc_hud's per-frame read picks up the change. Safe to call from any
+// thread; idempotent (writing the same values again is a no-op apart
+// from a wasted seq bump).
+
+// Set the round-win score shown in the HUD's center score box.
+// Hidden when this has never been called (seq=0). Pass {0,0} to
+// reset visible scores at match start.
+void SharedMem_PublishHudScores(uint16_t p1, uint16_t p2);
+
+// Push a system message (centered overlay) with a TTL in milliseconds.
+// `text` is UTF-8; truncated to 159 bytes + NUL on overflow.
+// `ttl_ms == 0` immediately clears any pending message.
+void SharedMem_PublishHudSystemMessage(const char* text_utf8, uint32_t ttl_ms);
+
+// Update the spectator count shown in the HUD bar.
+void SharedMem_PublishHudSpectatorCount(uint16_t n);

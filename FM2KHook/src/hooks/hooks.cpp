@@ -1457,10 +1457,12 @@ static HWND GetOurGameWindow() {
     return g_cached_window;
 }
 
-// FPS tracking
+// FPS tracking. `g_current_fps` is read by fc_hud (via extern decl
+// in imgui_overlay.cpp) so the always-on HUD shows live framerate;
+// it's still file-scope-visible for everything inside this TU.
 static DWORD g_last_fps_time = 0;
 static int g_fps_frame_count = 0;
-static int g_current_fps = 0;
+int g_current_fps = 0;
 
 // Hook: RenderGame
 // Set in the GekkoNet AdvanceEvent handler (netplay.cpp). Each advance

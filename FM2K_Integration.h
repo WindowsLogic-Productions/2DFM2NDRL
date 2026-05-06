@@ -940,6 +940,14 @@ private:
     // K::MatchStart). Cheap no-op when there is no active game process.
     void PushStatsToHook();
 
+    // Push a system-message to the in-game HUD (centered overlay
+    // with TTL fade). Mirrors PushStatsToHook's PID-resolution path:
+    // writes into both running clients' shared-mem mappings if any.
+    // No-op when no game is running. Used for netplay events the
+    // user benefits from seeing without alt-tabbing (peer dropped,
+    // hub-side state change, match starting).
+    void PushHudSystemMessage(const char* text_utf8, uint32_t ttl_ms);
+
     // Append one row to %APPDATA%\FM2K_Rollback\results.csv (#42). Writes
     // a UTF-8 BOM on first creation so Excel renders JP/accented names
     // correctly. Invoked from PollMatchOutcome alongside the hub send so

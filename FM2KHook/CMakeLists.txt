@@ -36,6 +36,7 @@ set(FM2KHOOK_SOURCES
     src/audio/sound_rollback.cpp
     # UI
     src/ui/imgui_overlay.cpp
+    src/ui/fc_hud.cpp
     src/ui/shared_mem.cpp
     src/ui/input_binder.cpp
     src/ui/screenshot.cpp
