@@ -15140,6 +15140,32 @@
     }
   },
   {
+    "game_id": "pkmncc",
+    "name": "Pokemon: Close Combat",
+    "alt_names": [
+      "pkmnccv16c",
+      "Pokemon Close Combat"
+    ],
+    "engine": "FM2K",
+    "year": "2020",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [
+      "pkmncc"
+    ],
+    "kgt_filename": "pkmncc.kgt",
+    "homepage": "",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "manual"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {}
+  },
+  {
     "game_id": "pocketazukaku",
     "name": "Pocket Azukaku",
     "alt_names": [
@@ -19527,14 +19553,39 @@
     }
   },
   {
-    "game_id": "vanpri",
-    "name": "Vanguard Princess (v.1.8.7) (52)",
+    "game_id": "URORFGRelease102",
+    "name": "Untitled Risk of Rain Fighting Game",
     "alt_names": [
-      "Magical Heroines plus!"
+      "URORFG"
+    ],
+    "engine": "FM2K",
+    "year": "",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [
+      "URORFGRelease102"
+    ],
+    "kgt_filename": "URORFGRelease102.kgt",
+    "homepage": "",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "manual"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {}
+  },
+  {
+    "game_id": "vanpri",
+    "name": "Vanguard Princess",
+    "alt_names": [
+      "Vanguard.Princess"
     ],
     "engine": "FM2K",
     "year": "2009",
-    "developer": "Suge9",
+    "developer": "Tomoaki Sugeno (suge9)",
     "publisher": "",
     "exe_stems": [
       "vanpri"
@@ -19545,7 +19596,8 @@
     "banner_url": "",
     "thumb_url": "",
     "sources": [
-      "archive.org"
+      "archive.org",
+      "manual"
     ],
     "characters": [],
     "stages": [],
@@ -20204,6 +20256,35 @@
         "exe_stem": "wonderfulworld_ver_0945"
       }
     }
+  },
+  {
+    "game_id": "wonderfulworld_ver_0946",
+    "name": "Wonderful World",
+    "alt_names": [
+      "WonderfulWorld_ver_0945",
+      "WonderfulWorld_ver_0946",
+      "WonderfulWorld"
+    ],
+    "engine": "FM2K",
+    "year": "2010",
+    "developer": "RAY",
+    "publisher": "",
+    "exe_stems": [
+      "WonderfulWorld_ver_0946",
+      "wonderfulworld_ver_0945"
+    ],
+    "kgt_filename": "WonderfulWorld_ver_0946.kgt",
+    "homepage": "https://archive.org/details/wonderful-world-ver-0945",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "manual",
+      "archive.org"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {}
   },
   {
     "game_id": "wundercartfm95",

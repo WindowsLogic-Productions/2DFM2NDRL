@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}{{ g.game_id }} — FM2K Stats{% endblock %}
+{% block title %}{{ friendly_name(g.game_id) }} — FM2K Stats{% endblock %}
 {% block content %}
 <section class="hero">
-  <h1>{{ g.game_id }}</h1>
+  <h1>{{ friendly_name(g.game_id) }}</h1>
   <p class="lede"><strong>{{ g.total }}</strong> matches recorded.</p>
 </section>
 
