@@ -64,15 +64,15 @@ FM2K_MARKERS = [
     r"Fighter_Maker_95",
     r"FM95",
     r"格闘ツクール",                          # JP name
-    # LilithPort / BBBR are netplay tools used ONLY by FM2K games
-    # (one of the original mid-2010s rollback / delay tools for the
-    # engine). If the wiki page mentions either as the netcode method
-    # we can confidently classify the page as FM2K. Catches Pokemon:
-    # Close Combat, etc., whose wikitext doesn't name the engine
-    # itself but lists "via LilithPort" in the netcode field.
+    # LilithPort is the FM2K-specific netplay tool. If the wiki page
+    # mentions it as the netcode method we can confidently classify
+    # the page as FM2K. Catches Pokemon: Close Combat, Pokemon:
+    # PsyStrike, etc., whose wikitext doesn't name the engine itself
+    # but lists "via LilithPort" in the infobox. Avoid using game-
+    # specific abbreviations as engine markers — "BBBR" tripped the
+    # filter on Big Bang Beat -Revolve- (Alice Soft, not FM2K).
     r"\bLilithPort\b",
     r"\boldmud0/LilithPort\b",
-    r"\bBBBR\b",
 ]
 FM2K_MARKER_RE = re.compile("|".join(FM2K_MARKERS), re.IGNORECASE)
 
@@ -146,13 +146,23 @@ def normalize(parse: dict[str, Any]) -> dict[str, Any]:
     title = parse.get("title") or ""
     wikitext = (parse.get("wikitext") or {}).get("*") or ""
 
-    # Lead image: the first {{Infobox …| image= ...}} or the first
-    # `[[File:...]]` that isn't a thumbnail link to docs.
+    # Lead image. Two patterns to try in order:
+    #   1. {{Infobox Game | image = <filename> }} — the canonical
+    #      banner / cover slot. Most modern game pages use this.
+    #   2. First `[[File:<name>.png]]` reference — older pages that
+    #      pre-date the infobox template embed images via raw
+    #      bracket syntax.
+    # Whichever resolves first wins.
     lead_image = ""
-    m = re.search(r"\[\[File:([^|\]]+\.(?:png|jpg|jpeg|gif))",
+    m = re.search(r"\|\s*image\s*=\s*([^|\n]+\.(?:png|jpg|jpeg|gif))",
                   wikitext, re.IGNORECASE)
     if m:
         lead_image = m.group(1).strip()
+    if not lead_image:
+        m = re.search(r"\[\[File:([^|\]]+\.(?:png|jpg|jpeg|gif))",
+                      wikitext, re.IGNORECASE)
+        if m:
+            lead_image = m.group(1).strip()
 
     # Try to extract a year — most wikitext lead paragraphs include a
     # "released [date]" or just a 19xx/20xx number near the top.
