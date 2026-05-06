@@ -2,9 +2,7 @@
   {
     "game_id": "2d2nd",
     "name": "2 D格闘ツクール 2nd",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2001",
     "developer": "Enterbrain",
@@ -529,9 +527,7 @@
   {
     "game_id": "8-marbles",
     "name": "8 Marbles",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -1069,9 +1065,7 @@
   {
     "game_id": "8-marbles-2",
     "name": "8 Marbles 2",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -1735,9 +1729,7 @@
   {
     "game_id": "8-marbles-2x",
     "name": "8 Marbles 2X",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -2400,9 +2392,7 @@
   {
     "game_id": "8-marbles-r",
     "name": "8 Marbles R",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -2679,9 +2669,7 @@
   {
     "game_id": "8-marbles-ura",
     "name": "8 Marbles Ura",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -3277,9 +3265,7 @@
   {
     "game_id": "angel-star-road",
     "name": "Angel Star Road",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Keropyon",
@@ -3475,11 +3461,58 @@
     }
   },
   {
+    "game_id": "angelsofbattle",
+    "name": "Angels of Battle",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2019",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Angels_of_Battle",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Angels of Battle",
+        "homepage": "https://mizuumi.wiki/w/Angels_of_Battle",
+        "name": "Angels of Battle",
+        "year": "2019",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Angels_of_Battle"
+        ],
+        "images": [
+          "AoB_Cover.png",
+          "Icon_faq.png",
+          "Icon_controls.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "AoB_Eve_Icon.png",
+          "AoB_Zeiko_Icon.png",
+          "AoB_Elvi_Icon.png",
+          "AoB_Erus_Icon.png",
+          "AoB_Kay_Icon.png",
+          "AoB_R-Voltes_Icon.png",
+          "AoB_Yinan_Icon.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Angels of Battle\n| abbreviation = AoB\n| image        = AoB_Cover.png\n| version      = 1.6\n| developer    = BV Taisei\n| system       = [https://bvtaisei.itch.io/angels-of-battle '''PC (Windows)''']<br>January 6th, 2019\n| netcode     = Delay-Based Netcode (via Lilithport)\n| community    = [https://discord.gg/vD6JUFyNNs Discord Server]\n}}\n\nAngels of Battle is a 2019 2D fighting game made in 2D Fighter Maker 2nd (yes, seriously). It's a 4-button game in the same vein ",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "animetenchoubattlelive",
     "name": "Anime Tenchou Battle Live",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2004",
     "developer": "ZENRYOKUTEI",
@@ -3631,9 +3664,7 @@
   {
     "game_id": "annavssentimentalfightervs",
     "name": "Anna Vs. Sentimental Fighter [あんなVSせんちめんたるふぁいたー]",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2006",
     "developer": "うにくらげ",
@@ -3758,9 +3789,7 @@
   {
     "game_id": "another-force",
     "name": "Another Force",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -3859,11 +3888,218 @@
     }
   },
   {
+    "game_id": "armjoe",
+    "name": "Arm Joe",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "",
+    "developer": "Takase",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "LesMiserables.kgt",
+    "homepage": "https://mizuumi.wiki/w/Arm_Joe",
+    "download_url": "https://archive.org/download/arm-joe-v-14b",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki",
+      "archive.org"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Arm Joe",
+        "homepage": "https://mizuumi.wiki/w/Arm_Joe",
+        "name": "Arm Joe",
+        "year": "",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Arm_Joe"
+        ],
+        "images": [
+          "AJ_TitleScreen.webp",
+          "Icon_controls.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "Icon_network.png",
+          "Icon_faq.png",
+          "AJ_Valjean_Icon.webp",
+          "AJ_Enjolras_Icon.webp",
+          "AJ_Eponine_Icon.webp",
+          "AJ_Thenardier_Icon.webp",
+          "AJ_Javert_Icon.webp",
+          "AJ_Cosette_Icon.webp",
+          "AJ_Marius_Icon.webp",
+          "AJ_Police_Icon.webp",
+          "AJ_RoboJean_Icon.webp",
+          "AJ_Ponpon_Icon.webp",
+          "AJ_JUDGEMENT_Icon.webp"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Arm Joe\n| abbreviation = AJ\n| image        = AJ_TitleScreen.webp\n| version      = Official: [https://www.vector.co.jp/soft/win95/game/se365091.html v1.4b]\n| version2     = Community: [https://www.mediafire.com/file/xbk8ce161doyagj/ArmJoe_v14c_Installer.exe/file v1.4c]\n| developer    = Takase\n| system       = PC\n| website      = https://takase.syuriken.jp/ArmJoe.htm\n| netcode      = Delay-based netcode (LilithPort)\n| community    = [https://discord.gg/c8QrBhGcyR Di",
+        "source": "mizuumi.wiki"
+      },
+      "archive.org": {
+        "ia_identifier": "arm-joe-v-14b",
+        "title": "Arm Joe",
+        "creator": "Takase",
+        "year": "",
+        "homepage": "https://archive.org/details/arm-joe-v-14b",
+        "download": "https://archive.org/download/arm-joe-v-14b",
+        "files": [
+          "01.PNG",
+          "01_thumb.jpg",
+          "02.PNG",
+          "02_thumb.jpg",
+          "03.PNG",
+          "03_thumb.jpg",
+          "ArmJoeV14b.zip",
+          "__ia_thumb.jpg",
+          "arm-joe-v-14b_archive.torrent",
+          "arm-joe-v-14b_files.xml",
+          "arm-joe-v-14b_meta.sqlite",
+          "arm-joe-v-14b_meta.xml"
+        ],
+        "subjects": [
+          "fighting game maker 2d fighter maker 95 anime doujin"
+        ],
+        "description": "Fighting game made using 2DFM95",
+        "source": "archive.org",
+        "verified": true,
+        "inner_files": [
+          "ArmJoeV14b/AJHelpV14b/AJ-help/HPTitle.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto01.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto02.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto03.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto04.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto05.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Joystick.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Menu.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Takase.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Thumbs.db",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/V1.4b.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/V1.4b2.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/Ver.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/WIP_245.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/WIP_253.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/What'sNew.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/What'sNew.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/basic.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/command.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/command.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/A.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/AJ_V13_01.bmp.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Aj000.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Aj001.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/B.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj02.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj03.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Bug01.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Bug02.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/C.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Combo.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Cosette.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/D.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Dash.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Enjolras.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Eponine.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Gage.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Guardattack.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/HitEscape01.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/HitEscape02.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/JOYSTICK.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Javert.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Judgement.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Police.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Ponpon.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Robojean.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Sblow.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Takase.jpg",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Tenardier.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Thumbs.db",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Valjean.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hanekaeri.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidari.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidarisita.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidariue.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/marius.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migi.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migisita.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migiue.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/sita.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/system.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/ue.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/win.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/img/zokusei.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/joy.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/kidou.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/kihon.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/logo1.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/main.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/sakusha.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/system.gif",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/system.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/takase.html",
+          "ArmJoeV14b/AJHelpV14b/AJ-help/top.html",
+          "ArmJoeV14b/AJHelpV14b/Help_Index.html",
+          "ArmJoeV14b/AJHelpV14b/Thumbs.db",
+          "ArmJoeV14b/Cosette.player",
+          "ArmJoeV14b/EPONINE.player",
+          "ArmJoeV14b/Ending01.demo",
+          "ArmJoeV14b/Enjolras.player",
+          "ArmJoeV14b/Gameover.demo",
+          "ArmJoeV14b/Graveyard Win.demo",
+          "ArmJoeV14b/Graveyard.bg",
+          "ArmJoeV14b/Hill.bg",
+          "ArmJoeV14b/Hill2.bg",
+          "ArmJoeV14b/Judgement.player",
+          "ArmJoeV14b/Last.bg",
+          "ArmJoeV14b/LesMiserables.exe",
+          "ArmJoeV14b/LesMiserables.kgt",
+          "ArmJoeV14b/Marius.player",
+          "ArmJoeV14b/Mistery Hill Win.demo",
+          "ArmJoeV14b/Mistery Hill.bg",
+          "ArmJoeV14b/PRACTICE.player",
+          "ArmJoeV14b/Police.player",
+          "ArmJoeV14b/PonPon.player",
+          "ArmJoeV14b/ROBOJEAN.player",
+          "ArmJoeV14b/Readme.txt",
+          "ArmJoeV14b/Tunnel-win.demo",
+          "ArmJoeV14b/V121TITLE.demo",
+          "ArmJoeV14b/V14ENDING01.demo",
+          "ArmJoeV14b/V14ENDING02.demo",
+          "ArmJoeV14b/VS02.demo",
+          "ArmJoeV14b/Valjean.player",
+          "ArmJoeV14b/e.demo",
+          "ArmJoeV14b/forest-win.demo",
+          "ArmJoeV14b/forest.bg",
+          "ArmJoeV14b/hill-win.demo",
+          "ArmJoeV14b/javert.player",
+          "ArmJoeV14b/last-win.demo",
+          "ArmJoeV14b/nighttown.bg",
+          "ArmJoeV14b/road-win.demo",
+          "ArmJoeV14b/road.bg",
+          "ArmJoeV14b/seine-win.demo",
+          "ArmJoeV14b/seine.bg",
+          "ArmJoeV14b/seine02.bg",
+          "ArmJoeV14b/select.demo",
+          "ArmJoeV14b/street-win.demo",
+          "ArmJoeV14b/tenardier.player",
+          "ArmJoeV14b/title.demo",
+          "ArmJoeV14b/tunnel02.bg",
+          "ArmJoeV14b/２Ｄ格闘ツクール９５.ini"
+        ],
+        "kgt_filename": "LesMiserables.kgt",
+        "exe_stem": "lesmiserables"
+      }
+    }
+  },
+  {
     "game_id": "arugan",
     "name": "Arugan",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -4000,9 +4236,7 @@
   {
     "game_id": "axelcitycomplete",
     "name": "Axel City Complete",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Project Atsuki",
@@ -4302,9 +4536,7 @@
   {
     "game_id": "battlecapacity",
     "name": "Battle Capacity",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2013",
     "developer": "IvanB",
@@ -4386,11 +4618,89 @@
     }
   },
   {
+    "game_id": "bigbangbeatrevolve",
+    "name": "Big Bang Beat Revolve",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2011",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Big_Bang_Beat_Revolve",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Big Bang Beat Revolve",
+        "homepage": "https://mizuumi.wiki/w/Big_Bang_Beat_Revolve",
+        "name": "Big Bang Beat Revolve",
+        "year": "2011",
+        "developer": "",
+        "lead_image": "BBBR Logo.png",
+        "categories": [
+          "Big_Bang_Beat_Revolve"
+        ],
+        "images": [
+          "BBBR_Banner.png",
+          "BBBR_Logo.png",
+          "BBBR_Burai_CSel.png",
+          "BBBR_Miyazato_CSel.png",
+          "BBBR_Heita_CSel.png",
+          "BBBR_Kunagi_CSel.png",
+          "BBBR_Rouga_CSel.png",
+          "BBBR_Senna_CSel.png",
+          "BBBR_Nakanishi_CSel.png",
+          "BBBR_Kinako_CSel.png",
+          "BBBR_Daigo_CSel.png",
+          "BBBR_Kamui_CSel.png",
+          "BBBR_Hanny_CSel.png",
+          "BBBR_Manbou_CSel.png",
+          "BBBR_Sanzou_CSel.png",
+          "BBBR_Ren_CSel.png",
+          "BBBR_Agito_CSel.png",
+          "BBBR_Mecha_CSel.png",
+          "BBBR_Devil_CSel.png",
+          "BBBR_Kojirou_CSel.png",
+          "Icon_faq.png",
+          "Icon_controls.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "Icon_glossary.png",
+          "BBBR_Burai_Icon.png",
+          "BBBR_Miyazato_Icon.png",
+          "BBBR_Heita_Icon.png",
+          "BBBR_Kunagi_Icon.png",
+          "BBBR_Rouga_Icon.png",
+          "BBBR_Senna_Icon.png",
+          "BBBR_Nakanishi_Icon.png",
+          "BBBR_Kinako_Icon.png",
+          "BBBR_Daigo_Icon.png",
+          "BBBR_Kamui_Icon.png",
+          "BBBR_Hanny_Icon.png",
+          "BBBR_Manbou_Icon.png",
+          "BBBR_Sanzou_Icon.png",
+          "BBBR_Ren_Icon.png",
+          "BBBR_Agito_Icon.png",
+          "BBBR_Mecha_Icon.png",
+          "BBBR_Devil_Icon.png",
+          "BBBR_Kojirou_Icon.png"
+        ],
+        "wikitext_excerpt": "{{DISPLAYTITLE:Big Bang Beat -Revolve-}}\n{{Infobox Game\n| gamename     = ''Big Bang Beat -Revolve-''\n| abbreviation = BBBR\n| image        = BBBR Banner.png\n| version      = 1.06\n| developer    = AliceSoft\n| developer2    = Frontier Aja\n| system       = PC<br>August 14, 2011\n| website      = [http://aja-games.com/products_BBBR/ Frontier Aja] (Dead)\n| netcode      = Delay-based Netcode<br>(Requires ZeroTier)\n| community    = [https://discord.gg/B5MPazfP7U Discord Server]\n| extra        =\n! rowspan",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "bishibashitouhou14",
     "name": "Bishi Bashi Touhou 1.4",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2016",
     "developer": "AonoriKame",
@@ -4486,9 +4796,7 @@
   {
     "game_id": "boobytales",
     "name": "BOOBYTALES",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2003",
     "developer": "BIGWHEEL",
@@ -4786,9 +5094,7 @@
   {
     "game_id": "bradercrisis",
     "name": "Blader Crisis",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -5034,9 +5340,7 @@
   {
     "game_id": "burning-blaze-red",
     "name": "Burning Blaze Red",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -5393,9 +5697,7 @@
   {
     "game_id": "cinemastar",
     "name": "CINEMASTAR",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -5625,9 +5927,7 @@
   {
     "game_id": "colors-party-the-roll-up-end",
     "name": "Colors Party The Roll Up End",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -5745,9 +6045,9 @@
   },
   {
     "game_id": "comicpartywars2",
-    "name": "Comic Party Wars 2 (第弐次こみっく大戦)",
+    "name": "Comic Party Wars 2",
     "alt_names": [
-      "Magical Heroines plus!"
+      "Comic Party Wars 2 (第弐次こみっく大戦)"
     ],
     "engine": "FM2K",
     "year": "2001",
@@ -5755,16 +6055,52 @@
     "publisher": "",
     "exe_stems": [],
     "kgt_filename": "",
-    "homepage": "https://archive.org/details/cpw2_20230916",
+    "homepage": "https://mizuumi.wiki/w/Comic_Party_Wars_2",
     "download_url": "https://archive.org/download/cpw2_20230916",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
+      "mizuumi.wiki",
       "archive.org"
     ],
     "characters": [],
     "stages": [],
     "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Comic Party Wars 2",
+        "homepage": "https://mizuumi.wiki/w/Comic_Party_Wars_2",
+        "name": "Comic Party Wars 2",
+        "year": "2001",
+        "developer": "",
+        "lead_image": "CPW2 Logo.png",
+        "categories": [
+          "Comic_Party_Wars_2"
+        ],
+        "images": [
+          "CPW2_Logo.png",
+          "CPW2_getting_started_icon.png",
+          "CPW2_faq_icon.png",
+          "CPW2_controls_icon.png",
+          "CPW2_mechanics_icon.png",
+          "CPW2_Poster.gif",
+          "CPW2_Mizuki_CSel.png",
+          "CPW2_Reiko_CSel.png",
+          "CPW2_Minami_CSel.png",
+          "CPW2_Asahi_CSel.png",
+          "CPW2_Chisa_CSel.png",
+          "CPW2_Eimi_CSel.png",
+          "CPW2_Aya_CSel.png",
+          "CPW2_Mizuki_icon.png",
+          "CPW2_Reiko_icon.png",
+          "CPW2_Minami_icon.png",
+          "CPW2_Asahi_icon.png",
+          "CPW2_Chisa_icon.png",
+          "CPW2_Eimi_icon.png",
+          "CPW2_Aya_icon.png"
+        ],
+        "wikitext_excerpt": "{{DISPLAYTITLE:Comic Party Wars: Comic Party 2}}\n{{2 Column Flex|flex1=7|flex2=3|reverse=yes\n|content1=\n{{Content Box|content=\n<center><div style=\"max-width:686px;\">[[File:CPW2 Logo.png|class=flex-image|link=]]</div></center>\n'''Comic Party Wars: Comic Party 2''' or more commonly '''Comic Party Wars 2''' is a Fighter Maker 95 game made by Run-Liatto or rariattou. It is the second game in the Comic Party Wars series and by far the most complete. It was last updated some time in September of 2001.",
+        "source": "mizuumi.wiki"
+      },
       "archive.org": {
         "ia_identifier": "cpw2_20230916",
         "title": "Comic Party Wars 2 (第弐次こみっく大戦)",
@@ -5807,9 +6143,7 @@
   {
     "game_id": "comicpartywarsendlesswaltzendlesswaltz",
     "name": "Comic Party Wars Endless Waltz (こみっく大戦EndlessWaltz)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2003",
     "developer": "Run-Liatto",
@@ -5872,9 +6206,7 @@
   {
     "game_id": "dandaniii2nd",
     "name": "Dan Dan III 2nd",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -6081,11 +6413,77 @@
     }
   },
   {
+    "game_id": "dongdongneverdie",
+    "name": "Dong Dong Never Die",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2009",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Dong_Dong_Never_Die",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Dong Dong Never Die",
+        "homepage": "https://mizuumi.wiki/w/Dong_Dong_Never_Die",
+        "name": "Dong Dong Never Die",
+        "year": "2009",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Dong_Dong_Never_Die"
+        ],
+        "images": [
+          "DDND_Cover.jpeg",
+          "Icon_controls.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "Icon_faq.png",
+          "Icon_community.png",
+          "Icon_links.png",
+          "DDND_DongDong_Select.png",
+          "DDND_AShuang_Select.png",
+          "DDND_Ken_Select.png",
+          "DDND_YinYin_Select.png",
+          "DDND_MingBoy_Select.png",
+          "DDND_LiuMang_Select.png",
+          "DDND_MrBoring_Select.png",
+          "DDND_FlowerTwins_Select.png",
+          "DDND_Gouki_Select.png",
+          "DDND_Terminator_Select.png",
+          "DDND_Marhsmellow_Select.png",
+          "DDND_Kenjiro_Select.png",
+          "DDND_Magician_Select.png",
+          "DDND_JiangBao_Select.png",
+          "DDND_Jackie_Select.png",
+          "DDND_XiaoPan_Select.png",
+          "DDND_Matchstick_Select.png",
+          "DDND_Mario_Select.png",
+          "DDND_SunWukong_Select.png",
+          "DDND_DaLan_Select.png",
+          "DDND_ZhugeLiang_Select.png",
+          "DDND_FeiFei_Select.png",
+          "DDND_Bioman_Select.png",
+          "DDND_Korone_Select.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Dong Dong Never Die: Judgment Day\n| abbreviation = DDND\n| image        = DDND Cover.jpeg\n| developer    = Jiangxi Dinosaur (江西恐龙),\n| developer2   = Wang Dong (王东)\n| developer3   = hlwz (V1.65-1.651)\n| developer4   = DismasThePenitent (Judgment Day)\n| system       = PC\n| netcode      = Delay-based netcode (Lilithport)\n| netcode2     = Player Lobbies (Lilithport)\n| netcode3     = Parsec\n| resources    = [https://sites.google.com/view/dong-dong-never-die/home Google ",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "doubutsukakutoukari",
     "name": "Doubutsu Kakutou Kari",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -6353,27 +6751,53 @@
   {
     "game_id": "dynamitebomb",
     "name": "Dynamite Bomb",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2014",
     "developer": "lightgreen8",
     "publisher": "",
-    "exe_stems": [
-      "dynamitebomb"
-    ],
+    "exe_stems": [],
     "kgt_filename": "稲歩町ダイナマイトボム.kgt",
-    "homepage": "https://archive.org/details/indb_20260405",
+    "homepage": "https://mizuumi.wiki/w/Dynamite_Bomb",
     "download_url": "https://archive.org/download/indb_20260405",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
+      "mizuumi.wiki",
       "archive.org"
     ],
     "characters": [],
     "stages": [],
     "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Dynamite Bomb",
+        "homepage": "https://mizuumi.wiki/w/Dynamite_Bomb",
+        "name": "Dynamite Bomb",
+        "year": "2014",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Dynamite_Bomb"
+        ],
+        "images": [
+          "DynamiteBomb.png",
+          "Icon_controls.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "Icon_faq.png",
+          "Icon_patch_notes.png",
+          "Kotetsu_dynabomb_profile.png",
+          "Sakura_dynabomb_profile.png",
+          "Youzou_dynabomb_profile.png",
+          "Mana_dynabomb_profile.png",
+          "Tiger_dynabomb_profile.png",
+          "Saia_dynabomb_profile.png",
+          "Seitarou_dynabomb_profile.png",
+          "Annie_dynabomb_profile.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Inahocho Dynamite BOMB\nDYNAMITE BOMB!!\n| abbreviation = DynaBomb) </br> (INDB\n| image        = DynamiteBomb.png\n| version      = \n| developer    = lightgreen8 (Doujin)\n| developer2   = lightgreen8 & EXA-AM2 (exA-Arcadia)\n| publisher    = \n| publisher2   = \n| system       = PC via [https://www.dlsite.com/home/work/=/product_id/RJ132032.html/?locale=en_US DLsite] </br> March 27, 2014\n| system2      = exA-Arcadia\n2023\n| website      = \n[https://exa.ac/en/games/dynami",
+        "source": "mizuumi.wiki"
+      },
       "archive.org": {
         "ia_identifier": "indb_20260405",
         "title": "Dynamite Bomb",
@@ -6666,9 +7090,7 @@
   {
     "game_id": "elfen-lied-fighting",
     "name": "Elfen Lied Fighting Remade",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2003",
     "developer": "",
@@ -7347,9 +7769,7 @@
   {
     "game_id": "ever-nights_092",
     "name": "EVER NIGHTS 092",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -7589,9 +8009,7 @@
   {
     "game_id": "famicomdyingparty",
     "name": "Famicom Dying Party",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2014",
     "developer": "Umigami",
@@ -7842,9 +8260,7 @@
   {
     "game_id": "fighterkototai",
     "name": "Fighters Kyodotai",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2000",
     "developer": "ALICUU",
@@ -7946,9 +8362,7 @@
   {
     "game_id": "fightermakerfm2002",
     "name": "fighter_maker_FM_2002",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -8002,11 +8416,55 @@
     }
   },
   {
+    "game_id": "fightingismagicaurora",
+    "name": "Fighting is Magic: Aurora",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2021",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Fighting_is_Magic%3A_Aurora",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Fighting is Magic: Aurora",
+        "homepage": "https://mizuumi.wiki/w/Fighting_is_Magic%3A_Aurora",
+        "name": "Fighting is Magic: Aurora",
+        "year": "2021",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Under_Construction",
+          "Fighting_is_Magic:_Aurora"
+        ],
+        "images": [
+          "Icon_patch_notes.png",
+          "Fimar.png",
+          "Icon_faq.png",
+          "Icon_glossary.png",
+          "Icon_controls.png",
+          "Icon_system.png",
+          "Applejack_small.png",
+          "Icon_network.png"
+        ],
+        "wikitext_excerpt": "{{WIP}}\n\n{{Infobox Game\n| gamename     = Fighting is Magic: Aurora\n| abbreviation = FiM:A\n| image        = Fimar.png\n| version      = 1.14.x.x\n| developer    = WindowsLogic Productions\n| system       = PC (Windows) November 2021\n| website      = http://fightingismagic.com/\n| netcode      = Delay-based netcode (via MorningStar)\n| community    = [https://discord.fightingismagic.com/ Discord Server]\n}}\n\n== Overview ==\n\nFighting is Magic: Aurora, often referred to as \"Aurora,\" is an unofficial proje",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "floating-pallet",
     "name": "Floating Pallet",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Rainy Cloudy",
@@ -8097,9 +8555,7 @@
   {
     "game_id": "geki2",
     "name": "Geki 2",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -8301,9 +8757,7 @@
   {
     "game_id": "genpei",
     "name": "Genpei",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -8508,9 +8962,7 @@
   {
     "game_id": "gravefighters",
     "name": "Grave Fighters",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -8711,9 +9163,7 @@
   {
     "game_id": "happy-battle",
     "name": "Happy Battle",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -8902,9 +9352,7 @@
   {
     "game_id": "helloprojectbattlefestival",
     "name": "Hello Project Battle Festival",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -9120,9 +9568,7 @@
   {
     "game_id": "hhrtfgrelease01",
     "name": "Hypothetical Horse Race Tests Fighting Game Release 0.1",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2025",
     "developer": "AHamUWU",
@@ -9204,9 +9650,7 @@
   {
     "game_id": "higurashibattlecolosseumhigubato",
     "name": "ひぐらしバトル頃シアム Higurashi Battle Colosseum (Higubato)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -9280,9 +9724,7 @@
   {
     "game_id": "hinshisousa",
     "name": "Hinshi Sousa",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -9643,6 +10085,69 @@
     }
   },
   {
+    "game_id": "kemofrefight",
+    "name": "KemoFre Fight",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2018",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/KemoFre_Fight",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "KemoFre Fight",
+        "homepage": "https://mizuumi.wiki/w/KemoFre_Fight",
+        "name": "KemoFre Fight",
+        "year": "2018",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "KemoFre_Fight"
+        ],
+        "images": [
+          "KFF_Okawari_Logo.png",
+          "Icon_controls.png",
+          "Icon_menu.png",
+          "Icon_hud.png",
+          "Icon_system.png",
+          "Icon_network.png",
+          "Icon_glossary.png",
+          "Icon_links.png",
+          "Icon_faq.png",
+          "KFF_Serv_icon.png",
+          "KFF_Kaban_Icon.png",
+          "KFF_Ibis_Icon.png",
+          "KFF_Tsuch_Icon.png",
+          "KFF_Raco_Icon.png",
+          "KFF_Lion_icon.png",
+          "KFF_Moose_icon.png",
+          "KFF_Shoe_Icon.png",
+          "KFF_Kono_Icon.png",
+          "KFF_Alpac_icon.png",
+          "KFF_Jag_icon.png",
+          "KFF_Hippo_icon.png",
+          "KFF_Fox_icon.png",
+          "KFF_Bear_icon.png",
+          "KFF_Gold_icon.png",
+          "KFF_Wolf_icon.png",
+          "KFF_Cell_icon.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = KemoFre Fight! Okawari\n| abbreviation = KFF\n| image        = KFF Okawari Logo.png\n| version      = 1.1\n| developer    = StudioS Circle\n| system       = Windows PC\n| website      = [https://www.dlsite.com/home/work/=/product_id/RJ230326.html DLSite Page]\n| netcode      = Delay-based netcode\n| netcode2     = LilithPort\n| netcode3     = Player Lobbies\n| resources    = [https://wikiwiki.jp/kf-fight/ JP Wiki]\n| community    = [https://discord.gg/PkK5hdY EN Discord Serv",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "kenseishojo",
     "name": "Kensei Shoujo",
     "alt_names": [],
@@ -9679,9 +10184,7 @@
   {
     "game_id": "kenseishojo",
     "name": "Kenseishojo",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -9773,9 +10276,7 @@
   {
     "game_id": "kinnikumanmusclefighting",
     "name": "Kinnikuman Muscle Fighting",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -10125,9 +10626,7 @@
   {
     "game_id": "kkombat",
     "name": "Kkombat",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -10761,191 +11260,9 @@
     }
   },
   {
-    "game_id": "lesmiserables",
-    "name": "Arm Joe",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "Takase",
-    "publisher": "",
-    "exe_stems": [
-      "lesmiserables"
-    ],
-    "kgt_filename": "LesMiserables.kgt",
-    "homepage": "https://archive.org/details/arm-joe-v-14b",
-    "download_url": "https://archive.org/download/arm-joe-v-14b",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "archive.org"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "archive.org": {
-        "ia_identifier": "arm-joe-v-14b",
-        "title": "Arm Joe",
-        "creator": "Takase",
-        "year": "",
-        "homepage": "https://archive.org/details/arm-joe-v-14b",
-        "download": "https://archive.org/download/arm-joe-v-14b",
-        "files": [
-          "01.PNG",
-          "01_thumb.jpg",
-          "02.PNG",
-          "02_thumb.jpg",
-          "03.PNG",
-          "03_thumb.jpg",
-          "ArmJoeV14b.zip",
-          "__ia_thumb.jpg",
-          "arm-joe-v-14b_archive.torrent",
-          "arm-joe-v-14b_files.xml",
-          "arm-joe-v-14b_meta.sqlite",
-          "arm-joe-v-14b_meta.xml"
-        ],
-        "subjects": [
-          "fighting game maker 2d fighter maker 95 anime doujin"
-        ],
-        "description": "Fighting game made using 2DFM95",
-        "source": "archive.org",
-        "verified": true,
-        "inner_files": [
-          "ArmJoeV14b/AJHelpV14b/AJ-help/HPTitle.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto01.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto02.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto03.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto04.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Howto05.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Joystick.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Menu.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Takase.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Thumbs.db",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/V1.4b.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/V1.4b2.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/Ver.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/WIP_245.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/WIP_253.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/What'sNew.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/What'sNew.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/basic.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/command.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/command.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/A.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/AJ_V13_01.bmp.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Aj000.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Aj001.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/B.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj02.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/BGaj03.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Bug01.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Bug02.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/C.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Combo.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Cosette.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/D.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Dash.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Enjolras.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Eponine.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Gage.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Guardattack.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/HitEscape01.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/HitEscape02.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/JOYSTICK.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Javert.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Judgement.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Police.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Ponpon.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Robojean.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Sblow.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Takase.jpg",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Tenardier.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Thumbs.db",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/Valjean.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hanekaeri.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidari.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidarisita.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/hidariue.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/marius.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migi.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migisita.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/migiue.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/sita.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/system.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/ue.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/win.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/img/zokusei.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/joy.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/kidou.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/kihon.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/logo1.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/main.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/sakusha.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/system.gif",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/system.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/takase.html",
-          "ArmJoeV14b/AJHelpV14b/AJ-help/top.html",
-          "ArmJoeV14b/AJHelpV14b/Help_Index.html",
-          "ArmJoeV14b/AJHelpV14b/Thumbs.db",
-          "ArmJoeV14b/Cosette.player",
-          "ArmJoeV14b/EPONINE.player",
-          "ArmJoeV14b/Ending01.demo",
-          "ArmJoeV14b/Enjolras.player",
-          "ArmJoeV14b/Gameover.demo",
-          "ArmJoeV14b/Graveyard Win.demo",
-          "ArmJoeV14b/Graveyard.bg",
-          "ArmJoeV14b/Hill.bg",
-          "ArmJoeV14b/Hill2.bg",
-          "ArmJoeV14b/Judgement.player",
-          "ArmJoeV14b/Last.bg",
-          "ArmJoeV14b/LesMiserables.exe",
-          "ArmJoeV14b/LesMiserables.kgt",
-          "ArmJoeV14b/Marius.player",
-          "ArmJoeV14b/Mistery Hill Win.demo",
-          "ArmJoeV14b/Mistery Hill.bg",
-          "ArmJoeV14b/PRACTICE.player",
-          "ArmJoeV14b/Police.player",
-          "ArmJoeV14b/PonPon.player",
-          "ArmJoeV14b/ROBOJEAN.player",
-          "ArmJoeV14b/Readme.txt",
-          "ArmJoeV14b/Tunnel-win.demo",
-          "ArmJoeV14b/V121TITLE.demo",
-          "ArmJoeV14b/V14ENDING01.demo",
-          "ArmJoeV14b/V14ENDING02.demo",
-          "ArmJoeV14b/VS02.demo",
-          "ArmJoeV14b/Valjean.player",
-          "ArmJoeV14b/e.demo",
-          "ArmJoeV14b/forest-win.demo",
-          "ArmJoeV14b/forest.bg",
-          "ArmJoeV14b/hill-win.demo",
-          "ArmJoeV14b/javert.player",
-          "ArmJoeV14b/last-win.demo",
-          "ArmJoeV14b/nighttown.bg",
-          "ArmJoeV14b/road-win.demo",
-          "ArmJoeV14b/road.bg",
-          "ArmJoeV14b/seine-win.demo",
-          "ArmJoeV14b/seine.bg",
-          "ArmJoeV14b/seine02.bg",
-          "ArmJoeV14b/select.demo",
-          "ArmJoeV14b/street-win.demo",
-          "ArmJoeV14b/tenardier.player",
-          "ArmJoeV14b/title.demo",
-          "ArmJoeV14b/tunnel02.bg",
-          "ArmJoeV14b/２Ｄ格闘ツクール９５.ini"
-        ],
-        "kgt_filename": "LesMiserables.kgt",
-        "exe_stem": "lesmiserables"
-      }
-    }
-  },
-  {
     "game_id": "little-battlersex",
     "name": "Little Battlers EX",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -11062,9 +11379,7 @@
   {
     "game_id": "lunaport",
     "name": "Nettou Jakuniku Gakuen 2",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2011",
     "developer": "",
@@ -11086,9 +11401,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Nettou Jakuniku Gakuen 2",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2011",
         "publisher": "empty",
         "developer": "empty",
@@ -11219,9 +11532,7 @@
   {
     "game_id": "lunaport",
     "name": "Ultra Mortal Kombat Vendetta",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2001",
     "developer": "",
@@ -11243,9 +11554,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Ultra Mortal Kombat Vendetta",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2001",
         "publisher": "empty",
         "developer": "empty",
@@ -11419,9 +11728,7 @@
   {
     "game_id": "machnersvalkyrie",
     "name": "Machners Valkyrie",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -11972,9 +12279,7 @@
   {
     "game_id": "mai-girls-revolution",
     "name": "Mai Girls Revolution",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -12586,9 +12891,7 @@
   {
     "game_id": "mariku",
     "name": "Mariku",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -12696,11 +12999,47 @@
     }
   },
   {
+    "game_id": "messiahendrecoming",
+    "name": "Messiah End Re Coming",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2019",
+    "developer": "Hiyori Osin",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Messiah_End_Re_Coming",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Messiah End Re Coming",
+        "homepage": "https://mizuumi.wiki/w/Messiah_End_Re_Coming",
+        "name": "Messiah End Re Coming",
+        "year": "2019",
+        "developer": "Hiyori Osin",
+        "lead_image": "Evi-XeaUcAYR7BI.jpg",
+        "categories": [
+          "MESSIAH_END_RE_COMING"
+        ],
+        "images": [
+          "Evi-XeaUcAYR7BI.jpg"
+        ],
+        "wikitext_excerpt": "[[File:Evi-XeaUcAYR7BI.jpg|476px|thumb|right|'''Devs Twitter:''' [https://twitter.com/hiyori_osin @hiyori_osin]<br>\n'''Game Download:''' [https://drive.google.com/drive/folders/1EB_67QsG5lIpEFS3sXFtrndzyPSbCdiv?usp=drive_link 4.03]<br>\n'''Netplay:''' [https://github.com/oldmud0/LilithPort/releases/tag/v1.07-e3 Lilithport]<br>\n'''Community Discord:''' https://discord.gg/GasBQ2g]]\n\n==Messiah End Revenge==\nVer. 4.00 of '''Messiah End Re Coming''', renamed to '''Messiah End Revenge''' or short, '''M",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "metalblade",
     "name": "Metal Blade",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -12856,9 +13195,7 @@
   {
     "game_id": "mk_soft-presents",
     "name": "Stale Fight",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -13046,9 +13383,7 @@
   {
     "game_id": "mkim",
     "name": "Mortal Kombat Immortal",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2001",
     "developer": "",
@@ -13070,9 +13405,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Mortal Kombat Immortal",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2001",
         "publisher": "empty",
         "developer": "empty",
@@ -13178,9 +13511,7 @@
   {
     "game_id": "mlp-fim-ekame-madare-v2_0_0",
     "name": "MLP: Fighting is Magic Ekame Madare 2.0.0 (2022)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2022",
     "developer": "Tails Rahman",
@@ -13413,9 +13744,7 @@
   {
     "game_id": "mlp-fim-tribute-edition-ekame-madare",
     "name": "MLP FIM Tribute Edition Ekame Madare",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2022",
     "developer": "Tails Rahman",
@@ -13614,9 +13943,7 @@
   {
     "game_id": "monsterot199b7z",
     "name": "Monster ot199b.7z",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "8105graphics",
@@ -13678,9 +14005,7 @@
   {
     "game_id": "monsterversion1007z",
     "name": "Monster Version 1.00.7z",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "8105graphics",
@@ -13740,9 +14065,7 @@
   {
     "game_id": "monsterversion100d7z",
     "name": "Monster Version 1.00d. 7z",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "8105graphics",
@@ -13802,9 +14125,7 @@
   {
     "game_id": "monsterversion1017z",
     "name": "Monster Version 1.01.7z",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "8105graphics",
@@ -13865,7 +14186,6 @@
     "game_id": "mtsp",
     "name": "Mortal Kombat vs Street Fighter",
     "alt_names": [
-      "Magical Heroines plus!",
       "Mortal Kombat Vs Street Fighter"
     ],
     "engine": "FM2K",
@@ -13890,7 +14210,6 @@
       "MyAbandonware": {
         "name": "Mortal Kombat vs Street Fighter",
         "alternative names": [
-          "Magical Heroines plus!",
           "Mortal Kombat Vs Street Fighter"
         ],
         "year": "2012",
@@ -14100,9 +14419,7 @@
   {
     "game_id": "munekyunnn",
     "name": "Munekyunnn",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -14221,9 +14538,7 @@
   {
     "game_id": "mylittleponyfightingismagicekamemadarefinalshowdown",
     "name": "My Little Pony: Fighting is Magic Ekame Madare Final Showdown",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2023",
     "developer": "Tails Rahman",
@@ -14292,9 +14607,7 @@
   {
     "game_id": "ninjahattori3rdstrikedash",
     "name": "Ninja Hattori 3rd Strike Dash",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -14386,9 +14699,7 @@
   {
     "game_id": "ninjamastershaouninpouko1996fightingmame",
     "name": "Ninja Master's - Haou Ninpou-ko (1996) (Fighting) (MAME)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2022",
     "developer": "The Data Archivist V0.01",
@@ -14452,9 +14763,7 @@
   {
     "game_id": "novaaerial",
     "name": "Nova Aerial",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -14611,9 +14920,7 @@
   {
     "game_id": "otepuri",
     "name": "Otepuri",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Maiga858",
@@ -14795,9 +15102,7 @@
   {
     "game_id": "otokoiii",
     "name": "Otoko III",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -14941,9 +15246,7 @@
   {
     "game_id": "parotte-fighters",
     "name": "Parotte Fighters",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "Retsuzan",
@@ -15038,9 +15341,7 @@
   {
     "game_id": "perfect",
     "name": "Ninja Hattori 3rd PERFECT",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2003",
     "developer": "とら",
@@ -15164,14 +15465,65 @@
     ],
     "characters": [],
     "stages": [],
-    "_raw": {}
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Pokemon: Close Combat",
+        "homepage": "https://mizuumi.wiki/w/Pokemon%3A_Close_Combat",
+        "name": "Pokemon: Close Combat",
+        "year": "2023",
+        "developer": "",
+        "lead_image": "PKMNCC Pikachu Main.png",
+        "categories": [
+          "Pokemon:_Close_Combat"
+        ],
+        "images": [
+          "Pkmnccplaceholderlogo.png",
+          "PKMNCC_Pikachu_Main.png",
+          "PKMNCC_Sunsetserenade_viewall.png",
+          "PKMNCC_Rotom.png",
+          "PKMNCC_PsyFAQ.png",
+          "PKMNCC_HUD.png",
+          "PKMNCC_Training.png",
+          "PKMNCC_Netplay.png",
+          "PKMNCC_SmearTail2.png",
+          "PKMNCC_Klink.png",
+          "PKMNCC_Patch.png",
+          "PKMNCC_Stonjourner.png",
+          "PKMNCC_Content_Icon.png",
+          "PKMNCC_Pory.png",
+          "PKMNCC_MewTube.png",
+          "PKMNCC_Pikachu_NavboxIcon.png",
+          "PKMNCC_Bewear_NavboxIcon.png",
+          "PKMNCC_Blaziken_NavboxIcon.png",
+          "PKMNCC_Breloom_NavboxIcon.png",
+          "PKMNCC_Chesnaught_NavboxIcon.png",
+          "PKMNCC_Falinks_NavboxIcon.png",
+          "PKMNCC_GZapdos_NavboxIcon.png",
+          "PKMNCC_Great_Tusk_NavboxIcon.png",
+          "PKMNCC_Hawlucha_NavboxIcon.png",
+          "PKMNCC_Heracross_NavboxIcon.png",
+          "PKMNCC_Kommo-o_NavboxIcon.png",
+          "PKMNCC_MLopunny_NavBoxIcon.png",
+          "PKMNCC_Marshadow_NavBoxIcon.png",
+          "PKMNCC_Medicham_NavboxIcon.png",
+          "PKMNCC_Mienshao_NavboxIcon.png",
+          "PKMNCC_Passimian_NavBoxIcon.png",
+          "PKMNCC_Poliwrath_Navboxicon.png",
+          "PKMNCC_Primeape_NavboxIcon.png",
+          "PKMNCC_Scrafty_NavboxIcon.png",
+          "PKMNCC_Slither_Wing_NavboxIcon.png",
+          "PKMNCC_Toxicroak_NavboxIcon.png",
+          "PKMNCC_Tyrogue_NavboxIcon.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Pokemon: Close Combat\n| abbreviation = PKMN:CC\n| image        = Pkmnccplaceholderlogo.png\n| version      = [https://www.mediafire.com/file_premium/6utnjj4c3vnww9v/PKMNCC_Setup.exe/file Demo 16c]\n| developer    = BattleCapacity\n<br>([https://t.co/8Ln9OXSOTo YouTube]/[https://twitter.com/BattleCapacity Twitter])\n| system       = PC\n| netcode      = Delay-based Netcode<br>(via LilithPort)\n| community    = [https://discord.gg/zyPHGAvYSE Discord Server]\n}}\n'''Pokemon: ",
+        "source": "mizuumi.wiki"
+      }
+    }
   },
   {
     "game_id": "pocketazukaku",
     "name": "Pocket Azukaku",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -15250,10 +15602,55 @@
     }
   },
   {
+    "game_id": "pokemonpsystrike",
+    "name": "Pokemon: PsyStrike",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2024",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Pokemon%3A_PsyStrike",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Pokemon: PsyStrike",
+        "homepage": "https://mizuumi.wiki/w/Pokemon%3A_PsyStrike",
+        "name": "Pokemon: PsyStrike",
+        "year": "2024",
+        "developer": "",
+        "lead_image": "",
+        "categories": [
+          "Pokemon:_PsyStrike"
+        ],
+        "images": [
+          "Pkmnccplaceholderlogo.png",
+          "PKMNCC_Rotom.png",
+          "PKMNCC_HUD.png",
+          "PKMNCC_Training.png",
+          "PKMNCC_Netplay.png",
+          "PKMNCC_Klink.png",
+          "PKMNPS_Hoopa_Icon.png",
+          "PKMNPS_Veluza_Icon.png",
+          "PKMNPS_Xatu_Icon.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename \t= ''Pokemon: PsyStrike''\n| abbreviation = PKMN:PS\n| image    \t= Pkmnccplaceholderlogo.png\n| version  \t= [https://mega.nz/folder/RiFjzI5Q#U662CyTdX3x9gRj420dXdA]\n| developer\t= [https://www.youtube.com/@PokemonPsystrike A lot of people]\n| system   \t= PC\n| netcode  \t= Delay-based Netcode<br>(via LilithPort)\n| community\t= [https://discord.gg/6EXFB3Eu Discord Server]\n}}\n'''''Pokemon: Psystrike''''' is a beginner-friendly 2D fighting game currently in development by so many ",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
     "game_id": "ps2nd",
     "name": "PS2nd",
     "alt_names": [
-      "Magical Heroines plus!",
       "ps2nd"
     ],
     "engine": "FM2K",
@@ -15278,7 +15675,6 @@
       "MyAbandonware": {
         "name": "PS2nd",
         "alternative names": [
-          "Magical Heroines plus!",
           "ps2nd"
         ],
         "year": "2004",
@@ -15355,9 +15751,7 @@
   {
     "game_id": "rabbitjapan1997versusfightingchdisosegasaturn",
     "name": "Rabbit (Japan) (1997) (Versus Fighting) (CHD, ISO) (Sega Saturn)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2022",
     "developer": "The Data Archivist V0.01",
@@ -15426,9 +15820,7 @@
   {
     "game_id": "reference-game",
     "name": "S P F Road To Wastedmania",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2010",
     "developer": "Miciosegone Games",
@@ -15591,9 +15983,7 @@
   {
     "game_id": "requiem-final_ver07",
     "name": "Requiem Final Ver 07",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -15819,9 +16209,7 @@
   {
     "game_id": "reshuffle",
     "name": "120623 ( Eo RR)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -15931,9 +16319,7 @@
   {
     "game_id": "reshuffle",
     "name": "Emblem Of Red Re SHUFFLE",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -16047,9 +16433,7 @@
   {
     "game_id": "rider-dattle",
     "name": "Rider Dattle",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2010",
     "developer": "",
@@ -16071,9 +16455,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Rider Dattle",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2010",
         "publisher": "empty",
         "developer": "empty",
@@ -16210,9 +16592,7 @@
   {
     "game_id": "rumblefish220052020versusfightingchddreamcast",
     "name": "Rumble Fish 2 (2005) (2020) (Versus Fighting) (CHD) (Dreamcast)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2024",
     "developer": "The Data Archivist V0.01",
@@ -16280,9 +16660,7 @@
   {
     "game_id": "secondcross",
     "name": "Second Cross",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -16473,8 +16851,7 @@
     "game_id": "shadowarts",
     "name": "Shadow Arts",
     "alt_names": [
-      "Shadowarts+",
-      "Magical Heroines plus!"
+      "Shadowarts+"
     ],
     "engine": "FM2K",
     "year": "2004",
@@ -16610,9 +16987,7 @@
   {
     "game_id": "shiburi-game",
     "name": "Shiburi Game",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2002",
     "developer": "",
@@ -16634,9 +17009,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Shiburi Game",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2002",
         "publisher": "empty",
         "developer": "empty",
@@ -16785,9 +17158,7 @@
   {
     "game_id": "slash-re",
     "name": "Slash RE",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2004",
     "developer": "",
@@ -16809,9 +17180,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Slash RE",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2004",
         "publisher": "empty",
         "developer": "empty",
@@ -16918,9 +17287,7 @@
   {
     "game_id": "spfi98",
     "name": "Spirit Fighters 2000",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -17017,9 +17384,7 @@
   {
     "game_id": "stay-on-taboo-0826",
     "name": "Stay On Taboo",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -17139,9 +17504,7 @@
   {
     "game_id": "streetfighteralpha3maxeujpus2006versusfightingpsp",
     "name": "Street Fighter Alpha 3 MAX (EU,JP,US) (2006) (Versus Fighting) (PSP)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2023",
     "developer": "The Data Archivist V0.01",
@@ -17212,9 +17575,7 @@
   {
     "game_id": "tcuco",
     "name": "”q@ˆê”­",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -17377,9 +17738,7 @@
   {
     "game_id": "the-police-24",
     "name": "The Police 24",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2009",
     "developer": "Desire Factory",
@@ -17401,9 +17760,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "The Police 24",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2009",
         "publisher": "empty",
         "developer": "Desire Factory",
@@ -17493,9 +17850,7 @@
   {
     "game_id": "the_favorite_fighters_2_5",
     "name": "The Favorite Fighters 2",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2010",
     "developer": "",
@@ -17695,7 +18050,6 @@
     "game_id": "thein-ron",
     "name": "Thein-Ron",
     "alt_names": [
-      "Magical Heroines plus!",
       "Thein Ron"
     ],
     "engine": "FM2K",
@@ -17720,7 +18074,6 @@
       "MyAbandonware": {
         "name": "Thein-Ron",
         "alternative names": [
-          "Magical Heroines plus!",
           "Thein Ron"
         ],
         "year": "2007",
@@ -17859,9 +18212,7 @@
   {
     "game_id": "thekingoffighters97globalmatchportable",
     "name": "THE KING OF FIGHTERS 97' (GLOBAL MATCH) Portable",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2026",
     "developer": "SNK",
@@ -17913,9 +18264,7 @@
   {
     "game_id": "therumblefish2005japanversusfightingplaystation2",
     "name": "The Rumble Fish (2005) (Japan) (Versus Fighting) (Playstation 2)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2022",
     "developer": "The Data Archivist V0.01",
@@ -17987,9 +18336,7 @@
   {
     "game_id": "thespiritfighters992ndimpact",
     "name": "The Spirit Fighters '99: 2nd impact",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "1999",
     "developer": "IS-SOFT",
@@ -18040,9 +18387,7 @@
   {
     "game_id": "time-and-stopper_ver05",
     "name": "Time And Stopper Ver 05",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -18290,9 +18635,7 @@
   {
     "game_id": "tokidoki",
     "name": "Tokidoki",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -18420,9 +18763,7 @@
   {
     "game_id": "tomabuyden",
     "name": "Tomabuyūden",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2009",
     "developer": "トモキR",
@@ -18542,9 +18883,7 @@
   {
     "game_id": "toushiki",
     "name": "toushiki",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2005",
     "developer": "トモキR",
@@ -18764,7 +19103,6 @@
     "game_id": "tpc-vs-hay-2nd",
     "name": "TPC vs HAY 2ND",
     "alt_names": [
-      "Magical Heroines plus!",
       "TPC Vs HAY 2 ND"
     ],
     "engine": "FM2K",
@@ -18789,7 +19127,6 @@
       "MyAbandonware": {
         "name": "TPC vs HAY 2ND",
         "alternative names": [
-          "Magical Heroines plus!",
           "TPC Vs HAY 2 ND"
         ],
         "year": "2004",
@@ -18928,9 +19265,7 @@
   {
     "game_id": "tsuzukisonohigurashinonakukoronivstouhouuniverse2game",
     "name": "Tsuzuki Sono Higurashi no Naku Koro ni vs Touhou Universe 2 Game",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -19477,9 +19812,7 @@
   {
     "game_id": "urban-battle",
     "name": "Urban Battle",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "RRGGEE",
@@ -19567,22 +19900,108 @@
       "URORFGRelease102"
     ],
     "kgt_filename": "URORFGRelease102.kgt",
-    "homepage": "",
+    "homepage": "https://mizuumi.wiki/w/Untitled_Risk_of_Rain_Fighting_Game",
     "download_url": "",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
-      "manual"
+      "manual",
+      "mizuumi.wiki"
     ],
     "characters": [],
     "stages": [],
-    "_raw": {}
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Untitled Risk of Rain Fighting Game",
+        "homepage": "https://mizuumi.wiki/w/Untitled_Risk_of_Rain_Fighting_Game",
+        "name": "Untitled Risk of Rain Fighting Game",
+        "year": "",
+        "developer": "",
+        "lead_image": "bannerupdated.png",
+        "categories": [
+          "Under_Construction",
+          "Untitled_Risk_of_Rain_Fighting_Game"
+        ],
+        "images": [
+          "Icon_patch_notes.png",
+          "URORFGLogoWiki.png",
+          "Bannerupdated.png",
+          "URORFGCSS.png",
+          "URORFGControlsIcon.png",
+          "URORFGTrainingModeIcon.png",
+          "URORFGNetplayIcon.png",
+          "URORFGSystemMechanicsIcon.png",
+          "URORFGPatchNotesIcon.png",
+          "CommandoIconNEW).png",
+          "HeroLemIcon.png",
+          "BanditIconNEW.png",
+          "LoaderIconNEW.png",
+          "AcridIconNEW.png",
+          "MercenaryIconNEW.png",
+          "HuntressIconNEW.png",
+          "MithrixIconNEW.png",
+          "ProvidenceIconNEW.png",
+          "DrifterIconNEW.png",
+          "CaptainIconNEW.png",
+          "FalseSonIconNEW.png",
+          "HereticIconNEW.png",
+          "MinerIconNEW.png",
+          "PilotIconNEW.png",
+          "ArtificerIconNEW.png",
+          "EnforcerIcon.png",
+          "ChefIcon.png",
+          "SeekerIcon.png"
+        ],
+        "wikitext_excerpt": "{{WIP}}\n\n{{Infobox Game\n| gamename     = Untitled Risk of Rain Fighting Game\n| abbreviation = urorfg/rorfg\n| image        = URORFGLogoWiki.png\n| version      = Release 37HF ([https://ahamuwu.itch.io/untitled-risk-of-rain-fighting-game Itch.io])\n| developer    = [https://x.com/AHamUWU AHamUWU (Creates the video game)]\n<br>[https://www.youtube.com/channel/UCuONh8Z2hZuTjzdCf4RCQxw ApaoloMusic (Makes the Music for the game)]\n<br>and [https://x.com/ItsKKing KKing (Announcer for the game)]\n| system   ",
+        "source": "mizuumi.wiki"
+      }
+    }
+  },
+  {
+    "game_id": "vanguardprincess",
+    "name": "Vanguard Princess",
+    "alt_names": [],
+    "engine": "FM2K",
+    "year": "2014",
+    "developer": "",
+    "publisher": "",
+    "exe_stems": [],
+    "kgt_filename": "",
+    "homepage": "https://mizuumi.wiki/w/Vanguard_Princess",
+    "download_url": "",
+    "banner_url": "",
+    "thumb_url": "",
+    "sources": [
+      "mizuumi.wiki"
+    ],
+    "characters": [],
+    "stages": [],
+    "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Vanguard Princess",
+        "homepage": "https://mizuumi.wiki/w/Vanguard_Princess",
+        "name": "Vanguard Princess",
+        "year": "2014",
+        "developer": "",
+        "lead_image": "VanPri Logo.png",
+        "categories": [
+          "Vanguard_Princess"
+        ],
+        "images": [
+          "Vptitle.jpg",
+          "VanPri_Logo.png"
+        ],
+        "wikitext_excerpt": "{{Infobox Game\n| gamename     = Vanguard Princess\n| abbreviation = VP, VanPri\n| image        = vptitle.jpg\n| version      = [https://drive.google.com/uc?id=1Iqifz_qqMYfAkjdNaOTeTjVessisAVO_&export=download 1.08e]\n| version2     = [http://mega.co.nz/#!S4o2CLZR!WYw5byyDR9O3OQ0yVVvHEu1hCzRLaY1T0oa81Oy0Kdk Alternate Link]\n| developer    = SUGE9<br>exA-Arcadia (Arcade) \n| publisher    = \n| system       = \n| website      = [https://exa.ac/en/games/vanguard-princess-r Arcade Site] \n| netcode      = [ht",
+        "source": "mizuumi.wiki"
+      }
+    }
   },
   {
     "game_id": "vanpri",
     "name": "Vanguard Princess",
     "alt_names": [
-      "Vanguard.Princess"
+      "Vanguard.Princess",
+      "Vanguard Princess (v.1.8.7) (52)"
     ],
     "engine": "FM2K",
     "year": "2009",
@@ -19820,9 +20239,7 @@
   {
     "game_id": "vssamchayvssagat",
     "name": "サムチャイvsサガット (Samchay vs Sagat)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -19908,27 +20325,77 @@
     }
   },
   {
-    "game_id": "wonderfulworld_ver_0945",
-    "name": "WonderfulWorld",
-    "alt_names": [],
+    "game_id": "wonderfulworld",
+    "name": "Wonderful World",
+    "alt_names": [
+      "WonderfulWorld"
+    ],
     "engine": "FM2K",
     "year": "2018",
     "developer": "Project Atsuki",
     "publisher": "",
-    "exe_stems": [
-      "wonderfulworld_ver_0945"
-    ],
+    "exe_stems": [],
     "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/wonderfulworld-rg3",
+    "homepage": "https://mizuumi.wiki/w/Wonderful_World",
     "download_url": "https://www.myabandonware.com/download/o9yp-wonderfulworld",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
+      "mizuumi.wiki",
       "MyAbandonware"
     ],
     "characters": [],
     "stages": [],
     "_raw": {
+      "mizuumi.wiki": {
+        "wiki_title": "Wonderful World",
+        "homepage": "https://mizuumi.wiki/w/Wonderful_World",
+        "name": "Wonderful World",
+        "year": "",
+        "developer": "",
+        "lead_image": "Wwbattle.jpeg",
+        "categories": [
+          "Wonderful_World"
+        ],
+        "images": [
+          "Wwbattle.jpeg",
+          "Icon_glossary.png",
+          "Icon_faq.png",
+          "Icon_hud.png",
+          "Icon_stage.png",
+          "Icon_network.png",
+          "Icon_system.png",
+          "WanWan_Ryuza_NavIcon.jpg",
+          "WanWan_Duna_NavIcon.jpg",
+          "WanWan_Lemius_NavIcon.jpg",
+          "WanWan_Aiwhen_NavIcon.jpg",
+          "WanWan_Corona_NavIcon.jpg",
+          "WanWan_Sasari_NavIcon.jpg",
+          "WanWan_Lunathia_NavIcon.jpg",
+          "WanWan_Orphe_NavIcon.jpg",
+          "WanWan_Cielo_NavIcon.jpg",
+          "WanWan_Alicephia_NavIcon.jpg",
+          "WanWan_Sabe_NavIcon.jpg",
+          "WanWan_Neva_NavIcon.jpg",
+          "WanWan_Lynia_NavIcon.jpg",
+          "WanWan_Friede_NavIcon.jpg",
+          "WanWan_Kiki_NavIcon.jpg",
+          "WanWan_Chartette_NavIcon.jpg",
+          "WanWan_Claudette_NavIcon.jpg",
+          "WanWan_Shake_NavIcon.jpg",
+          "WanWan_Fuga_NavIcon.jpg",
+          "WanWan_Eldio_NavIcon.jpg",
+          "WanWan_Etielle_NavIcon.jpg",
+          "WanWan_Pale_NavIcon.jpg",
+          "WanWan_Semnia_NavIcon.jpg",
+          "WanWan_Rosalice_NavIcon.jpg",
+          "WanWan_Magenda_NavIcon.jpg",
+          "WanWan_Hinokage_NavIcon.jpg",
+          "WanWan_Abeldy_NavIcon.jpg"
+        ],
+        "wikitext_excerpt": "[[File:Wwbattle.jpeg|350px|right|thumb|\n\n'''Official Links'''&nbsp;&nbsp;&#8212;&nbsp;&nbsp;[http://ainefill.web.fc2.com/ Website], [https://twitter.com/Wonderful_wan Twitter]<br>\n'''Resources'''&nbsp;&nbsp;&#8212;&nbsp;&nbsp;[https://www55.atwiki.jp/ainefill_oinusama/ Japanese Wiki]<br>\n'''Community'''&nbsp;&nbsp;&#8212;&nbsp;&nbsp;[https://discord.gg/XQSV7kE English Discord server]<br>\n'''Download'''&nbsp;&nbsp;&#8212;&nbsp;&nbsp;[https://www.freem.ne.jp/dl/win/2753 Game] [https://wiki.gbl.gg/",
+        "source": "mizuumi.wiki"
+      },
       "MyAbandonware": {
         "name": "WonderfulWorld",
         "alternative names": [],
@@ -19942,25 +20409,31 @@
     }
   },
   {
-    "game_id": "wonderfulworld_ver_0945",
-    "name": "Wonderful World Ver 0945",
+    "game_id": "wonderfulworld_ver_0946",
+    "name": "Wonderful World",
     "alt_names": [
-      "Magical Heroines plus!"
+      "WonderfulWorld_ver_0945",
+      "WonderfulWorld_ver_0946",
+      "WonderfulWorld",
+      "Wonderful World Ver 0945"
     ],
     "engine": "FM2K",
-    "year": "",
-    "developer": "",
+    "year": "2010",
+    "developer": "RAY",
     "publisher": "",
     "exe_stems": [
+      "WonderfulWorld_ver_0946",
       "wonderfulworld_ver_0945"
     ],
-    "kgt_filename": "WonderfulWorld_ver_0945.kgt",
-    "homepage": "https://archive.org/details/wonderful-world-ver-0945",
+    "kgt_filename": "WonderfulWorld_ver_0946.kgt",
+    "homepage": "https://mizuumi.wiki/w/Wonderful_World",
     "download_url": "https://archive.org/download/wonderful-world-ver-0945",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
-      "archive.org"
+      "archive.org",
+      "mizuumi.wiki",
+      "manual"
     ],
     "characters": [],
     "stages": [],
@@ -20260,41 +20733,9 @@
     }
   },
   {
-    "game_id": "wonderfulworld_ver_0946",
-    "name": "Wonderful World",
-    "alt_names": [
-      "WonderfulWorld_ver_0945",
-      "WonderfulWorld_ver_0946",
-      "WonderfulWorld"
-    ],
-    "engine": "FM2K",
-    "year": "2010",
-    "developer": "RAY",
-    "publisher": "",
-    "exe_stems": [
-      "WonderfulWorld_ver_0946",
-      "wonderfulworld_ver_0945"
-    ],
-    "kgt_filename": "WonderfulWorld_ver_0946.kgt",
-    "homepage": "https://mizuumi.wiki/w/Wonderful_World",
-    "download_url": "",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "manual",
-      "mizuumi.wiki",
-      "archive.org"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {}
-  },
-  {
     "game_id": "wundercartfm95",
     "name": "Wundercart_FM95",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -20391,9 +20832,7 @@
   {
     "game_id": "xenophagealienbloodsportusa",
     "name": "Xenophage - Alien Bloodsport (USA)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "1996",
     "developer": "Argo Games",
@@ -20449,9 +20888,7 @@
   {
     "game_id": "zangef",
     "name": "Zangefool Fighter 20XX (ザンゲフールファイター20XX)",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "setsuhiwa",
@@ -20628,9 +21065,7 @@
   {
     "game_id": "zangefool-fighter-20xx",
     "name": "Zangefool Fighter 20 XX",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "",
     "developer": "",
@@ -20806,9 +21241,7 @@
   {
     "game_id": "zero-fighters",
     "name": "Zero Fighters",
-    "alt_names": [
-      "Magical Heroines plus!"
-    ],
+    "alt_names": [],
     "engine": "FM2K",
     "year": "2004",
     "developer": "",
@@ -20830,9 +21263,7 @@
     "_raw": {
       "MyAbandonware": {
         "name": "Zero Fighters",
-        "alternative names": [
-          "Magical Heroines plus!"
-        ],
+        "alternative names": [],
         "year": "2004",
         "publisher": "empty",
         "developer": "empty",

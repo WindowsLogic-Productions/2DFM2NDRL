@@ -31,11 +31,23 @@ from pathlib import Path
 from typing import Any
 
 
+import copy
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GAMES_DIR_DEFAULT = Path("/mnt/c/games/2dfm")
 IA_SCRAPE_PATH = REPO_ROOT / "tools" / "ia_scrape.json"
+MIZUUMI_SCRAPE_PATH = REPO_ROOT / "tools" / "mizuumi_scrape.json"
 OVERRIDES_PATH = REPO_ROOT / "games" / "registry_overrides.json"
 OUT_PATH = REPO_ROOT / "games" / "registry.json"
+
+
+def empty_record() -> dict[str, Any]:
+    """Fresh deep-copy of the registry-record skeleton. dict() of the
+    module-level EMPTY_REGISTRY_RECORD shallow-copies the lists/dicts
+    inside, which means every append leaked across all records and
+    pkmncc ended up with the alt_names of every other game. deepcopy
+    fixes that."""
+    return copy.deepcopy(EMPTY_REGISTRY_RECORD)
 
 
 # Canonical record shape. New scrapers add to `_raw[<source>]` rather
@@ -168,7 +180,7 @@ def load_myabandonware_records(games_dir: Path) -> list[dict[str, Any]]:
         zips = list(meta_path.parent.glob("*.zip"))
         zip_path = zips[0] if zips else None
         exe_stem = derive_exe_stem(zip_path, raw.get("name", ""))
-        rec = dict(EMPTY_REGISTRY_RECORD)
+        rec = empty_record()
         rec["_raw"] = {"MyAbandonware": raw}
         rec["name"] = raw.get("name", "")
         rec["alt_names"] = raw.get("alternative names", [])
@@ -215,7 +227,7 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
         if raw.get("engine_bundle"):
             skipped_engine += 1
             continue
-        rec = dict(EMPTY_REGISTRY_RECORD)
+        rec = empty_record()
         rec["_raw"] = {"archive.org": raw}
         rec["name"] = raw.get("title", "")
         rec["year"] = (raw.get("year") or "")[:4]
@@ -252,6 +264,40 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
         out.append(rec)
     print(f"loaded {len(out)} archive.org records from {path.name} "
           f"({skipped_engine} engine-bundle uploads dropped)")
+    return out
+
+
+def load_mizuumi_records(path: Path) -> list[dict[str, Any]]:
+    """Convert tools/mizuumi_scrape.json into registry records.
+
+    mizuumi.wiki has the cleanest curated friendly names of any
+    source, so its `name` always wins over the IA / MyAbandonware
+    auto-derived titles in the merge step (build_registry's slug
+    dedup keeps the first scalar; we order mizuumi first so its
+    fields take precedence). It rarely has exe_stem info though, so
+    we lean on slug-of-name for the merge key and rely on the
+    other sources to provide the actual game_id."""
+    if not path.exists():
+        print(f"info: {path.name} not present "
+              f"(run scrape_mizuumi.py to generate)")
+        return []
+    raw_list = json.loads(path.read_text(encoding="utf-8"))
+    out: list[dict[str, Any]] = []
+    for raw in raw_list:
+        rec = empty_record()
+        rec["_raw"] = {"mizuumi.wiki": raw}
+        rec["name"] = raw.get("name") or raw.get("wiki_title") or ""
+        rec["year"] = raw.get("year") or ""
+        rec["developer"] = raw.get("developer") or ""
+        rec["homepage"] = raw.get("homepage") or ""
+        rec["sources"] = ["mizuumi.wiki"]
+        # mizuumi rarely yields the exe_stem on its own — leave
+        # game_id as the slugified name for now; the merger will
+        # find the IA / MyAbandonware sibling and pull the real
+        # exe_stem in.
+        rec["game_id"] = slugify(rec["name"])
+        out.append(rec)
+    print(f"loaded {len(out)} mizuumi.wiki records from {path.name}")
     return out
 
 
@@ -310,22 +356,71 @@ def merge(records: list[dict[str, Any]],
             if not existing.get(fld) and rec.get(fld):
                 existing[fld] = rec[fld]
 
-    # Apply hand-edits last.
+    # Apply hand-edits last. Override matching tries three keys, in
+    # priority order, so a manual entry can patch any auto-derived
+    # record without the user having to know which slug it ended up
+    # under:
+    #   1. exact game_id match
+    #   2. exe_stem in alt list (or in record's exe_stems)
+    #   3. slug(name) equality OR slug(any alt_name) equality
+    # This last rule fixes the "pkmncc override + pokemonclosecombat
+    # mizuumi" duplicate where the override's name "Pokemon: Close
+    # Combat" matches the mizuumi-derived record's slugified name.
+    def find_override_target(ov: dict) -> str | None:
+        gid = ov.get("game_id", "")
+        for k, v in by_key.items():
+            if v.get("game_id") == gid:
+                return k
+            stems = v.get("exe_stems") or []
+            if gid in stems:
+                return k
+            for s in (ov.get("exe_stems") or []):
+                if s in stems or v.get("game_id") == s:
+                    return k
+        # Slug-of-name fallback.
+        ov_slug = slugify(ov.get("name", ""))
+        if not ov_slug:
+            return None
+        for k, v in by_key.items():
+            if slugify(v.get("name", "")) == ov_slug:
+                return k
+            for alt in (v.get("alt_names") or []):
+                if slugify(alt) == ov_slug:
+                    return k
+        return None
+
     for ov in overrides:
         gid = ov.get("game_id")
         if not gid:
             print(f"  override missing game_id, skipping: {ov}")
             continue
-        # Find by exe_stem first, then by game_id direct match.
-        target_key = next((k for k, v in by_key.items()
-                           if gid in v.get("exe_stems", []) or
-                           v.get("game_id") == gid), None)
+        target_key = find_override_target(ov)
         if target_key:
-            by_key[target_key].update({k: v for k, v in ov.items()
-                                       if k != "_raw"})
+            target = by_key[target_key]
+            # Track existing alt_names + sources before the patch so
+            # overrides additively expand both (rather than replacing).
+            old_alts = list(target.get("alt_names") or [])
+            old_sources = list(target.get("sources") or [])
+            old_name = target.get("name") or ""
+            target.update({k: v for k, v in ov.items() if k != "_raw"})
+            # Merge alt_names: every previously-seen name (including
+            # the old canonical name) becomes an alt_name on the new
+            # record so we don't lose the cross-reference.
+            merged_alts = list(target.get("alt_names") or [])
+            for a in old_alts + [old_name]:
+                if a and a != target.get("name") and a not in merged_alts:
+                    merged_alts.append(a)
+            target["alt_names"] = merged_alts
+            # Merge sources: union, preserving order so the override's
+            # sources land first (= caller's preference).
+            seen = set(target.get("sources") or [])
+            for s in old_sources:
+                if s not in seen:
+                    target.setdefault("sources", []).append(s)
+                    seen.add(s)
         else:
             # New record from scratch via override.
-            rec = dict(EMPTY_REGISTRY_RECORD)
+            rec = empty_record()
             rec.update(ov)
             rec["sources"] = list(set(rec.get("sources", []) + ["manual"]))
             by_key[f"stem:{gid}"] = rec
@@ -342,9 +437,15 @@ def main() -> int:
 
     mw = load_myabandonware_records(games_dir)
     ia = load_ia_records(IA_SCRAPE_PATH)
+    mz = load_mizuumi_records(MIZUUMI_SCRAPE_PATH)
     ov = load_overrides(OVERRIDES_PATH)
 
-    merged = merge(mw + ia, ov)
+    # Order matters: the merger keeps the FIRST scalar value seen and
+    # accumulates list fields. We want mizuumi.wiki's curated names to
+    # win over IA's auto-derived ones (which often carry version
+    # suffixes / upload-naming noise) and over MyAbandonware's
+    # canonical-but-occasionally-misspelled titles.
+    merged = merge(mz + mw + ia, ov)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
