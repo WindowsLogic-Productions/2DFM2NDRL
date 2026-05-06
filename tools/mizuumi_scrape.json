@@ -5,7 +5,7 @@
     "name": "Angels of Battle",
     "year": "2019",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "AoB_Cover.png",
     "categories": [
       "Angels_of_Battle"
     ],
@@ -59,70 +59,12 @@
     "source": "mizuumi.wiki"
   },
   {
-    "wiki_title": "Big Bang Beat Revolve",
-    "homepage": "https://mizuumi.wiki/w/Big_Bang_Beat_Revolve",
-    "name": "Big Bang Beat Revolve",
-    "year": "2011",
-    "developer": "",
-    "lead_image": "BBBR Logo.png",
-    "categories": [
-      "Big_Bang_Beat_Revolve"
-    ],
-    "images": [
-      "BBBR_Banner.png",
-      "BBBR_Logo.png",
-      "BBBR_Burai_CSel.png",
-      "BBBR_Miyazato_CSel.png",
-      "BBBR_Heita_CSel.png",
-      "BBBR_Kunagi_CSel.png",
-      "BBBR_Rouga_CSel.png",
-      "BBBR_Senna_CSel.png",
-      "BBBR_Nakanishi_CSel.png",
-      "BBBR_Kinako_CSel.png",
-      "BBBR_Daigo_CSel.png",
-      "BBBR_Kamui_CSel.png",
-      "BBBR_Hanny_CSel.png",
-      "BBBR_Manbou_CSel.png",
-      "BBBR_Sanzou_CSel.png",
-      "BBBR_Ren_CSel.png",
-      "BBBR_Agito_CSel.png",
-      "BBBR_Mecha_CSel.png",
-      "BBBR_Devil_CSel.png",
-      "BBBR_Kojirou_CSel.png",
-      "Icon_faq.png",
-      "Icon_controls.png",
-      "Icon_hud.png",
-      "Icon_system.png",
-      "Icon_glossary.png",
-      "BBBR_Burai_Icon.png",
-      "BBBR_Miyazato_Icon.png",
-      "BBBR_Heita_Icon.png",
-      "BBBR_Kunagi_Icon.png",
-      "BBBR_Rouga_Icon.png",
-      "BBBR_Senna_Icon.png",
-      "BBBR_Nakanishi_Icon.png",
-      "BBBR_Kinako_Icon.png",
-      "BBBR_Daigo_Icon.png",
-      "BBBR_Kamui_Icon.png",
-      "BBBR_Hanny_Icon.png",
-      "BBBR_Manbou_Icon.png",
-      "BBBR_Sanzou_Icon.png",
-      "BBBR_Ren_Icon.png",
-      "BBBR_Agito_Icon.png",
-      "BBBR_Mecha_Icon.png",
-      "BBBR_Devil_Icon.png",
-      "BBBR_Kojirou_Icon.png"
-    ],
-    "wikitext_excerpt": "{{DISPLAYTITLE:Big Bang Beat -Revolve-}}\n{{Infobox Game\n| gamename     = ''Big Bang Beat -Revolve-''\n| abbreviation = BBBR\n| image        = BBBR Banner.png\n| version      = 1.06\n| developer    = AliceSoft\n| developer2    = Frontier Aja\n| system       = PC<br>August 14, 2011\n| website      = [http://aja-games.com/products_BBBR/ Frontier Aja] (Dead)\n| netcode      = Delay-based Netcode<br>(Requires ZeroTier)\n| community    = [https://discord.gg/B5MPazfP7U Discord Server]\n| extra        =\n! rowspan",
-    "source": "mizuumi.wiki"
-  },
-  {
     "wiki_title": "Comic Party Wars 2",
     "homepage": "https://mizuumi.wiki/w/Comic_Party_Wars_2",
     "name": "Comic Party Wars 2",
     "year": "2001",
     "developer": "",
-    "lead_image": "CPW2 Logo.png",
+    "lead_image": "CPW2 getting started icon.png",
     "categories": [
       "Comic_Party_Wars_2"
     ],
@@ -157,7 +99,7 @@
     "name": "Dong Dong Never Die",
     "year": "2009",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "DDND Cover.jpeg",
     "categories": [
       "Dong_Dong_Never_Die"
     ],
@@ -203,7 +145,7 @@
     "name": "Dynamite Bomb",
     "year": "2014",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "DynamiteBomb.png",
     "categories": [
       "Dynamite_Bomb"
     ],
@@ -232,7 +174,7 @@
     "name": "Fighting is Magic: Aurora",
     "year": "2021",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "Fimar.png",
     "categories": [
       "Under_Construction",
       "Fighting_is_Magic:_Aurora"
@@ -256,7 +198,7 @@
     "name": "KemoFre Fight",
     "year": "2018",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "KFF Okawari Logo.png",
     "categories": [
       "KemoFre_Fight"
     ],
@@ -313,7 +255,7 @@
     "name": "Pokemon: Close Combat",
     "year": "2023",
     "developer": "",
-    "lead_image": "PKMNCC Pikachu Main.png",
+    "lead_image": "Pkmnccplaceholderlogo.png",
     "categories": [
       "Pokemon:_Close_Combat"
     ],
@@ -365,7 +307,7 @@
     "name": "Pokemon: PsyStrike",
     "year": "2024",
     "developer": "",
-    "lead_image": "",
+    "lead_image": "Pkmnccplaceholderlogo.png",
     "categories": [
       "Pokemon:_PsyStrike"
     ],
@@ -389,7 +331,7 @@
     "name": "Untitled Risk of Rain Fighting Game",
     "year": "",
     "developer": "",
-    "lead_image": "bannerupdated.png",
+    "lead_image": "URORFGLogoWiki.png",
     "categories": [
       "Under_Construction",
       "Untitled_Risk_of_Rain_Fighting_Game"
@@ -433,7 +375,7 @@
     "name": "Vanguard Princess",
     "year": "2014",
     "developer": "",
-    "lead_image": "VanPri Logo.png",
+    "lead_image": "vptitle.jpg",
     "categories": [
       "Vanguard_Princess"
     ],
