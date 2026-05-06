@@ -2014,9 +2014,45 @@ void LauncherUI::RenderDiscordAuthWindow() {
 
     if (s_pairing) {
         switch (s_pairing->status()) {
-            case Pairing::Status::Pending:
+            case Pairing::Status::Pending: {
                 ImGui::TextWrapped("%s", s_status.c_str());
+                // Always surface the authorize URL while pairing is
+                // pending — if the user's browser didn't auto-open
+                // (running as Admin, no http handler, AV blocked
+                // ShellExecute) they can still copy/paste manually.
+                // The hub log has the failure reason, but most users
+                // won't read that — making the URL visible-and-copyable
+                // here is the user-facing escape hatch.
+                const std::string url = s_pairing->authorize_url();
+                if (!url.empty()) {
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("If your browser didn't open:");
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                        ImVec4(0.10f, 0.10f, 0.12f, 1.0f));
+                    char url_buf[1024];
+                    std::snprintf(url_buf, sizeof(url_buf), "%s", url.c_str());
+                    ImGui::PushItemWidth(-90);
+                    ImGui::InputText("##authorize_url", url_buf,
+                                     sizeof(url_buf),
+                                     ImGuiInputTextFlags_ReadOnly);
+                    ImGui::PopItemWidth();
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Copy")) {
+                        ImGui::SetClipboardText(url.c_str());
+                        s_status = "URL copied — paste it in your browser.";
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reopen")) {
+                        // Manual retry of the browser launch. Useful
+                        // when the first attempt fired before the user
+                        // had focus on a browser-capable session.
+                        ShellExecuteA(nullptr, "open", url.c_str(),
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                }
                 break;
+            }
             case Pairing::Status::Ok: {
                 auto a = s_pairing->result();
                 if (SaveCached(a)) s_cached = a;

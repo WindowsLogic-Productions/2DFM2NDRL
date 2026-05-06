@@ -331,6 +331,16 @@ CachedAuth Pairing::result() const {
     return result_;
 }
 
+std::string Pairing::authorize_url() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return authorize_url_;
+}
+
+std::string Pairing::pairing_code() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return pairing_code_;
+}
+
 void Pairing::Cancel() {
     cancel_.store(true);
     if (worker_.joinable()) {
@@ -364,14 +374,55 @@ Pairing* Begin(const std::string& hub_base_url) {
             p->status_.store((int)Pairing::Status::Error);
             return;
         }
-        p->pairing_code_ = pc;
+        {
+            std::lock_guard<std::mutex> lk(p->mtx_);
+            p->pairing_code_   = pc;
+            p->authorize_url_  = url;
+        }
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "DiscordAuth: opening browser for pairing %s", pc.c_str());
 
         // Step 2: pop the OS browser to the Discord authorize URL.
-        ShellExecuteA(nullptr, "open", url.c_str(),
-                      nullptr, nullptr, SW_SHOWNORMAL);
+        // ShellExecuteA returns HINSTANCE cast to INT_PTR; values > 32
+        // mean success, <= 32 are SE_ERR_* failure codes (NOASSOC=31
+        // when no http handler is registered, ACCESSDENIED=5, etc).
+        // Common silent-failure cases:
+        //   - launcher running as Administrator → UAC blocks spawning
+        //     a non-elevated browser (success code may even be returned
+        //     but the browser launches in a session the user can't see)
+        //   - no default browser registered (Edge wiped post-install)
+        //   - AV/EDR blocking the un-whitelisted exe's spawn
+        // Whichever path fails, we ALSO show the URL in the auth modal
+        // so manual paste is the always-works fallback.
+        auto try_open = [&](const char* url_c) -> bool {
+            HINSTANCE rc = ShellExecuteA(nullptr, "open", url_c,
+                                         nullptr, nullptr, SW_SHOWNORMAL);
+            return (INT_PTR)rc > 32;
+        };
+        bool opened = try_open(url.c_str());
+        if (!opened) {
+            // Fallback: spawn `cmd.exe /c start "" <url>` — `start` uses
+            // its own URL-handler resolution path which sometimes works
+            // when ShellExecute("open") fails (e.g. when the http verb
+            // is mis-registered but the URL falls through to whatever
+            // 'start' considers default).
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DiscordAuth: ShellExecute(\"open\") failed; "
+                "trying cmd /c start fallback");
+            std::string cmd = "/c start \"\" \"" + url + "\"";
+            HINSTANCE rc = ShellExecuteA(nullptr, "open", "cmd.exe",
+                                         cmd.c_str(), nullptr, SW_HIDE);
+            opened = (INT_PTR)rc > 32;
+        }
+        if (!opened) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DiscordAuth: browser auto-launch FAILED — user must "
+                "copy the URL from the auth modal and paste in browser "
+                "manually. Common cause: launcher running as Admin "
+                "(UAC blocks elevated→non-elevated browser spawn). "
+                "URL: %s", url.c_str());
+        }
 
         // Step 3: poll the hub for a result.
         const auto deadline = std::chrono::steady_clock::now() +

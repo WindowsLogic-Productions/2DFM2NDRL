@@ -58,6 +58,14 @@ struct Pairing {
     Status      status() const;
     std::string error_detail() const;   // human-readable, only when Error
     CachedAuth  result() const;         // valid only when Ok
+    // The Discord authorize URL as returned by /pair/begin. Empty until
+    // the worker has fetched it; populated as soon as `status()` flips
+    // out of "Pending" with a code/url-known state. UI surfaces this so
+    // a user whose default-browser auto-launch failed (admin process
+    // launching a non-admin browser, no http handler registered, AV
+    // blocking spawn, etc.) can still copy/paste the URL manually.
+    std::string authorize_url() const;
+    std::string pairing_code() const;
 
     // Cancel and tear down the polling thread. Implicit on dtor.
     void        Cancel();
@@ -68,6 +76,7 @@ private:
 
     std::string                     hub_base_url_;
     std::string                     pairing_code_;
+    std::string                     authorize_url_;
     std::atomic<int>                status_{0};
     std::string                     error_;
     CachedAuth                      result_;
