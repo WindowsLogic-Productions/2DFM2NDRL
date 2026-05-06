@@ -62,6 +62,13 @@ PACKER_SECTIONS = {
     "Armadillo":   (".armadillo", "nicode"),
     "ExeStealth":  (".exest", ".exestea"),
     "Krypton":     (".krypton",),
+    # FM2K-scene packer. Adds a `.uro\x07` section (the trailing byte
+    # is non-printable). Light wrapper — original four standard
+    # sections still present, just +4 KB of payload tacked on. Common
+    # on _NODEV releases (Cascom Henichi, all the Battle Calling /
+    # Breakers / Chaos Striker / etc. drops) and on Maiga858's
+    # "Cleaned exe" variants.
+    "URO":         (".uro",),
 }
 
 # Some packers don't rename sections cleanly; fall back to byte
@@ -154,6 +161,15 @@ def classify(path: Path) -> ExeReport:
                         matches.append(label)
                     break
     matches.extend(s for s in scan_byte_sigs(path) if s not in matches)
+    # All-null-named sections is a packer telltale (MoleBox /
+    # similar set every section name to NUL bytes to hide the
+    # original layout). A clean compile always produces named
+    # sections (`.text`, `.rdata`, ...). If we have multiple
+    # sections and all of them came back empty after NUL strip,
+    # that's a packer.
+    if pe_valid and len(sections) >= 2 and all(s == "" for s in sections):
+        if "MoleBox?" not in matches:
+            matches.append("MoleBox?")
     packer = matches[0] if matches else ""
     # Heuristic: a clean FM2K exe is <4MB, has the standard PE
     # sections (.text/.rdata/.data/.rsrc), and no packer hits. Bigger
@@ -161,8 +177,9 @@ def classify(path: Path) -> ExeReport:
     # (probably packed by something we don't have a signature for).
     standard_sections = {".text", ".rdata", ".data", ".rsrc",
                          ".reloc", ".bss", ".idata"}
-    has_only_standard = (pe_valid and
-                         set(s for s in sections if s) <= standard_sections)
+    nonempty_sections = set(s for s in sections if s)
+    has_only_standard = (pe_valid and bool(nonempty_sections)
+                         and nonempty_sections <= standard_sections)
     likely_clean = (pe_valid and not matches and size < 4 * 1024 * 1024
                     and has_only_standard)
     return ExeReport(

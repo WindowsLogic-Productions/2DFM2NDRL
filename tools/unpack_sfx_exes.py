@@ -55,18 +55,21 @@ def have_7z() -> bool:
 
 
 def list_archive_contents(exe: Path,
-                          timeout_s: float = 15.0
+                          timeout_s: float = 5.0
                           ) -> list[str] | None:
-    """Run `7z l -ba` on the exe. Returns parsed file paths or None
+    """Run `7z l -slt` on the exe. Returns parsed file paths or None
     if 7z refused (= it's a normal exe).
 
-    `-ba` strips the table header so we get one row per file. The
-    last column is the path. Some packers / mode strings push it
-    around; we take everything after the last whitespace gap, which
-    matches every 7z output template seen in the wild."""
-    cmd = ["7z", "l", "-ba", "-slt", str(exe)]
+    `-slt` is the long-table format that emits "Path = ..." lines
+    we can grep. `stdin=DEVNULL` so encrypted-archive password
+    prompts fail fast instead of blocking. Default timeout is 5s —
+    7z l only reads the archive header + footer; even a 700 MB SFX
+    finishes in well under a second. If we ever hit the timeout,
+    the file is something pathological we should skip anyway."""
+    cmd = ["7z", "l", "-slt", str(exe)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL,
                            timeout=timeout_s, errors="replace")
     except subprocess.TimeoutExpired:
         return None
@@ -156,33 +159,58 @@ def main() -> int:
 
     started = time.monotonic()
     candidates: list[Path] = []
-    for p in args.root.rglob("*"):
+    print(f"enumerating *.exe under {args.root} ...", flush=True)
+    enum_started = time.monotonic()
+    last_tick = enum_started
+    # rglob with an explicit glob (vs "*") filters at the libc
+    # readdir layer instead of stat-ing every regular file. Big win
+    # on WSL /mnt/d (9P bridge to NTFS) where stat() is the slow op.
+    for p in args.root.rglob("*.exe"):
         if not p.is_file():
-            continue
-        if p.suffix.lower() != ".exe":
             continue
         if (not args.include_launchers and
                 SKIP_NAME_RE.search(str(p))):
             continue
         candidates.append(p)
-    print(f"scanning {len(candidates)} exe(s) under {args.root}")
+        # Heartbeat every 2s so the user knows enumeration is alive
+        # — the tree can be 100k+ files post-extraction.
+        now = time.monotonic()
+        if now - last_tick >= 2.0:
+            print(f"  ... found {len(candidates)} exe(s) so far "
+                  f"({now - enum_started:.0f}s)", flush=True)
+            last_tick = now
+    enum_elapsed = time.monotonic() - enum_started
+    print(f"enumeration done in {enum_elapsed:.0f}s — "
+          f"probing {len(candidates)} exe(s)", flush=True)
 
     n_sfx = 0
     n_unpacked = 0
     n_failed = 0
     n_normal = 0
 
-    for exe in candidates:
+    probe_started = time.monotonic()
+    last_probe_tick = probe_started
+    for i, exe in enumerate(candidates):
         files = list_archive_contents(exe)
         if files is None or not looks_like_game_sfx(files):
             n_normal += 1
-            continue
-        n_sfx += 1
-        ok = unpack_sfx(exe, refresh=args.refresh, dry_run=args.dry_run)
-        if ok:
-            n_unpacked += 1
         else:
-            n_failed += 1
+            n_sfx += 1
+            ok = unpack_sfx(exe, refresh=args.refresh,
+                            dry_run=args.dry_run)
+            if ok:
+                n_unpacked += 1
+            else:
+                n_failed += 1
+        # Probe heartbeat every 5s — going through hundreds of exes
+        # at one 7z spawn each across the WSL bridge takes a while.
+        now = time.monotonic()
+        if now - last_probe_tick >= 5.0:
+            done = i + 1
+            print(f"  probed {done}/{len(candidates)} "
+                  f"({n_sfx} sfx so far, {now - probe_started:.0f}s)",
+                  flush=True)
+            last_probe_tick = now
 
     elapsed = time.monotonic() - started
     print()
