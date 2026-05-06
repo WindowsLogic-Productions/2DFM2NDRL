@@ -109,3 +109,134 @@ table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.r-win  td:last-child { color: var(--win);  font-weight: 600; }
 tr.r-loss td:last-child { color: var(--loss); font-weight: 600; }
 tr.r-draw td:last-child { color: var(--draw); font-weight: 600; }
+
+/* ─── Game grid (Fightcade-style cards) ────────────────────────────────
+ *
+ * 16:9-ish banner over a colored gradient (deterministic from game_id),
+ * monogram fallback when banner image isn't cached yet, engine + verified
+ * pips on the banner, and a flat strip below for name + year + match
+ * count. Hover lifts + brightens; whole card is the link target.
+ */
+.subtitle { color: var(--text-dim); margin: 0; }
+.subtitle .pill { margin-left: 0.5rem; }
+.pill {
+  display: inline-block;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.78rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+}
+.pill-win  { color: var(--win);  border-color: rgba(74,222,128,0.35); }
+.pill-loss { color: var(--loss); border-color: rgba(248,113,113,0.35); }
+
+.game-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.game-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  text-decoration: none;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  transition: transform 80ms ease, border-color 80ms ease,
+              box-shadow 80ms ease;
+}
+.game-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  text-decoration: none;
+}
+.game-card-banner {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.game-card-banner img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.game-card-monogram {
+  font-size: 2.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  user-select: none;
+}
+.game-card-badge {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--text);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+}
+.engine-fm95 { background: rgba(88, 166, 255, 0.85); color: #06121e; }
+.game-card-pip {
+  position: absolute;
+  top: 0.55rem;
+  right: 0.55rem;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--win);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.4);
+}
+.game-card-active { border-color: rgba(74, 222, 128, 0.5); }
+.game-card-body {
+  padding: 0.6rem 0.7rem 0.7rem;
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.game-card-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+  line-height: 1.2;
+  /* Two-line clamp so long names don't break the grid alignment. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.game-card-meta {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: auto;
+}
+.game-card-meta .dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  display: inline-block;
+}
+.game-card-meta .active-count { color: var(--win); }
+
+/* Wider main container on the grid page so cards don't squeeze into 3
+ * columns at desktop widths. Other pages stay at the existing 980px
+ * because their tabular content reads better narrow. */
+body.page-games main { max-width: 1400px; }

@@ -7,10 +7,11 @@
   <title>{% block title %}FM2K Stats{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <header>
     <nav>
       <a class="brand" href="/">FM2K Stats</a>
+      <a href="/games">Games</a>
       <a href="/recent">Recent</a>
     </nav>
   </header>

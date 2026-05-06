@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Games — FM2K Stats{% endblock %}
+{% block body_class %}page-games{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>Games</h1>
+  <p class="subtitle">
+    {{ total_games }} cataloged
+    · <span class="pill pill-win">{{ total_active }} with matches played</span>
+  </p>
+</section>
+
+<div class="game-grid">
+  {% for r in rows %}
+  <a class="game-card{% if r.match_count > 0 %} game-card-active{% endif %}"
+     href="/g/{{ r.game_id }}"
+     data-game-id="{{ r.game_id }}">
+    <div class="game-card-banner"
+         style="background: {{ banner_color(r.game_id) }};">
+      {% if r.thumb_url %}
+        <img src="{{ r.thumb_url }}" alt="" loading="lazy">
+      {% elif r.banner_url %}
+        <img src="{{ r.banner_url }}" alt="" loading="lazy">
+      {% else %}
+        <span class="game-card-monogram">{{ banner_monogram(r.name) }}</span>
+      {% endif %}
+      {% if r.engine %}
+      <span class="game-card-badge engine-{{ r.engine|lower }}">{{ r.engine }}</span>
+      {% endif %}
+      {% if r.has_kgt %}
+      <span class="game-card-pip" title=".kgt verified"></span>
+      {% endif %}
+    </div>
+    <div class="game-card-body">
+      <div class="game-card-name">{{ r.name }}</div>
+      <div class="game-card-meta">
+        {% if r.year %}<span>{{ r.year }}</span>{% endif %}
+        {% if r.match_count > 0 %}
+          <span class="dot"></span>
+          <span class="active-count">{{ r.match_count }} match{{ 'es' if r.match_count != 1 else '' }}</span>
+        {% endif %}
+      </div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% endblock %}
