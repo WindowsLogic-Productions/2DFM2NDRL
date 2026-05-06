@@ -36,7 +36,6 @@ import copy
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GAMES_DIR_DEFAULT = Path("/mnt/c/games/2dfm")
 IA_SCRAPE_PATH = REPO_ROOT / "tools" / "ia_scrape.json"
-MIZUUMI_SCRAPE_PATH = REPO_ROOT / "tools" / "mizuumi_scrape.json"
 OVERRIDES_PATH = REPO_ROOT / "games" / "registry_overrides.json"
 OUT_PATH = REPO_ROOT / "games" / "registry.json"
 
@@ -267,40 +266,6 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def load_mizuumi_records(path: Path) -> list[dict[str, Any]]:
-    """Convert tools/mizuumi_scrape.json into registry records.
-
-    mizuumi.wiki has the cleanest curated friendly names of any
-    source, so its `name` always wins over the IA / MyAbandonware
-    auto-derived titles in the merge step (build_registry's slug
-    dedup keeps the first scalar; we order mizuumi first so its
-    fields take precedence). It rarely has exe_stem info though, so
-    we lean on slug-of-name for the merge key and rely on the
-    other sources to provide the actual game_id."""
-    if not path.exists():
-        print(f"info: {path.name} not present "
-              f"(run scrape_mizuumi.py to generate)")
-        return []
-    raw_list = json.loads(path.read_text(encoding="utf-8"))
-    out: list[dict[str, Any]] = []
-    for raw in raw_list:
-        rec = empty_record()
-        rec["_raw"] = {"mizuumi.wiki": raw}
-        rec["name"] = raw.get("name") or raw.get("wiki_title") or ""
-        rec["year"] = raw.get("year") or ""
-        rec["developer"] = raw.get("developer") or ""
-        rec["homepage"] = raw.get("homepage") or ""
-        rec["sources"] = ["mizuumi.wiki"]
-        # mizuumi rarely yields the exe_stem on its own — leave
-        # game_id as the slugified name for now; the merger will
-        # find the IA / MyAbandonware sibling and pull the real
-        # exe_stem in.
-        rec["game_id"] = slugify(rec["name"])
-        out.append(rec)
-    print(f"loaded {len(out)} mizuumi.wiki records from {path.name}")
-    return out
-
-
 def load_overrides(path: Path) -> list[dict[str, Any]]:
     """Hand-edited corrections / additions. Shape matches the registry
     schema directly so an entry can either patch existing fields by
@@ -437,15 +402,11 @@ def main() -> int:
 
     mw = load_myabandonware_records(games_dir)
     ia = load_ia_records(IA_SCRAPE_PATH)
-    mz = load_mizuumi_records(MIZUUMI_SCRAPE_PATH)
     ov = load_overrides(OVERRIDES_PATH)
 
-    # Order matters: the merger keeps the FIRST scalar value seen and
-    # accumulates list fields. We want mizuumi.wiki's curated names to
-    # win over IA's auto-derived ones (which often carry version
-    # suffixes / upload-naming noise) and over MyAbandonware's
-    # canonical-but-occasionally-misspelled titles.
-    merged = merge(mz + mw + ia, ov)
+    # MyAbandonware first so its hand-curated titles beat IA's
+    # auto-derived ones in the slug-dedup tiebreak.
+    merged = merge(mw + ia, ov)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n",

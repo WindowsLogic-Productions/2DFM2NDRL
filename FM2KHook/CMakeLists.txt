@@ -38,6 +38,7 @@ set(FM2KHOOK_SOURCES
     src/ui/imgui_overlay.cpp
     src/ui/shared_mem.cpp
     src/ui/input_binder.cpp
+    src/ui/screenshot.cpp
     # Parity — kgtengine cross-engine ground-truth recorder
     src/parity/parity_recorder.cpp
     # Locale spoofing for Japanese-only games (CPW etc.)

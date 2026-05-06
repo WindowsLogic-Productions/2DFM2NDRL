@@ -16,6 +16,7 @@
 #include "../audio/sound_rollback.h"        // Mike Z desired/actual sound layer
 #include "../netplay/spectator_node.h"      // spectator playback queue accessors
 #include "../ui/input_binder.h"             // FM2KInputBinder::Sample_Win32 + Bindings
+#include "../ui/screenshot.h"               // FM2KCapture::SaveScreenshot for the auto-banner pipeline
 #include <MinHook.h>
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -77,6 +78,38 @@ static inline void PinFPUControlWord() {
 extern bool Netplay_IsActive();
 using timeGetTime_t = DWORD(WINAPI*)();
 static timeGetTime_t original_timeGetTime = nullptr;
+
+// FM95 vs-mode random-stage hook.
+// FM2K's selected_stage scalar (0x43010c) doesn't exist on FM95 — vs/story
+// mode reads stage_id from g_char_stage_per_round[char][round] table at
+// LoadStageFile_alt call time. To override, we trampoline the function
+// itself and rewrite arg0 (stage_id) when random-stage is enabled. The
+// rolled value comes from the same xorshift sequence the FM2K random-stage
+// block uses in netplay.cpp; here we just consume the next pre-rolled
+// value via Netplay_RandomStagePeekRoll() and write it through.
+//
+// Practice mode uses g_practice_stage_id (which our existing random-stage
+// write target ADDR_SELECTED_STAGE points at on FM95), so this hook is
+// only load-bearing for vs/story-mode random-stage. Practice mode still
+// works via the direct memory write — this hook is a NO-OP in that path
+// because the override comes back as the same value.
+using LoadStageFileAlt_t = int(__cdecl*)(int, int, int);
+static LoadStageFileAlt_t original_LoadStageFileAlt = nullptr;
+extern "C" uint32_t Netplay_PeekNextRolledStage();  // 0xFFFFFFFF if random off
+static int __cdecl Hook_LoadStageFileAlt(int stage_id, int slot, int palette) {
+    if constexpr (FM2K::kIsFM95) {
+        const uint32_t override_id = Netplay_PeekNextRolledStage();
+        if (override_id != 0xFFFFFFFFu && (int)override_id != stage_id) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "FM95 random-stage: LoadStageFile_alt override %d -> %u",
+                stage_id, override_id);
+            stage_id = (int)override_id;
+        }
+    }
+    return original_LoadStageFileAlt
+        ? original_LoadStageFileAlt(stage_id, slot, palette)
+        : 0;
+}
 uint32_t g_virtual_time_ms = 0;  // bumped by 10 per AdvanceEvent in netplay.cpp
 
 static DWORD WINAPI Hook_timeGetTime() {
@@ -480,6 +513,39 @@ static void CheckGameModeTransition() {
     if (current_mode != g_last_game_mode) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "Hooks: game_mode changed: %u -> %u", g_last_game_mode, current_mode);
+
+        // Auto-capture banner pipeline. Drives one screenshot at each
+        // mode-boundary the launcher's capture-runner cares about,
+        // then writes a "DONE" sentinel file the launcher polls
+        // before terminating the game. No-op when FM2K_AUTO_CAPTURE
+        // wasn't set (FM2KCapture::IsActive() short-circuits).
+        if (FM2KCapture::IsActive()) {
+            static bool s_captured_title = false;
+            static bool s_captured_css   = false;
+            static bool s_captured_battle = false;
+            if (!s_captured_title && current_mode == 1000) {
+                FM2KCapture::SaveScreenshot("title.png");
+                s_captured_title = true;
+            }
+            if (!s_captured_css && current_mode == 2000) {
+                FM2KCapture::SaveScreenshot("css_initial.png");
+                s_captured_css = true;
+            }
+            if (!s_captured_battle && current_mode >= 3000
+                && current_mode < 4000) {
+                FM2KCapture::SaveScreenshot("battle.png");
+                s_captured_battle = true;
+                // All three core captures done — touch a sentinel so
+                // the launcher's capture-runner sees "ready to kill".
+                // Empty zero-byte file; the launcher polls for its
+                // existence on a 250 ms cadence.
+                FILE* f = std::fopen(
+                    (std::string(std::getenv("FM2K_CAPTURE_DIR") ?
+                                 std::getenv("FM2K_CAPTURE_DIR") : ".")
+                     + "/.capture_done").c_str(), "wb");
+                if (f) std::fclose(f);
+            }
+        }
 
         // Whenever the game crosses any CSS↔battle boundary, kick off a
         // 300-frame (3 second @ 100 Hz) state dump so we can diff
@@ -2101,6 +2167,30 @@ bool InitializeHooks() {
     } else {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Hooks: SKIP RunGameLoop hook on FM95 — frame loop is inlined into WinMain");
+    }
+
+    // FM95-only: hook LoadStageFile_alt so vs-mode random-stage can rewrite
+    // arg0 at call time. FM2K has no equivalent — its stage selection
+    // already routes through ADDR_SELECTED_STAGE (0x43010c) which the
+    // random-stage block writes directly.
+    if constexpr (FM2K::kIsFM95) {
+        if (FM2K::ADDR_LOAD_STAGE_FILE_ALT != 0) {
+            if (MH_CreateHook((void*)FM2K::ADDR_LOAD_STAGE_FILE_ALT,
+                              (void*)Hook_LoadStageFileAlt,
+                              (void**)&original_LoadStageFileAlt) != MH_OK ||
+                MH_EnableHook((void*)FM2K::ADDR_LOAD_STAGE_FILE_ALT) != MH_OK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: Failed to hook LoadStageFile_alt — vs-mode "
+                    "random-stage will not override game's per-character "
+                    "stage table (practice-mode random still works via "
+                    "direct g_practice_stage_id write).");
+                // Non-fatal: random-stage is opt-in. Continue init.
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: LoadStageFile_alt hooked at 0x%08X (FM95 vs-mode random-stage)",
+                    (unsigned)FM2K::ADDR_LOAD_STAGE_FILE_ALT);
+            }
+        }
     }
 
     // Hook GameRand
