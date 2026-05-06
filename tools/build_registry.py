@@ -150,14 +150,24 @@ def load_myabandonware_records(games_dir: Path) -> list[dict[str, Any]]:
 
 
 def load_ia_records(path: Path) -> list[dict[str, Any]]:
-    """Convert tools/ia_scrape.json output into registry records."""
+    """Convert tools/ia_scrape.json output into registry records.
+
+    Drops records flagged engine_bundle=true (the FM2K editor / engine
+    upload itself, not a playable game). Prefers the inner-zip .kgt
+    name as the exe_stem when inspect_ia_zips.py was run; falls back
+    to slugified title otherwise.
+    """
     if not path.exists():
         print(f"info: {path.name} not present "
               f"(run scrape_archive_org.py to generate)")
         return []
     raw_list = json.loads(path.read_text(encoding="utf-8"))
     out: list[dict[str, Any]] = []
+    skipped_engine = 0
     for raw in raw_list:
+        if raw.get("engine_bundle"):
+            skipped_engine += 1
+            continue
         rec = dict(EMPTY_REGISTRY_RECORD)
         rec["_raw"] = {"archive.org": raw}
         rec["name"] = raw.get("title", "")
@@ -166,20 +176,32 @@ def load_ia_records(path: Path) -> list[dict[str, Any]]:
         rec["homepage"] = raw.get("homepage", "")
         rec["download_url"] = raw.get("download", "")
         rec["sources"] = ["archive.org"]
-        # Try to pull an exe stem from the file list. IA bundles often
-        # contain the install root with the game's exe at top level.
-        kgt = next((Path(f).stem for f in raw.get("files") or []
-                    if f.lower().endswith(".kgt")), "")
-        if kgt:
-            rec["kgt_filename"] = kgt + ".kgt"
-            # Convention: most FM2K games ship with exe and .kgt sharing
-            # the same stem. Match-or-fallback to slugified title.
-            rec["exe_stems"] = [kgt.lower()]
-            rec["game_id"] = kgt.lower()
+        # Prefer the inner-zip-derived exe_stem (set by
+        # inspect_ia_zips.py when a .kgt was confirmed inside the zip).
+        # Fall back to scanning the outer files list (rare — IA usually
+        # only lists the zip itself), then to slugified title.
+        inner_files = raw.get("inner_files") or []
+        outer_files = raw.get("files") or []
+        kgt_in_inner = next(
+            (Path(f).name for f in inner_files
+             if f.lower().endswith(".kgt")), "")
+        kgt_in_outer = next(
+            (Path(f).stem for f in outer_files
+             if f.lower().endswith(".kgt")), "")
+        kgt_stem = (Path(kgt_in_inner).stem if kgt_in_inner else
+                    kgt_in_outer)
+        if kgt_stem:
+            rec["kgt_filename"] = kgt_stem + ".kgt"
+            rec["exe_stems"] = [kgt_stem.lower()]
+            rec["game_id"] = kgt_stem.lower()
+        elif raw.get("exe_stem"):  # set by inspect_ia_zips.py
+            rec["exe_stems"] = [raw["exe_stem"]]
+            rec["game_id"] = raw["exe_stem"]
         else:
             rec["game_id"] = slugify(rec["name"])
         out.append(rec)
-    print(f"loaded {len(out)} archive.org records from {path.name}")
+    print(f"loaded {len(out)} archive.org records from {path.name} "
+          f"({skipped_engine} engine-bundle uploads dropped)")
     return out
 
 
