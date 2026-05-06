@@ -58,4 +58,36 @@ void SetStats(int fps, uint32_t ping_ms, int delay);
 // peer is known and active, false on disconnect.
 void SetConnected(bool connected);
 
+// True while the user has the chat-input box open (Slice F). Read
+// by the game-input hooks to zero out local input for the duration
+// (so typing 'a' doesn't make the local fighter throw a punch) and
+// by Hook_WndProc to know it should forward keyboard messages to
+// ImGui even when the F9 debug overlay isn't visible.
+bool IsChatInputActive();
+
+// ─── Runtime style controls ──────────────────────────────────────
+//
+// Live-tuned from the F9 debug overlay's HUD tab. All HUD metrics
+// derive from `frame_scale = rect_h / 260` × these multipliers;
+// ship-default values keep current visual sizing. The visibility
+// flags hide whole sections so users can pare down to "just FPS"
+// or "just chat" without code changes.
+struct StyleControls {
+    // Defaults tuned for typical 640×480 / 800×600 windowed FM2K +
+    // upscaled cnc-ddraw output — at scale 1.0 the HUD bar dominates
+    // the screen on small game rects. 0.3 keeps it discreet at native
+    // size and the user can dial up via the F9 slider when running
+    // on big monitors.
+    float scale          = 0.3f;   // 0.3..2.0; multiplier on bar/text/chat
+    float bar_opacity    = 0.50f;  // 0..1; alpha multiplier for top-bar fill
+    bool  show_top_bar   = true;
+    bool  show_chat      = true;
+    bool  show_system_message = true;
+};
+
+// Mutable accessor; the F9 HUD tab edits the returned reference
+// directly, fc_hud::Render reads on each frame. Values persist for
+// the process lifetime; not yet written to disk.
+StyleControls& Style();
+
 }  // namespace fc_hud

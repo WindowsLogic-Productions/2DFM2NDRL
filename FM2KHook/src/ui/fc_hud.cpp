@@ -4,6 +4,7 @@
 #include "shared_mem.h"   // FM2KSharedMemData::ui_*_nick (launcher-populated)
 #include "../netplay/netplay.h"  // Netplay_PopChatMessage / ChatEntry
 
+#include <SDL3/SDL_log.h>
 #include <imgui.h>
 #include <windows.h>      // GetTickCount for Slice D system-msg fade
 
@@ -61,6 +62,23 @@ struct ChatLine {
 std::deque<ChatLine> g_chat_lines;
 DWORD                g_chat_last_arrived_tick = 0;
 
+// Slice F — chat input mode.
+//   - Tab toggles open/close (edge-detected via GetAsyncKeyState).
+//   - Enter inside InputText submits via Netplay_SendChatMessage.
+//   - Esc cancels.
+// While active, IsChatInputActive() returns true so the input hooks
+// can zero local input (chat keystrokes shouldn't drive the
+// fighter), and Hook_WndProc forwards messages to ImGui regardless
+// of overlay-visible state. ChatEntry.text is 24 bytes; clamp the
+// draft to that — over-long sends would silently truncate at the
+// netplay layer anyway.
+constexpr size_t kChatDraftCap = 24;
+
+bool  g_chat_input_active   = false;
+bool  g_chat_focus_pending  = false;   // first-frame autofocus
+bool  g_chat_tab_was_down   = false;   // Tab edge-detection
+char  g_chat_draft[kChatDraftCap]{};
+
 }  // namespace
 
 void Init() {
@@ -91,6 +109,15 @@ void SetStats(int fps, uint32_t ping_ms, int delay) {
 void SetConnected(bool connected) {
     std::lock_guard<std::mutex> lk(g_mtx);
     g_state.connected = connected;
+}
+
+bool IsChatInputActive() {
+    return g_chat_input_active;
+}
+
+StyleControls& Style() {
+    static StyleControls s_style{};
+    return s_style;
 }
 
 void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
@@ -131,6 +158,40 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
         s = g_state;
     }
 
+    // ─── Slice F: Tab edge-detection ──────────────────────────────
+    // Press → toggle chat input. Polled via GetAsyncKeyState so the
+    // toggle works regardless of message-pump details. GetAsyncKeyState
+    // is process-global, though, so we MUST gate on the foreground
+    // window belonging to this process — otherwise pressing Tab while
+    // the launcher (or any other app) has focus would pop the chat
+    // box open in the background. Side effect: ImGui won't see any
+    // typed characters either way unless this process is foreground,
+    // so refusing to open in that state matches the only state where
+    // the user could actually type.
+    {
+        const HWND fg = GetForegroundWindow();
+        DWORD fg_pid = 0;
+        if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+        const bool game_focused = (fg_pid == GetCurrentProcessId());
+        const bool tab_now = game_focused &&
+                             (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+        if (tab_now && !g_chat_tab_was_down) {
+            g_chat_input_active = !g_chat_input_active;
+            if (g_chat_input_active) {
+                g_chat_draft[0] = '\0';
+                g_chat_focus_pending = true;
+            } else {
+                g_chat_draft[0] = '\0';
+            }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "fc_hud: chat input %s (fg_pid=%lu my_pid=%lu)",
+                g_chat_input_active ? "OPEN" : "CLOSE",
+                (unsigned long)fg_pid,
+                (unsigned long)GetCurrentProcessId());
+        }
+        g_chat_tab_was_down = tab_now;
+    }
+
     ImDrawList* dl   = ImGui::GetForegroundDrawList();
     ImFont*     font = ImGui::GetFont();
 
@@ -138,26 +199,32 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
     // canvas — same idiom Fightcade uses (vid_overlay.cpp:1031), so
     // tweaking constants below to adjust look-and-feel translates
     // 1:1 across game resolutions (FM2K 480, FM95 240, larger
-    // upscales).
-    const float frame_scale = (float)rect_h / 260.0f;
+    // upscales). Multiplied by the user's runtime style scale so
+    // the F9 HUD tab can scale everything together.
+    const StyleControls& style = Style();
+    const float frame_scale = ((float)rect_h / 260.0f) * style.scale;
 
-    // Top bar geometry. ~16 logical units tall — slim like Fightcade,
-    // but we don't shrink under a floor so very-small windows stay
-    // legible. Player labels and the right-aligned stats both live
-    // inside the bar with vertical-center alignment.
+    // Top bar geometry. ~16 logical units tall — slim like Fightcade.
+    // Floor at 8px so even at scale 0.3 over a 480-pixel rect the bar
+    // doesn't disappear into a sub-pixel sliver, but small enough to
+    // honor the user's "smaller please" intent at low scales.
     float bar_h = 16.0f * frame_scale;
-    if (bar_h < 18.0f) bar_h = 18.0f;
+    if (bar_h < 8.0f) bar_h = 8.0f;
 
     const ImVec2 bar_a((float)rect_x, (float)rect_y);
     const ImVec2 bar_b((float)(rect_x + rect_w), (float)rect_y + bar_h);
-    // Semi-transparent dark fill. 180/255 alpha keeps the underlying
-    // game pixels faintly visible — same density as Fightcade's bar.
-    dl->AddRectFilled(bar_a, bar_b, IM_COL32(0, 0, 0, 180));
-    // 1-pixel bottom edge so the bar's lower border is crisp against
-    // active gameplay.
-    dl->AddLine(ImVec2(bar_a.x, bar_b.y - 0.5f),
-                ImVec2(bar_b.x, bar_b.y - 0.5f),
-                IM_COL32(60, 60, 60, 200), 1.0f);
+    // Semi-transparent dark fill — alpha modulated by the user
+    // style.bar_opacity. Floor at 1/255 so a 0.0 setting hides the
+    // fill but keeps the divider line visible (lets users see chrome
+    // anchoring without the dark band over the action).
+    if (style.show_top_bar) {
+        const int bar_alpha = (int)(255.0f * style.bar_opacity);
+        dl->AddRectFilled(bar_a, bar_b, IM_COL32(0, 0, 0, bar_alpha));
+        // 1-pixel bottom edge so the bar's lower border is crisp.
+        dl->AddLine(ImVec2(bar_a.x, bar_b.y - 0.5f),
+                    ImVec2(bar_b.x, bar_b.y - 0.5f),
+                    IM_COL32(60, 60, 60, 200), 1.0f);
+    }
 
     // Type sizing. Default ImGui font is ~13px at scale 1; we rescale
     // to ~70% of bar height so the text reads inside the bar without
@@ -166,6 +233,11 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
     const float pad       = bar_h * 0.45f;
     const float text_y    = (float)rect_y + (bar_h - font_size) * 0.5f;
 
+    // The remaining top-bar contents (player names, score box,
+    // right-side stats) all key off the same visibility flag as the
+    // bar fill above — together they form the "top bar" the user
+    // can hide.
+    if (style.show_top_bar) {
     // Left side — local player.
     char left_buf[128];
     std::snprintf(left_buf, sizeof(left_buf), "P1: %s",
@@ -196,25 +268,26 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
                     IM_COL32_WHITE, score_buf);
     }
 
-    // Right side — opponent + live stats. Spectator count tucks in
-    // before the ping number when non-zero (Fightcade-style). Offline
-    // collapses to just FPS so the bar still confirms the HUD is alive.
+    // Right side — opponent name first, then a compact stat block.
+    // Two-pipe separator keeps the stats group visually distinct from
+    // the name without spending bar real estate on a divider sprite.
+    // Offline → just `fps:N`.
     char right_buf[224];
     if (s.connected) {
         if (s.spectators > 0) {
             std::snprintf(right_buf, sizeof(right_buf),
-                "%s :P2    %u spec    ping %u ms  delay %d  fps %d",
+                "%s :P2  | %us  p:%u  d:%d  fps:%d",
                 s.p2_name[0] ? s.p2_name : "P2",
                 (unsigned)s.spectators,
                 (unsigned)s.ping_ms, s.delay, s.fps);
         } else {
             std::snprintf(right_buf, sizeof(right_buf),
-                "%s :P2    ping %u ms  delay %d  fps %d",
+                "%s :P2  | p:%u  d:%d  fps:%d",
                 s.p2_name[0] ? s.p2_name : "P2",
                 (unsigned)s.ping_ms, s.delay, s.fps);
         }
     } else {
-        std::snprintf(right_buf, sizeof(right_buf), "fps %d", s.fps);
+        std::snprintf(right_buf, sizeof(right_buf), "fps:%d", s.fps);
     }
 
     const ImVec2 right_size = font->CalcTextSizeA(font_size, FLT_MAX,
@@ -222,6 +295,7 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
     dl->AddText(font, font_size,
                 ImVec2((float)(rect_x + rect_w) - pad - right_size.x, text_y),
                 IM_COL32_WHITE, right_buf);
+    }  // if (style.show_top_bar)
 
     // ─── Slice E: chat history (bottom-left) ───────────────────────
     // Drain Netplay's chat ring into our local list every frame —
@@ -246,7 +320,25 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
         }
     }
 
-    if (!g_chat_lines.empty()) {
+    // Chat box geometry (used by both the history block and the input
+    // box below). Computed even when there are no lines so the input
+    // box has a consistent width regardless of history fullness.
+    const float chat_font   = bar_h * 0.85f;
+    const float chat_line_h = chat_font * 1.25f;
+    const float chat_pad    = bar_h * 0.4f;
+    const float chat_box_w  = chat_font * 26.0f;
+    const float chat_box_x  = (float)rect_x + chat_pad;
+    // When chat input is active, leave room for the input box at the
+    // very bottom — the history stack shifts up by one input-row's
+    // worth so they don't overlap.
+    const float input_box_h = chat_font * 1.6f;
+    const float input_box_y = (float)(rect_y + rect_h)
+                            - chat_pad - input_box_h;
+    const float history_bottom_y = g_chat_input_active
+        ? (input_box_y - chat_pad * 0.5f)
+        : (float)(rect_y + rect_h) - chat_pad;
+
+    if (!g_chat_lines.empty() && style.show_chat) {
         // Fade entire chat block out after 30 s of silence; full
         // alpha during the first 28 s, fading the last 2 s.
         const DWORD now = GetTickCount();
@@ -257,19 +349,15 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
             chat_alpha = (fade >= 1.0f) ? 0.0f : (1.0f - fade);
         }
         if (chat_alpha > 0.005f) {
-            const float chat_font = bar_h * 0.85f;
-            const float line_h    = chat_font * 1.25f;
-            const float chat_pad  = bar_h * 0.4f;
             // Container box bottom-left of game rect, sized to fit
             // current line count (max kChatLines).
             const size_t n = g_chat_lines.size();
-            const float box_h = line_h * (float)n + chat_pad * 0.6f;
+            const float box_h = chat_line_h * (float)n + chat_pad * 0.6f;
             // Wide enough for ~36 chars at this font size; ChatEntry
             // truncates to 23 chars so this fits comfortably.
-            const float box_w = chat_font * 26.0f;
-            const float box_x = (float)rect_x + chat_pad;
-            const float box_y = (float)(rect_y + rect_h)
-                              - chat_pad - box_h;
+            const float box_w = chat_box_w;
+            const float box_x = chat_box_x;
+            const float box_y = history_bottom_y - box_h;
 
             // Background — same idiom as the top bar's tinted fill,
             // ramped by the silence fade.
@@ -304,16 +392,87 @@ void Render(int rect_x, int rect_y, int rect_w, int rect_h) {
                 dl->AddText(font, chat_font,
                             ImVec2(nick_x + nick_size.x, ty),
                             col_text, ln.text.c_str());
-                ty += line_h;
+                ty += chat_line_h;
             }
         }
+    }
+
+    // ─── Slice F: chat input box (when active) ─────────────────────
+    // Borderless ImGui window with InputText. ImGui handles all the
+    // typing, copy/paste, IME composition, cursor movement out of
+    // the box — we only need to: position it, autofocus on first
+    // frame, submit on Enter, cancel on Esc. Bytes go to the existing
+    // peer-to-peer netplay chat path; both peers' fc_hud rings then
+    // pick the message up via the existing Slice E drain.
+    if (g_chat_input_active) {
+        ImGui::SetNextWindowPos(ImVec2(chat_box_x, input_box_y),
+                                ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(chat_box_w, input_box_h),
+                                 ImGuiCond_Always);
+        constexpr ImGuiWindowFlags kWf =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+        const bool begin_ok = ImGui::Begin("##fc_chat_input", nullptr, kWf);
+        if (begin_ok) {
+            // Scale the font ImGui uses inside this window to match the
+            // HUD's logical chat-line size. Without this, InputText
+            // stays at the loaded base font size (16 px) regardless of
+            // the user's scale slider, which both makes the box too
+            // tall at scale 0.3 and breaks the visual continuity with
+            // the chat history above. Base font load size is 16; we
+            // map chat_font px to that ratio.
+            ImGui::SetWindowFontScale(chat_font / 16.0f);
+            if (g_chat_focus_pending) {
+                // Scrub any keys ImGui still has marked "down" from a
+                // previous session — when chat closes after Enter, the
+                // submitting Enter KEYUP can race with the chat-active
+                // gate flip and leak past as a still-pressed-key entry
+                // in ImGui's io state, which the next chat-open would
+                // otherwise re-trigger as a phantom event. Cheap call;
+                // resets only key-down/up state, not focus or other UI.
+                ImGui::GetIO().ClearInputKeys();
+                // Two-step focus: the window itself (so ImGui treats
+                // it as the NavFocus / active context), then the
+                // next-rendered item (the InputText). Without
+                // SetWindowFocus the InputText sees no key events
+                // because ImGui doesn't route keyboard to a window
+                // that isn't the active one.
+                ImGui::SetWindowFocus();
+                ImGui::SetKeyboardFocusHere();
+                g_chat_focus_pending = false;
+            }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            // EnterReturnsTrue makes Enter both fire the callback AND
+            // keep the buffer's content available for one frame so we
+            // can read it before clearing.
+            const bool submitted = ImGui::InputText(
+                "##draft", g_chat_draft, sizeof(g_chat_draft),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            if (submitted && g_chat_draft[0]) {
+                Netplay_SendChatMessage(g_chat_draft);
+                g_chat_draft[0] = '\0';
+                g_chat_input_active = false;
+            } else if (submitted) {
+                // Empty submit = same as cancel (nothing to send).
+                g_chat_input_active = false;
+            }
+            // Esc cancels — checked via ImGui's keyboard state so it
+            // works while the InputText has focus.
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, /*repeat=*/false)) {
+                g_chat_draft[0] = '\0';
+                g_chat_input_active = false;
+            }
+        }
+        ImGui::End();
     }
 
     // ─── Slice D: centered system message ──────────────────────────
     // Renders centered on the rect (vertically near the top third),
     // with a fade-out in the last 500 ms before expiry. Skipped when
-    // never published (seq=0) or already expired.
-    if (s.sys_seq > 0 && s.sys_message[0]) {
+    // never published (seq=0) or already expired, or when the user
+    // has hidden the system-message overlay.
+    if (s.sys_seq > 0 && s.sys_message[0] && style.show_system_message) {
         const DWORD now = GetTickCount();
         // Branchless "remaining" using 32-bit modular subtraction so
         // wraparound at the 49-day tick boundary doesn't false-fire.

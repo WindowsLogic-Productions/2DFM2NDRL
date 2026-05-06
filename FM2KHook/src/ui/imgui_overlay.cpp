@@ -1,7 +1,7 @@
 // ImGui overlay for FM2K - debug display
 #include "imgui_overlay.h"
 #include "fc_hud.h"
-#include "globals.h"
+#include "globals.h"  // FM2K::kIsFM95 — engine-aware window class match
 #include "netplay.h"
 #include "savestate.h"
 #include <imgui.h>
@@ -23,6 +23,13 @@ static WNDPROC oWndProc = nullptr;
 
 // State
 static bool g_overlay_visible = false;
+// In-game HUD master visibility. Defaults OFF for the v0.2.5 release —
+// the HUD scaffolding (top bar / chat / system message) is shipped but
+// hidden until F9 toggles it on. Once user-tested for stability and we
+// wire delay/score/match-state surfacing properly, flip the default to
+// true. F9's ToggleOverlay() flips this alongside g_overlay_visible
+// so one keystroke shows both the dev overlay and the in-game HUD.
+static bool g_hud_master_visible = false;
 static bool g_imgui_initialized = false;
 static bool g_hooks_installed = false;
 static HWND g_game_window = nullptr;
@@ -296,6 +303,44 @@ void RenderDebugOverlay() {
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("DebugTabs")) {
+        // HUD Tab - tunable runtime style for the always-on overlay.
+        // First in the tab bar because it's the most likely thing the
+        // user wants to touch when iterating on the in-game look.
+        if (ImGui::BeginTabItem("HUD")) {
+            fc_hud::StyleControls& s = fc_hud::Style();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+                "In-game HUD style — applies live each frame.");
+            ImGui::Spacing();
+
+            ImGui::SliderFloat("Scale", &s.scale, 0.3f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Multiplies the entire HUD (top bar height, fonts, "
+                    "chat box). Default 1.0 = scaled to game-rect height.");
+            }
+            ImGui::SliderFloat("Top-bar opacity", &s.bar_opacity,
+                               0.0f, 1.0f, "%.2f");
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Visibility");
+            ImGui::Checkbox("Show top bar (names, ping, fps)", &s.show_top_bar);
+            ImGui::Checkbox("Show chat history",               &s.show_chat);
+            ImGui::Checkbox("Show system message",             &s.show_system_message);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            if (ImGui::Button("Reset to defaults")) {
+                s = fc_hud::StyleControls{};
+            }
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Tab opens chat input (game window must be focused).");
+
+            ImGui::EndTabItem();
+        }
+
         // CSS Tab - for debugging character select desync
         if (ImGui::BeginTabItem("CSS")) {
             uint32_t p1_cursor = *(uint32_t*)DebugAddrs::CSS_P1_CURSOR_X;
@@ -467,6 +512,37 @@ void RenderDebugOverlay() {
     ImGui::End();
 }
 
+// Find the game window owned by THIS process. Mirrors
+// wndproc_subclass.cpp's FindOwnWindowProc — the previous code used
+// `FindWindowA(nullptr, "WonderfulWorld")` (title hardcoded, only
+// matched one specific game) with a `GetForegroundWindow()` fallback
+// that, in dual-client local testing, happily returned the OTHER
+// instance's HWND when that client happened to be foreground at the
+// moment we polled. SetWindowLongPtr cross-process is rejected, prev
+// comes back NULL, Hook_WndProc never enters any subclass chain, and
+// ImGui never receives key events for the wrongly-targeted instance.
+struct FindOwnGameWndCtx {
+    DWORD pid;
+    HWND  result;
+};
+static BOOL CALLBACK FindOwnGameWndProc(HWND hwnd, LPARAM lparam) {
+    auto* ctx = reinterpret_cast<FindOwnGameWndCtx*>(lparam);
+    DWORD owner_pid = 0;
+    GetWindowThreadProcessId(hwnd, &owner_pid);
+    if (owner_pid != ctx->pid) return TRUE;
+    char cls[32] = {0};
+    if (GetClassNameA(hwnd, cls, sizeof(cls)) == 0) return TRUE;
+    const char* expect_cls = FM2K::kIsFM95 ? "KGT95GAME" : "KGT2KGAME";
+    if (lstrcmpA(cls, expect_cls) != 0) return TRUE;
+    ctx->result = hwnd;
+    return FALSE;  // stop enumeration
+}
+static HWND FindOwnGameWindow() {
+    FindOwnGameWndCtx ctx{ GetCurrentProcessId(), nullptr };
+    EnumWindows(FindOwnGameWndProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
+
 // Returns true if `pDevice`'s back buffer carries our private-data
 // tag — i.e. the same surface we already initialized the imgui DX9
 // backend against. False means it's fresh (Reset rebuilt it, or
@@ -539,15 +615,43 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+        // Replace ImGui's stock ProggyClean (a bitmap pixel font) with
+        // Segoe UI from %WINDIR%\Fonts. Loaded at 16px as a "base" —
+        // fc_hud renders most text via ImDrawList::AddText with an
+        // explicit font_size that scales with the bar geometry, so the
+        // base size only matters as a rasterization quality target. If
+        // the font isn't available (e.g. modified Windows install), we
+        // silently fall back to the default font.
+        {
+            io.Fonts->Clear();
+            const char* segoe = "C:\\Windows\\Fonts\\segoeui.ttf";
+            ImFont* f = io.Fonts->AddFontFromFileTTF(segoe, 16.0f);
+            if (!f) io.Fonts->AddFontDefault();
+        }
+
         if (!g_game_window) {
-            g_game_window = FindWindowA(nullptr, "WonderfulWorld");
-            if (!g_game_window) g_game_window = GetForegroundWindow();
+            // Process-scoped window lookup — must NOT cross processes
+            // when running multiple clients on the same machine
+            // (matches wndproc_subclass.cpp's class-name discovery).
+            g_game_window = FindOwnGameWindow();
+        }
+        if (!g_game_window) {
+            // No game window yet (very early init). Skip ImGui init
+            // this frame; we'll retry on the next frame.
+            g_imgui_initialized = false;
+            ImGui::DestroyContext();
+            return EndScene_orig(pDevice);
         }
 
         // Hook WndProc
         if (g_game_window && !oWndProc) {
             oWndProc = (WNDPROC)SetWindowLongPtr(g_game_window,
                 GWLP_WNDPROC, (LONG_PTR)Hook_WndProc);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "imgui_overlay: Hook_WndProc=%p installed on hwnd=%p, "
+                "captured prev=%p (oWndProc)",
+                (void*)Hook_WndProc, (void*)g_game_window,
+                (void*)oWndProc);
         }
 
         ImGui_ImplWin32_Init(g_game_window);
@@ -587,9 +691,14 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
         const int delay = conn ? Netplay_GetLocalDelay() : 0;
         fc_hud::SetStats(g_current_fps, ping, delay);
         fc_hud::SetConnected(conn);
-        fc_hud::Render((int)g_game_viewport.X, (int)g_game_viewport.Y,
-                       (int)g_game_viewport.Width,
-                       (int)g_game_viewport.Height);
+        // v0.2.5: HUD shipped-but-hidden by default, F9 reveals.
+        // Skip the entire Render call when off so we don't pay the
+        // foreground draw-list cost on every frame for a hidden HUD.
+        if (g_hud_master_visible) {
+            fc_hud::Render((int)g_game_viewport.X, (int)g_game_viewport.Y,
+                           (int)g_game_viewport.Width,
+                           (int)g_game_viewport.Height);
+        }
     }
 
     // Optional visual: green frame around the detected rect.
@@ -640,7 +749,35 @@ HRESULT APIENTRY Hook_Reset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* pP
 }
 
 LRESULT WINAPI Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (g_overlay_visible && g_imgui_initialized) {
+    // Tab is OUR chat-toggle key — swallow it at this layer so:
+    //   - The game's WndProc / DefWindowProc don't see it (Tab would
+    //     otherwise trigger focus-traversal in default DefWindowProc,
+    //     which is harmless for FM2K but pointless).
+    //   - ImGui doesn't see it either. Default Tab in a focused
+    //     InputText is "focus next/prev item"; with our single-item
+    //     chat window that immediately defocuses InputText, which is
+    //     why earlier builds could open chat but couldn't type into
+    //     it. Eating Tab before ImGui's input layer keeps the
+    //     InputText's focus stable.
+    //
+    // fc_hud's GetAsyncKeyState polling handles the open/close toggle
+    // independently of the message pump, so we don't need ImGui or
+    // the game to see Tab at all. Covers WM_KEYDOWN, WM_KEYUP, and
+    // WM_CHAR (Tab generates 0x09 as a typed character too).
+    if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR) &&
+        wParam == VK_TAB) {
+        return 0;
+    }
+
+    // Always forward everything else so ImGui's key state stays
+    // coherent — the previous "gate forwarding on chat-active" mode
+    // dropped KEYUP events when chat closed mid-press, leaving keys
+    // stuck "down" in ImGui state and breaking subsequent reopens.
+    // ImGui_ImplWin32_WndProcHandler returns 1 only when a focused
+    // widget actually consumes the input (WantCaptureKeyboard etc.),
+    // so passing it to the game's WndProc happens iff ImGui doesn't
+    // care.
+    if (g_imgui_initialized) {
         if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
             return true;
         }
@@ -699,7 +836,7 @@ DWORD WINAPI DirectXInit(LPVOID lpParameter) {
     d3d->Release();
     DestroyWindow(tmpWnd);
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "D3D9 hooks installed - Press F9 to toggle overlay");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "D3D9 hooks installed - Press F9 to toggle overlay + in-game HUD");
     return 1;
 }
 
@@ -727,8 +864,16 @@ void ShutdownImGuiOverlay() {
 bool IsOverlayVisible() { return g_overlay_visible; }
 
 void ToggleOverlay() {
-    g_overlay_visible = !g_overlay_visible;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Overlay %s", g_overlay_visible ? "shown" : "hidden");
+    g_overlay_visible    = !g_overlay_visible;
+    // Mirror the dev overlay state onto the in-game HUD master flag
+    // so a single F9 press reveals both (and a second press hides
+    // both). Default is "everything off" so a fresh launch never
+    // shows the in-game HUD until the user explicitly opts in.
+    g_hud_master_visible = g_overlay_visible;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Overlay %s (in-game HUD %s)",
+                g_overlay_visible    ? "shown" : "hidden",
+                g_hud_master_visible ? "shown" : "hidden");
 }
 
 void CheckOverlayHotkey() {
