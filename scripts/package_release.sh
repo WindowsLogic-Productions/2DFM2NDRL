@@ -27,30 +27,49 @@ if [ -z "$VERSION" ]; then
 fi
 
 LAUNCHER="$BUILD_DIR/FM2K_RollbackLauncher.exe"
-# Ninja drops the hook DLL alongside the launcher (single-config build).
+# Ninja drops the hook DLLs alongside the launcher (single-config build).
 # Paths are relative to the project root because we cd'd here above.
-HOOK="$BUILD_DIR/FM2KHook.dll"
+HOOK_FM2K="$BUILD_DIR/FM2KHook.dll"
+HOOK_FM95="$BUILD_DIR/FM95Hook.dll"
 UPDATER="$BUILD_DIR/FM2KUpdater.exe"
+LOCALES_SRC="$REPO_ROOT/locales"
 
-for f in "$LAUNCHER" "$HOOK" "$UPDATER"; do
+for f in "$LAUNCHER" "$HOOK_FM2K" "$HOOK_FM95" "$UPDATER"; do
     if [ ! -f "$f" ]; then
         echo "package_release: missing $f — run ./go.sh first" >&2
         exit 1
     fi
 done
+if [ ! -d "$LOCALES_SRC" ]; then
+    echo "package_release: missing $LOCALES_SRC — translation files won't ship" >&2
+    exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 STAGED="$(mktemp -d)"
-cp "$LAUNCHER" "$HOOK" "$UPDATER" "$STAGED/"
+# Top-level files at the zip root — match the layout the launcher
+# expects on disk after extraction (locale subfolder beside the EXE).
+cp "$LAUNCHER" "$HOOK_FM2K" "$HOOK_FM95" "$UPDATER" "$STAGED/"
 i686-w64-mingw32-strip --strip-debug "$STAGED/FM2K_RollbackLauncher.exe"
 i686-w64-mingw32-strip --strip-debug "$STAGED/FM2KHook.dll"
+i686-w64-mingw32-strip --strip-debug "$STAGED/FM95Hook.dll"
 i686-w64-mingw32-strip --strip-debug "$STAGED/FM2KUpdater.exe"
+
+# Locale .ini files under locales/. T() reads <exedir>\locales at
+# runtime; without these every UI string falls back to its literal
+# translation key, which looks completely broken to a fresh user.
+mkdir -p "$STAGED/locales"
+cp "$LOCALES_SRC"/*.ini "$STAGED/locales/"
 
 ZIP_NAME="fm2k_v${VERSION}.zip"
 ZIP_PATH="$OUT_DIR/$ZIP_NAME"
 rm -f "$ZIP_PATH"
-( cd "$STAGED" && zip -9 -j "$ZIP_PATH" \
-    FM2K_RollbackLauncher.exe FM2KHook.dll FM2KUpdater.exe )
+# Use -r (recursive) instead of -j (junk paths) so locales/ stays a
+# subdirectory inside the zip. FM2KUpdater.exe extracts via tar -xf
+# which preserves dir structure on its way into the install dir.
+( cd "$STAGED" && zip -9 -r "$ZIP_PATH" \
+    FM2K_RollbackLauncher.exe FM2KHook.dll FM95Hook.dll FM2KUpdater.exe \
+    locales )
 
 rm -rf "$STAGED"
 
