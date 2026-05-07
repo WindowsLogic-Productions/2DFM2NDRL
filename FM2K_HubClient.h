@@ -255,8 +255,12 @@ public:
     // with a `auth_required` error if empty/invalid. Pass "" to attempt
     // an unauthenticated connect (only works against a hub started
     // with FM2K_HUB_AUTH_DISABLE=1).
+    // secure=true upgrades the WebSocket to TLS (wss://) — required
+    // when fronting through Caddy / a reverse proxy that terminates
+    // HTTPS. Defaults to false for the legacy direct-port path.
     bool Connect(const std::string& host, uint16_t port, const std::string& path,
-                 const std::string& nick, const std::string& hub_token);
+                 const std::string& nick, const std::string& hub_token,
+                 bool secure = false);
     // Compat overload — defaults hub_token to empty.
     bool Connect(const std::string& host, uint16_t port, const std::string& path,
                  const std::string& nick) {
@@ -380,6 +384,7 @@ private:
     // in the WS hello payload. Empty when running against a hub that
     // disables auth (FM2K_HUB_AUTH_DISABLE=1 server-side).
     std::string hub_token_;
+    bool        use_tls_ = false;  // wss:// when true
 
     std::mutex out_mtx_;
     std::condition_variable out_cv_;

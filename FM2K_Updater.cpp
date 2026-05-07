@@ -141,6 +141,16 @@ GetResp HttpGetText(const std::string& url, int timeout_ms = 8000) {
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return out; }
 
+    // GitHub's REST API rejects requests without a User-Agent (returns
+    // 403). WinHttp's WinHttpOpen agent string only sets the underlying
+    // User-Agent in some cases; explicitly add the header to be safe so
+    // /repos/.../releases/latest works as well as raw.githubusercontent.
+    const wchar_t* extra_hdr = L"User-Agent: FM2K_Updater/0.2\r\n"
+                               L"Accept: application/vnd.github+json\r\n";
+    WinHttpAddRequestHeaders(hReq, extra_hdr, (DWORD)-1,
+                             WINHTTP_ADDREQ_FLAG_ADD |
+                             WINHTTP_ADDREQ_FLAG_REPLACE);
+
     BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
@@ -294,9 +304,15 @@ std::string AppDir() {
 
 void CheckWorker() {
     SetState(State::Checking);
+    // v0.2.8: use api.github.com/.../releases/latest instead of
+    // raw.githubusercontent.com/.../LatestVersion. The raw endpoint is
+    // CDN-cached for 5–15 min, so a freshly-cut release wasn't visible
+    // to clients until the cache expired. The API endpoint reflects
+    // changes within seconds. Returns JSON; we extract "tag_name"
+    // (e.g. "v0.2.8") and strip the leading "v".
     char url[512];
     std::snprintf(url, sizeof(url),
-        "https://raw.githubusercontent.com/%s/%s/main/LatestVersion",
+        "https://api.github.com/repos/%s/%s/releases/latest",
         kUpdateRepoOwner, kUpdateRepoName);
 
     GetResp r = HttpGetText(url);
@@ -305,17 +321,30 @@ void CheckWorker() {
         g_st.busy.store(false);
         return;
     }
-    // Trim whitespace
-    std::string remote = r.body;
-    while (!remote.empty() && (remote.back() == '\n' || remote.back() == '\r' ||
-                               remote.back() == ' '  || remote.back() == '\t')) {
-        remote.pop_back();
+    // Minimal JSON parse: find "tag_name":"vX.Y.Z" and pull the value.
+    // No need for a full JSON lib here — body is small + the key/value
+    // shape is fixed by GitHub's API contract.
+    std::string remote;
+    {
+        const std::string& body = r.body;
+        size_t p = body.find("\"tag_name\"");
+        if (p != std::string::npos) {
+            p = body.find('"', p + 10);  // open quote of value
+            if (p != std::string::npos) {
+                size_t end = body.find('"', p + 1);
+                if (end != std::string::npos) {
+                    remote = body.substr(p + 1, end - p - 1);
+                }
+            }
+        }
     }
-    while (!remote.empty() && (remote.front() == ' ' || remote.front() == '\t')) {
+    // Strip leading "v" if present (tag_name is "v0.2.8" but we
+    // compare bare semver "0.2.8" against kAppVersion).
+    if (!remote.empty() && (remote.front() == 'v' || remote.front() == 'V')) {
         remote.erase(remote.begin());
     }
     if (remote.empty()) {
-        SetFail("Update server returned empty version");
+        SetFail("Update server returned empty/unparseable version");
         g_st.busy.store(false);
         return;
     }
