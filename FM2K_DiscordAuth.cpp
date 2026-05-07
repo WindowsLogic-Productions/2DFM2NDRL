@@ -172,6 +172,16 @@ std::string JsonField(const std::string& src, const std::string& key) {
 struct HttpResp {
     int         status   = 0;
     std::string body;
+    // Win32 error from GetLastError after the failing WinHttp call.
+    // Only meaningful when status == 0. Common WinHTTP codes:
+    //   12002 ERROR_WINHTTP_TIMEOUT
+    //   12007 ERROR_WINHTTP_NAME_NOT_RESOLVED   (DNS)
+    //   12029 ERROR_WINHTTP_CANNOT_CONNECT      (TCP refused / firewalled)
+    //   12030 ERROR_WINHTTP_CONNECTION_ERROR
+    //   12152 ERROR_WINHTTP_INVALID_SERVER_RESPONSE
+    //   12175 ERROR_WINHTTP_SECURE_FAILURE      (TLS issue)
+    DWORD       last_error = 0;
+    const char* failed_at  = "";   // string lit identifying the call site
 };
 
 bool ParseUrl(const std::string& url, bool& https_out, std::wstring& host_out,
@@ -201,28 +211,44 @@ bool ParseUrl(const std::string& url, bool& https_out, std::wstring& host_out,
     return true;
 }
 
-HttpResp HttpGet(const std::string& url, int timeout_ms = 15000) {
+// Internal: single attempt at a GET with the given proxy access mode.
+// Returns out.status>0 on success, status==0 with last_error/failed_at
+// populated on any WinHttp failure.
+static HttpResp HttpGetOnce(const std::string& url, int timeout_ms,
+                            DWORD access_type) {
     HttpResp out;
     bool         https = false;
     std::wstring host, path;
     uint16_t     port = 0;
     if (!ParseUrl(url, https, host, port, path)) {
+        out.failed_at = "ParseUrl";
         return out;
     }
 
     HINTERNET hSes = WinHttpOpen(L"FM2K_Rollback/0.1",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        access_type,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSes) return out;
+    if (!hSes) {
+        out.last_error = GetLastError();
+        out.failed_at  = "WinHttpOpen";
+        return out;
+    }
     WinHttpSetTimeouts(hSes, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
     HINTERNET hCon = WinHttpConnect(hSes, host.c_str(), port, 0);
-    if (!hCon) { WinHttpCloseHandle(hSes); return out; }
+    if (!hCon) {
+        out.last_error = GetLastError();
+        out.failed_at  = "WinHttpConnect";
+        WinHttpCloseHandle(hSes);
+        return out;
+    }
 
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path.c_str(), nullptr,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hReq) {
+        out.last_error = GetLastError();
+        out.failed_at  = "WinHttpOpenRequest";
         WinHttpCloseHandle(hCon);
         WinHttpCloseHandle(hSes);
         return out;
@@ -230,8 +256,17 @@ HttpResp HttpGet(const std::string& url, int timeout_ms = 15000) {
 
     BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
     if (!ok) {
+        out.last_error = GetLastError();
+        out.failed_at  = "WinHttpSendRequest";
+        WinHttpCloseHandle(hReq);
+        WinHttpCloseHandle(hCon);
+        WinHttpCloseHandle(hSes);
+        return out;
+    }
+    if (!WinHttpReceiveResponse(hReq, nullptr)) {
+        out.last_error = GetLastError();
+        out.failed_at  = "WinHttpReceiveResponse";
         WinHttpCloseHandle(hReq);
         WinHttpCloseHandle(hCon);
         WinHttpCloseHandle(hSes);
@@ -260,6 +295,23 @@ HttpResp HttpGet(const std::string& url, int timeout_ms = 15000) {
     WinHttpCloseHandle(hCon);
     WinHttpCloseHandle(hSes);
     return out;
+}
+
+// Public: tries auto-proxy first, then falls back to no-proxy if WinHttp
+// failed before getting an HTTP response. Covers the case where WPAD
+// auto-detection stalls or returns a bad proxy that breaks the
+// connection — common on machines with broken/orphaned VPN clients.
+HttpResp HttpGet(const std::string& url, int timeout_ms = 15000) {
+    HttpResp r = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY);
+    if (r.status == 0 && r.last_error != 0) {
+        // Any WinHttp-level failure → retry without proxy detection.
+        HttpResp r2 = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_NO_PROXY);
+        if (r2.status > 0) return r2;
+        // Both failed — return the auto-proxy result so the error code
+        // matches the typical failure mode (most users hit this path
+        // because of AV/firewall, not because of proxy config).
+    }
+    return r;
 }
 
 }  // namespace
@@ -365,8 +417,30 @@ Pairing* Begin(const std::string& hub_base_url) {
         // Step 1: ask the hub for a pairing code + authorize URL.
         HttpResp begin = HttpGet(p->hub_base_url_ + "/pair/begin");
         if (begin.status != 200) {
+            // Map common WinHttp error codes to actionable hints. Code
+            // list: docs.microsoft.com/en-us/windows/win32/winhttp/error-messages
+            const char* hint = "";
+            switch (begin.last_error) {
+                case 12002: hint = " — timeout, hub unreachable (firewall / port blocked / VPN)"; break;
+                case 12007: hint = " — DNS lookup failed for hub host"; break;
+                case 12029: hint = " — connection refused (firewall / AV web shield / hub down)"; break;
+                case 12030: hint = " — connection dropped"; break;
+                case 12152: hint = " — bad response from hub (hub crashed?)"; break;
+                case 12175: hint = " — TLS handshake failed (clock skew / cert issue)"; break;
+                case 0:     hint = "";  break;  // normal HTTP-level failure
+                default:    hint = " — WinHttp error";  break;
+            }
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "Hub didn't respond (http=%d, win32=%lu, at=%s)%s\n"
+                "Workarounds: pause AV web shield, run as admin, try VPN.",
+                begin.status, (unsigned long)begin.last_error,
+                begin.failed_at && *begin.failed_at ? begin.failed_at : "?",
+                hint);
             std::lock_guard<std::mutex> lk(p->mtx_);
-            p->error_ = "Hub didn't respond (status=" + std::to_string(begin.status) + ")";
+            p->error_ = buf;
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DiscordAuth: /pair/begin failed: %s", buf);
             p->status_.store((int)Pairing::Status::Error);
             return;
         }
