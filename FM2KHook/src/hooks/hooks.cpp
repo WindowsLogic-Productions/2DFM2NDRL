@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
 #include "netplay.h"
 #include "control_channel.h"
 #include "../netplay/game_hash.h"
@@ -97,6 +100,9 @@ static timeGetTime_t original_timeGetTime = nullptr;
 using LoadStageFileAlt_t = int(__cdecl*)(int, int, int);
 static LoadStageFileAlt_t original_LoadStageFileAlt = nullptr;
 extern "C" uint32_t Netplay_PeekNextRolledStage();  // 0xFFFFFFFF if random off
+// Forward decl — definition at line ~280. Used by Hook_CreateFileA/W to
+// register virtual-file aliases for .player loads (other agent's WIP).
+extern "C" void MaybeRegisterPlayerVFileA(HANDLE h, LPCSTR name);
 static int __cdecl Hook_LoadStageFileAlt(int stage_id, int slot, int palette) {
     if constexpr (FM2K::kIsFM95) {
         const uint32_t override_id = Netplay_PeekNextRolledStage();
@@ -180,21 +186,251 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share,
                 HANDLE h = CreateFileW(wide.data(), access,
                                        share | kRelaxedShareMode,
                                        sa, disp, flags, tmpl);
-                if (h != INVALID_HANDLE_VALUE) return h;
+                if (h != INVALID_HANDLE_VALUE) {
+                    extern void MaybeRegisterPlayerVFile(HANDLE, LPCWSTR);
+                    MaybeRegisterPlayerVFile(h, wide.data());
+                    return h;
+                }
                 // W path failed — fall through to A so a system-codepage
                 // path (e.g. ASCII like "log.txt") still has a chance.
             }
         }
     }
-    return original_CreateFileA(name, access, share | kRelaxedShareMode,
-                                sa, disp, flags, tmpl);
+    HANDLE h = original_CreateFileA(name, access, share | kRelaxedShareMode,
+                                    sa, disp, flags, tmpl);
+    if (h != INVALID_HANDLE_VALUE && name) {
+        MaybeRegisterPlayerVFileA(h, name);
+    }
+    return h;
 }
 
 static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share,
                                       LPSECURITY_ATTRIBUTES sa, DWORD disp,
                                       DWORD flags, HANDLE tmpl) {
-    return original_CreateFileW(name, access, share | kRelaxedShareMode,
-                                sa, disp, flags, tmpl);
+    HANDLE h = original_CreateFileW(name, access, share | kRelaxedShareMode,
+                                    sa, disp, flags, tmpl);
+    // VFile slurp registration handled below via the path-aware extension.
+    extern void MaybeRegisterPlayerVFile(HANDLE, LPCWSTR);
+    if (h != INVALID_HANDLE_VALUE && name) {
+        MaybeRegisterPlayerVFile(h, name);
+    }
+    return h;
+}
+
+// ============================================================================
+// Fast .player loader: VFile syscall-collapse intercept
+// ============================================================================
+// FM2K's `character_data_loader@0x403600` issues 200+ tiny ReadFile syscalls
+// per character (one per sound header + one per sound payload). On modern
+// Windows each syscall costs ~150 µs of kernel ping-pong; for a 100-150
+// sound character that's 30 ms of syscall overhead PER LOAD — and a CSS
+// cursor flick triggers one of these synchronously every time the user
+// moves to a new character.
+//
+// This intercept slurps the entire .player file in ONE big ReadFile on
+// open, then serves all subsequent ReadFile / SetFilePointer / etc. calls
+// from RAM. The original loader runs unchanged but its inner loop becomes
+// memcpy-bound (~50 ns per "syscall") instead of kernel-bound. Net effect:
+// ~30-62 ms cold first hover → ~5 ms (NVMe disk-read time only). Repeat
+// hovers within a session hit the OS page cache for <1 ms.
+//
+// Gated on `FM2K_FAST_PLAYER_LOAD=1`. Off by default so behavior is bit-
+// identical to vanilla until explicitly opted in via the launcher dev
+// panel. Doesn't change parse semantics — every byte the original loader
+// would see, it still sees, just from RAM not disk.
+
+namespace {
+
+struct VFile {
+    std::vector<uint8_t> data;
+    size_t offset = 0;
+};
+
+// Toggle initialized at hook install time from FM2K_FAST_PLAYER_LOAD env var.
+bool g_fast_player_load = false;
+
+// Map of OS handle → buffered .player content. Real Windows handles are
+// returned to the game (no synthetic-handle plumbing) so any other API
+// the game might call on the handle (GetFileSize, etc.) still works.
+std::mutex                                          g_vfile_mtx;
+std::unordered_map<HANDLE, std::unique_ptr<VFile>>  g_vfiles;
+
+// Aggregate timing across the session so we can see the win in the log.
+LONGLONG g_qpc_freq      = 0;
+LONGLONG g_qpc_load_sum  = 0;
+uint32_t g_qpc_load_count = 0;
+
+inline bool ends_with_player_a(const char* path) {
+    if (!path) return false;
+    size_t n = std::strlen(path);
+    if (n < 7) return false;
+    return _strnicmp(path + n - 7, ".player", 7) == 0;
+}
+
+inline bool ends_with_player_w(LPCWSTR path) {
+    if (!path) return false;
+    size_t n = wcslen(path);
+    if (n < 7) return false;
+    return _wcsnicmp(path + n - 7, L".player", 7) == 0;
+}
+
+}  // anon
+
+// Slurp full file content into a VFile and register the handle. Called
+// from Hook_CreateFileA/W with the real OS handle returned by the
+// original CreateFile. Failures leave the handle alone — the game's
+// existing per-byte ReadFile path runs as a fallback.
+extern "C" void MaybeRegisterPlayerVFileA(HANDLE h, LPCSTR name) {
+    if (!g_fast_player_load) return;
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) return;
+    if (!ends_with_player_a(name)) return;
+
+    LARGE_INTEGER sz_li{};
+    if (!::GetFileSizeEx(h, &sz_li)) return;
+    if (sz_li.QuadPart <= 0 || sz_li.QuadPart > 64LL * 1024 * 1024) return;
+
+    DWORD sz = static_cast<DWORD>(sz_li.QuadPart);
+    auto vf = std::make_unique<VFile>();
+    vf->data.resize(sz);
+
+    LARGE_INTEGER t0{}, t1{};
+    if (g_qpc_freq) ::QueryPerformanceCounter(&t0);
+
+    DWORD got = 0;
+    BOOL ok = ::ReadFile(h, vf->data.data(), sz, &got, nullptr);
+    if (!ok || got != sz) return;
+
+    if (g_qpc_freq) ::QueryPerformanceCounter(&t1);
+
+    // Reset OS file position to 0 so anything that bypasses the
+    // intercept (e.g. another DLL holding the same handle) sees the
+    // start of the stream.
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER cur{};
+    ::SetFilePointerEx(h, zero, &cur, FILE_BEGIN);
+
+    {
+        std::lock_guard<std::mutex> lk(g_vfile_mtx);
+        g_vfiles[h] = std::move(vf);
+    }
+
+    if (g_qpc_freq) {
+        LONGLONG dt_us = (t1.QuadPart - t0.QuadPart) * 1'000'000LL / g_qpc_freq;
+        g_qpc_load_sum += dt_us;
+        ++g_qpc_load_count;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[FastPlayer] slurp '%s' %u B in %lld us",
+                    name, sz, dt_us);
+    }
+}
+
+void MaybeRegisterPlayerVFile(HANDLE h, LPCWSTR name) {
+    if (!g_fast_player_load) return;
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) return;
+    if (!ends_with_player_w(name)) return;
+    // Reuse the A path by transcoding the name for the log message only.
+    char utf8[1024] = {0};
+    ::WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr, nullptr);
+    MaybeRegisterPlayerVFileA(h, utf8[0] ? utf8 : "<wide>");
+}
+
+// ─── ReadFile / SetFilePointer / CloseHandle hooks ──────────────────────
+// All four hot-path handle APIs get a fast lookup. Non-VFile handles fall
+// through to the original via a single map.find() — typically ~30 ns,
+// invisible against the work the game is doing on the same call.
+
+using ReadFile_t          = BOOL (WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using SetFilePointer_t    = DWORD(WINAPI*)(HANDLE, LONG, PLONG, DWORD);
+using SetFilePointerEx_t  = BOOL (WINAPI*)(HANDLE, LARGE_INTEGER, PLARGE_INTEGER, DWORD);
+using CloseHandle_t       = BOOL (WINAPI*)(HANDLE);
+
+static ReadFile_t          original_ReadFile         = nullptr;
+static SetFilePointer_t    original_SetFilePointer   = nullptr;
+static SetFilePointerEx_t  original_SetFilePointerEx = nullptr;
+static CloseHandle_t       original_CloseHandle      = nullptr;
+
+static BOOL WINAPI Hook_ReadFile(HANDLE h, LPVOID buf, DWORD n,
+                                 LPDWORD got, LPOVERLAPPED ov) {
+    if (g_fast_player_load) {
+        std::lock_guard<std::mutex> lk(g_vfile_mtx);
+        auto it = g_vfiles.find(h);
+        if (it != g_vfiles.end()) {
+            VFile& vf = *it->second;
+            DWORD remaining = (vf.offset >= vf.data.size())
+                              ? 0u
+                              : (DWORD)(vf.data.size() - vf.offset);
+            DWORD avail = (n < remaining) ? n : remaining;
+            if (avail && buf) {
+                std::memcpy(buf, vf.data.data() + vf.offset, avail);
+                vf.offset += avail;
+            }
+            if (got) *got = avail;
+            return TRUE;
+        }
+    }
+    return original_ReadFile(h, buf, n, got, ov);
+}
+
+static DWORD WINAPI Hook_SetFilePointer(HANDLE h, LONG dist, PLONG hi,
+                                        DWORD method) {
+    if (g_fast_player_load) {
+        std::lock_guard<std::mutex> lk(g_vfile_mtx);
+        auto it = g_vfiles.find(h);
+        if (it != g_vfiles.end()) {
+            VFile& vf = *it->second;
+            int64_t dist64 = dist;
+            if (hi) {
+                dist64 = (int64_t)((uint64_t)(uint32_t)dist
+                                  | ((uint64_t)(uint32_t)*hi << 32));
+            }
+            int64_t newpos;
+            switch (method) {
+                case FILE_BEGIN:   newpos = dist64; break;
+                case FILE_CURRENT: newpos = (int64_t)vf.offset + dist64; break;
+                case FILE_END:     newpos = (int64_t)vf.data.size() + dist64; break;
+                default:           return INVALID_SET_FILE_POINTER;
+            }
+            if (newpos < 0) newpos = 0;
+            if ((uint64_t)newpos > vf.data.size()) newpos = vf.data.size();
+            vf.offset = (size_t)newpos;
+            if (hi) *hi = (LONG)((uint64_t)newpos >> 32);
+            return (DWORD)((uint64_t)newpos & 0xFFFFFFFFu);
+        }
+    }
+    return original_SetFilePointer(h, dist, hi, method);
+}
+
+static BOOL WINAPI Hook_SetFilePointerEx(HANDLE h, LARGE_INTEGER dist,
+                                         PLARGE_INTEGER newpos_out,
+                                         DWORD method) {
+    if (g_fast_player_load) {
+        std::lock_guard<std::mutex> lk(g_vfile_mtx);
+        auto it = g_vfiles.find(h);
+        if (it != g_vfiles.end()) {
+            VFile& vf = *it->second;
+            int64_t newpos;
+            switch (method) {
+                case FILE_BEGIN:   newpos = dist.QuadPart; break;
+                case FILE_CURRENT: newpos = (int64_t)vf.offset + dist.QuadPart; break;
+                case FILE_END:     newpos = (int64_t)vf.data.size() + dist.QuadPart; break;
+                default:           return FALSE;
+            }
+            if (newpos < 0) newpos = 0;
+            if ((uint64_t)newpos > vf.data.size()) newpos = vf.data.size();
+            vf.offset = (size_t)newpos;
+            if (newpos_out) newpos_out->QuadPart = newpos;
+            return TRUE;
+        }
+    }
+    return original_SetFilePointerEx(h, dist, newpos_out, method);
+}
+
+static BOOL WINAPI Hook_CloseHandle(HANDLE h) {
+    if (g_fast_player_load) {
+        std::lock_guard<std::mutex> lk(g_vfile_mtx);
+        g_vfiles.erase(h);  // no-op if not a VFile handle
+    }
+    return original_CloseHandle(h);
 }
 
 // ============================================================================
@@ -552,9 +788,19 @@ static void CheckGameModeTransition() {
         // 300-frame (3 second @ 100 Hz) state dump so we can diff
         // working games (WonderfulWorld) vs broken ones (SFZ, StudioS
         // Fighters) at battle entry. Reset the per-window counter.
-        bool boundary =
-            (IsCSSMode(g_last_game_mode)    && IsBattleMode(current_mode)) ||
-            (IsBattleMode(g_last_game_mode) && IsCSSMode(current_mode));
+        // BATTLE-DIAG window: gated on FM2K_BATTLE_DIAG=1. Off by default
+        // because each open-window dumps 300 frames of [BD ##] state into
+        // the log per CSS↔battle transition — useful for diffing broken
+        // FM2K variants at battle entry but pure noise during normal play.
+        // Cached once at first call.
+        static int s_battle_diag_enabled = -1;
+        if (s_battle_diag_enabled < 0) {
+            const char* v = std::getenv("FM2K_BATTLE_DIAG");
+            s_battle_diag_enabled = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+        }
+        bool boundary = s_battle_diag_enabled &&
+            ((IsCSSMode(g_last_game_mode)    && IsBattleMode(current_mode)) ||
+             (IsBattleMode(g_last_game_mode) && IsCSSMode(current_mode)));
         if (boundary) {
             g_battle_diag_frames_remaining = 300;
             g_battle_diag_frame_idx = 0;
@@ -562,71 +808,19 @@ static void CheckGameModeTransition() {
                 ">>> BATTLE-DIAG window OPEN (300 frames) <<<");
         }
 
-        // Spectator: never run player-state-machine code on transitions
-        // (no BATTLE_ENTERING, no GekkoNet session, etc.). But we DO need
-        // to mirror the deterministic RNG reseeds the host performs at
-        // both 2000→3000 (Netplay_StartBattle) and at every CSS-SYNC
-        // (Netplay_ProcessCSS). Without this mirroring the spectator's RNG
-        // diverges from the host the moment battle starts: spectator's
-        // RNG is whatever CSS evolved to, host's was just force-written
-        // back to 0x12345678. One frame is enough to desync.
+        // Spectator: state init no longer mirrors via local game_mode flips.
+        // Host emits PIN_RNG / RESET_INPUT_STATE / SOUND_INIT ops as part of
+        // the SessionEvent stream (see Netplay_StartBattle, Netplay_ProcessCSS,
+        // CheckFullyConnected); the spectator applies them in
+        // SpectatorNode_PopFrameInputs's head-drain at the moment its local
+        // sim is about to consume the corresponding INPUT — same logical
+        // frame the host's pin happened. Eliminates the off-by-N race
+        // between host-side write and spectator-side game_mode flip.
+        //
+        // Just bail before any host-only player-state-machine work runs,
+        // and let the BATTLE-DIAG window + capture pipeline above still
+        // observe the boundary for diagnostics.
         if (g_spectator_mode) {
-            constexpr uint32_t HOST_FIXED_SEED = 0x12345678;
-            bool was_battle = IsBattleMode(g_last_game_mode);
-            bool is_battle  = IsBattleMode(current_mode);
-            bool was_css    = IsCSSMode(g_last_game_mode);
-            bool is_css     = IsCSSMode(current_mode);
-
-            if (!was_battle && is_battle) {
-                // CSS → battle. Mirror Netplay_StartBattle's seed pin AND
-                // SaveState_Save's first-call "initial sync" reset of input
-                // tracking state. Host hits this reset on its first battle
-                // SaveEvent (savestate.cpp:223-237). Spectator never runs
-                // Save/Load, so without this mirror the spectator carries
-                // its CSS-evolved input_buffer_index (~600) into battle while
-                // the host's is reset to 0 — every input_history[idx-N]
-                // read (combo windows, charge inputs) returns different
-                // values on the two sides. Permanent battle desync.
-                *(uint32_t*)FM2K::ADDR_RANDOM_SEED = HOST_FIXED_SEED;
-                *(uint32_t*)0x447EE0 = 0;            // g_input_buffer_index
-                *(uint32_t*)0x4456FC = 0;            // render frame counter
-                memset((void*)0x447F00, 0, 0x20);    // g_prev_input_state
-                memset((void*)0x447F40, 0, 0x20);    // g_processed_input
-                memset((void*)0x447F60, 0, 0x20);    // g_input_changes
-                memset((void*)0x4280D8, 0, 0x2008);  // input_history rings (P1+P2)
-
-                // CRITICAL: initialize the SoundRollback channel table so the
-                // dispatch_script_sound hook's Mike-Z dedup logic returns the
-                // same suppress/pass decisions on spectator as on host. Without
-                // this, host suppresses ~thousands of redundant sound dispatches
-                // (RecordDesired returns true → original dispatcher skipped),
-                // but spectator's table is empty (RecordDesired returns false)
-                // → spectator runs original_dispatch_script_sound for EVERY
-                // call. Whatever game_rand calls live inside FM2K's
-                // dispatch_script_sound (pitch/pan jitter most likely) then
-                // run on spectator but not host → RNG drifts on every frame
-                // with sound activity. Verified via paired [HOST-FP]/[SPEC-FP]
-                // logs: bf=0..270 RNG matched, bf=300+ diverged after first
-                // sound dispatch, with all other state (HP/timer/pos/input)
-                // still matching = isolated to RNG.
-                SoundRollback::Init();
-
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Spectator: battle entry — pinned RNG to 0x%08X, "
-                            "reset input_buf_idx + edge state + history rings, "
-                            "SoundRollback::Init",
-                            HOST_FIXED_SEED);
-            } else if (!was_css && is_css) {
-                // Anything → CSS (rematch). Mirror Netplay_ProcessCSS's
-                // CSS-SYNC reseed so the next match's CSS evolves the
-                // RNG identically to the host's.
-                *(uint32_t*)FM2K::ADDR_RANDOM_SEED = HOST_FIXED_SEED;
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Spectator: CSS entry — pinned RNG to 0x%08X",
-                            HOST_FIXED_SEED);
-                // (Save/load mirror tear-down removed — see battle-entry comment.)
-            }
-
             g_last_game_mode = current_mode;
             return;
         }
@@ -1661,6 +1855,17 @@ typedef int(__cdecl* DispatchScriptSoundFunc)(int);
 static DispatchScriptSoundFunc original_dispatch_script_sound = nullptr;
 
 int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
+    // Spectator catch-up mute (C5.5). While the spectator is burning
+    // through queued events to reach live edge, we run sim only — no
+    // render, no audio. Without this, joining 30k events late would
+    // blast 5 minutes of compressed audio in the few seconds it takes
+    // to drain. SoundRollback's dedup table still updates on the host
+    // pass (RecordDesired runs as part of the sim), so steady-state
+    // dispatch stays correct once catch-up clears.
+    if (g_spectator_catchup) {
+        return 0;
+    }
+
     // Mute gates — applied UNCONDITIONALLY (offline + online + spectator).
     // Re-checks the audio.ini file ~once per second so the launcher's
     // toggle reaches the running game without a separate IPC channel.
@@ -2290,6 +2495,60 @@ bool InitializeHooks() {
                             "Hooks: CreateFileW hooked (relaxed share mode)");
             }
         }
+
+        // ── Fast .player load: collapse syscall storm ──
+        // Gated on FM2K_FAST_PLAYER_LOAD env var. Hooks always install (so
+        // the toggle can be flipped without re-injecting); the per-hook
+        // fast-paths early-out when the flag is false.
+        if (const char* env_fpl = std::getenv("FM2K_FAST_PLAYER_LOAD")) {
+            g_fast_player_load = (env_fpl[0] == '1');
+        }
+        // QPC frequency for the slurp timing log; if it ever fails, we
+        // disable the timing path (load still works, just no instrumentation).
+        LARGE_INTEGER freq{};
+        if (::QueryPerformanceFrequency(&freq) && freq.QuadPart > 0) {
+            g_qpc_freq = freq.QuadPart;
+        }
+        void* real_ReadFile         = (void*)GetProcAddress(kernel32, "ReadFile");
+        void* real_SetFilePointer   = (void*)GetProcAddress(kernel32, "SetFilePointer");
+        void* real_SetFilePointerEx = (void*)GetProcAddress(kernel32, "SetFilePointerEx");
+        void* real_CloseHandle      = (void*)GetProcAddress(kernel32, "CloseHandle");
+
+        if (real_ReadFile) {
+            if (MH_CreateHook(real_ReadFile, (void*)Hook_ReadFile,
+                              (void**)&original_ReadFile) != MH_OK ||
+                MH_EnableHook(real_ReadFile) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook ReadFile");
+            }
+        }
+        if (real_SetFilePointer) {
+            if (MH_CreateHook(real_SetFilePointer, (void*)Hook_SetFilePointer,
+                              (void**)&original_SetFilePointer) != MH_OK ||
+                MH_EnableHook(real_SetFilePointer) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook SetFilePointer");
+            }
+        }
+        if (real_SetFilePointerEx) {
+            if (MH_CreateHook(real_SetFilePointerEx, (void*)Hook_SetFilePointerEx,
+                              (void**)&original_SetFilePointerEx) != MH_OK ||
+                MH_EnableHook(real_SetFilePointerEx) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook SetFilePointerEx");
+            }
+        }
+        if (real_CloseHandle) {
+            if (MH_CreateHook(real_CloseHandle, (void*)Hook_CloseHandle,
+                              (void**)&original_CloseHandle) != MH_OK ||
+                MH_EnableHook(real_CloseHandle) != MH_OK) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hooks: Failed to hook CloseHandle");
+            }
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: FM2K_FAST_PLAYER_LOAD=%s (ReadFile/SetFP/CloseHandle hooked)",
+                    g_fast_player_load ? "1 (active)" : "0 (passthrough)");
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: All hooks installed successfully");
