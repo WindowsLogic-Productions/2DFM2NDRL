@@ -40,7 +40,7 @@ constexpr uint8_t TAG_PROBE      = 0x01;
 constexpr uint8_t TAG_ACK        = 0x02;
 constexpr uint8_t TAG_CTRL_PUNCH = 0x10;
 
-constexpr size_t USER_ID_LEN     = 12;
+constexpr size_t USER_ID_LEN     = 24;  // fits Discord snowflake (≤19) + "_<suffix>"; hub STUN_USER_ID_LEN must match
 constexpr size_t MATCH_TOKEN_LEN = 16;
 
 bool g_have_reflexive = false;
