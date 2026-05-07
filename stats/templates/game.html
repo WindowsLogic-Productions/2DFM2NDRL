@@ -1,67 +1,94 @@
 {% extends "base.html" %}
-{% block title %}{{ friendly_name(g.game_id) }} — FM2K Stats{% endblock %}
+{% block title %}{{ friendly_name(g.game_id) }} · 2DFM HUB{% endblock %}
 {% block content %}
+
 <section class="hero">
   <h1>{{ friendly_name(g.game_id) }}</h1>
-  <p class="lede"><strong>{{ g.total }}</strong> matches recorded.</p>
+  <p class="lede">
+    <strong>{{ g.total }}</strong> match{{ 'es' if g.total != 1 else '' }} recorded ·
+    cabinet ID <strong>{{ g.game_id }}</strong>
+  </p>
 </section>
 
-<section>
-  <h2>Top players</h2>
-  <table class="grid">
-    <thead><tr><th>#</th><th>Nick</th><th class="num">Matches</th></tr></thead>
-    <tbody>
-      {% for p in g.top_players %}
-      <tr>
-        <td>{{ loop.index }}</td>
-        <td><a href="/u/{{ p.user_id }}">{{ p.nick }}</a></td>
-        <td class="num">{{ p.matches }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
+<div class="cols-2">
+  <section>
+    <div class="sec-head">
+      <h2>Top Pilots</h2>
+      <span class="count">// LEADERBOARD</span>
+    </div>
+    {% if g.top_players %}
+    <table class="grid">
+      <thead><tr><th class="rank">#</th><th>Nick</th><th class="num">Matches</th></tr></thead>
+      <tbody>
+        {% for p in g.top_players %}
+        <tr>
+          <td class="rank">{{ '%02d' % loop.index }}</td>
+          <td><a href="/u/{{ p.user_id }}">{{ p.nick }}</a></td>
+          <td class="num">{{ p.matches }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No pilots logged.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Top Characters</h2>
+      <span class="count">// MOST PICKED</span>
+    </div>
+    {% if g.top_chars %}
+    <table class="grid">
+      <thead><tr><th class="rank">#</th><th>Character</th><th class="num">Picks</th></tr></thead>
+      <tbody>
+        {% for c in g.top_chars %}
+        <tr>
+          <td class="rank">{{ '%02d' % loop.index }}</td>
+          <td><a href="/g/{{ g.game_id }}/c/{{ c.char }}">{{ c.char }}</a></td>
+          <td class="num">{{ c.matches }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No character data.</p>
+    {% endif %}
+  </section>
+</div>
 
 <section>
-  <h2>Most-played characters</h2>
-  <table class="grid">
-    <thead><tr><th>#</th><th>Character</th><th class="num">Picks</th></tr></thead>
-    <tbody>
-      {% for c in g.top_chars %}
-      <tr>
-        <td>{{ loop.index }}</td>
-        <td><a href="/g/{{ g.game_id }}/c/{{ c.char }}">{{ c.char }}</a></td>
-        <td class="num">{{ c.matches }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-
-<section>
-  <h2>Recent matches</h2>
-  <table class="grid">
-    <thead><tr><th>When</th><th>P1</th><th>P2</th><th>Winner</th></tr></thead>
-    <tbody>
-      {% for m in g.recent %}
-      <tr>
-        <td>{{ format_iso(m.finished_at) }}</td>
-        <td>
-          <a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a>
-          ({{ char_label(m.p1_char_name, m.p1_char_id) }})
-        </td>
-        <td>
-          <a href="/u/{{ m.p2_id }}">{{ m.p2_nick }}</a>
-          ({{ char_label(m.p2_char_name, m.p2_char_id) }})
-        </td>
-        <td>
-          {% if not m.winner_id %}draw
-          {% elif m.winner_id == m.p1_id %}P1
-          {% else %}P2{% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="sec-head">
+    <h2>Recent Matches</h2>
+    <span class="count">// LAST {{ g.recent|length }} FIGHTS</span>
+  </div>
+  {% if g.recent %}
+  <div class="vs-feed">
+    {% for m in g.recent %}
+    {% set p1_won  = m.winner_id == m.p1_id %}
+    {% set is_draw = not m.winner_id %}
+    <div class="vs-card">
+      <div class="side p1 {{ 'win' if p1_won else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a></div>
+        <div class="char">{{ char_label(m.p1_char_name, m.p1_char_id) }}</div>
+        <div class="stat">{{ 'WIN' if p1_won else ('DRAW' if is_draw else 'LOSS') }}</div>
+      </div>
+      <div class="vs">
+        <div class="vs-text">VS</div>
+        <div class="game">{{ friendly_name(m.game_id) }}</div>
+        <div class="when">{{ format_iso(m.finished_at) }}</div>
+      </div>
+      <div class="side p2 {{ 'win' if (not p1_won and not is_draw) else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ m.p2_id }}">{{ m.p2_nick }}</a></div>
+        <div class="char">{{ char_label(m.p2_char_name, m.p2_char_id) }}</div>
+        <div class="stat">{{ 'WIN' if (not p1_won and not is_draw) else ('DRAW' if is_draw else 'LOSS') }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">No matches yet on this cabinet.</p>
+  {% endif %}
 </section>
 {% endblock %}

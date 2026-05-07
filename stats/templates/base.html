@@ -4,22 +4,38 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>{% block title %}FM2K Stats{% endblock %}</title>
+  <title>{% block title %}2DFM HUB · STATS{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <header>
+    <div class="statbar">
+      <span><span class="blink"></span>HUB ONLINE</span>
+      <span class="sep">·</span>
+      <span>RUNTIME <span class="blue">v0.1</span></span>
+      <span class="sep">·</span>
+      <span>FM<span class="pink">2K</span> + FM<span class="blue">95</span></span>
+      <span class="sep">·</span>
+      <span>READ-ONLY</span>
+    </div>
     <nav>
-      <a class="brand" href="/">FM2K Stats</a>
-      <a href="/games">Games</a>
-      <a href="/recent">Recent</a>
+      <a class="brand" href="/">2DFM<span style="opacity:.4">·</span>HUB</a>
+      <div class="links">
+        <a href="/">Overview</a>
+        <a href="/games">Games</a>
+        <a href="/recent">Recent</a>
+      </div>
     </nav>
   </header>
   <main>
     {% block content %}{% endblock %}
   </main>
   <footer>
-    <small>Read-only public stats. Match log served from the hub.</small>
+    <span>// READ-ONLY MIRROR · MATCH LOG SERVED FROM HUB</span>
+    <span style="margin: 0 0.5rem;">·</span>
+    <span class="runtime">2DFM.SYTES.NET</span>
   </footer>
 </body>
 </html>
