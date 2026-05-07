@@ -175,10 +175,17 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
     // Loopback shortcut: same-machine peers don't need NAT punch. Two
     // FM2K instances on 127.0.0.1 were eating ~2.4s each on the
     // relay-fallback timeout and 30×10ms burst, all to fight a NAT
-    // that doesn't exist. Send a tiny CTRL_PUNCH burst (still needed
-    // so the peer's TAG_CTRL_PUNCH handler authenticates us) and
-    // return synchronously — no relay wait, no thread.
-    if (peer_ip_be == htonl(INADDR_LOOPBACK)) {
+    // that doesn't exist.
+    //
+    // BUT: only safe when relay is NOT configured. If the hub gave us
+    // a relay endpoint (hub.2dfm.org:7712 + session), it means the hub
+    // expected a real cross-NAT match — and the launcher's preflight
+    // code has historically misset peer_ip=127.0.0.1 when the public
+    // probe failed even on different machines. Skipping the relay in
+    // that case left both peers sending HELLO into their own loopback
+    // forever. Fall through to the normal punch + relay-wait path so
+    // the relay saves us when the loopback assumption is wrong.
+    if (peer_ip_be == htonl(INADDR_LOOPBACK) && !g_relay_configured) {
         SOCKET sock = ControlChannel_GetSocket();
         if (sock != INVALID_SOCKET) {
             uint8_t pkt[2 + MATCH_TOKEN_LEN] = {MAGIC, TAG_CTRL_PUNCH};
@@ -191,9 +198,16 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
             }
         }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "NAT: loopback peer %s:%u — skipping NAT punch / relay wait",
+            "NAT: loopback peer %s:%u — same-box, skipping NAT punch / relay wait",
             ip_str, (unsigned)peer_port);
         return;
+    }
+    if (peer_ip_be == htonl(INADDR_LOOPBACK)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: peer claimed loopback %s:%u BUT relay configured — "
+            "running normal punch + relay path (launcher likely set "
+            "127.0.0.1 by mistake during preflight)",
+            ip_str, (unsigned)peer_port);
     }
 
     g_punching.store(true);
