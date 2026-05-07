@@ -153,6 +153,12 @@ struct LauncherUI::HubState {
     // disconnected event when the peer's WS closes. Whichever lands
     // first sets this flag; the other two skip. Reset on MatchStart.
     bool        disconnect_toast_fired = false;
+
+    // Wall-clock SDL_GetTicks() of the last successful pre-match STUN.
+    // Refreshed every ~20 s by the lobby tick so the hub-stored external
+    // port stays alive — most home NATs idle-time UDP mappings out
+    // around 30 s, so 20 s gives one re-bind worth of headroom.
+    uint32_t    last_stun_refresh_ms = 0;
 };
 
 // Case-insensitive match of `room_id` against installed games. A
@@ -286,6 +292,101 @@ static bool HubPreflightPunch(uint16_t local_port,
         (long long)elapsed, sends_done, peer_ip.c_str(),
         (unsigned)peer_port, (int)local_port);
     return peer_seen;
+}
+
+// Pre-match launcher STUN. Binds the UDP port the game will reuse, sends
+// 0xCD 0x01 STUN probe to hub:7711 with the full Discord user_id (24-byte
+// padded), so the hub records this user's *external* NAT mapping BEFORE
+// any match_start fires. Without this, hub's peer_dict() ships the
+// launcher-reported local port — which only matches reality on
+// port-preserving NATs, and silently breaks for everyone else (Comcast
+// CGNAT, Spanish ISPs that randomize ports, etc.).
+//
+// Called on Connected so the lobby is STUN-stamped from the moment we
+// appear, and refreshed periodically while we sit in the lobby. Closes
+// the socket on return — the game's hook re-binds the same local port
+// shortly after, and most cone NATs preserve the (local_port -> ext_port)
+// mapping for ≥30 s of inactivity.
+static void LauncherStunProbe(uint16_t local_port,
+                              const std::string& hub_host,
+                              uint16_t hub_udp_port,
+                              const std::string& user_id)
+{
+    if (user_id.empty()) return;
+    WSADATA wsa{};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return;
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in laddr{};
+    laddr.sin_family = AF_INET;
+    laddr.sin_port   = htons(local_port);
+    laddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(s, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr)) != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "STUN: bind() to %u failed err=%d (skipping pre-match STUN)",
+            (unsigned)local_port, WSAGetLastError());
+        closesocket(s);
+        return;
+    }
+
+    addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(hub_host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "STUN: getaddrinfo('%s') failed", hub_host.c_str());
+        closesocket(s);
+        return;
+    }
+    sockaddr_in haddr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
+    haddr.sin_port = htons(hub_udp_port);
+    freeaddrinfo(res);
+
+    constexpr size_t kUserIdLen = 24;
+    uint8_t pkt[2 + kUserIdLen] = { 0xCD, 0x01 };
+    size_t n = user_id.size();
+    if (n > kUserIdLen) n = kUserIdLen;
+    std::memcpy(pkt + 2, user_id.data(), n);
+
+    int sent = sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                      reinterpret_cast<const sockaddr*>(&haddr), sizeof(haddr));
+    if (sent != (int)sizeof(pkt)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "STUN: sendto failed err=%d", WSAGetLastError());
+    }
+
+    DWORD recv_to = 800;  // hub is on the same continent for most users; 800 ms is plenty
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&recv_to), sizeof(recv_to));
+    uint8_t buf[64];
+    sockaddr_in from{};
+    int from_len = sizeof(from);
+    int got = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                       reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (got >= 8 && buf[0] == 0xCD && buf[1] == 0x02) {
+        uint32_t ip_be = 0;
+        std::memcpy(&ip_be, buf + 2, 4);
+        uint16_t port_be = 0;
+        std::memcpy(&port_be, buf + 6, 2);
+        in_addr ia{}; ia.s_addr = ip_be;
+        char ip_str[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &ia, ip_str, sizeof(ip_str));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "STUN: hub ack — reflexive %s:%u (local=%u, user=%s)",
+            ip_str, (unsigned)ntohs(port_be), (unsigned)local_port,
+            user_id.c_str());
+    } else {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "STUN: no ack from %s:%u within 800ms (hub records mapping anyway)",
+            hub_host.c_str(), (unsigned)hub_udp_port);
+    }
+
+    closesocket(s);
 }
 
 // Read the spawned game's hook log and extract the most recent
@@ -3679,6 +3780,28 @@ void LauncherUI::PollMatchOutcome() {
 void LauncherUI::RenderHubPanel() {
     auto& hs = *hub_state_;
 
+    // Periodic pre-match STUN refresh (every 20 s while connected) so
+    // the hub-stored external NAT port stays alive even on quiet
+    // lobbies. Cheap — one UDP packet up, one back, ≤800 ms timeout.
+    // Skipped while we're in an active match (the in-game hook owns the
+    // socket then) and while the user is mid-challenge (we'd briefly
+    // bind/release the port the preflight punch is about to need).
+    if (hs.client.IsConnected() && !hs.my_id.empty() &&
+        hs.current_match_token.empty()) {
+        uint32_t now_ms = static_cast<uint32_t>(SDL_GetTicks());
+        if (hs.last_stun_refresh_ms == 0 ||
+            (now_ms - hs.last_stun_refresh_ms) > 20000) {
+            const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
+            std::string hub_host = (hub_host_env && hub_host_env[0])
+                                 ? hub_host_env
+                                 : (hub_host_[0] ? hub_host_ : "hub.2dfm.org");
+            LauncherStunProbe(
+                static_cast<uint16_t>(network_config_.local_port),
+                hub_host, 7711, hs.my_id);
+            hs.last_stun_refresh_ms = now_ms;
+        }
+    }
+
     // Drain hub events into local state once per frame.
     hs.client.Poll([&](const fm2k::HubEvent& ev) {
         using K = fm2k::HubEvent::Kind;
@@ -3693,6 +3816,26 @@ void LauncherUI::RenderHubPanel() {
                 // For LAN/internet, replace "127.0.0.1" with the hub-
                 // observed reflexive IP (Phase 2 — STUN responder).
                 hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port);
+                // Pre-match STUN. The in-game hook does its own STUN at
+                // launch but match_start fires immediately on accept and
+                // the hook's STUN doesn't arrive at the hub for several
+                // seconds (after game spawn + hook init). Without a
+                // pre-match STUN, hub.peer_dict() falls back to the
+                // launcher-reported local port, which only matches the
+                // external NAT mapping on port-preserving cone NATs —
+                // every other client gets the wrong port and punches a
+                // closed door. Doing this here means the hub has the
+                // correct (ip, ext_port) before any challenge fires.
+                {
+                    const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
+                    std::string hub_host = (hub_host_env && hub_host_env[0])
+                                         ? hub_host_env
+                                         : (hub_host_[0] ? hub_host_ : "hub.2dfm.org");
+                    LauncherStunProbe(
+                        static_cast<uint16_t>(network_config_.local_port),
+                        hub_host, 7711, hs.my_id);
+                    hs.last_stun_refresh_ms = static_cast<uint32_t>(SDL_GetTicks());
+                }
                 // Pull our own W/L/D + per-opponent breakdown so the
                 // lobby column and titlebar both have data on first
                 // render. Refreshed after every match end via the same
