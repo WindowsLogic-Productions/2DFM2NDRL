@@ -729,16 +729,27 @@ static void RunNativeTick() {
             RenderFrameWithSnapshot();
             return;
         }
-        // Timed out — log once, fall through to free-run (legacy behavior).
+        // Timed out — peer never showed up. Bleed-through to CSS lets
+        // the user "control" a non-match (no peer ever joins, but the
+        // game advances anyway), which is worse than a clean failure.
+        // Publish DISCONNECT — the launcher's PollMatchOutcome path
+        // sees that, kills the game, shows a toast, and returns the
+        // user to the lobby. We just stay frozen on title until the
+        // launcher tears the process down.
         static bool s_logged_timeout = false;
         if (!s_logged_timeout) {
             s_logged_timeout = true;
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Trampoline: handshake hold timed out after %u ms — "
-                        "running free (peer may be missing)",
+                        "publishing DISCONNECT (launcher will close us)",
                         MAX_HANDSHAKE_HOLD_MS);
+            SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DISCONNECT);
         }
-        // Fall through — let the title screen advance.
+        // Hold the snapshot until the launcher's outcome poll fires
+        // (≤500 ms) and tears the process down. No fall-through —
+        // we don't want CSS / inputs reaching the user.
+        RenderFrameWithSnapshot();
+        return;
     }
 
     if (!skip_netplay) {
@@ -968,71 +979,83 @@ static void RunSpectatorTick() {
         const char* v = std::getenv("FM2K_SPECTATOR_ALWAYS_CATCHUP");
         s_always_catchup_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
     }
-    static bool s_initial_catchup_done = false;
+    static bool s_initial_catchup_done   = false;
+    static bool s_initial_catchup_active = false;
 
-    // Suppress catchup during CSS — each cursor-move INPUT triggers a
-    // .player file load on the spectator's local FM2K, which can take
-    // 100s of ms cold-cache. Racing through CSS at catchup speed thrashes
-    // disk and visually presents a useless flicker through every
-    // character preview anyway. Let CSS replay at 1x natural pace.
-    const uint32_t local_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-    const bool in_css_phase   = (local_mode >= 2000 && local_mode < 3000);
+    // CSS catchup is now allowed. Earlier we suppressed it because catchup
+    // ran PGI+UG without render, and CSS character-preview state is heavily
+    // render-RNG dependent (cursor flicker, palette interp) — diverging there
+    // bled into battle as mirrored-character desync. Now that render fires
+    // inside the catchup loop alongside sim, RNG stays locked to host and
+    // CSS can drain like any other phase. The 250ms burst cap still bounds
+    // disk-load thrash from cold-cache .player loads (first time through
+    // each character on the roster); subsequent matches replay from warm
+    // cache and drain at full speed.
 
-    // Initial catchup latch: fire ONCE when the queue first exceeds the
-    // lag target — whether we engage catchup this tick or not.
-    //   - Joined mid-battle: latch fires AND catchup engages (drains
-    //     backfill to live edge, like other rollback game spectators).
-    //   - Joined mid-CSS: latch fires but catchup is suppressed (CSS
-    //     replay would thrash disk on .player loads). When CSS ends
-    //     and game_mode flips to battle, the latch is already set so
-    //     we DON'T re-engage initial catchup — spectator stays at
-    //     whatever delay accumulated during CSS replay. User can press
-    //     F12 once in battle if they want to catch up.
-    // Without this two-step (latch then conditionally engage), the
-    // CSS-phase wait left s_initial_catchup_done=false until battle,
-    // and the first battle tick burst-drained 1500+ buffered frames
-    // in <1 sec — the "jumps to live on CSS→battle" symptom.
-    const bool first_threshold_hit = !s_initial_catchup_done &&
-                                     qd > SPECTATOR_LIVE_LAG_FRAMES;
-    if (first_threshold_hit) {
-        s_initial_catchup_done = true;
+    // Initial catchup state machine. Engages once when the queue first
+    // exceeds the lag target (typically right after JOIN_ACK + backfill
+    // replay), stays engaged across MANY outer ticks — bounded per-tick by
+    // CATCHUP_MAX_BURST_MS so we yield between bursts — until the queue
+    // actually drops to the live edge. Then disengages permanently for
+    // this session: later jitter or packet-loss accumulation no longer
+    // re-triggers a catchup burst (no jarring superspeed snap-to-live).
+    // The whole point is "drain backfill ONCE, smoothly". Without this,
+    // the previous one-shot semantics gave us 30 frames of drain and left
+    // the other 1100+ buffered, so first battle started 11 seconds behind
+    // host with no recovery path short of F12.
+    if (!s_initial_catchup_done && !s_initial_catchup_active &&
+        qd > SPECTATOR_LIVE_LAG_FRAMES) {
+        s_initial_catchup_active = true;
     }
-
-    const bool needs_initial_catchup = first_threshold_hit && !in_css_phase;
+    if (s_initial_catchup_active && qd <= SPECTATOR_LIVE_LAG_FRAMES) {
+        s_initial_catchup_active = false;
+        s_initial_catchup_done   = true;
+    }
+    const bool needs_initial_catchup = s_initial_catchup_active;
     const bool needs_always_catchup  = s_always_catchup_env != 0 &&
-                                       qd > SPECTATOR_LIVE_LAG_FRAMES &&
-                                       !in_css_phase;
+                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
     // User-toggled FF (F12) is the explicit "speed up to live" lever.
-    // Honors CSS suppression like the other catchup tiers — pressing F12
-    // during CSS does nothing useful (cursor flicker through char
-    // previews) so we ignore it. User can press again once in battle.
     const bool needs_user_ff         = g_spectator_ff_user &&
-                                       qd > SPECTATOR_LIVE_LAG_FRAMES &&
-                                       !in_css_phase;
+                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
+    // Render parity is required during catchup — every phase. Render-side
+    // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
+    // mode 3, particle FX) run on the host once per simulated frame. If the
+    // spectator's catchup loop runs PGI+UG N times but renders only once per
+    // outer tick, the host advances the RNG by N renders' worth while we
+    // advance by 1, and state diverges in proportion to catchup speedup.
+    // Symptom: F12-fast-forward in battle desynced HP/positions/scripts even
+    // with PIN_RNG synced — render mutations had been silently dropped for
+    // 50+ catchup-loop iterations. Render in the loop costs more GPU but
+    // keeps RNG locked to host across CSS, battle, and inter-match drain.
     g_spectator_catchup = needs_initial_catchup || needs_always_catchup ||
                           needs_user_ff;
 
     const uint64_t catchup_start_ms = GetTickCount64();
     while (g_spectator_catchup) {
         if (!SpectatorSimOneFrame()) break;
+        RenderFrameWithSnapshot();
         ControlChannel_Poll();   // keeps TCP recv drained, no failover side-effects
         if (SpectatorNode_PendingFrameCount() <= SPECTATOR_LIVE_LAG_FRAMES) {
-            s_initial_catchup_done = true;
-            g_spectator_catchup    = false;
-            break;
+            // Live edge reached. The outer-tick state machine flips
+            // s_initial_catchup_active → s_initial_catchup_done next
+            // call, so this branch only needs to bail.
+            g_spectator_catchup = false;
+            return;  // catchup-final tick already sim'd + rendered
         }
         if (GetTickCount64() - catchup_start_ms >= CATCHUP_MAX_BURST_MS) {
-            // Bounded — yield to the outer tick. Catchup re-engages
-            // next frame if we're still over the lag target.
-            break;
+            // Bounded — yield to the outer tick. Catchup re-engages next
+            // tick if we're still over the lag target. We've already
+            // rendered this iteration, so return without the trailing
+            // steady-state sim+render.
+            g_spectator_catchup = false;
+            return;
         }
     }
     g_spectator_catchup = false;  // safety: clear before render path
 
-    // Steady-state path: one popped frame, one render. Reached either after
-    // catch-up brought queue depth ≤ LIVE_LAG_FRAMES, or directly when the
-    // queue was already in the live band. Skip render when no INPUT was
-    // available (drained head non-INPUTs only).
+    // Steady-state path: one popped frame, one render. Reached when catchup
+    // never engaged (queue was already in the live band). Skip render when no
+    // INPUT was available (drained head non-INPUTs only).
     if (!SpectatorSimOneFrame()) {
         RenderFrameWithSnapshot();
         return;
