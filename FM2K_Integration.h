@@ -628,15 +628,18 @@ private:
     bool LaunchLocalSpectator2(const std::string& game_path,
                                int spectator_port,
                                int upstream_port);
+public:
     // Launch a spectator pointing at an arbitrary remote host (typically
     // received via hub spectate_grant). Used by the lobby UI's "click an
-    // active match to watch it" path. spectator_port is local UDP bind;
-    // host_ip:host_port is where the spectator's FM2K_REMOTE_ADDR points
-    // and the SpectatorNode JOIN_REQ is sent.
+    // active match to watch it" path AND the --spectate CLI flag for e2e
+    // testing. spectator_port is local UDP bind; host_ip:host_port is where
+    // the spectator's FM2K_REMOTE_ADDR points and SpectatorNode JOIN_REQ
+    // is sent.
     bool LaunchRemoteSpectator(const std::string& game_path,
                                int spectator_port,
                                const std::string& host_ip,
                                int host_port);
+private:
     bool TerminateAllClients();
     
     

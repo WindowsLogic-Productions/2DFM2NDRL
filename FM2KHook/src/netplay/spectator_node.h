@@ -44,6 +44,18 @@ enum class SpecDataType : uint8_t {
                         // INPUT_BATCH starting at that frame (or empty if
                         // not yet recorded). Gives bulletproof delivery —
                         // any persistent gap gets re-requested until filled.
+    EVENT_BATCH   = 5,  // Payload = packed SessionEvent[] stream (variable-
+                        // length, each event is 1-byte type + variant payload).
+                        // Replaces INPUT_BATCH for the C2+ wire format —
+                        // carries inputs interleaved with PIN_RNG /
+                        // RESET_INPUT_STATE / SOUND_INIT / MATCH_START /
+                        // MATCH_END / FINGERPRINT ops in a single ordered
+                        // stream. SpecDataHeader.start_frame is the
+                        // session-relative index of the first INPUT event
+                        // in this batch; frame_count is the number of INPUT
+                        // events (non-INPUT events are not counted). flags
+                        // bit 0 set = the batch begins with deferred ops
+                        // (ops with no following INPUT in this batch).
 };
 
 #pragma pack(push, 1)
@@ -56,6 +68,95 @@ struct SpecDataHeader {
 };
 static_assert(sizeof(SpecDataHeader) == 10, "SpecDataHeader must be 10 bytes");
 #pragma pack(pop)
+
+// =============================================================================
+// SESSION EVENT STREAM (C1+: typed event log)
+// =============================================================================
+//
+// One ordered event stream replaces the old "INPUT_BATCH only" wire format.
+// Every state mutation the host applies — RNG pin, input-state reset, sound
+// dedup re-init, match boundaries, per-frame inputs — is appended as a typed
+// event in the same vector. The spectator drains the stream in order: non-
+// INPUT events at the head are applied immediately; INPUT events are popped
+// one per sim tick.
+//
+// "Frame number" is implicit: it's the index of the next INPUT event in the
+// stream. Non-INPUT events execute *before* the input that follows them.
+// This collapses ordering — there's no separate "ops timeline" to schedule
+// against the input timeline, which is exactly the race that caused the
+// game_mode-driven CheckGameModeTransition spectator branch to desync.
+//
+// Wire encoding per event (1-byte type tag + variant payload):
+//
+//   Type | Tag | Wire payload          | Bytes (incl. tag)
+//   ---------------------------------------------------------
+//   INPUT             | 1 | u16 p1, u16 p2     | 5
+//   PIN_RNG           | 2 | u32 seed           | 5
+//   RESET_INPUT_STATE | 3 | (none)             | 1
+//   SOUND_INIT        | 4 | (none)             | 1
+//   MATCH_START       | 5 | u8[96] ReplayHeader| 97
+//   MATCH_END         | 6 | (none)             | 1
+//   FINGERPRINT       | 7 | u32 fletcher32     | 5
+//
+// Endianness: little-endian throughout (matches FM2K's native layout).
+enum class SessionEventType : uint8_t {
+    INPUT             = 1,
+    PIN_RNG           = 2,
+    RESET_INPUT_STATE = 3,
+    SOUND_INIT        = 4,
+    MATCH_START       = 5,
+    MATCH_END         = 6,
+    FINGERPRINT       = 7,
+};
+
+constexpr size_t SESSION_EVENT_MATCH_HDR_SIZE = 96;
+constexpr size_t SESSION_EVENT_MAX_WIRE_SIZE  = 1 + SESSION_EVENT_MATCH_HDR_SIZE;  // 97 (MATCH_START)
+
+// Compact in-memory event. MATCH_START's 96-byte header is stored out-of-
+// band in a parallel vector (see g_state.match_headers in spectator_node.cpp)
+// keyed by match_start_idx. Keeps SessionEvent fixed at 5 bytes so a
+// vector<SessionEvent> for a 1-hour 100 Hz set stays at ~1.7 MB instead of
+// ~35 MB if MATCH_START's 96-byte payload were inline.
+#pragma pack(push, 1)
+struct SessionEvent {
+    SessionEventType type;          // 1 byte
+    union {                         // 4 bytes — same size across all variants
+        struct { uint16_t p1; uint16_t p2; } input;
+        uint32_t                             pin_rng_seed;
+        uint32_t                             fingerprint_hash;
+        uint16_t                             match_start_idx;  // index into match_headers side table
+        uint8_t                              raw[4];
+    } u;
+};
+#pragma pack(pop)
+static_assert(sizeof(SessionEvent) == 5, "SessionEvent must be 5 bytes packed");
+
+// ---- Wire-format encoders ---------------------------------------------------
+// Each Encode* writes one event into `out`. Returns bytes written, or 0 if
+// `cap` is insufficient. No partial writes — the buffer is left untouched on
+// overflow.
+
+size_t SessionEvent_EncodeInput            (uint8_t* out, size_t cap, uint16_t p1, uint16_t p2);
+size_t SessionEvent_EncodePinRng           (uint8_t* out, size_t cap, uint32_t seed);
+size_t SessionEvent_EncodeResetInputState  (uint8_t* out, size_t cap);
+size_t SessionEvent_EncodeSoundInit        (uint8_t* out, size_t cap);
+size_t SessionEvent_EncodeMatchStart       (uint8_t* out, size_t cap,
+                                            const uint8_t header[SESSION_EVENT_MATCH_HDR_SIZE]);
+size_t SessionEvent_EncodeMatchEnd         (uint8_t* out, size_t cap);
+size_t SessionEvent_EncodeFingerprint      (uint8_t* out, size_t cap, uint32_t hash);
+
+// ---- Wire-format decoder ----------------------------------------------------
+// Decode the next event from a byte buffer. Returns bytes consumed (1, 5, or
+// 97), or 0 if the buffer is truncated or the type byte isn't a valid
+// SessionEventType.
+//
+// `out_event->u.match_start_idx` is left at 0 on MATCH_START — caller
+// (HandleSpecData) populates it after appending the parsed header to the
+// match_headers side table. The 96-byte header is copied into
+// `out_match_header` if non-null; pass nullptr to skip the copy.
+size_t SessionEvent_Decode(const uint8_t* in, size_t in_len,
+                           SessionEvent* out_event,
+                           uint8_t out_match_header[SESSION_EVENT_MATCH_HDR_SIZE]);
 
 // =============================================================================
 // LIFECYCLE
@@ -88,6 +189,96 @@ void SpectatorNode_OnFrameConfirmed(uint16_t p1_input, uint16_t p2_input);
 
 // Called at battle end — broadcasts MATCH_END to subscribers.
 void SpectatorNode_OnMatchEnd();
+
+// Append a state-init op to the session event log + flush immediately so
+// any currently-subscribed spectator receives it before the INPUT events
+// that follow. The spectator drains non-INPUT events at the head of its
+// playback queue and dispatches on type, applying the same memory writes
+// the host just did. Late joiners see ops as part of their session backfill.
+//
+// Call sites (host only — no-op on spectator nodes):
+//   PIN_RNG           — every site that writes 0x12345678 to ADDR_RANDOM_SEED
+//                       (handshake, CSS rendezvous, battle start)
+//   RESET_INPUT_STATE — paired with battle-start SaveState_Save's first-call
+//                       buf_idx + edge-state + history-rings reset
+//   SOUND_INIT        — every SoundRollback::Init() call site
+//   FINGERPRINT       — diagnostic only; gated on FM2K_SPEC_FINGERPRINT
+void SpectatorNode_AppendPinRng(uint32_t seed);
+void SpectatorNode_AppendResetInputState();
+void SpectatorNode_AppendSoundInit();
+void SpectatorNode_AppendFingerprint(uint32_t hash);
+
+// Append a MATCH_START op carrying the 96-byte ReplayHeader-compatible
+// payload (magic + version + game_hash + initial_rng_seed +
+// initial_state_hash + p1/p2 char/color/name + stage_id). The receiver
+// caches the header in its pb_match_headers side table and flips
+// playing_back=true at apply time. C6 supersedes the legacy
+// INITIAL_MATCH packet path; the wire packet type stays in the enum
+// for compatibility but is no longer emitted by C6+ hosts.
+void SpectatorNode_AppendMatchStart(const uint8_t header[96]);
+
+// Append a MATCH_END op. Apply-time effect: playing_back=false (queue
+// keeps draining naturally so the final frames render).
+void SpectatorNode_AppendMatchEnd();
+
+// =============================================================================
+// SESSION REPLAY FILE WRITERS (C7)
+// =============================================================================
+//
+// Both write the same on-disk format — packed SessionEvent bytes (1-byte
+// tag + variant payload, MATCH_START's 96-byte header inline) preceded by
+// a 32-byte file header. Distinguished by the `is_battle_slice` flag in
+// the header. Loaders (Replay_LoadSessionFile, C8) feed events into the
+// playback driver pb_queue same as live wire ingest.
+//
+// Path format:
+//   replays/<timestamp>.fm2krep   — per-battle slice
+//   sessions/<timestamp>.fm2kset  — full session
+// (Relative to the game's working directory; matches existing `replays/`
+//  layout used by Replay_BeginRecording.)
+//
+// Returns true on successful write. False if there's no usable data
+// (empty session, MATCH_START not seen yet, etc.) or the file open failed.
+
+// Write everything in session_events to a .fm2kset.
+bool SpectatorNode_WriteSessionFile(const char* path);
+
+// Write the slice [last_match_start_idx ... session_events.size()) — i.e.
+// the per-battle segment closing on the most-recent MATCH_END. Call
+// AFTER OnMatchEnd has appended its MATCH_END so the slice includes it.
+bool SpectatorNode_WriteCurrentBattleFile(const char* path);
+
+// =============================================================================
+// SESSION FILE LOADER (C8)
+// =============================================================================
+//
+// Read a .fm2kset / .fm2krep file written by SpectatorNode_WriteSessionFile
+// or WriteCurrentBattleFile and push every event into pb_queue. Same
+// playback driver as the live wire path (HandleSpecData::EVENT_BATCH) —
+// the trampoline's RunSpectatorTick drains them identically.
+//
+// Resets receiver-side state on entry: pb_queue cleared, pb_match_headers
+// cleared, dedup baseline cleared, playing_back flipped on. Caller is
+// responsible for ensuring g_spectator_mode is true before calling — the
+// trampoline only routes through RunSpectatorTick when it is.
+//
+// Returns true on successful parse + queue. False on file open failure,
+// magic/version mismatch, or truncated body.
+bool SpectatorNode_LoadSessionFile(const char* path);
+
+// =============================================================================
+// FINGERPRINT DIAGNOSTIC (C9)
+// =============================================================================
+
+// True if FM2K_SPEC_FINGERPRINT=1 was set at process start. Gates host
+// emit of FINGERPRINT ops + spectator-side mismatch logging.
+bool SpectatorFingerprint_Enabled();
+
+// Compute Fletcher-32 over the current FM2K state sample (RNG, buf_idx,
+// HPs, timer, positions, scripts). Same shape on host and spectator;
+// drain-at-head ordering on the spectator means both sides hash at the
+// same logical frame. Mismatch indicates a desync.
+uint32_t SpectatorFingerprint_Compute();
 
 // =============================================================================
 // JOIN / REDIRECT (runs on any accepting node)

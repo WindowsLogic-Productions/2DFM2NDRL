@@ -40,6 +40,17 @@ struct SubConn {
                                       // unused — host doesn't read structured
                                       // data from subscribers post-INPUT_REQUEST
                                       // removal; we just discard inbound bytes).
+    bool                  backfill_done = false;
+                                      // Backfill ordering fence (C5). Set true
+                                      // by SpectatorNode_TickHostMaintenance
+                                      // after SendInitialMatchTo +
+                                      // SendSessionBackfillTo finish. Until
+                                      // then, BroadcastToAll skips this sub —
+                                      // closes the race where a live FlushBatch
+                                      // would otherwise reach the spectator
+                                      // before its backfill bytes, anchoring
+                                      // next_expected_frame mid-stream and
+                                      // dropping the early session events.
 };
 
 bool                              g_net_inited        = false;
@@ -104,14 +115,22 @@ bool GetPeerIpString(NET_StreamSocket* sock, char* out, size_t out_sz) {
     return ok;
 }
 
-size_t PayloadLenForType(SpecDataType t, uint16_t frame_count) {
-    switch (t) {
+size_t PayloadLenForType(const SpecDataHeader& hdr) {
+    switch (hdr.type) {
         case SpecDataType::INITIAL_MATCH: return 96;
-        case SpecDataType::INPUT_BATCH:   return static_cast<size_t>(frame_count) * 4u;
+        case SpecDataType::INPUT_BATCH:   return static_cast<size_t>(hdr.frame_count) * 4u;
         case SpecDataType::MATCH_END:     return 0;
         case SpecDataType::INPUT_REQUEST: return 0; // shouldn't appear upstream
-        default:                          return SIZE_MAX; // sentinel for "bad"
+        case SpecDataType::EVENT_BATCH:
+            // C2+ wire: payload is a packed SessionEvent[] stream of
+            // variable length. The byte count lives in hdr.flags (was a
+            // reserved field; capped at 65535 B which is well above the
+            // BACKFILL_CHUNK_BYTES=1024 chunk size + any reasonable live
+            // FlushBatch). frame_count carries the INPUT count for the
+            // receiver's dedup gate but doesn't size the payload.
+            return static_cast<size_t>(hdr.flags);
     }
+    return SIZE_MAX;  // unknown tag
 }
 
 }  // namespace
@@ -239,9 +258,19 @@ void BroadcastToAll(const void* buf, size_t len) {
     if (!buf || len == 0) return;
     for (auto& sc : g_subs) {
         if (!sc.sock) continue;
+        if (!sc.backfill_done) continue;   // C5 fence: skip until backfill ships
         if (!NET_WriteToStreamSocket(sc.sock, buf, static_cast<int>(len))) {
             // Mark broken; next PollIncoming will reap on read error.
             // We don't tear down here to keep the call non-failing.
+        }
+    }
+}
+
+void MarkBackfillComplete(const sockaddr_in& sub_addr) {
+    for (auto& sc : g_subs) {
+        if (AddrEquals(sc.addr, sub_addr)) {
+            sc.backfill_done = true;
+            return;
         }
     }
 }
@@ -361,7 +390,7 @@ void PollUpstream() {
             g_upstream_read_buf.clear();
             return;
         }
-        const size_t payload_len = PayloadLenForType(hdr.type, hdr.frame_count);
+        const size_t payload_len = PayloadLenForType(hdr);
         if (payload_len == SIZE_MAX) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "SpectatorTCP: unknown SpecDataType=%u upstream — "

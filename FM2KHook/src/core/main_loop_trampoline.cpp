@@ -695,26 +695,48 @@ static void RunNativeTick() {
 
     const bool skip_netplay = g_offline_mode || g_stress_mode;
 
-    // Title screen: no netplay state, no sim-determinism requirement.
-    // We used to block here on Netplay_IsConnected() to avoid the
-    // "Connecting → snap-to-ready at CSS" UX flash, but it caused the
-    // peer whose window came up first to sit frozen on the title
-    // screen for the duration of the handshake gap (up to ~1s on
-    // loopback even after the NAT-skip optimization, more on real
-    // networks). Result: asymmetric CSS arrival.
+    // Pre-handshake gate: hold the game at the boot frame until both peers
+    // have completed HELLO/HELLO_ACK. Without this, each peer free-runs
+    // through title at its own wall-clock pace; their per-frame RNG/timer
+    // states diverge by tens-to-hundreds of frames before CSS-rendezvous
+    // reseeds RNG, and CSS state itself evolves locally on each side
+    // (cursor moves, animation counters, etc.) before lockstep takes
+    // over — visible as cursor-position desync the moment CSS-SYNC fires.
     //
-    // Tick the title screen freely; pump the control channel and
-    // resend HELLO until handshake completes. The CSS barrier
-    // (RunCssTick) and the BATTLE_READY barrier downstream still hold
-    // peers in lockstep before any sim-relevant frame runs.
+    // Cost: the peer whose window comes up first sits frozen on title for
+    // up to ~MAX_HANDSHAKE_HOLD_MS while the slower peer's process spawns
+    // and binds its socket. Hard cap so a missing peer doesn't hang the
+    // game forever — after the cap we fall through to the legacy free-run
+    // (matches pre-C* behavior, lets users at least reach offline UI).
+    constexpr uint32_t MAX_HANDSHAKE_HOLD_MS = 10000;
+    static uint32_t s_first_native_tick_ms = 0;
     if (!skip_netplay && !Netplay_IsConnected()) {
         ControlChannel_Poll();
+        const uint32_t now_ms = GetTickCount();
+        if (s_first_native_tick_ms == 0) s_first_native_tick_ms = now_ms;
         static uint32_t last_poll = 0;
-        uint32_t now = GetTickCount();
-        if (now - last_poll > 500) {
+        if (now_ms - last_poll > 500) {
             ControlChannel_SendHello((uint8_t)g_player_index,
                                      fm2k::game_hash::Compute());
-            last_poll = now;
+            last_poll = now_ms;
+        }
+        const bool give_up = (now_ms - s_first_native_tick_ms) >= MAX_HANDSHAKE_HOLD_MS;
+        if (!give_up) {
+            // Hold: render the current snapshot (so the game's window
+            // doesn't go black/freeze visibly), pump messages, do nothing
+            // else. No PGI, no UG, no game_mode transition. Both peers
+            // sit here until CheckFullyConnected fires on both sides.
+            RenderFrameWithSnapshot();
+            return;
+        }
+        // Timed out — log once, fall through to free-run (legacy behavior).
+        static bool s_logged_timeout = false;
+        if (!s_logged_timeout) {
+            s_logged_timeout = true;
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Trampoline: handshake hold timed out after %u ms — "
+                        "running free (peer may be missing)",
+                        MAX_HANDSHAKE_HOLD_MS);
         }
         // Fall through — let the title screen advance.
     }
@@ -763,31 +785,22 @@ constexpr size_t SPECTATOR_LIVE_TARGET = 8;   // jitter buffer floor
 constexpr size_t SPECTATOR_FF_ENTER    = 100; // ~1 sec of host frames queued
 constexpr size_t SPECTATOR_FF_EXIT     = 16;  // hysteresis: 2x live target
 
-static void RunSpectatorTick() {
-    Hook_CheckGameModeTransition_Public();
+// Fast catch-up target (C5.5). Once pb_queue depth drops to or below this,
+// we revert to one-pop-per-trampoline-tick paced render. Set higher than
+// SPECTATOR_LIVE_TARGET (jitter floor) so the catch-up loop doesn't oscillate
+// across the floor on every tick. ~1 sec at 100 Hz = 100 frames of buffered
+// headroom is enough to absorb host jitter without lagging the viewer
+// noticeably behind real-time.
+constexpr size_t SPECTATOR_LIVE_LAG_FRAMES = 100;
 
-    // Drain UDP — control channel (0xCC: SPEC_JOIN_ACK / HEARTBEAT) and
-    // 0xCE INPUT_BATCH datagrams land on the same multiplex socket.
-    ControlChannel_Poll();
-
-    // Health: heartbeat send, silence-failover, daisy-chain reconnect.
-    SpectatorNode_TickHealth();
-
-    const size_t qd = SpectatorNode_PendingFrameCount();
-    if (qd < SPECTATOR_LIVE_TARGET) {
-        // Queue starved — hold the current rendered frame. Don't tick sim,
-        // don't read inputs, don't run process_game_inputs/update_game.
-        RenderFrameWithSnapshot();
-        return;
-    }
-
-    // Pop the next confirmed (p1, p2). PopFrameInputs caches them into
-    // pb_current_p1/p2 which Hook_GetPlayerInput reads as its single
-    // source of truth this tick.
+// One sim step (popped INPUT → PGI → UG → diagnostics). Returns false if
+// the queue couldn't supply an INPUT (head non-INPUTs were drained but no
+// INPUT followed them), true if a frame was simulated. Render is the
+// caller's responsibility.
+static bool SpectatorSimOneFrame() {
     uint16_t p1 = 0, p2 = 0;
     if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
-        RenderFrameWithSnapshot();
-        return;
+        return false;
     }
 
     // PER-FRAME alignment-trace log: capture RNG before PGI runs so we can
@@ -821,12 +834,12 @@ static void RunSpectatorTick() {
         s_spec_trace_bf++;
     }
 
-    // Per-frame state fingerprint log for desync diagnosis. Counts pops
-    // (= sim frames executed) since spectator boot. Logs once we're in
-    // battle (mode 3000) at battle-frame multiples of 30 (~3x per sec).
-    // Pairs with the host's matching log at netplay.cpp's AdvanceEvent
-    // recording site so we can grep both .log files for the same
-    // sim_frame and find the first divergent state by hand.
+    // Per-frame state fingerprint log for desync diagnosis. Counts every
+    // simulated frame (catch-up included). Logs once we're in battle
+    // (mode 3000) at battle-frame multiples of 30 (~3x per sec). Pairs
+    // with the host's matching log at netplay.cpp's AdvanceEvent recording
+    // site — grep both .log files for the same sim_frame to find first
+    // divergence.
     {
         static uint32_t s_pop_count = 0;
         ++s_pop_count;
@@ -845,11 +858,6 @@ static void RunSpectatorTick() {
                 const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
                 const uint32_t p2_hp   = *(uint32_t*)0x4EDCC4;
                 const uint32_t timer   = *(uint32_t*)0x470044;
-                // Real battle positions in object pool. (Earlier this read
-                // 0x470020 which is the CSS-selected character index
-                // (g_p1_selected_char_idx) — useless for detecting
-                // in-match drift since it's set during char-select and
-                // doesn't change once battle starts.)
                 constexpr uintptr_t POOL = 0x4701E0;
                 constexpr size_t    SLOT = 382;
                 const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
@@ -863,21 +871,172 @@ static void RunSpectatorTick() {
                     "p1_hp=%u p2_hp=%u timer=%u "
                     "p1_pos=(%d,%d) p2_pos=(%d,%d) "
                     "p1_script=%d p2_script=%d "
-                    "p1_in=0x%03X p2_in=0x%03X",
+                    "p1_in=0x%03X p2_in=0x%03X catchup=%d",
                     bf, s_pop_count, rng, buf_idx,
                     p1_hp, p2_hp, timer,
                     p1_x, p1_y, p2_x, p2_y,
                     p1_script, p2_script,
-                    p1, p2);
+                    p1, p2, (int)g_spectator_catchup);
             }
         } else {
             s_in_battle = false;
         }
     }
 
-    // Advance the deterministic virtual clock (Hook_timeGetTime reads it).
+    // Advance the deterministic virtual clock per simulated frame so
+    // Hook_timeGetTime stays consistent with sim progression even when
+    // we're inside the catch-up loop.
     extern uint32_t g_virtual_time_ms;
     g_virtual_time_ms += 10;
+
+    return true;
+}
+
+static void RunSpectatorTick() {
+    Hook_CheckGameModeTransition_Public();
+
+    // Drain UDP — control channel (0xCC: SPEC_JOIN_ACK / HEARTBEAT) and
+    // 0xCE INPUT_BATCH datagrams land on the same multiplex socket.
+    ControlChannel_Poll();
+
+    // Health: heartbeat send, silence-failover, daisy-chain reconnect.
+    SpectatorNode_TickHealth();
+
+    const size_t qd = SpectatorNode_PendingFrameCount();
+    if (qd < SPECTATOR_LIVE_TARGET) {
+        // Queue starved — hold the current rendered frame. Don't tick sim,
+        // don't read inputs, don't run process_game_inputs/update_game.
+        RenderFrameWithSnapshot();
+        return;
+    }
+
+    // Catch-up inner loop (C5.5). When the queue is far ahead of the
+    // jitter floor, drain multiple sim steps per trampoline tick to close
+    // the gap to live edge — without this, late join replays from session
+    // start at 1 frame per tick and a 30k-event backlog takes 5 minutes
+    // to drain. Audio dispatch and render are gated on g_spectator_catchup
+    // so we don't blast compressed audio or burn render bandwidth during
+    // the burn-down.
+    //
+    // Network poll interleave: WITHOUT this, the inner loop holds the
+    // trampoline thread for 100s of ms processing thousands of events,
+    // and SpectatorTCP::Poll never gets called. The kernel's TCP receive
+    // buffer fills up; the host's send blocks via TCP backpressure; from
+    // the spectator's perspective the upstream goes silent.
+    //
+    // ControlChannel_Poll drains UDP control + TCP receive (which feeds
+    // new EVENT_BATCH packets into pb_queue and updates
+    // LastUpstreamRecvMs). We poll every iteration during catchup since
+    // a single SpectatorSimOneFrame can take 100s of ms when FM2K's
+    // CSS-cursor-move triggers a synchronous .player character file
+    // load — much longer than the ~10ms a normal sim tick takes.
+    //
+    // We do NOT call SpectatorNode_TickHealth here: its silence-failover
+    // would fire during legitimate catchup (we've been "silent" because
+    // we're disk-blocked, not because the upstream died) and tear down
+    // the very connection we're using to receive the backfill. The
+    // top-level RunSpectatorTick path calls TickHealth post-catchup
+    // when we're back at the live edge.
+    // Catchup policy (post-mvp tuning):
+    //
+    //   1. ONE-SHOT at join. On the first run where the queue is over the
+    //      lag target — typically right after JOIN_ACK + backfill replay —
+    //      we burn through the buffered events to reach the live edge.
+    //      After that, even if the buffer grows from network jitter,
+    //      packet loss, or a reconnect-with-backfill, we play at normal
+    //      1-frame-per-tick speed. Once you've been caught up, you stay
+    //      at whatever delay naturally accumulates from later disruption
+    //      — no jarring superspeed snap-to-live.
+    //
+    //   2. NO AUTOMATIC SAFETY DRAIN. Buffer is allowed to grow if the
+    //      spectator falls behind; the user explicitly asked us not to
+    //      speed up after lag/loss recovery. Memory cost is bounded by
+    //      the sender (host TCP send blocks via backpressure if our
+    //      kernel recv buffer fills) — not by us auto-draining.
+    //
+    //   3. ENV OVERRIDE. FM2K_SPECTATOR_ALWAYS_CATCHUP=1 keeps the
+    //      always-catch-up behaviour for users who explicitly want low-
+    //      latency live viewing.
+    //
+    // Per-tick wall-clock bound: catchup yields after CATCHUP_MAX_BURST_MS
+    // so a single SpectatorSimOneFrame blocking on a .player disk load
+    // (50–500ms cold cache) can't dominate the trampoline thread.
+    constexpr uint64_t CATCHUP_MAX_BURST_MS = 250;
+
+    static int  s_always_catchup_env = -1;
+    if (s_always_catchup_env < 0) {
+        const char* v = std::getenv("FM2K_SPECTATOR_ALWAYS_CATCHUP");
+        s_always_catchup_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    static bool s_initial_catchup_done = false;
+
+    // Suppress catchup during CSS — each cursor-move INPUT triggers a
+    // .player file load on the spectator's local FM2K, which can take
+    // 100s of ms cold-cache. Racing through CSS at catchup speed thrashes
+    // disk and visually presents a useless flicker through every
+    // character preview anyway. Let CSS replay at 1x natural pace.
+    const uint32_t local_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    const bool in_css_phase   = (local_mode >= 2000 && local_mode < 3000);
+
+    // Initial catchup latch: fire ONCE when the queue first exceeds the
+    // lag target — whether we engage catchup this tick or not.
+    //   - Joined mid-battle: latch fires AND catchup engages (drains
+    //     backfill to live edge, like other rollback game spectators).
+    //   - Joined mid-CSS: latch fires but catchup is suppressed (CSS
+    //     replay would thrash disk on .player loads). When CSS ends
+    //     and game_mode flips to battle, the latch is already set so
+    //     we DON'T re-engage initial catchup — spectator stays at
+    //     whatever delay accumulated during CSS replay. User can press
+    //     F12 once in battle if they want to catch up.
+    // Without this two-step (latch then conditionally engage), the
+    // CSS-phase wait left s_initial_catchup_done=false until battle,
+    // and the first battle tick burst-drained 1500+ buffered frames
+    // in <1 sec — the "jumps to live on CSS→battle" symptom.
+    const bool first_threshold_hit = !s_initial_catchup_done &&
+                                     qd > SPECTATOR_LIVE_LAG_FRAMES;
+    if (first_threshold_hit) {
+        s_initial_catchup_done = true;
+    }
+
+    const bool needs_initial_catchup = first_threshold_hit && !in_css_phase;
+    const bool needs_always_catchup  = s_always_catchup_env != 0 &&
+                                       qd > SPECTATOR_LIVE_LAG_FRAMES &&
+                                       !in_css_phase;
+    // User-toggled FF (F12) is the explicit "speed up to live" lever.
+    // Honors CSS suppression like the other catchup tiers — pressing F12
+    // during CSS does nothing useful (cursor flicker through char
+    // previews) so we ignore it. User can press again once in battle.
+    const bool needs_user_ff         = g_spectator_ff_user &&
+                                       qd > SPECTATOR_LIVE_LAG_FRAMES &&
+                                       !in_css_phase;
+    g_spectator_catchup = needs_initial_catchup || needs_always_catchup ||
+                          needs_user_ff;
+
+    const uint64_t catchup_start_ms = GetTickCount64();
+    while (g_spectator_catchup) {
+        if (!SpectatorSimOneFrame()) break;
+        ControlChannel_Poll();   // keeps TCP recv drained, no failover side-effects
+        if (SpectatorNode_PendingFrameCount() <= SPECTATOR_LIVE_LAG_FRAMES) {
+            s_initial_catchup_done = true;
+            g_spectator_catchup    = false;
+            break;
+        }
+        if (GetTickCount64() - catchup_start_ms >= CATCHUP_MAX_BURST_MS) {
+            // Bounded — yield to the outer tick. Catchup re-engages
+            // next frame if we're still over the lag target.
+            break;
+        }
+    }
+    g_spectator_catchup = false;  // safety: clear before render path
+
+    // Steady-state path: one popped frame, one render. Reached either after
+    // catch-up brought queue depth ≤ LIVE_LAG_FRAMES, or directly when the
+    // queue was already in the live band. Skip render when no INPUT was
+    // available (drained head non-INPUTs only).
+    if (!SpectatorSimOneFrame()) {
+        RenderFrameWithSnapshot();
+        return;
+    }
 
     RenderFrameWithSnapshot();
 }
@@ -918,9 +1077,71 @@ LoopPhase TrampolineFrameTick() {
     return phase;
 }
 
+// .player file cache pre-warmer (background thread).
+//
+// FM2K's CSS code path opens a .player file synchronously every time the
+// player's cursor hovers a new character. Cold-cache reads on Windows take
+// 100-500ms per file — fine for a human cursor (one move = one load) but
+// disastrous for the spectator's input-replay-driven CSS replay, where
+// 30+ cursor moves get replayed back-to-back as fast as the trampoline
+// can run them. Pre-warming pulls every *.player file in the game
+// directory into the OS page cache once at startup so subsequent reads
+// hit RAM. No game-state side effects — purely passive.
+//
+// Dev-mode gated. Enable via FM2K_DEV_MODE=1.
+static DWORD WINAPI PreloadPlayerFiles_Worker(LPVOID) {
+    const char* dev = std::getenv("FM2K_DEV_MODE");
+    if (!(dev && dev[0] == '1' && dev[1] == '\0')) return 0;
+    char cwd[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwd) == 0) return 0;
+    char pattern[MAX_PATH] = {};
+    std::snprintf(pattern, sizeof(pattern), "%s\\*.player", cwd);
+
+    WIN32_FIND_DATAA fd = {};
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int warmed = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char full[MAX_PATH] = {};
+        std::snprintf(full, sizeof(full), "%s\\%s", cwd, fd.cFileName);
+        // Open with read-share so we don't fight FM2K's own open if it
+        // happens to race us. FILE_FLAG_SEQUENTIAL_SCAN hints the cache
+        // manager to read-ahead aggressively.
+        HANDLE f = CreateFileA(full, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING,
+                               FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        // Drain into a small scratch buffer — we don't care about the
+        // bytes, only that the OS pages them in.
+        char scratch[64 * 1024];
+        DWORD n = 0;
+        while (ReadFile(f, scratch, sizeof(scratch), &n, nullptr) && n > 0) {}
+        CloseHandle(f);
+        ++warmed;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "PlayerPreload: warmed OS cache for %d .player file(s) in %s",
+                warmed, cwd);
+    return 0;
+}
+
 BOOL TrampolineMainLoop() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Trampoline: main loop ACTIVE — GekkoNet-driven outer loop");
+
+    // Kick off background .player file cache pre-warmer. Runs once;
+    // typically completes within a second or two. Subsequent FM2K opens
+    // of these files (during CSS cursor moves) hit the OS page cache.
+    {
+        HANDLE t = CreateThread(nullptr, 0, PreloadPlayerFiles_Worker,
+                                nullptr, 0, nullptr);
+        if (t) CloseHandle(t);  // detached
+    }
 
     // g_frame_time_ms @ 0x41E2F0 was set to 10 by the original main_game_loop
     // at 0x405AD3. We no longer run that code, so this global stays at
@@ -995,17 +1216,20 @@ BOOL TrampolineMainLoop() {
                 SleepToTarget(tick_start, 10);
                 break;
             case LoopPhase::SPECTATOR_PLAYBACK: {
-                // FF with hysteresis. Live edge: queue oscillates around
-                // LIVE_TARGET, sleep 10 ms (100 Hz). Backfill (>FF_ENTER):
-                // sleep 1 ms (~1000 Hz) to drain the catch-up window.
-                // Hysteresis: only EXIT fast-forward when queue drops
-                // below FF_EXIT, so routine batch-arrival jitter doesn't
-                // toggle pacing every burst.
-                static bool s_fast_fwd = false;
-                size_t qd = SpectatorNode_PendingFrameCount();
-                if      (qd > SPECTATOR_FF_ENTER) s_fast_fwd = true;
-                else if (qd < SPECTATOR_FF_EXIT)  s_fast_fwd = false;
-                SleepToTarget(tick_start, s_fast_fwd ? 1 : 10);
+                // Always 100 Hz outer tick. Catchup behaviour lives entirely
+                // INSIDE RunSpectatorTick's inner loop (one-shot at join,
+                // bounded at 250ms wall-clock per outer tick) — that path
+                // drains 5–25 sim frames per outer tick during the burst,
+                // which is plenty to chew through a typical join-time
+                // backfill in a couple seconds. We deliberately don't
+                // override the outer sleep here: the previous queue-depth-
+                // based fast-forward (sleep 1ms when qd > 100) ignored
+                // the user's "don't speed up after lag/loss" requirement
+                // and re-engaged superspeed every reconnect. Holding 100
+                // Hz here means once the initial catchup completes the
+                // spectator simply tracks the live edge with whatever
+                // delay the network gives it.
+                SleepToTarget(tick_start, 10);
                 break;
             }
         }

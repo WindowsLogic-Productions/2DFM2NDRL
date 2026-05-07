@@ -691,7 +691,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // Parse command line arguments for backward compatibility
     NetworkConfig config;
     bool direct_mode = false;
-    
+    bool spectate_mode = false;
+    std::string spectate_target_addr;  // "host_ip:host_port" for --spectate
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -705,6 +707,19 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 direct_mode = true;
             } else {
                 std::cerr << "Error: --connect requires an address\n";
+                return SDL_APP_FAILURE;
+            }
+        } else if (arg == "--spectate" || arg == "--spec") {
+            // Spectate a remote host: --spectate <ip:port>
+            // Skips netplay handshake and stands the game up as a passive
+            // viewer dialing the host's spectator listener. Matches the UI
+            // path's LaunchRemoteSpectator + the FM2K_SPECTATOR_MODE=1 hook
+            // gate.
+            if (i + 1 < argc) {
+                spectate_target_addr = argv[++i];
+                spectate_mode = true;
+            } else {
+                std::cerr << "Error: --spectate requires <host_ip:host_port>\n";
                 return SDL_APP_FAILURE;
             }
         } else if (arg == "--port" || arg == "-p") {
@@ -730,35 +745,57 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             }
         }
     }
-    
+
     // Create launcher instance
     g_launcher = std::make_unique<FM2KLauncher>();
-    
+
     if (!g_launcher->Initialize()) {
         std::cerr << "Failed to initialize launcher\n";
         return SDL_APP_FAILURE;
     }
-    
+
     // If direct mode, skip UI and go straight to game launch + network
-    if (direct_mode) {
+    if (direct_mode || spectate_mode) {
         if (g_launcher->GetDiscoveredGames().empty()) {
             std::cerr << "No FM2K games found for direct mode\n";
             return SDL_APP_FAILURE;
         }
-        
+
         // In direct mode, we assume the first discovered game is the target.
         const auto& game_to_launch = g_launcher->GetDiscoveredGames()[0];
-        
+
         // Manually set the selected game for the launcher
         g_launcher->SetSelectedGame(game_to_launch);
 
-        // Start network session
-        NetworkConfig online_config = config;
-        online_config.session_mode = SessionMode::ONLINE;
-        g_launcher->StartOnlineSession(online_config, config.is_host);
-        
+        if (spectate_mode) {
+            // Parse "host_ip:host_port" target.
+            const size_t colon = spectate_target_addr.find(':');
+            if (colon == std::string::npos) {
+                std::cerr << "Error: --spectate target must be <ip:port>, got: "
+                          << spectate_target_addr << "\n";
+                return SDL_APP_FAILURE;
+            }
+            const std::string host_ip = spectate_target_addr.substr(0, colon);
+            const int host_port       = std::stoi(spectate_target_addr.substr(colon + 1));
+            const int spectator_port  = (config.local_port > 0) ? config.local_port : 7702;
+
+            if (!g_launcher->LaunchRemoteSpectator(game_to_launch.exe_path,
+                                                    spectator_port,
+                                                    host_ip, host_port)) {
+                std::cerr << "Spectate: launch failed\n";
+                return SDL_APP_FAILURE;
+            }
+            std::cout << "Direct spectate mode: dialing " << host_ip << ":" << host_port
+                      << " on local port " << spectator_port << "\n";
+        } else {
+            // Start regular host/client network session
+            NetworkConfig online_config = config;
+            online_config.session_mode = SessionMode::ONLINE;
+            g_launcher->StartOnlineSession(online_config, config.is_host);
+            std::cout << "Direct mode: game launched + network started\n";
+        }
+
         g_launcher->SetState(LauncherState::InGame);
-        std::cout << "? Direct mode: Game launched and network started\n";
     }
     
     // Store launcher in appstate for other callbacks

@@ -84,7 +84,19 @@ bool RegisterAcceptedClient(const sockaddr_in& sub_addr);
 // SendInitialMatchTo / SendMatchEndToAll. Non-blocking; on pending-write
 // the bytes are queued in the per-connection out buffer and drained
 // later in PollIncoming.
+//
+// Skips subscribers whose backfill hasn't completed yet — see
+// MarkBackfillComplete. This avoids the race where a live FlushBatch
+// reaches a freshly-bound spectator before its backfill bytes anchor
+// next_expected_frame at session start.
 void BroadcastToAll(const void* buf, size_t len);
+
+// Mark a subscriber's initial backfill (INITIAL_MATCH +
+// SendSessionBackfillTo chunks) complete. Called by
+// SpectatorNode_TickHostMaintenance after the last backfill chunk's
+// send returns. From this point on, BroadcastToAll will include this
+// subscriber in live-batch broadcasts. Idempotent.
+void MarkBackfillComplete(const sockaddr_in& sub_addr);
 
 // Send to ONE subscriber. Used by SendSessionBackfillTo for late-joiner
 // chunks. Address-matched against the subscriber list. No-op if the sub

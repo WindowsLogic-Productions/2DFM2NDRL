@@ -1,8 +1,10 @@
 #include "wndproc_subclass.h"
 #include "../netplay/control_channel.h"
-#include "../core/globals.h"   // FM2K::kIsFM2K / kIsFM95
+#include "../core/globals.h"   // FM2K::kIsFM2K / kIsFM95, g_spectator_*
 #include <SDL3/SDL_log.h>
 #include <windows.h>
+#include <cstring>
+#include <cstdio>
 
 namespace FM2KWndProc {
 
@@ -20,6 +22,22 @@ static HWND    g_hwnd            = nullptr;
 static WNDPROC g_orig_wndproc    = nullptr;
 static bool    g_in_modal_loop   = false;
 
+// Original window title captured at install time. We append " [FF]" when
+// the user toggles fast-forward via F12 in spectator mode and restore the
+// plain title on toggle off. ANSI titles only — FM2K windows are ASCII.
+static char    g_original_title[256] = {};
+
+static void UpdateSpectatorTitle() {
+    if (!g_hwnd || !g_spectator_mode) return;
+    char buf[320] = {};
+    if (g_spectator_ff_user) {
+        std::snprintf(buf, sizeof(buf), "%s [FF]", g_original_title);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%s", g_original_title);
+    }
+    SetWindowTextA(g_hwnd, buf);
+}
+
 static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
                                      WPARAM wparam, LPARAM lparam) {
     switch (msg) {
@@ -34,6 +52,26 @@ static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
         case WM_SYSKEYDOWN:
         case WM_SYSKEYUP:
             if (wparam == VK_MENU || wparam == VK_F10) return 0;
+            break;
+
+        // -- F12 fast-forward toggle (spectator mode only) ----------------
+        // Spectators sit at whatever delay the network gave them; F12
+        // requests one-burst catchup-to-live. Toggle off to drop back to
+        // 1x. Title-bar shows "[FF]" while active. Swallowed before
+        // game-input layer so it doesn't accidentally drive any FM2K
+        // CSS/title menu (none of our games bind F12, but we're polite).
+        case WM_KEYDOWN:
+            if (wparam == VK_F12 && g_spectator_mode) {
+                g_spectator_ff_user = !g_spectator_ff_user;
+                UpdateSpectatorTitle();
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Spectator: F12 fast-forward %s",
+                            g_spectator_ff_user ? "ON" : "OFF");
+                return 0;
+            }
+            break;
+        case WM_KEYUP:
+            if (wparam == VK_F12 && g_spectator_mode) return 0;
             break;
         case WM_SYSCHAR:
             // Suppresses the "ding" Alt+letter would otherwise emit.
@@ -159,6 +197,11 @@ void TryInstall() {
     }
     g_hwnd         = hwnd;
     g_orig_wndproc = prev;
+
+    // Snapshot the original title so the F12 spectator FF toggle can
+    // append/strip "[FF]" without losing the game's chosen title text.
+    GetWindowTextA(hwnd, g_original_title, sizeof(g_original_title) - 1);
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "WndProcSubclass: installed on hwnd=%p prev_wndproc=%p "
                 "(Alt-mute + modal-pump)",
