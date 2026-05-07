@@ -1,160 +1,724 @@
-/* FM2K Stats — minimal, opinionated. Dark theme to match the launcher's
-   default look. No JS, no external font, no third-party CSS. */
+/* ═══════════════════════════════════════════════════════════════════════
+ * 2DFM HUB · STATS TERMINAL
+ * ─────────────────────────────────────────────────────────────────────
+ * Aesthetic: 2002 Japanese doujin fighter / Famitsu magazine spread /
+ * arcade cabinet marquee / CRT terminal boot screen.
+ * Three fonts, dual-tone neon (hot pink × electric blue), scanlines on
+ * a fixed overlay, chromatic-aberration headers.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+@import url('/static/fonts/_fonts.css');
 
 :root {
-  --bg:        #14171c;
-  --bg-elev:   #1c2128;
-  --border:    #30363d;
-  --text:      #e6edf3;
-  --text-dim:  #8b949e;
-  --accent:    #58a6ff;
-  --win:       #4ade80;
-  --loss:      #f87171;
-  --draw:      #c4b5fd;
+  /* surfaces */
+  --bg:           #06060d;
+  --bg-rad-top:   #0c0c1a;
+  --surface:      #10101c;
+  --surface-2:    #161624;
+  --surface-3:    #1c1c2e;
+  --line:         #22223a;
+  --line-bright:  #2e2e4a;
+
+  /* ink */
+  --ink:          #f4f4ff;
+  --ink-dim:      #9999b8;
+  --ink-mute:     #5a5a7a;
+
+  /* dual accent */
+  --pink:         #ff2d8d;       /* primary */
+  --pink-deep:    #c2156d;
+  --pink-glow:    #ff2d8d40;
+  --blue:         #00e5ff;       /* secondary */
+  --blue-deep:    #0099b8;
+  --blue-glow:    #00e5ff40;
+
+  /* signal */
+  --green:        #4dff8a;       /* win / online / fresh */
+  --green-deep:   #1fa358;
+  --amber:        #ffb840;       /* draw / warn */
+  --red:          #ff3866;       /* loss */
+
+  /* shadows */
+  --shadow-soft:  0 8px 28px #00000080;
+  --shadow-neon-pink: 0 0 18px var(--pink-glow), 0 0 0 1px var(--pink);
+  --shadow-neon-blue: 0 0 18px var(--blue-glow), 0 0 0 1px var(--blue);
+
+  /* fonts */
+  --font-display: 'Bowlby One', 'Bungee', system-ui, sans-serif;
+  --font-chrome:  'Zen Dots', 'Bowlby One', system-ui, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, 'Cascadia Code',
+                  Consolas, 'MS Gothic', monospace;
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
+html, body { margin: 0; padding: 0; min-height: 100vh; }
+
+/* ─── Background atmosphere ────────────────────────────────────────────
+ *  Vertical color wash (surface → bg) anchored under a soft radial
+ *  highlight, plus a fixed scanline overlay at low opacity. The
+ *  scanlines never animate — flicker reads as broken, not retro.       */
+
 body {
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
-               "MS Gothic", sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.5;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--ink);
+  background:
+    radial-gradient(ellipse 90% 50% at 50% -10%,
+                    var(--bg-rad-top) 0%,
+                    var(--bg) 60%,
+                    var(--bg) 100%);
+  background-attachment: fixed;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
+
+body::before {
+  /* CRT scanlines — fixed full-viewport overlay, very subtle. */
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent 2px,
+      rgba(255, 255, 255, 0.025) 2px,
+      rgba(255, 255, 255, 0.025) 3px);
+  z-index: 1000;
+  mix-blend-mode: overlay;
+}
+
+body::after {
+  /* Soft vignette so corners feel like a tube monitor. */
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 100% 80% at 50% 50%,
+                    transparent 60%,
+                    rgba(0, 0, 0, 0.55) 100%);
+  z-index: 999;
+}
+
+/* ─── Header / nav ─────────────────────────────────────────────────────
+ *  Two-row marquee: top "system status" strip in mono caps, then a
+ *  thicker brand row. Hot-pink underline on the active link. The
+ *  scanline overlay is deliberately layered above this; it bleeds onto
+ *  the chrome and ties it visually into the data area.                 */
 
 header {
-  background: var(--bg-elev);
-  border-bottom: 1px solid var(--border);
-  padding: 0.75rem 1.25rem;
+  position: relative;
+  background: linear-gradient(180deg,
+              var(--surface-2) 0%,
+              var(--surface) 100%);
+  border-bottom: 1px solid var(--line);
+  z-index: 1;
 }
-nav { display: flex; gap: 1.25rem; align-items: baseline; }
+header::before {
+  /* hot pink+blue hairline above the bottom border */
+  content: "";
+  position: absolute;
+  inset: auto 0 -2px 0;
+  height: 1px;
+  background: linear-gradient(90deg,
+              transparent 0%,
+              var(--pink) 25%,
+              var(--blue) 75%,
+              transparent 100%);
+  opacity: 0.7;
+}
+.statbar {
+  display: flex;
+  gap: 1.5rem;
+  padding: 0.45rem 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  border-bottom: 1px dashed var(--line);
+  background: rgba(0, 0, 0, 0.25);
+}
+.statbar .blink {
+  display: inline-block;
+  width: 0.5rem; height: 0.5rem;
+  background: var(--green);
+  border-radius: 50%;
+  margin-right: 0.4rem;
+  vertical-align: middle;
+  box-shadow: 0 0 8px var(--green);
+  animation: blink 2.4s ease-in-out infinite;
+}
+@keyframes blink {
+  0%, 65%, 100% { opacity: 1; }
+  70%, 80%      { opacity: 0.25; }
+}
+.statbar .sep { color: var(--line-bright); }
+.statbar .blue { color: var(--blue); }
+.statbar .pink { color: var(--pink); }
+
+nav {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0.6rem 1.5rem 0.7rem;
+}
 nav .brand {
-  font-weight: 700;
-  font-size: 1.1rem;
-  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 1.55rem;
+  letter-spacing: 0.04em;
+  color: var(--ink);
   text-decoration: none;
+  text-transform: uppercase;
+  /* triple-shadow chromatic aberration */
+  text-shadow:
+    -1px 0 0 var(--pink),
+     1px 0 0 var(--blue),
+     0 0 18px rgba(0, 229, 255, 0.15);
+  margin-right: 1.6rem;
+  white-space: nowrap;
+  position: relative;
 }
-nav a { color: var(--accent); text-decoration: none; }
-nav a:hover { text-decoration: underline; }
+nav .brand::after {
+  content: "★";
+  position: absolute;
+  top: -0.55rem;
+  right: -0.6rem;
+  font-size: 0.65rem;
+  color: var(--pink);
+  font-family: var(--font-mono);
+  text-shadow: 0 0 6px var(--pink);
+}
+
+nav .links {
+  display: flex;
+  gap: 0;
+  margin-left: auto;
+}
+nav .links a {
+  font-family: var(--font-chrome);
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  color: var(--ink-dim);
+  text-decoration: none;
+  text-transform: uppercase;
+  padding: 0.55rem 1.1rem;
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  position: relative;
+  transition: color 120ms ease;
+}
+nav .links a:hover {
+  color: var(--ink);
+  background: linear-gradient(180deg,
+              transparent 0%,
+              rgba(255, 45, 141, 0.08) 100%);
+}
+nav .links a:hover::before {
+  /* lit underline on hover, hot pink */
+  content: "";
+  position: absolute;
+  inset: auto 0.6rem 0 0.6rem;
+  height: 2px;
+  background: var(--pink);
+  box-shadow: 0 0 12px var(--pink), 0 0 4px var(--pink);
+}
+
+/* ─── Main / footer ────────────────────────────────────────────────────*/
 
 main {
-  max-width: 980px;
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 1.5rem 1.25rem 3rem;
+  padding: 2rem 1.5rem 4rem;
+  position: relative;
+  z-index: 2;
 }
+body.page-games main { max-width: 1500px; }
 
 footer {
-  border-top: 1px solid var(--border);
-  color: var(--text-dim);
+  border-top: 1px solid var(--line);
+  margin-top: 4rem;
+  padding: 1.2rem 1.5rem 1.6rem;
+  background: linear-gradient(180deg,
+              transparent 0%,
+              rgba(0, 0, 0, 0.4) 100%);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-mute);
   text-align: center;
-  padding: 1rem;
-  margin-top: 3rem;
+  position: relative;
+  z-index: 2;
 }
+footer .runtime { color: var(--blue); }
 
-a { color: var(--accent); }
+a { color: var(--blue); text-decoration: none; }
+a:hover { color: var(--pink); }
+
+/* ─── Hero ─────────────────────────────────────────────────────────────
+ *  Big arcade-marquee title with chromatic split, monospace lede.
+ *  When totals are present, render them as a row of huge Bowlby
+ *  numerals against tiny mono labels.                                  */
 
 .hero {
-  margin-bottom: 2rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
+  position: relative;
+  margin-bottom: 2.4rem;
+  padding: 1.4rem 1.6rem 1.8rem;
+  background:
+    linear-gradient(180deg,
+      var(--surface) 0%,
+      var(--surface-2) 100%);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--pink);
+  overflow: hidden;
 }
-.hero h1 { margin: 0 0 0.25rem 0; font-size: 1.75rem; }
-.hero .lede { color: var(--text-dim); margin: 0; }
+.hero::before {
+  /* corner gleam */
+  content: "";
+  position: absolute;
+  inset: -50% auto auto -10%;
+  width: 140%; height: 100%;
+  background: radial-gradient(ellipse at 30% 0%,
+              rgba(255, 45, 141, 0.10) 0%,
+              transparent 55%);
+  pointer-events: none;
+}
+.hero::after {
+  /* tiny corner code, like a Famitsu page header */
+  content: "// FM2K_HUB · STATS";
+  position: absolute;
+  top: 0.65rem;
+  right: 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.16em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+}
+
+.hero h1 {
+  margin: 0 0 0.3rem 0;
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 5vw, 3.4rem);
+  font-weight: 400;
+  line-height: 0.95;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-shadow:
+    -2px 0 0 var(--pink),
+     2px 0 0 var(--blue);
+  position: relative;
+}
+.hero .lede {
+  margin: 0.6rem 0 0;
+  color: var(--ink-dim);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+}
+.hero .lede strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+.hero .lede a { color: var(--blue); }
+
+.hero .subtitle {
+  margin: 0.3rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+}
+
 .hero .totals {
   list-style: none;
   padding: 0;
-  margin: 1rem 0 0;
+  margin: 1.4rem 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+.hero .totals li {
+  background: var(--surface);
+  padding: 0.85rem 1rem 0.95rem;
   display: flex;
-  gap: 2rem;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 0.15rem;
 }
-.hero .totals li { color: var(--text-dim); }
-.hero .totals strong { color: var(--text); font-size: 1.25rem; }
-
-section { margin: 2rem 0; }
-section h2 {
-  font-size: 1.1rem;
-  margin: 0 0 0.75rem;
-  color: var(--text-dim);
+.hero .totals strong {
+  font-family: var(--font-display);
+  font-size: clamp(1.6rem, 3vw, 2.4rem);
+  line-height: 1;
+  color: var(--ink);
+  letter-spacing: 0;
+  font-weight: 400;
+  text-shadow: 0 0 18px rgba(255, 45, 141, 0.18);
+}
+.hero .totals li:nth-child(2) strong {
+  text-shadow: 0 0 18px rgba(0, 229, 255, 0.22);
+  color: var(--blue);
+}
+.hero .totals li:nth-child(3) strong {
+  text-shadow: 0 0 18px rgba(77, 255, 138, 0.22);
+  color: var(--green);
+}
+.hero .totals .tag {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.18em;
+  color: var(--ink-mute);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
 
-.empty { color: var(--text-dim); font-style: italic; }
+/* User-profile hero variant: oversized W-L-D record split. */
+.hero-user .record {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 0;
+  margin: 1.2rem 0 0;
+  align-items: end;
+  font-family: var(--font-display);
+}
+.hero-user .record .cell {
+  padding: 0.4rem 1.4rem 0.5rem 0;
+  border-right: 1px solid var(--line);
+  margin-right: 1.4rem;
+}
+.hero-user .record .cell:last-child {
+  border-right: 0;
+  margin-right: 0;
+}
+.hero-user .record .num {
+  font-size: clamp(2.4rem, 6vw, 4rem);
+  line-height: 0.9;
+  font-weight: 400;
+}
+.hero-user .record .num.win  { color: var(--green); text-shadow: 0 0 18px var(--green); }
+.hero-user .record .num.loss { color: var(--red);   text-shadow: 0 0 18px var(--red); }
+.hero-user .record .num.draw { color: var(--amber); text-shadow: 0 0 14px var(--amber); }
+.hero-user .record .lbl {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.18em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  margin-top: 0.2rem;
+}
+.hero-user .total-line {
+  margin: 0.9rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink-dim);
+  letter-spacing: 0.06em;
+}
+
+/* ─── Sections + headings ──────────────────────────────────────────────
+ *  Each section gets a triple-glyph leader (▶▶▶) and a hairline rule.
+ *  Headings are Zen Dots. They feel like menu items off a 2002 boot
+ *  loader.                                                             */
+
+section { margin: 2.2rem 0; }
+.sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.8rem;
+  margin-bottom: 0.9rem;
+  position: relative;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px dashed var(--line);
+}
+.sec-head h2 {
+  margin: 0;
+  font-family: var(--font-chrome);
+  font-size: 0.95rem;
+  font-weight: 400;
+  letter-spacing: 0.18em;
+  color: var(--ink);
+  text-transform: uppercase;
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+}
+.sec-head h2::before {
+  content: "▶";
+  color: var(--pink);
+  font-size: 0.72em;
+  text-shadow: 0 0 8px var(--pink);
+}
+.sec-head .count {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+}
+.sec-head .actions {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--ink-mute);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* Plain h2 (used pre-cleanup pages) — same treatment, less chrome. */
+section > h2 {
+  margin: 0 0 0.85rem;
+  font-family: var(--font-chrome);
+  font-size: 0.95rem;
+  letter-spacing: 0.18em;
+  font-weight: 400;
+  text-transform: uppercase;
+  color: var(--ink);
+  border-bottom: 1px dashed var(--line);
+  padding-bottom: 0.5rem;
+}
+section > h2::before {
+  content: "▶ ";
+  color: var(--pink);
+  text-shadow: 0 0 8px var(--pink);
+}
+
+.empty {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-mute);
+  font-style: normal;
+  padding: 1rem 0;
+  text-align: center;
+  border: 1px dashed var(--line);
+  background: rgba(0, 0, 0, 0.25);
+}
+.empty::before {
+  content: "// ";
+  color: var(--pink);
+}
+
+/* ─── Tables (data grid) ──────────────────────────────────────────────
+ *  Monospace numerals, hairline grid, alternating row stripe so a long
+ *  list of fights stays readable. Win/loss/draw color the rightmost
+ *  cell with an inset glow so the eye lands on outcomes.               */
 
 table.grid {
   width: 100%;
-  border-collapse: collapse;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  border-collapse: separate;
+  border-spacing: 0;
+  background:
+    linear-gradient(180deg,
+      var(--surface) 0%,
+      var(--surface-2) 100%);
+  border: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
 }
 table.grid th, table.grid td {
   text-align: left;
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
 }
 table.grid th {
-  background: rgba(255, 255, 255, 0.02);
-  color: var(--text-dim);
-  font-weight: 600;
-  font-size: 0.85rem;
+  background: rgba(255, 45, 141, 0.05);
+  color: var(--ink-dim);
+  font-weight: 500;
+  font-size: 0.7rem;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.14em;
+  border-bottom: 1px solid var(--line-bright);
+  font-family: var(--font-chrome);
+}
+table.grid tbody tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.012);
+}
+table.grid tbody tr:hover td {
+  background: rgba(0, 229, 255, 0.04);
 }
 table.grid tbody tr:last-child td { border-bottom: 0; }
-table.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+table.grid .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+table.grid .rank {
+  width: 2.4rem;
+  color: var(--ink-mute);
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  letter-spacing: 0;
+}
+table.grid tbody tr:nth-child(1) .rank { color: var(--pink);  text-shadow: 0 0 8px var(--pink); }
+table.grid tbody tr:nth-child(2) .rank { color: var(--blue);  text-shadow: 0 0 8px var(--blue); }
+table.grid tbody tr:nth-child(3) .rank { color: var(--green); text-shadow: 0 0 6px var(--green); }
 
-tr.r-win  td:last-child { color: var(--win);  font-weight: 600; }
-tr.r-loss td:last-child { color: var(--loss); font-weight: 600; }
-tr.r-draw td:last-child { color: var(--draw); font-weight: 600; }
+table.grid a {
+  color: var(--ink);
+  border-bottom: 1px dotted transparent;
+}
+table.grid a:hover {
+  color: var(--blue);
+  border-bottom-color: var(--blue);
+}
 
-/* ─── Game grid (Fightcade-style cards) ────────────────────────────────
- *
- * 16:9-ish banner over a colored gradient (deterministic from game_id),
- * monogram fallback when banner image isn't cached yet, engine + verified
- * pips on the banner, and a flat strip below for name + year + match
- * count. Hover lifts + brightens; whole card is the link target.
- */
-.subtitle { color: var(--text-dim); margin: 0; }
-.subtitle .pill { margin-left: 0.5rem; }
-.pill {
-  display: inline-block;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  color: var(--text);
+tr.r-win  td:last-child {
+  color: var(--green);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
   font-size: 0.78rem;
+  text-shadow: 0 0 6px rgba(77, 255, 138, 0.4);
+}
+tr.r-loss td:last-child {
+  color: var(--red);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+}
+tr.r-draw td:last-child {
+  color: var(--amber);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+}
+
+/* ─── Pills + badges ──────────────────────────────────────────────────*/
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--surface-3);
+  border: 1px solid var(--line-bright);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   padding: 0.15rem 0.55rem;
   border-radius: 999px;
+  white-space: nowrap;
 }
-.pill-win  { color: var(--win);  border-color: rgba(74,222,128,0.35); }
-.pill-loss { color: var(--loss); border-color: rgba(248,113,113,0.35); }
+.pill-win {
+  color: var(--green);
+  border-color: rgba(77, 255, 138, 0.4);
+  background: rgba(77, 255, 138, 0.05);
+}
+.pill-loss {
+  color: var(--red);
+  border-color: rgba(255, 56, 102, 0.4);
+  background: rgba(255, 56, 102, 0.05);
+}
+.pill-pink {
+  color: var(--pink);
+  border-color: rgba(255, 45, 141, 0.4);
+  background: rgba(255, 45, 141, 0.05);
+}
+.pill-blue {
+  color: var(--blue);
+  border-color: rgba(0, 229, 255, 0.4);
+  background: rgba(0, 229, 255, 0.05);
+}
+
+/* ─── Game grid (catalog) ─────────────────────────────────────────────
+ *  Engine-bucketed sections, banner-first cards. Cards have:
+ *  - a 16:9 banner area with a deterministic gradient fallback
+ *  - an engine badge (top-right), pink for FM2K, blue for FM95
+ *  - a thin neon edge that lights up on hover
+ *  - a footer strip with name (Zen Dots), studio · year (mono), and
+ *    match count when active                                          */
+
+.grid-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.55rem 0.7rem;
+  margin: -0.4rem 0 1.2rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--blue);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.grid-toolbar .lbl { color: var(--ink-mute); margin-right: 0.3rem; }
+.grid-toolbar .count-pink { color: var(--pink); }
+.grid-toolbar .count-blue { color: var(--blue); }
+
+.engine-section { margin-top: 2rem; }
+.engine-section .sec-head h2 .engine-tag {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  letter-spacing: 0.04em;
+  margin-right: 0.4rem;
+  text-shadow:
+    -1px 0 0 currentColor,
+    1px 0 0 currentColor;
+}
+.engine-section.fm2k .sec-head h2::before { color: var(--pink); }
+.engine-section.fm2k .sec-head h2 .engine-tag { color: var(--pink); }
+.engine-section.fm95 .sec-head h2::before { color: var(--blue); }
+.engine-section.fm95 .sec-head h2 .engine-tag { color: var(--blue); }
 
 .game-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 1rem;
-  margin-top: 1rem;
+  gap: 0.9rem;
 }
+
 .game-card {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--line);
   text-decoration: none;
-  color: var(--text);
+  color: var(--ink);
   display: flex;
   flex-direction: column;
-  transition: transform 80ms ease, border-color 80ms ease,
-              box-shadow 80ms ease;
+  overflow: hidden;
+  transition: transform 140ms ease,
+              border-color 140ms ease,
+              box-shadow 220ms ease;
 }
+.game-card::before {
+  /* corner accent — diagonal slash on top-left */
+  content: "";
+  position: absolute;
+  top: 0; left: 0;
+  width: 14px; height: 14px;
+  background: var(--pink);
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+  z-index: 3;
+  opacity: 0.95;
+}
+.game-card.engine-fm95::before { background: var(--blue); }
 .game-card:hover {
-  transform: translateY(-2px);
-  border-color: var(--accent);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
-  text-decoration: none;
+  transform: translateY(-3px);
+  border-color: var(--pink);
+  box-shadow:
+    0 0 0 1px var(--pink),
+    0 8px 24px var(--pink-glow),
+    0 14px 40px rgba(0, 0, 0, 0.55);
 }
+.game-card.engine-fm95:hover {
+  border-color: var(--blue);
+  box-shadow:
+    0 0 0 1px var(--blue),
+    0 8px 24px var(--blue-glow),
+    0 14px 40px rgba(0, 0, 0, 0.55);
+}
+
 .game-card-banner {
   position: relative;
   aspect-ratio: 16 / 9;
@@ -162,81 +726,359 @@ tr.r-draw td:last-child { color: var(--draw); font-weight: 600; }
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--line);
 }
 .game-card-banner img {
-  width: 100%;
-  height: 100%;
+  width: 100%; height: 100%;
   object-fit: cover;
   display: block;
+  filter: saturate(1.05);
+}
+.game-card-banner::after {
+  /* horizontal scanline overlay specifically for cards */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent 3px,
+      rgba(0, 0, 0, 0.15) 3px,
+      rgba(0, 0, 0, 0.15) 4px),
+    linear-gradient(180deg,
+      transparent 60%,
+      rgba(0, 0, 0, 0.55) 100%);
+  pointer-events: none;
 }
 .game-card-monogram {
-  font-size: 2.6rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  color: rgba(255, 255, 255, 0.85);
-  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  font-family: var(--font-display);
+  font-size: 2.2rem;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.92);
+  text-shadow:
+    -1px 0 0 var(--pink),
+     1px 0 0 var(--blue),
+     0 4px 16px rgba(0, 0, 0, 0.6);
   user-select: none;
+  z-index: 1;
+  position: relative;
 }
 .game-card-badge {
   position: absolute;
   top: 0.5rem;
-  left: 0.5rem;
-  background: rgba(0, 0, 0, 0.55);
-  color: var(--text);
-  font-size: 0.68rem;
-  font-weight: 700;
+  right: 0.55rem;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid var(--line-bright);
+  font-family: var(--font-chrome);
+  font-size: 0.62rem;
+  font-weight: 400;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 0.15rem 0.4rem;
-  border-radius: 4px;
+  letter-spacing: 0.12em;
+  padding: 0.18rem 0.45rem;
+  z-index: 4;
 }
-.engine-fm95 { background: rgba(88, 166, 255, 0.85); color: #06121e; }
+.game-card-badge.engine-fm2k {
+  color: var(--pink);
+  border-color: rgba(255, 45, 141, 0.6);
+  text-shadow: 0 0 6px rgba(255, 45, 141, 0.6);
+}
+.game-card-badge.engine-fm95 {
+  color: var(--blue);
+  border-color: rgba(0, 229, 255, 0.6);
+  text-shadow: 0 0 6px rgba(0, 229, 255, 0.6);
+}
 .game-card-pip {
   position: absolute;
-  top: 0.55rem;
+  bottom: 0.5rem;
   right: 0.55rem;
-  width: 8px;
-  height: 8px;
+  width: 10px; height: 10px;
   border-radius: 50%;
-  background: var(--win);
-  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.4);
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  z-index: 4;
 }
-.game-card-active { border-color: rgba(74, 222, 128, 0.5); }
+.game-card-active .game-card-pip {
+  /* slow pulse for games with matches */
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.3); opacity: 0.7; }
+}
+
 .game-card-body {
-  padding: 0.6rem 0.7rem 0.7rem;
+  padding: 0.65rem 0.75rem 0.7rem;
   flex-grow: 1;
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
 }
 .game-card-name {
-  font-weight: 600;
-  font-size: 0.95rem;
-  line-height: 1.2;
-  /* Two-line clamp so long names don't break the grid alignment. */
+  font-family: var(--font-chrome);
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.25;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 .game-card-meta {
-  font-size: 0.78rem;
-  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-mute);
   display: flex;
   align-items: center;
   gap: 0.4rem;
   margin-top: auto;
+  padding-top: 0.35rem;
+  text-transform: uppercase;
+  border-top: 1px dashed var(--line);
 }
+.game-card-meta .studio { color: var(--ink-dim); }
 .game-card-meta .dot {
-  width: 4px;
-  height: 4px;
+  width: 3px; height: 3px;
   border-radius: 50%;
-  background: var(--text-dim);
+  background: var(--ink-mute);
   display: inline-block;
 }
-.game-card-meta .active-count { color: var(--win); }
+.game-card-meta .active-count {
+  margin-left: auto;
+  color: var(--green);
+  font-weight: 500;
+  letter-spacing: 0.12em;
+}
 
-/* Wider main container on the grid page so cards don't squeeze into 3
- * columns at desktop widths. Other pages stay at the existing 980px
- * because their tabular content reads better narrow. */
-body.page-games main { max-width: 1400px; }
+/* Banner monogram fallback — colored gradient backdrop set inline by
+ * `style="background: ..."` from the banner_color() helper. */
+
+/* ─── VS-card (recent matches feed) ───────────────────────────────────
+ *  Two-up player cards split by a neon "VS" pill. Outcome pulses on the
+ *  winner's side (green inset glow), the loser dims slightly.          */
+
+.vs-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.vs-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: stretch;
+  background:
+    linear-gradient(135deg,
+      rgba(255, 45, 141, 0.04) 0%,
+      transparent 50%,
+      rgba(0, 229, 255, 0.04) 100%),
+    var(--surface);
+  border: 1px solid var(--line);
+  text-decoration: none;
+  color: var(--ink);
+  overflow: hidden;
+  transition: border-color 140ms ease, box-shadow 220ms ease;
+}
+.vs-card:hover {
+  border-color: var(--line-bright);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+}
+.vs-card .side {
+  padding: 0.7rem 1rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.vs-card .side.p2 { text-align: right; align-items: flex-end; }
+.vs-card .side .nick {
+  font-family: var(--font-chrome);
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  color: var(--ink);
+  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.vs-card .side .nick a {
+  color: inherit;
+  border-bottom: 1px dotted transparent;
+}
+.vs-card .side .nick a:hover {
+  border-bottom-color: var(--blue);
+  color: var(--blue);
+}
+.vs-card .side .char {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+}
+.vs-card .side .stat {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  margin-top: 0.15rem;
+}
+.vs-card .side.win  { background: linear-gradient(180deg,
+                        rgba(77, 255, 138, 0.06) 0%,
+                        transparent 100%); }
+.vs-card .side.win .nick   { color: var(--green); text-shadow: 0 0 8px rgba(77, 255, 138, 0.4); }
+.vs-card .side.loss .nick  { color: var(--ink-dim); }
+.vs-card .side.draw .nick  { color: var(--amber); }
+
+.vs-card .vs {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0.7rem;
+  background:
+    linear-gradient(180deg,
+      var(--surface-2) 0%,
+      var(--surface-3) 100%);
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  position: relative;
+  min-width: 7.5rem;
+}
+.vs-card .vs::before, .vs-card .vs::after {
+  /* diagonal slashes that hint at a VS-screen split */
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 14px;
+}
+.vs-card .vs::before {
+  left: -8px;
+  background: linear-gradient(45deg,
+              transparent 50%, var(--surface-3) 50%);
+}
+.vs-card .vs::after {
+  right: -8px;
+  background: linear-gradient(45deg,
+              var(--surface-3) 50%, transparent 50%);
+}
+.vs-card .vs .vs-text {
+  font-family: var(--font-display);
+  font-size: 1.4rem;
+  letter-spacing: 0;
+  color: var(--ink);
+  text-shadow:
+    -1.5px 0 0 var(--pink),
+     1.5px 0 0 var(--blue);
+  line-height: 0.9;
+}
+.vs-card .vs .game {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.12em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  margin-top: 0.25rem;
+  text-align: center;
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vs-card .vs .game a { color: var(--ink-dim); }
+.vs-card .vs .game a:hover { color: var(--pink); }
+.vs-card .vs .when {
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.16em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  margin-top: 0.15rem;
+}
+
+/* ─── Page-specific ───────────────────────────────────────────────────*/
+
+body.page-404 .glitch {
+  font-family: var(--font-display);
+  font-size: clamp(4rem, 12vw, 8rem);
+  line-height: 0.9;
+  letter-spacing: 0;
+  text-shadow:
+    -3px 0 0 var(--pink),
+     3px 0 0 var(--blue),
+     0 0 32px rgba(0, 229, 255, 0.2);
+  color: var(--ink);
+  margin: 0;
+  text-transform: uppercase;
+}
+body.page-404 .nosignal {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  letter-spacing: 0.18em;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  margin: 0.4rem 0 1.2rem;
+}
+body.page-404 .nosignal::before { content: "// "; color: var(--pink); }
+
+/* ─── Two-column dashboard helper ─────────────────────────────────────*/
+.cols-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.2rem;
+}
+@media (max-width: 800px) {
+  .cols-2 { grid-template-columns: 1fr; }
+  nav .links a { padding: 0.55rem 0.65rem; font-size: 0.7rem; }
+  .vs-card { grid-template-columns: 1fr 1fr; }
+  .vs-card .vs { grid-column: 1 / -1; order: -1; padding: 0.45rem;
+                 border-left: 0; border-right: 0;
+                 border-bottom: 1px solid var(--line); }
+  .vs-card .vs::before, .vs-card .vs::after { display: none; }
+}
+
+/* ─── Subtle utilities ────────────────────────────────────────────────*/
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  background: var(--surface-3);
+  border: 1px solid var(--line-bright);
+  border-bottom-width: 2px;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  color: var(--ink);
+}
+hr.div {
+  border: 0;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent 0%, var(--line-bright) 50%, transparent 100%);
+  margin: 1.5rem 0;
+}
+.muted { color: var(--ink-mute); }
+.cta {
+  display: inline-block;
+  font-family: var(--font-chrome);
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--pink);
+  border: 1px solid var(--pink);
+  padding: 0.4rem 0.9rem;
+  text-decoration: none;
+  background: rgba(255, 45, 141, 0.06);
+  transition: all 140ms ease;
+}
+.cta:hover {
+  color: var(--ink);
+  background: var(--pink);
+  box-shadow: 0 0 18px var(--pink-glow);
+}

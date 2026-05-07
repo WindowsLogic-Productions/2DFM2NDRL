@@ -1,18 +1,41 @@
 {% extends "base.html" %}
-{% block title %}Games — FM2K Stats{% endblock %}
+{% block title %}Games · 2DFM HUB{% endblock %}
 {% block body_class %}page-games{% endblock %}
 {% block content %}
+
+{# Server returns a flat list. Bucket by engine in the template so we
+   don't have to touch the backend just for visual grouping. #}
+{% set fm2k_rows = rows | selectattr('engine', 'equalto', 'FM2K') | list %}
+{% set fm95_rows = rows | selectattr('engine', 'equalto', 'FM95') | list %}
+{% set other_rows = rows | rejectattr('engine', 'in', ['FM2K', 'FM95']) | list %}
+
 <section class="hero">
   <h1>Games</h1>
+  <p class="lede">
+    <strong>{{ total_games }}</strong> cataloged across two engines —
+    every game we've curated, scraped, or seen a match on.
+  </p>
   <p class="subtitle">
-    {{ total_games }} cataloged
-    · <span class="pill pill-win">{{ total_active }} with matches played</span>
+    <span class="pill pill-win">{{ total_active }} with matches</span>
+    <span class="pill pill-pink">{{ fm2k_rows|length }} FM2K_2ND</span>
+    <span class="pill pill-blue">{{ fm95_rows|length }} FM95</span>
   </p>
 </section>
 
-<div class="game-grid">
-  {% for r in rows %}
-  <a class="game-card{% if r.match_count > 0 %} game-card-active{% endif %}"
+<div class="grid-toolbar">
+  <span class="lbl">// SCANNING</span>
+  <span class="count-pink">FM2K_2ND × {{ fm2k_rows|length }}</span>
+  <span style="color: var(--ink-mute);">/</span>
+  <span class="count-blue">FM95 × {{ fm95_rows|length }}</span>
+  {% if other_rows %}
+    <span style="color: var(--ink-mute);">/</span>
+    <span style="color: var(--ink-dim);">UNKNOWN × {{ other_rows|length }}</span>
+  {% endif %}
+  <span style="margin-left: auto; color: var(--ink-mute);">SORT: A-Z</span>
+</div>
+
+{% macro game_card(r) -%}
+  <a class="game-card{% if r.match_count > 0 %} game-card-active{% endif %} engine-{{ r.engine|lower }}"
      href="/g/{{ r.game_id }}"
      data-game-id="{{ r.game_id }}">
     <div class="game-card-banner"
@@ -25,23 +48,59 @@
         <span class="game-card-monogram">{{ banner_monogram(r.name) }}</span>
       {% endif %}
       {% if r.engine %}
-      <span class="game-card-badge engine-{{ r.engine|lower }}">{{ r.engine }}</span>
+        <span class="game-card-badge engine-{{ r.engine|lower }}">{{ r.engine }}</span>
       {% endif %}
-      {% if r.has_kgt %}
-      <span class="game-card-pip" title=".kgt verified"></span>
+      {% if r.match_count > 0 %}
+        <span class="game-card-pip" title="{{ r.match_count }} match{{ 'es' if r.match_count != 1 else '' }}"></span>
       {% endif %}
     </div>
     <div class="game-card-body">
       <div class="game-card-name">{{ r.name }}</div>
       <div class="game-card-meta">
-        {% if r.year %}<span>{{ r.year }}</span>{% endif %}
+        <span class="studio">{{ r.developer or 'unsigned' }}</span>
+        {% if r.year %}<span class="dot"></span><span>{{ r.year }}</span>{% endif %}
         {% if r.match_count > 0 %}
-          <span class="dot"></span>
-          <span class="active-count">{{ r.match_count }} match{{ 'es' if r.match_count != 1 else '' }}</span>
+          <span class="active-count">×{{ r.match_count }}</span>
         {% endif %}
       </div>
     </div>
   </a>
-  {% endfor %}
-</div>
+{%- endmacro %}
+
+{% if fm2k_rows %}
+<section class="engine-section fm2k">
+  <div class="sec-head">
+    <h2><span class="engine-tag">FM2K</span> 2nd · ROLLBACK COMPATIBLE</h2>
+    <span class="count">// {{ fm2k_rows|length }} games</span>
+  </div>
+  <div class="game-grid">
+    {% for r in fm2k_rows %}{{ game_card(r) }}{% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if fm95_rows %}
+<section class="engine-section fm95">
+  <div class="sec-head">
+    <h2><span class="engine-tag">FM95</span> · LEGACY ENGINE</h2>
+    <span class="count">// {{ fm95_rows|length }} games</span>
+  </div>
+  <div class="game-grid">
+    {% for r in fm95_rows %}{{ game_card(r) }}{% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if other_rows %}
+<section class="engine-section">
+  <div class="sec-head">
+    <h2>Uncategorized</h2>
+    <span class="count">// {{ other_rows|length }} games</span>
+  </div>
+  <div class="game-grid">
+    {% for r in other_rows %}{{ game_card(r) }}{% endfor %}
+  </div>
+</section>
+{% endif %}
+
 {% endblock %}

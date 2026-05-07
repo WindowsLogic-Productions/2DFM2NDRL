@@ -1,43 +1,46 @@
 {% extends "base.html" %}
-{% block title %}Recent matches — FM2K Stats{% endblock %}
+{% block title %}Recent · 2DFM HUB{% endblock %}
 {% block content %}
+
 <section class="hero">
-  <h1>Recent matches</h1>
-  <p class="lede">Newest first. {{ matches|length }} shown.</p>
+  <h1>Recent Matches</h1>
+  <p class="lede">
+    Newest first · <strong>{{ matches|length }}</strong> shown.
+    Live mirror of the hub's match log.
+  </p>
 </section>
 
 <section>
-  <table class="grid">
-    <thead>
-      <tr>
-        <th>When</th>
-        <th>Game</th>
-        <th>P1</th>
-        <th>P2</th>
-        <th>Winner</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for m in matches %}
-      <tr>
-        <td>{{ format_iso(m.finished_at) }}</td>
-        <td><a href="/g/{{ m.game_id }}">{{ friendly_name(m.game_id) }}</a></td>
-        <td>
-          <a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a>
-          ({{ char_label(m.p1_char_name, m.p1_char_id) }})
-        </td>
-        <td>
-          <a href="/u/{{ m.p2_id }}">{{ m.p2_nick }}</a>
-          ({{ char_label(m.p2_char_name, m.p2_char_id) }})
-        </td>
-        <td>
-          {% if not m.winner_id %}draw
-          {% elif m.winner_id == m.p1_id %}P1
-          {% else %}P2{% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="sec-head">
+    <h2>Match Feed</h2>
+    <span class="count">// CHRONOLOGICAL</span>
+  </div>
+  {% if matches %}
+  <div class="vs-feed">
+    {% for m in matches %}
+    {% set p1_won  = m.winner_id == m.p1_id %}
+    {% set is_draw = not m.winner_id %}
+    <div class="vs-card">
+      <div class="side p1 {{ 'win' if p1_won else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ m.p1_id }}">{{ m.p1_nick }}</a></div>
+        <div class="char">{{ char_label(m.p1_char_name, m.p1_char_id) }}</div>
+        <div class="stat">{{ 'WIN' if p1_won else ('DRAW' if is_draw else 'LOSS') }}</div>
+      </div>
+      <div class="vs">
+        <div class="vs-text">VS</div>
+        <div class="game"><a href="/g/{{ m.game_id }}">{{ friendly_name(m.game_id) }}</a></div>
+        <div class="when">{{ format_iso(m.finished_at) }}</div>
+      </div>
+      <div class="side p2 {{ 'win' if (not p1_won and not is_draw) else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ m.p2_id }}">{{ m.p2_nick }}</a></div>
+        <div class="char">{{ char_label(m.p2_char_name, m.p2_char_id) }}</div>
+        <div class="stat">{{ 'WIN' if (not p1_won and not is_draw) else ('DRAW' if is_draw else 'LOSS') }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">No matches in the feed yet.</p>
+  {% endif %}
 </section>
 {% endblock %}

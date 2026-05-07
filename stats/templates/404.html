@@ -1,9 +1,15 @@
 {% extends "base.html" %}
-{% block title %}Not found — FM2K Stats{% endblock %}
+{% block title %}NO SIGNAL · 2DFM HUB{% endblock %}
+{% block body_class %}page-404{% endblock %}
 {% block content %}
-<section class="hero">
-  <h1>Not found</h1>
-  <p class="lede">{% if detail %}{{ detail }}{% else %}That page isn't here.{% endif %}</p>
-  <p><a href="/">Back to overview</a></p>
+<section class="hero" style="text-align: center;">
+  <p class="glitch">404</p>
+  <p class="nosignal">NO SIGNAL — TUNE TO ANOTHER CABINET</p>
+  <p class="lede" style="text-align: center;">
+    {% if detail %}{{ detail }}{% else %}That page isn't here.{% endif %}
+  </p>
+  <p style="text-align: center; margin-top: 1.4rem;">
+    <a class="cta" href="/">RETURN TO LOBBY</a>
+  </p>
 </section>
 {% endblock %}
