@@ -4007,7 +4007,16 @@ void LauncherUI::RenderHubPanel() {
                         static_cast<uint16_t>(peer_port),
                         ev.match.token,
                         2000);
-                    if (!public_reachable) {
+                    // Same-box dev test loopback fallback only fires when
+                    // there is NO hub relay configured. With a relay
+                    // available, falsely flipping peer_ip to 127.0.0.1
+                    // sends HELLO into our own loopback while the relay
+                    // sits idle — both peers stall at handshake. Trust
+                    // the public peer_ip on real cross-NAT matches and
+                    // let the hook's NAT traversal use the relay.
+                    const bool have_relay = !ev.match.relay_ip.empty()
+                                         && ev.match.relay_port > 0;
+                    if (!public_reachable && !have_relay) {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Hub: public probe timed out — trying 127.0.0.1 "
                             "in case this is a same-box test");
@@ -4023,12 +4032,18 @@ void LauncherUI::RenderHubPanel() {
                                 "using 127.0.0.1 as remote");
                         } else {
                             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                "Hub: probe didn't get a reply on either path. "
-                                "Spawning game anyway — in-game NAT traversal "
-                                "(STUN + punch + relay) will retry on its own. "
-                                "If you stall in 'Connecting...' for >10s, your "
-                                "NAT probably needs the relay path.");
+                                "Hub: probe didn't get a reply. Spawning "
+                                "game anyway — in-game NAT traversal "
+                                "(STUN + punch + relay) will retry on its own.");
                         }
+                    } else if (!public_reachable && have_relay) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: public probe failed; relay configured "
+                            "(%s:%u). Hook NAT path will fall through to "
+                            "the relay — keeping peer=%s:%d as remote.",
+                            ev.match.relay_ip.c_str(),
+                            (unsigned)ev.match.relay_port,
+                            peer_ip.c_str(), peer_port);
                     } else {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Hub: public probe succeeded — direct path looks good");
