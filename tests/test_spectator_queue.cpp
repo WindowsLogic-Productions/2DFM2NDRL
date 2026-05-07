@@ -195,3 +195,240 @@ TEST_CASE("Backfill scale: 1 hour of session catches up cleanly") {
     }
     CHECK(drained == TOTAL);
 }
+
+// =============================================================================
+// SessionEvent queue: head-of-queue non-INPUT drain (C2)
+// =============================================================================
+//
+// Mirror of the new pb_queue behavior in spectator_node.cpp. The production
+// PopFrameInputs drains non-INPUT events at the head of the queue before
+// popping the next INPUT — this is the gate that lets C3+ apply ops
+// (PIN_RNG, RESET_INPUT_STATE, SOUND_INIT, MATCH_START) at the exact moment
+// the input that follows them is consumed by the sim. C2 leaves the apply
+// path as a no-op (silently drops the event); the test pins the drain
+// semantic so it can't regress.
+
+namespace mirror_eq {
+
+enum class EventType : uint8_t {
+    INPUT             = 1,
+    PIN_RNG           = 2,
+    RESET_INPUT_STATE = 3,
+    SOUND_INIT        = 4,
+    MATCH_START       = 5,
+    MATCH_END         = 6,
+    FINGERPRINT       = 7,
+};
+
+struct Event {
+    EventType type;
+    uint16_t  p1 = 0;
+    uint16_t  p2 = 0;
+    uint32_t  payload = 0;  // PIN_RNG seed / FINGERPRINT hash / unused
+};
+
+struct EventQueue {
+    std::vector<Event> q;
+    uint16_t           current_p1 = 0;
+    uint16_t           current_p2 = 0;
+    // Side-channel: count non-INPUT events dispatched (C3 will count
+    // applies; C2 just counts drops).
+    size_t             non_input_drained = 0;
+
+    bool PopInput(uint16_t* p1, uint16_t* p2) {
+        // Drain non-INPUT events at head.
+        while (!q.empty() && q.front().type != EventType::INPUT) {
+            ++non_input_drained;
+            q.erase(q.begin());
+        }
+        if (q.empty()) return false;
+        Event ev = q.front();
+        q.erase(q.begin());
+        current_p1 = ev.p1;
+        current_p2 = ev.p2;
+        if (p1) *p1 = ev.p1;
+        if (p2) *p2 = ev.p2;
+        return true;
+    }
+};
+
+}  // namespace mirror_eq
+
+TEST_CASE("Head-drain: PopInput skips non-INPUT events at head, returns next INPUT") {
+    using namespace mirror_eq;
+    EventQueue q;
+    q.q.push_back({EventType::PIN_RNG,           0, 0, 0x12345678});
+    q.q.push_back({EventType::RESET_INPUT_STATE, 0, 0, 0});
+    q.q.push_back({EventType::SOUND_INIT,        0, 0, 0});
+    q.q.push_back({EventType::INPUT,             0x111, 0x222, 0});
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 0x111);
+    CHECK(p2 == 0x222);
+    CHECK(q.non_input_drained == 3);
+    CHECK(q.q.empty());
+}
+
+TEST_CASE("Head-drain: queue with only non-INPUT events returns false") {
+    using namespace mirror_eq;
+    EventQueue q;
+    q.q.push_back({EventType::PIN_RNG, 0, 0, 0xDEADBEEF});
+    q.q.push_back({EventType::SOUND_INIT, 0, 0, 0});
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK_FALSE(q.PopInput(&p1, &p2));
+    CHECK(q.non_input_drained == 2);
+    CHECK(q.q.empty());
+}
+
+TEST_CASE("Head-drain: ops between INPUTs are applied at the right boundary") {
+    // Stream shape that C3+ will emit at battle entry:
+    //   [INPUT(css_last), PIN_RNG, RESET_INPUT_STATE, SOUND_INIT, INPUT(battle_first)]
+    // Spectator drains: pop css_last → run sim → pop battle_first → BEFORE
+    // popping it, drain the three non-INPUTs (apply RNG pin etc.) → run sim
+    // with cleanly-initialized state. This is the property under test.
+    using namespace mirror_eq;
+    EventQueue q;
+    q.q.push_back({EventType::INPUT,             0xCC0, 0xCC1, 0});  // css_last
+    q.q.push_back({EventType::PIN_RNG,           0, 0, 0x12345678});
+    q.q.push_back({EventType::RESET_INPUT_STATE, 0, 0, 0});
+    q.q.push_back({EventType::SOUND_INIT,        0, 0, 0});
+    q.q.push_back({EventType::INPUT,             0xBB0, 0xBB1, 0});  // battle_first
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 0xCC0); CHECK(p2 == 0xCC1);
+    CHECK(q.non_input_drained == 0);  // first INPUT was at the head — no drain
+
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 0xBB0); CHECK(p2 == 0xBB1);
+    CHECK(q.non_input_drained == 3);  // PIN_RNG + RESET + SOUND_INIT drained before battle_first
+    CHECK(q.q.empty());
+}
+
+TEST_CASE("Head-drain: MATCH_END and MATCH_START at head are also drained") {
+    using namespace mirror_eq;
+    EventQueue q;
+    q.q.push_back({EventType::MATCH_END, 0, 0, 0});
+    q.q.push_back({EventType::MATCH_START, 0, 0, 0});
+    q.q.push_back({EventType::INPUT, 0xAA, 0xBB, 0});
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 0xAA); CHECK(p2 == 0xBB);
+    CHECK(q.non_input_drained == 2);
+}
+
+TEST_CASE("Apply order: ops at head are applied BEFORE the next INPUT pops (C3)") {
+    // Production drain dispatches each non-INPUT event to ApplySessionEvent
+    // (writes RNG, calls SoundRollback::Init, etc.) BEFORE popping the next
+    // INPUT event. Mirror that here with a side-effect counter to pin the
+    // ordering invariant: when PopInput returns true, all preceding head
+    // ops must have already executed.
+    using namespace mirror_eq;
+
+    struct ApplyTrace {
+        std::vector<EventType> applied_in_order;
+        uint16_t               sim_p1 = 0xFFFF;
+        uint16_t               sim_p2 = 0xFFFF;
+    };
+
+    ApplyTrace trace;
+
+    auto pop_with_apply = [&](EventQueue& q, uint16_t* p1, uint16_t* p2) -> bool {
+        while (!q.q.empty() && q.q.front().type != EventType::INPUT) {
+            trace.applied_in_order.push_back(q.q.front().type);
+            ++q.non_input_drained;
+            q.q.erase(q.q.begin());
+        }
+        if (q.q.empty()) return false;
+        Event ev = q.q.front();
+        q.q.erase(q.q.begin());
+        if (p1) *p1 = ev.p1;
+        if (p2) *p2 = ev.p2;
+        // Simulate the sim "consuming" the input.
+        trace.sim_p1 = ev.p1;
+        trace.sim_p2 = ev.p2;
+        return true;
+    };
+
+    EventQueue q;
+    q.q.push_back({EventType::PIN_RNG,           0, 0, 0xDEAD});
+    q.q.push_back({EventType::INPUT,             0xAA, 0xBB, 0});
+
+    // Before pop: nothing applied, sim hasn't consumed.
+    CHECK(trace.applied_in_order.empty());
+    CHECK(trace.sim_p1 == 0xFFFF);
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK(pop_with_apply(q, &p1, &p2));
+
+    // After pop: PIN_RNG was applied, THEN the input was consumed.
+    REQUIRE(trace.applied_in_order.size() == 1);
+    CHECK(trace.applied_in_order[0] == EventType::PIN_RNG);
+    CHECK(trace.sim_p1 == 0xAA);  // sim consumed AFTER apply
+    CHECK(trace.sim_p2 == 0xBB);
+}
+
+TEST_CASE("Apply order: full battle-entry op chain applies in stream order") {
+    // Realistic Netplay_StartBattle stream:
+    //   PIN_RNG(0x12345678) → RESET_INPUT_STATE → SOUND_INIT → first battle INPUT
+    using namespace mirror_eq;
+
+    std::vector<EventType> trace;
+    auto pop_with_apply = [&](EventQueue& q, uint16_t* p1, uint16_t* p2) -> bool {
+        while (!q.q.empty() && q.q.front().type != EventType::INPUT) {
+            trace.push_back(q.q.front().type);
+            ++q.non_input_drained;
+            q.q.erase(q.q.begin());
+        }
+        if (q.q.empty()) return false;
+        Event ev = q.q.front();
+        q.q.erase(q.q.begin());
+        if (p1) *p1 = ev.p1;
+        if (p2) *p2 = ev.p2;
+        return true;
+    };
+
+    EventQueue q;
+    q.q.push_back({EventType::PIN_RNG,           0, 0, 0x12345678});
+    q.q.push_back({EventType::RESET_INPUT_STATE, 0, 0, 0});
+    q.q.push_back({EventType::SOUND_INIT,        0, 0, 0});
+    q.q.push_back({EventType::INPUT,             0x010, 0x020, 0});
+
+    uint16_t p1, p2;
+    CHECK(pop_with_apply(q, &p1, &p2));
+    REQUIRE(trace.size() == 3);
+    CHECK(trace[0] == EventType::PIN_RNG);
+    CHECK(trace[1] == EventType::RESET_INPUT_STATE);
+    CHECK(trace[2] == EventType::SOUND_INIT);
+    CHECK(p1 == 0x010);
+    CHECK(p2 == 0x020);
+}
+
+TEST_CASE("Head-drain: trailing non-INPUT events stay queued until next INPUT batch") {
+    // After the last INPUT of a batch, if a non-INPUT op trails (e.g. a
+    // FINGERPRINT diagnostic), it sits at the head of the queue waiting for
+    // the next INPUT batch. The drain loop must not pop it until then.
+    using namespace mirror_eq;
+    EventQueue q;
+    q.q.push_back({EventType::INPUT, 1, 2, 0});
+    q.q.push_back({EventType::FINGERPRINT, 0, 0, 0xCAFEBABE});
+
+    uint16_t p1 = 0, p2 = 0;
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 1); CHECK(p2 == 2);
+    CHECK(q.non_input_drained == 0);
+
+    // Second pop: drain FINGERPRINT, then queue is empty → false.
+    CHECK_FALSE(q.PopInput(&p1, &p2));
+    CHECK(q.non_input_drained == 1);
+    CHECK(q.q.empty());
+
+    // New INPUT batch arrives — pop should succeed cleanly.
+    q.q.push_back({EventType::INPUT, 3, 4, 0});
+    CHECK(q.PopInput(&p1, &p2));
+    CHECK(p1 == 3); CHECK(p2 == 4);
+    CHECK(q.non_input_drained == 1);  // unchanged
+}

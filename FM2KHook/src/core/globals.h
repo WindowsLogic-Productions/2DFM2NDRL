@@ -325,6 +325,21 @@ extern bool g_stress_mode;
 // Set via FM2K_SPECTATOR_MODE=1 env var.
 extern bool g_spectator_mode;
 
+// Spectator fast catch-up: true while RunSpectatorTick's inner loop is
+// burning through queued events to close the gap between pb_queue depth
+// and live edge (LIVE_LAG_FRAMES target). Read by Hook_RenderGame to
+// skip render and Hook_DispatchScriptSoundCommand to mute audio so a
+// 30k-event drain doesn't blast 5 minutes of compressed sound in a few
+// seconds. Cleared once pb_queue depth drops below the live-lag target.
+extern bool g_spectator_catchup;
+
+// User-toggled fast-forward (F12 in spectator window). When true, the
+// spectator's catchup loop engages regardless of the one-shot latch and
+// the queue-depth target — lets the user manually race to live edge
+// after a lag spike, then toggle off to resume normal-speed playback.
+// Window title displays "[FF]" while active. Default false.
+extern bool g_spectator_ff_user;
+
 // FM95 host-driven trampoline: Hook_UpdateGameState sets this to tell
 // Hook_RenderGame to skip the host's natural render call this frame
 // (the trampoline tick's RenderFrameWithSnapshot already rendered).

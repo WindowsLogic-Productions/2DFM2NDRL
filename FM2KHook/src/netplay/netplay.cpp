@@ -21,6 +21,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
 
@@ -212,6 +213,7 @@ static void CheckFullyConnected() {
 
             // Sync RNG immediately
             *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+            SpectatorNode_AppendPinRng(0x12345678);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: Synced RNG=0x12345678");
 
@@ -761,11 +763,29 @@ bool Netplay_ProcessCSS() {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
     }
 
-    // Keep resending BATTLE_READY until remote acknowledges. Without this,
-    // if P1 syncs first and sends only one BATTLE_READY that gets lost,
-    // P2 never syncs and gets stuck forever.
+    // Keep resending BATTLE_READY until BOTH sides are bilaterally
+    // confirmed in the GekkoNet CSS session.
+    //
+    // Why not gate on `!g_remote_css_ready`? That flag flips true the
+    // moment THIS side receives one BATTLE_READY from the peer — which
+    // can happen before this side has even entered CSS, because the peer
+    // who-entered-first is spamming. Then when this side finally enters
+    // CSS, the unconditional first-send fires (line 762) but the spam
+    // loop's `!g_remote_css_ready` is already false, so resends stop.
+    // If THAT one BATTLE_READY drops on a lossy / high-RTT link, the
+    // peer never receives this side's signal and stays stuck forever.
+    // Observed live in P1/P2 logs under simulated loss.
+    //
+    // Gate on `g_css_frame == 0` instead: g_css_frame is incremented in
+    // the GekkoNet CSS AdvanceEvent handler, which only fires once
+    // BOTH sides have joined the CSS session. So spam keeps going on
+    // both sides independently until bilateral sync is genuinely
+    // confirmed by a real GekkoNet frame. Once g_css_frame > 0 on a
+    // side, both sides have it (frame numbers are agreed). Idempotent
+    // BATTLE_READYs in the meantime are harmless (small payload, peer
+    // ignores duplicates beyond setting g_remote_css_ready).
     static uint32_t last_ready_send = 0;
-    if (!g_remote_css_ready && now - last_ready_send > 100) {
+    if (g_css_active && g_css_frame == 0 && now - last_ready_send > 100) {
         ControlChannel_SendBattleReady();
         last_ready_send = now;
     }
@@ -784,6 +804,7 @@ bool Netplay_ProcessCSS() {
         // uses RNG during CSS->battle transition, so it MUST be identical
         // from this point forward.
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+        SpectatorNode_AppendPinRng(0x12345678);
 
         if (!Netplay_StartCSSSession()) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1667,8 +1688,18 @@ bool Netplay_StartBattle() {
     gekko_set_runahead(g_session, 4);
 
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+    SpectatorNode_AppendPinRng(0x12345678);
     SaveState_Init();
     SoundRollback::Init();
+    // Battle-start init order matters: PIN_RNG → RESET_INPUT_STATE → SOUND_INIT
+    // mirrors what host's local sim is doing this frame. The RESET_INPUT_STATE
+    // op corresponds to SaveState_Save's first-call buf_idx + edge state +
+    // history-rings reset (savestate.cpp:223-237) which fires when the first
+    // GekkoNet AdvanceEvent triggers a Save, not here. We append it now so
+    // it lands BEFORE the first INPUT batch of the match — the spectator
+    // applies it at the same logical-frame boundary the host clears state at.
+    SpectatorNode_AppendResetInputState();
+    SpectatorNode_AppendSoundInit();
 
     // Start recording a replay of this match. Captures initial RNG +
     // char selects + per-frame inputs; on battle end we flush to disk and
@@ -1837,6 +1868,23 @@ void Netplay_EndBattle() {
     // Tell the spectator tree the match is over — subscribers receive
     // MATCH_END and go idle until the next SpectatorNode_OnMatchStart.
     SpectatorNode_OnMatchEnd();
+
+    // C7: per-battle .fm2krep — slice the SessionEvent log between the most
+    // recent MATCH_START and the just-appended MATCH_END. Same on-disk
+    // shape as .fm2kset (full session); is_battle_slice flag distinguishes.
+    // The legacy Replay_EndRecording above writes the older 96-byte-header
+    // .fm2krep format; this writes the new SessionEvent-based variant
+    // alongside under a distinct timestamped filename. Keeps both path
+    // active during the C8 transition.
+    {
+        char ts[64] = {};
+        std::time_t now = std::time(nullptr);
+        std::tm tm_buf{};
+        localtime_s(&tm_buf, &now);
+        std::strftime(ts, sizeof(ts), "replays/%Y-%m-%d_%H%M%S.battle.fm2krep", &tm_buf);
+        CreateDirectoryA("replays", nullptr);
+        SpectatorNode_WriteCurrentBattleFile(ts);
+    }
 
     // Stop any pending SFX "desired" entries and clear the channel map so
     // the next battle rescans the channel table (handles character-load
@@ -2370,6 +2418,16 @@ bool Netplay_ProcessBattleInputPhase() {
                             p1_x, p1_y, p2_x, p2_y,
                             p1_script, p2_script,
                             g_p1_input, g_p2_input);
+                    }
+
+                    // C9: append FINGERPRINT op every 30 confirmed INPUTs.
+                    // Off by default; gated on FM2K_SPEC_FINGERPRINT=1.
+                    // Spectator's ApplySessionEvent computes the same hash
+                    // and logs WARN on mismatch.
+                    if (SpectatorFingerprint_Enabled() &&
+                        (g_netplay_frame % 30) == 0) {
+                        SpectatorNode_AppendFingerprint(
+                            SpectatorFingerprint_Compute());
                     }
                 }
 

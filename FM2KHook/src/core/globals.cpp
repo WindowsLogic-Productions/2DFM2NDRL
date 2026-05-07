@@ -26,6 +26,15 @@ bool g_stress_mode = false;
 // Spectator mode (FM2K_SPECTATOR_MODE=1): passive viewer.
 bool g_spectator_mode = false;
 
+// Spectator fast catch-up flag (C5.5). Set by RunSpectatorTick's inner
+// loop while burning through queued events; cleared once pb_queue depth
+// drops below LIVE_LAG_FRAMES.
+bool g_spectator_catchup = false;
+
+// User-toggled FF (F12 in spectator window). Persistent across
+// catchup-loop iterations; flipped by WndProc subclass on key press.
+bool g_spectator_ff_user = false;
+
 // FM95 host-driven trampoline: when Hook_UpdateGameState runs the
 // trampoline tick on the FM95 build, it sets this to tell the host's
 // natural render_game call (caught by Hook_RenderGame) to skip its body
