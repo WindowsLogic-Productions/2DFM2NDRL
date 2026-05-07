@@ -2015,18 +2015,50 @@ void LauncherUI::RenderDiscordAuthWindow() {
     if (s_pairing) {
         switch (s_pairing->status()) {
             case Pairing::Status::Pending: {
-                ImGui::TextWrapped("%s", s_status.c_str());
-                // Always surface the authorize URL while pairing is
-                // pending — if the user's browser didn't auto-open
-                // (running as Admin, no http handler, AV blocked
-                // ShellExecute) they can still copy/paste manually.
-                // The hub log has the failure reason, but most users
-                // won't read that — making the URL visible-and-copyable
-                // here is the user-facing escape hatch.
                 const std::string url = s_pairing->authorize_url();
+                const bool open_failed = s_pairing->browser_open_failed();
+
+                // Auto-copy on the first render after we detect the
+                // browser launch failed. Static one-shot keyed by the
+                // pairing code so a fresh sign-in click after a prior
+                // failure re-arms (the URL changes; the user might
+                // try again on a different account etc.).
+                static std::string s_auto_copied_for_code;
+                if (open_failed && !url.empty()) {
+                    const std::string pc = s_pairing->pairing_code();
+                    if (s_auto_copied_for_code != pc) {
+                        ImGui::SetClipboardText(url.c_str());
+                        s_auto_copied_for_code = pc;
+                        s_status =
+                            "Browser didn't open — URL has been COPIED to "
+                            "your clipboard. Paste it (Ctrl+V) in your "
+                            "browser to authorize Discord.";
+                    }
+                }
+
+                // Status line. Yellow tint when the browser failed so
+                // the change in instruction stands out vs. the calm
+                // "browser opened, click Authorize" text.
+                if (open_failed) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.30f, 1.0f),
+                                       "%s", s_status.c_str());
+                } else {
+                    ImGui::TextWrapped("%s", s_status.c_str());
+                }
+
+                // Always surface the URL while pairing is pending —
+                // browser auto-launch can fail silently for many
+                // reasons (Admin process / no http handler / AV blocking
+                // ShellExecute / other). The Copy + Reopen buttons let
+                // the user retry without re-clicking sign-in.
                 if (!url.empty()) {
                     ImGui::Spacing();
-                    ImGui::TextDisabled("If your browser didn't open:");
+                    if (open_failed) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.30f, 1.0f),
+                            "Paste this URL in your browser:");
+                    } else {
+                        ImGui::TextDisabled("If your browser didn't open:");
+                    }
                     ImGui::PushStyleColor(ImGuiCol_FrameBg,
                         ImVec4(0.10f, 0.10f, 0.12f, 1.0f));
                     char url_buf[1024];

@@ -66,8 +66,13 @@ struct Pairing {
     // blocking spawn, etc.) can still copy/paste the URL manually.
     std::string authorize_url() const;
     std::string pairing_code() const;
-
-    // Cancel and tear down the polling thread. Implicit on dtor.
+    // True iff the worker tried to spawn the browser and BOTH the
+    // ShellExecute("open") attempt and the cmd /c start fallback
+    // returned <=32 (failure). UI uses this to flip the modal into
+    // "the browser did not open — paste this URL" mode and auto-copy
+    // the URL to the clipboard, instead of showing the optimistic
+    // "Browser opened. Click Authorize on Discord..." status.
+    bool        browser_open_failed() const;
     void        Cancel();
     ~Pairing();
 
@@ -81,6 +86,7 @@ private:
     std::string                     error_;
     CachedAuth                      result_;
     std::atomic<bool>               cancel_{false};
+    std::atomic<bool>               browser_open_failed_{false};
     std::thread                     worker_;
     mutable std::mutex              mtx_;
 };

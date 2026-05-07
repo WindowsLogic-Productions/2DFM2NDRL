@@ -341,6 +341,10 @@ std::string Pairing::pairing_code() const {
     return pairing_code_;
 }
 
+bool Pairing::browser_open_failed() const {
+    return browser_open_failed_.load();
+}
+
 void Pairing::Cancel() {
     cancel_.store(true);
     if (worker_.joinable()) {
@@ -422,6 +426,9 @@ Pairing* Begin(const std::string& hub_base_url) {
                 "manually. Common cause: launcher running as Admin "
                 "(UAC blocks elevated→non-elevated browser spawn). "
                 "URL: %s", url.c_str());
+            // Atomic flag the UI thread polls to flip the modal into
+            // "paste this URL" mode and auto-copy on first render.
+            p->browser_open_failed_.store(true);
         }
 
         // Step 3: poll the hub for a result.
