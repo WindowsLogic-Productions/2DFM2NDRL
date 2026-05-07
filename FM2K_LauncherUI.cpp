@@ -1109,7 +1109,7 @@ void LauncherUI::RenderHubServerBody() {
     if (!hub_host_initialized_) {
         hub_host_initialized_ = true;
         const char* env_h = std::getenv("FM2K_HUB_HOST");
-        const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
+        const char* def   = (env_h && env_h[0]) ? env_h : "hub.2dfm.org";
         std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
     }
     ImGui::PushItemWidth(280);
@@ -2001,12 +2001,26 @@ void LauncherUI::RenderDiscordAuthWindow() {
     const bool busy = s_pairing && s_pairing->status() == Pairing::Status::Pending;
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button(s_cached.valid ? T("hub_resignin") : T("hub_signin"))) {
-        // Build hub HTTP base URL from the configured Hub Server host.
-        // Note: separate port from the WebSocket. The hub's HUB_HTTP_PORT
-        // (default 7700) handles the OAuth callback; WS stays on 7711.
-        std::string base = "http://";
-        base += hub_host_[0] ? hub_host_ : "2dfm.sytes.net";
-        base += ":7700";
+        // Build hub HTTP base URL. v0.2.8 default uses HTTPS via the
+        // public reverse proxy (hub.2dfm.org → Caddy → 127.0.0.1:7700
+        // on the droplet). Legacy direct-port path
+        // ("http://2dfm.sytes.net:7700") is gone from the default but
+        // users who set a custom hub_host_ that includes the old
+        // hostname still hit the bridged 2dfm.sytes.net endpoint that
+        // points at the same droplet.
+        std::string base;
+        const char* host = hub_host_[0] ? hub_host_ : "hub.2dfm.org";
+        // Heuristic: any host that's the new public hostname OR an
+        // IP-with-no-port likely wants HTTPS on 443. Legacy NoIP host
+        // stays on http://...:7700 for backwards compat.
+        if (std::strstr(host, "sytes.net") || std::strchr(host, ':')) {
+            base = "http://";
+            base += host;
+            if (!std::strchr(host, ':')) base += ":7700";
+        } else {
+            base = "https://";
+            base += host;
+        }
         s_pairing.reset(Begin(base));
         s_status = "Browser opened. Click Authorize on Discord and come back.";
     }
@@ -4039,7 +4053,7 @@ void LauncherUI::RenderHubPanel() {
                     const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
                     const std::string hub_udp =
                         std::string(hub_host_env && hub_host_env[0]
-                                    ? hub_host_env : "2dfm.sytes.net")
+                                    ? hub_host_env : "hub.2dfm.org")
                         + ":7711";
                     ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   hub_udp.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
@@ -4340,7 +4354,7 @@ void LauncherUI::RenderHubPanel() {
     if (!hub_host_initialized_) {
         hub_host_initialized_ = true;
         const char* env_h = std::getenv("FM2K_HUB_HOST");
-        const char* def   = (env_h && env_h[0]) ? env_h : "2dfm.sytes.net";
+        const char* def   = (env_h && env_h[0]) ? env_h : "hub.2dfm.org";
         std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
     }
     // Delay override panel. Default is "computed" (CCCaster-style auto-
@@ -4417,7 +4431,7 @@ void LauncherUI::RenderHubPanel() {
         ImGui::PopItemWidth();
         // Show the configured hub host as read-only context. Edit from
         // Settings → Hub Server…
-        ImGui::TextDisabled(T("hub_server"), hub_host_[0] ? hub_host_ : "2dfm.sytes.net");
+        ImGui::TextDisabled(T("hub_server"), hub_host_[0] ? hub_host_ : "hub.2dfm.org");
         ImGui::SameLine();
         if (ImGui::SmallButton("change")) {
             show_hub_server_ = true;
@@ -4500,17 +4514,26 @@ void LauncherUI::RenderHubPanel() {
             // gets persisted into the FM2K_HUB_HOST env so the spawned
             // game's nat_traversal STUN probe / relay endpoint uses
             // the same host.
-            const std::string hub_host = (hub_host_[0] != '\0') ? hub_host_ : "2dfm.sytes.net";
+            const std::string hub_host = (hub_host_[0] != '\0') ? hub_host_ : "hub.2dfm.org";
             ::SetEnvironmentVariableA("FM2K_HUB_HOST", hub_host.c_str());
             // Pull the cached Discord hub_token. Hub will reject the
             // hello with `auth_required` if missing/expired and the
             // launcher will surface the error in status_line.
             const auto cached = fm2k::discord_auth::LoadCached();
+            // v0.2.8 routes WSS through Caddy on 443 by default; legacy
+            // 2dfm.sytes.net hosts (set by users on older configs) keep
+            // the direct-WS-on-7711 path so cutover is transparent.
+            const bool use_legacy = (hub_host.find("sytes.net") != std::string::npos);
+            const uint16_t      ws_port = use_legacy ? 7711  : 443;
+            const char*         ws_path = use_legacy ? "/"   : "/ws";
+            const bool          ws_tls  = !use_legacy;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Hub: connecting to %s:7711 (WS) auth=%s",
-                        hub_host.c_str(),
+                        "Hub: connecting to %s%s:%u (%sWS) auth=%s",
+                        hub_host.c_str(), ws_path, (unsigned)ws_port,
+                        ws_tls ? "WSS via " : "",
                         cached.valid ? "present" : "missing");
-            hs.client.Connect(hub_host, 7711, "/", hs.my_nick, cached.hub_token);
+            hs.client.Connect(hub_host, ws_port, ws_path, hs.my_nick,
+                              cached.hub_token, ws_tls);
             hs.status_line = "connecting to " + hub_host + " ...";
         }
         if (!can_connect) ImGui::EndDisabled();

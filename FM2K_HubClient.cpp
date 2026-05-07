@@ -290,7 +290,7 @@ HubClient::~HubClient() {
 
 bool HubClient::Connect(const std::string& host, uint16_t port,
                         const std::string& path, const std::string& nick,
-                        const std::string& hub_token) {
+                        const std::string& hub_token, bool secure) {
     if (running_.load()) return false;  // already connecting / connected
     // A previous failed Connect leaves io_ in a finished-but-joinable
     // state — IoThread returned, but std::thread doesn't auto-detach.
@@ -299,10 +299,11 @@ bool HubClient::Connect(const std::string& host, uint16_t port,
     if (io_.joinable()) {
         io_.join();
     }
-    // Stash the token for IoThread → hello-send to read. Member state
+    // Stash the token + secure flag for IoThread to read. Member state
     // because std::thread argument forwarding caps at 4 here without
     // pulling in another tuple wrapper.
-    hub_token_ = hub_token;
+    hub_token_  = hub_token;
+    use_tls_    = secure;
     running_.store(true);
     io_ = std::thread(&HubClient::IoThread, this, host, port, path, nick);
     return true;
@@ -591,8 +592,10 @@ void HubClient::IoThread(std::string host, uint16_t port,
     if (!conn_) { fail("WinHttpConnect"); return; }
 
     std::wstring wpath = Widen(path.empty() ? "/" : path);
+    DWORD req_flags = use_tls_ ? WINHTTP_FLAG_SECURE : 0;
     req_ = WinHttpOpenRequest(conn_, L"GET", wpath.c_str(), nullptr,
-                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                              req_flags);
     if (!req_) { fail("WinHttpOpenRequest"); return; }
 
     // Required to upgrade.
