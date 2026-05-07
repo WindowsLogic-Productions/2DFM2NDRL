@@ -4,7 +4,7 @@
 //
 // Wire protocol (matches docs/FM2K_Matchmaking_Design.md §15.4):
 //
-//   0xCD 0x01 [12-byte user_id] [padded NULs]
+//   0xCD 0x01 [24-byte user_id] [padded NULs]
 //        STUN probe — client -> hub. Hub replies and stores reflexive
 //        (ip, port) on the user. Used to learn our public mapping.
 //
