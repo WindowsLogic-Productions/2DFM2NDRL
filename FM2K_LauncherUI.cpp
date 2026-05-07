@@ -2113,8 +2113,10 @@ void LauncherUI::RenderDiscordAuthWindow() {
                 if (ImGui::Button(T("btn_dismiss"))) s_pairing.reset();
                 break;
             case Pairing::Status::Error:
-                ImGui::TextColored(ImVec4(0.95f, 0.32f, 0.32f, 1.0f),
-                                   "%s", s_pairing->error_detail().c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(0.95f, 0.32f, 0.32f, 1.0f));
+                ImGui::TextWrapped("%s", s_pairing->error_detail().c_str());
+                ImGui::PopStyleColor();
                 if (ImGui::Button(T("btn_dismiss"))) s_pairing.reset();
                 break;
         }
