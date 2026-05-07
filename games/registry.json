@@ -3223,66 +3223,56 @@
     }
   },
   {
-    "game_id": "angel-star-road",
-    "name": "Angel Star Road: Champion Carnival",
+    "game_id": "URORFGRelease102",
+    "name": "Untitled Risk of Rain Fighting Game",
     "alt_names": [
-      "エンジェルスターロード　チャンピオン☆カーニバル",
-      "Angel Star Road: Champion☆Carnival"
+      "URORFG"
     ],
     "engine": "FM2K",
-    "year": "2006",
-    "developer": "KEROPYON",
+    "year": "",
+    "developer": "",
     "publisher": "",
     "exe_stems": [
-      "angel-star-road"
+      "URORFGRelease102"
     ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/angel-star-road-champion-carnival-gyw",
-    "download_url": "https://www.myabandonware.com/download/m9nd-angel-star-road-champion-carnival",
+    "kgt_filename": "URORFGRelease102.kgt",
+    "homepage": "",
+    "download_url": "",
     "banner_url": "",
     "thumb_url": "",
     "sources": [
-      "MyAbandonware"
+      "manual"
     ],
     "characters": [],
     "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Angel Star Road: Champion Carnival",
-        "alternative names": [
-          "エンジェルスターロード　チャンピオン☆カーニバル",
-          "Angel Star Road: Champion☆Carnival"
-        ],
-        "year": "2006",
-        "publisher": "empty",
-        "developer": "KEROPYON",
-        "url": "https://www.myabandonware.com/game/angel-star-road-champion-carnival-gyw",
-        "download": "https://www.myabandonware.com/download/m9nd-angel-star-road-champion-carnival",
-        "source": "MyAbandonware"
-      }
-    }
+    "_raw": {}
   },
   {
     "game_id": "angel-star-road",
     "name": "Angel Star Road",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
+    "year": "2006",
     "developer": "Keropyon",
     "publisher": "",
+    "homepage": "https://archive.org/details/angel-star-road",
+    "download_url": "https://archive.org/download/angel-star-road",
+    "kgt_filename": "Angel Star Road.kgt",
+    "banner_url": "",
+    "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [
+      "エンジェルスターロード　チャンピオン☆カーニバル",
+      "Angel Star Road: Champion☆Carnival"
+    ],
+    "sources": [
+      "archive.org",
+      "MyAbandonware"
+    ],
     "exe_stems": [
       "angel-star-road"
     ],
-    "kgt_filename": "Angel Star Road.kgt",
-    "homepage": "https://archive.org/details/angel-star-road",
-    "download_url": "https://archive.org/download/angel-star-road",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "archive.org"
-    ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "angel-star-road",
@@ -3457,6 +3447,19 @@
         "exe_stem_from_ident": "angel-star-road",
         "kgt_filename": "Angel Star Road.kgt",
         "exe_stem": "angel star road"
+      },
+      "MyAbandonware": {
+        "name": "Angel Star Road: Champion Carnival",
+        "alternative names": [
+          "エンジェルスターロード　チャンピオン☆カーニバル",
+          "Angel Star Road: Champion☆Carnival"
+        ],
+        "year": "2006",
+        "publisher": "empty",
+        "developer": "KEROPYON",
+        "url": "https://www.myabandonware.com/game/angel-star-road-champion-carnival-gyw",
+        "download": "https://www.myabandonware.com/download/m9nd-angel-star-road-champion-carnival",
+        "source": "MyAbandonware"
       }
     }
   },
@@ -9744,59 +9747,27 @@
   },
   {
     "game_id": "kenseishojo",
-    "name": "Kensei Shoujo",
-    "alt_names": [],
-    "engine": "FM2K",
+    "name": "Kenseishojo",
     "year": "2004",
     "developer": "",
     "publisher": "",
-    "exe_stems": [
-      "kenseishojo"
-    ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/kensei-shoujo-hxx",
-    "download_url": "https://www.myabandonware.com/download/mbi4-kensei-shoujo",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Kensei Shoujo",
-        "alternative names": [],
-        "year": "2004",
-        "publisher": "empty",
-        "developer": "empty",
-        "url": "https://www.myabandonware.com/game/kensei-shoujo-hxx",
-        "download": "https://www.myabandonware.com/download/mbi4-kensei-shoujo",
-        "source": "MyAbandonware"
-      }
-    }
-  },
-  {
-    "game_id": "kenseishojo",
-    "name": "Kenseishojo",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "",
-    "publisher": "",
-    "exe_stems": [
-      "kenseishojo"
-    ],
-    "kgt_filename": "Kenseishojo.kgt",
     "homepage": "https://archive.org/details/Kenseishojo",
     "download_url": "https://archive.org/download/Kenseishojo",
+    "kgt_filename": "Kenseishojo.kgt",
     "banner_url": "",
     "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [],
     "sources": [
-      "archive.org"
+      "archive.org",
+      "MyAbandonware"
+    ],
+    "exe_stems": [
+      "kenseishojo"
     ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "Kenseishojo",
@@ -9865,6 +9836,16 @@
         ],
         "kgt_filename": "Kenseishojo.kgt",
         "exe_stem": "kenseishojo"
+      },
+      "MyAbandonware": {
+        "name": "Kensei Shoujo",
+        "alternative names": [],
+        "year": "2004",
+        "publisher": "empty",
+        "developer": "empty",
+        "url": "https://www.myabandonware.com/game/kensei-shoujo-hxx",
+        "download": "https://www.myabandonware.com/download/mbi4-kensei-shoujo",
+        "source": "MyAbandonware"
       }
     }
   },
@@ -10974,178 +10955,26 @@
   {
     "game_id": "lunaport",
     "name": "Nettou Jakuniku Gakuen 2",
-    "alt_names": [],
-    "engine": "FM2K",
     "year": "2011",
     "developer": "",
     "publisher": "",
-    "exe_stems": [
-      "lunaport"
-    ],
-    "kgt_filename": "Nettou Jakuniku Gakuen 2.kgt",
     "homepage": "https://www.myabandonware.com/game/nettou-jakuniku-gakuen-2-hy4",
     "download_url": "https://www.myabandonware.com/download/mbib-nettou-jakuniku-gakuen-2",
+    "kgt_filename": "Nettou Jakuniku Gakuen 2.kgt",
     "banner_url": "",
     "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [],
     "sources": [
       "MyAbandonware",
       "archive.org"
     ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Nettou Jakuniku Gakuen 2",
-        "alternative names": [],
-        "year": "2011",
-        "publisher": "empty",
-        "developer": "empty",
-        "url": "https://www.myabandonware.com/game/nettou-jakuniku-gakuen-2-hy4",
-        "download": "https://www.myabandonware.com/download/mbib-nettou-jakuniku-gakuen-2",
-        "source": "MyAbandonware"
-      },
-      "archive.org": {
-        "ia_identifier": "nettou-jakuniku-gakuen-2",
-        "title": "Nettou Jakuniku Gakuen 2",
-        "creator": "",
-        "year": "",
-        "homepage": "https://archive.org/details/nettou-jakuniku-gakuen-2",
-        "download": "https://archive.org/download/nettou-jakuniku-gakuen-2",
-        "files": [
-          "Nettou Jakuniku Gakuen 2.zip",
-          "SShot0032 2022-12-01, 16_31_16.png",
-          "SShot0032 2022-12-01, 16_31_16_thumb.jpg",
-          "SShot0033 2022-12-01, 16_31_26.png",
-          "SShot0033 2022-12-01, 16_31_26_thumb.jpg",
-          "SShot0034 2022-12-01, 16_31_43.png",
-          "SShot0034 2022-12-01, 16_31_43_thumb.jpg",
-          "__ia_thumb.jpg",
-          "nettou-jakuniku-gakuen-2_archive.torrent",
-          "nettou-jakuniku-gakuen-2_files.xml",
-          "nettou-jakuniku-gakuen-2_meta.sqlite",
-          "nettou-jakuniku-gakuen-2_meta.xml"
-        ],
-        "subjects": [
-          "fighting game maker 2d fighter maker 2nd anime doujin"
-        ],
-        "description": "2DFM2nd made fighting game.",
-        "source": "archive.org",
-        "verified": true,
-        "inner_files": [
-          "Nettou Jakuniku Gakuen 2/Arena.stage",
-          "Nettou Jakuniku Gakuen 2/Bathhouse.stage",
-          "Nettou Jakuniku Gakuen 2/Battle.player",
-          "Nettou Jakuniku Gakuen 2/Box.player",
-          "Nettou Jakuniku Gakuen 2/Boxing Gym.stage",
-          "Nettou Jakuniku Gakuen 2/CI.demo",
-          "Nettou Jakuniku Gakuen 2/Character Select BL.demo",
-          "Nettou Jakuniku Gakuen 2/Character Select.demo",
-          "Nettou Jakuniku Gakuen 2/Continue.demo",
-          "Nettou Jakuniku Gakuen 2/Dummy 2.demo",
-          "Nettou Jakuniku Gakuen 2/Dummy.demo",
-          "Nettou Jakuniku Gakuen 2/Fukutu.player",
-          "Nettou Jakuniku Gakuen 2/GAMEOVER.demo",
-          "Nettou Jakuniku Gakuen 2/Hazama.player",
-          "Nettou Jakuniku Gakuen 2/Honoo.player",
-          "Nettou Jakuniku Gakuen 2/Ibuki.player",
-          "Nettou Jakuniku Gakuen 2/Jakuniku School.stage",
-          "Nettou Jakuniku Gakuen 2/Mobius.stage",
-          "Nettou Jakuniku Gakuen 2/Nettou Jakuniku Gakuen 2.exe",
-          "Nettou Jakuniku Gakuen 2/Nettou Jakuniku Gakuen 2.kgt",
-          "Nettou Jakuniku Gakuen 2/New Mobius.stage",
-          "Nettou Jakuniku Gakuen 2/Ninjya.player",
-          "Nettou Jakuniku Gakuen 2/Observatory.stage",
-          "Nettou Jakuniku Gakuen 2/Onsenman.player",
-          "Nettou Jakuniku Gakuen 2/Staff Roll.demo",
-          "Nettou Jakuniku Gakuen 2/Takizawa.player",
-          "Nettou Jakuniku Gakuen 2/Title.demo",
-          "Nettou Jakuniku Gakuen 2/battle-VS.demo",
-          "Nettou Jakuniku Gakuen 2/box-VS.demo",
-          "Nettou Jakuniku Gakuen 2/ddraw.dll",
-          "Nettou Jakuniku Gakuen 2/end.demo",
-          "Nettou Jakuniku Gakuen 2/fukutu-VS.demo",
-          "Nettou Jakuniku Gakuen 2/hazama-VS.demo",
-          "Nettou Jakuniku Gakuen 2/honoo-VS.demo",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/G-at.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/Thumbs.db",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/b-combo.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-box.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-bs.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-dango.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-fukutu.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-ibuki.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-moyu.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-ninja.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-onsen.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-sima.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-tk.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/com-v.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/hi-jmp.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/kan.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/kou.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/logo.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/mode.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/nage.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name00.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name01.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name02.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name03.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name04.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name05.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name06.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name07.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name08.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name09.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/name10.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/pad.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/setup.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/snap0001.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/toku.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/top-logomini.gif",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji-sita.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji-ue.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji_hidari.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji_hidarisita.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji_migi.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/yaji_migisita.jpg",
-          "Nettou Jakuniku Gakuen 2/html/imgdata/zenryoku.jpg",
-          "Nettou Jakuniku Gakuen 2/html/main.htm",
-          "Nettou Jakuniku Gakuen 2/html/sub.htm",
-          "Nettou Jakuniku Gakuen 2/ibuki-VS.demo",
-          "Nettou Jakuniku Gakuen 2/ninjya-VS.demo",
-          "Nettou Jakuniku Gakuen 2/onsenman-VS.demo",
-          "Nettou Jakuniku Gakuen 2/readme.htm",
-          "Nettou Jakuniku Gakuen 2/simamoto-st.demo",
-          "Nettou Jakuniku Gakuen 2/takizawa-VS.demo"
-        ],
-        "exe_stem_from_ident": "nettou-jakuniku-gakuen-2",
-        "kgt_filename": "Nettou Jakuniku Gakuen 2.kgt",
-        "exe_stem": "nettou jakuniku gakuen 2"
-      }
-    }
-  },
-  {
-    "game_id": "lunaport",
-    "name": "Ultra Mortal Kombat Vendetta",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "2001",
-    "developer": "",
-    "publisher": "",
     "exe_stems": [
       "lunaport"
     ],
-    "kgt_filename": "Ultra Mortal Kombat Vendetta.kgt",
-    "homepage": "https://www.myabandonware.com/game/ultra-mortal-kombat-vendetta-jtl",
-    "download_url": "https://www.myabandonware.com/download/me0r-ultra-mortal-kombat-vendetta",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware",
-      "archive.org"
-    ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "MyAbandonware": {
         "name": "Ultra Mortal Kombat Vendetta",
@@ -11839,59 +11668,27 @@
   },
   {
     "game_id": "mai-girls-revolution",
-    "name": "Mai Girls Revolutions",
-    "alt_names": [],
-    "engine": "FM2K",
+    "name": "Mai Girls Revolution",
     "year": "2009",
     "developer": "",
     "publisher": "",
-    "exe_stems": [
-      "mai-girls-revolution"
-    ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/mai-girls-revolutions-hxz",
-    "download_url": "https://www.myabandonware.com/download/mbi6-mai-girls-revolutions",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Mai Girls Revolutions",
-        "alternative names": [],
-        "year": "2009",
-        "publisher": "empty",
-        "developer": "empty",
-        "url": "https://www.myabandonware.com/game/mai-girls-revolutions-hxz",
-        "download": "https://www.myabandonware.com/download/mbi6-mai-girls-revolutions",
-        "source": "MyAbandonware"
-      }
-    }
-  },
-  {
-    "game_id": "mai-girls-revolution",
-    "name": "Mai Girls Revolution",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "",
-    "publisher": "",
-    "exe_stems": [
-      "mai-girls-revolution"
-    ],
-    "kgt_filename": "Mai Girls Revolution.kgt",
     "homepage": "https://archive.org/details/mai-girls-revolution",
     "download_url": "https://archive.org/download/mai-girls-revolution",
+    "kgt_filename": "Mai Girls Revolution.kgt",
     "banner_url": "",
     "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [],
     "sources": [
-      "archive.org"
+      "archive.org",
+      "MyAbandonware"
+    ],
+    "exe_stems": [
+      "mai-girls-revolution"
     ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "mai-girls-revolution",
@@ -12172,6 +11969,16 @@
         "exe_stem_from_ident": "mai-girls-revolution",
         "kgt_filename": "Mai Girls Revolution.kgt",
         "exe_stem": "mai girls revolution"
+      },
+      "MyAbandonware": {
+        "name": "Mai Girls Revolutions",
+        "alternative names": [],
+        "year": "2009",
+        "publisher": "empty",
+        "developer": "empty",
+        "url": "https://www.myabandonware.com/game/mai-girls-revolutions-hxz",
+        "download": "https://www.myabandonware.com/download/mbi6-mai-girls-revolutions",
+        "source": "MyAbandonware"
       }
     }
   },
@@ -14768,59 +14575,27 @@
   },
   {
     "game_id": "parotte-fighters",
-    "name": "Parotte Fighter",
-    "alt_names": [],
-    "engine": "FM2K",
+    "name": "Parotte Fighters",
     "year": "2005",
     "developer": "Retsuzan",
     "publisher": "",
-    "exe_stems": [
-      "parotte-fighters"
-    ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/parotte-fighter-ihw",
-    "download_url": "https://www.myabandonware.com/download/mc0b-parotte-fighter",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Parotte Fighter",
-        "alternative names": [],
-        "year": "2005",
-        "publisher": "empty",
-        "developer": "Retsuzan",
-        "url": "https://www.myabandonware.com/game/parotte-fighter-ihw",
-        "download": "https://www.myabandonware.com/download/mc0b-parotte-fighter",
-        "source": "MyAbandonware"
-      }
-    }
-  },
-  {
-    "game_id": "parotte-fighters",
-    "name": "Parotte Fighters",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "Retsuzan",
-    "publisher": "",
-    "exe_stems": [
-      "parotte-fighters"
-    ],
-    "kgt_filename": "Parotte Fighters.kgt",
     "homepage": "https://archive.org/details/parotte-fighters",
     "download_url": "https://archive.org/download/parotte-fighters",
+    "kgt_filename": "Parotte Fighters.kgt",
     "banner_url": "",
     "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [],
     "sources": [
-      "archive.org"
+      "archive.org",
+      "MyAbandonware"
+    ],
+    "exe_stems": [
+      "parotte-fighters"
     ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "parotte-fighters",
@@ -14892,6 +14667,16 @@
         "exe_stem_from_ident": "parotte-fighters",
         "kgt_filename": "Parotte Fighters.kgt",
         "exe_stem": "parotte fighters"
+      },
+      "MyAbandonware": {
+        "name": "Parotte Fighter",
+        "alternative names": [],
+        "year": "2005",
+        "publisher": "empty",
+        "developer": "Retsuzan",
+        "url": "https://www.myabandonware.com/game/parotte-fighter-ihw",
+        "download": "https://www.myabandonware.com/download/mc0b-parotte-fighter",
+        "source": "MyAbandonware"
       }
     }
   },
@@ -15405,59 +15190,27 @@
   },
   {
     "game_id": "requiem-final_ver07",
-    "name": "Requiem Final",
-    "alt_names": [],
-    "engine": "FM2K",
+    "name": "Requiem Final Ver 07",
     "year": "2002",
     "developer": "Retsuzan",
     "publisher": "",
-    "exe_stems": [
-      "requiem-final_ver07"
-    ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/requiem-final-ihx",
-    "download_url": "https://www.myabandonware.com/download/mc0c-requiem-final",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "MyAbandonware": {
-        "name": "Requiem Final",
-        "alternative names": [],
-        "year": "2002",
-        "publisher": "empty",
-        "developer": "Retsuzan",
-        "url": "https://www.myabandonware.com/game/requiem-final-ihx",
-        "download": "https://www.myabandonware.com/download/mc0c-requiem-final",
-        "source": "MyAbandonware"
-      }
-    }
-  },
-  {
-    "game_id": "requiem-final_ver07",
-    "name": "Requiem Final Ver 07",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "",
-    "publisher": "",
-    "exe_stems": [
-      "requiem-final_ver07"
-    ],
-    "kgt_filename": "Requiem Final_ver07.kgt",
     "homepage": "https://archive.org/details/requiem-final-ver-07_202211",
     "download_url": "https://archive.org/download/requiem-final-ver-07_202211",
+    "kgt_filename": "Requiem Final_ver07.kgt",
     "banner_url": "",
     "thumb_url": "",
+    "engine": "FM2K",
+    "alt_names": [],
     "sources": [
-      "archive.org"
+      "archive.org",
+      "MyAbandonware"
+    ],
+    "exe_stems": [
+      "requiem-final_ver07"
     ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "requiem-final-ver-07_202211",
@@ -15626,39 +15379,15 @@
         "exe_stem_from_ident": "requiem-final-ver-07",
         "kgt_filename": "Requiem Final_ver07.kgt",
         "exe_stem": "requiem final_ver07"
-      }
-    }
-  },
-  {
-    "game_id": "reshuffle",
-    "name": "Emblem of Red Shuffle",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "2011",
-    "developer": "EXZAM",
-    "publisher": "",
-    "exe_stems": [
-      "reshuffle"
-    ],
-    "kgt_filename": "",
-    "homepage": "https://www.myabandonware.com/game/emblem-of-red-shuffle-gzq",
-    "download_url": "https://www.myabandonware.com/download/m9p6-emblem-of-red-shuffle",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "MyAbandonware"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
+      },
       "MyAbandonware": {
-        "name": "Emblem of Red Shuffle",
+        "name": "Requiem Final",
         "alternative names": [],
-        "year": "2011",
+        "year": "2002",
         "publisher": "empty",
-        "developer": "EXZAM",
-        "url": "https://www.myabandonware.com/game/emblem-of-red-shuffle-gzq",
-        "download": "https://www.myabandonware.com/download/m9p6-emblem-of-red-shuffle",
+        "developer": "Retsuzan",
+        "url": "https://www.myabandonware.com/game/requiem-final-ihx",
+        "download": "https://www.myabandonware.com/download/mc0c-requiem-final",
         "source": "MyAbandonware"
       }
     }
@@ -15666,134 +15395,26 @@
   {
     "game_id": "reshuffle",
     "name": "120623 ( Eo RR)",
-    "alt_names": [],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "",
+    "year": "2011",
+    "developer": "EXZAM",
     "publisher": "",
-    "exe_stems": [
-      "reshuffle"
-    ],
-    "kgt_filename": "ReSHUFFLE.kgt",
     "homepage": "https://archive.org/details/120623-eo-rr",
     "download_url": "https://archive.org/download/120623-eo-rr",
+    "kgt_filename": "ReSHUFFLE.kgt",
     "banner_url": "",
     "thumb_url": "",
-    "sources": [
-      "archive.org"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {
-      "archive.org": {
-        "ia_identifier": "120623-eo-rr",
-        "title": "120623 ( Eo RR)",
-        "creator": "",
-        "year": "",
-        "homepage": "https://archive.org/details/120623-eo-rr",
-        "download": "https://archive.org/download/120623-eo-rr",
-        "files": [
-          "017.jpg",
-          "017_thumb.jpg",
-          "120623 (EoRR).zip",
-          "120623-eo-rr_archive.torrent",
-          "120623-eo-rr_files.xml",
-          "120623-eo-rr_meta.sqlite",
-          "120623-eo-rr_meta.xml",
-          "__ia_thumb.jpg"
-        ],
-        "subjects": [
-          "doujin fighting game"
-        ],
-        "description": "<div class=\"translate-tooltip-mtz hidden\">\n                    <div class=\"header\">\n                        <div class=\"header-controls\">\n                            <span class=\"sound-translate\"></span>\n                            <span class=\"settings\"></span>\n                        </div>\n                        <div class=\"translate-icons\">2d fighter maker game made by this person: http://web.archive.org/web/20071127104936/http://www.geocities.jp/exzam3455/games.html</div></div><div class=\"controls\"><div class=\"controls__control-wrapper\"><span class=\"controls__toggle icon-trans active\"></span><div class=\"controls__inner-circle\"></div>\n                            \n                        </div>\n                    </div>\n                </div><span class=\"translate-button-mtz\"></span>",
-        "source": "archive.org",
-        "verified": true,
-        "inner_files": [
-          "120623/ReSHUFFLE/ReSHUFFLE.exe",
-          "120623/ReSHUFFLE/ReSHUFFLE.kgt",
-          "120623/ReSHUFFLE/alkanciel.player",
-          "120623/ReSHUFFLE/asuka.player",
-          "120623/ReSHUFFLE/church.stage",
-          "120623/ReSHUFFLE/church_2.stage",
-          "120623/ReSHUFFLE/continue.demo",
-          "120623/ReSHUFFLE/demo 01.demo",
-          "120623/ReSHUFFLE/demo 02.demo",
-          "120623/ReSHUFFLE/demo 03.demo",
-          "120623/ReSHUFFLE/demo 04.demo",
-          "120623/ReSHUFFLE/demo 05.demo",
-          "120623/ReSHUFFLE/dummy.demo",
-          "120623/ReSHUFFLE/dummy.player",
-          "120623/ReSHUFFLE/dummy.stage",
-          "120623/ReSHUFFLE/entrance.stage",
-          "120623/ReSHUFFLE/game.ini",
-          "120623/ReSHUFFLE/gate.stage",
-          "120623/ReSHUFFLE/highway.stage",
-          "120623/ReSHUFFLE/holl.stage",
-          "120623/ReSHUFFLE/info.demo",
-          "120623/ReSHUFFLE/intrude.stage",
-          "120623/ReSHUFFLE/kilala.player",
-          "120623/ReSHUFFLE/kirika.player",
-          "120623/ReSHUFFLE/kurus.player",
-          "120623/ReSHUFFLE/loading.demo",
-          "120623/ReSHUFFLE/loading2.demo",
-          "120623/ReSHUFFLE/mahiro.player",
-          "120623/ReSHUFFLE/mao.player",
-          "120623/ReSHUFFLE/midnight.stage",
-          "120623/ReSHUFFLE/mikoshiba.stage",
-          "120623/ReSHUFFLE/mikoshiba_2.stage",
-          "120623/ReSHUFFLE/rose.player",
-          "120623/ReSHUFFLE/select.demo",
-          "120623/ReSHUFFLE/sena.player",
-          "120623/ReSHUFFLE/shink.player",
-          "120623/ReSHUFFLE/shinokami.player",
-          "120623/ReSHUFFLE/sunshine60.stage",
-          "120623/ReSHUFFLE/title.demo",
-          "120623/ReSHUFFLE/training.stage",
-          "120623/ReSHUFFLE/winner.demo",
-          "120623/ReSHUFFLE/xion.player",
-          "120623/maunual/img/001.gif",
-          "120623/maunual/img/002.gif",
-          "120623/maunual/img/002_001.gif",
-          "120623/maunual/img/002_002.gif",
-          "120623/maunual/img/002_003.gif",
-          "120623/maunual/img/002_004.gif",
-          "120623/maunual/img/002_005.gif",
-          "120623/maunual/img/002_006.gif",
-          "120623/maunual/img/002_007.gif",
-          "120623/maunual/img/002_008.gif",
-          "120623/maunual/img/002_009.gif",
-          "120623/maunual/img/002_010.gif",
-          "120623/maunual/img/002_011.gif",
-          "120623/maunual/img/002_012.gif",
-          "120623/maunual/manual.html"
-        ],
-        "exe_stem_from_ident": "120623-eo-rr",
-        "kgt_filename": "ReSHUFFLE.kgt",
-        "exe_stem": "reshuffle"
-      }
-    }
-  },
-  {
-    "game_id": "reshuffle",
-    "name": "Emblem Of Red Re SHUFFLE",
-    "alt_names": [],
     "engine": "FM2K",
-    "year": "",
-    "developer": "",
-    "publisher": "",
+    "alt_names": [],
+    "sources": [
+      "archive.org",
+      "MyAbandonware"
+    ],
     "exe_stems": [
       "reshuffle"
     ],
-    "kgt_filename": "ReSHUFFLE.kgt",
-    "homepage": "https://archive.org/details/emblem-of-red-re-shuffle",
-    "download_url": "https://archive.org/download/emblem-of-red-re-shuffle",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "archive.org"
-    ],
     "characters": [],
     "stages": [],
+    "downloads": {},
     "_raw": {
       "archive.org": {
         "ia_identifier": "emblem-of-red-re-shuffle",
@@ -15884,6 +15505,16 @@
         "exe_stem_from_ident": "emblem-of-red-re-shuffle",
         "kgt_filename": "ReSHUFFLE.kgt",
         "exe_stem": "reshuffle"
+      },
+      "MyAbandonware": {
+        "name": "Emblem of Red Shuffle",
+        "alternative names": [],
+        "year": "2011",
+        "publisher": "empty",
+        "developer": "EXZAM",
+        "url": "https://www.myabandonware.com/game/emblem-of-red-shuffle-gzq",
+        "download": "https://www.myabandonware.com/download/m9p6-emblem-of-red-shuffle",
+        "source": "MyAbandonware"
       }
     }
   },
@@ -19342,31 +18973,6 @@
         "exe_stem": "urban battle"
       }
     }
-  },
-  {
-    "game_id": "URORFGRelease102",
-    "name": "Untitled Risk of Rain Fighting Game",
-    "alt_names": [
-      "URORFG"
-    ],
-    "engine": "FM2K",
-    "year": "",
-    "developer": "",
-    "publisher": "",
-    "exe_stems": [
-      "URORFGRelease102"
-    ],
-    "kgt_filename": "URORFGRelease102.kgt",
-    "homepage": "",
-    "download_url": "",
-    "banner_url": "",
-    "thumb_url": "",
-    "sources": [
-      "manual"
-    ],
-    "characters": [],
-    "stages": [],
-    "_raw": {}
   },
   {
     "game_id": "vanpri",
