@@ -2732,6 +2732,25 @@ void LauncherUI::RenderSessionControls() {
             ::SetEnvironmentVariableA("FM2K_EB_DIAG", v ? "1" : nullptr);
             return v;
         }();
+        // Fast .player loader — collapses ~30ms of per-sound ReadFile syscall
+        // overhead per CSS-cursor flick into one big slurp + RAM memcpy.
+        // OFF by default until validated; flipping it persists + applies to
+        // every launch path.
+        static bool s_fast_player_load = []() {
+            bool v = LoadDevFlag("fast_player_load", false);
+            ::SetEnvironmentVariableA("FM2K_FAST_PLAYER_LOAD",
+                                      v ? "1" : nullptr);
+            return v;
+        }();
+        // FM2K_DEV_MODE master flag for experimental hook features that
+        // aren't ready for default-on yet (current users: spectator-side
+        // .player OS-cache pre-warmer in the trampoline). Off by default;
+        // flipping persists + applies to every launch path.
+        static bool s_dev_mode = []() {
+            bool v = LoadDevFlag("dev_mode", false);
+            ::SetEnvironmentVariableA("FM2K_DEV_MODE", v ? "1" : nullptr);
+            return v;
+        }();
 
         // ---------- USER-FACING SECTION ----------
         ImGui::Text("%s", T("label_play"));
@@ -2808,6 +2827,26 @@ void LauncherUI::RenderSessionControls() {
 
             ImGui::Spacing();
 
+            // FM2K_DEV_MODE master flag — gates experimental hook features
+            // that aren't ready for production default-on. Current users:
+            //   * .player OS-cache pre-warmer in the spectator trampoline
+            //     (CSS replay performance).
+            // Persists across launcher restarts via dev_flags.ini, applies
+            // to all launch paths through the env var.
+            if (ImGui::Checkbox("FM2K dev mode (experimental hooks)", &s_dev_mode)) {
+                ::SetEnvironmentVariableA("FM2K_DEV_MODE",
+                                          s_dev_mode ? "1" : nullptr);
+                SaveDevFlag("dev_mode", s_dev_mode);
+            }
+            ImGui::SetItemTooltip(
+                "Enables experimental hook-side optimisations that haven't "
+                "been validated as production-default yet. Currently:\n"
+                "  - Spectator .player OS-cache pre-warmer (faster CSS replay "
+                "after the spectator's first session start).\n"
+                "Safe to leave off; required if you're testing spectator perf.");
+
+            ImGui::Spacing();
+
             // ---------- FM2K diagnostics (collapsed by default) ----------
             // FM2K-engine-specific toggles — most users never touch these
             // outside of debugging desync repros.
@@ -2848,6 +2887,25 @@ void LauncherUI::RenderSessionControls() {
                     "pkmncc Bewear 624B, slither wing 6A landing, URORFG Loader "
                     "5B / walking, Breloom 6a6a6b. Persists across launcher "
                     "restarts.");
+
+                if (ImGui::Checkbox("Fast .player load (FM2K_FAST_PLAYER_LOAD)",
+                                    &s_fast_player_load)) {
+                    ::SetEnvironmentVariableA("FM2K_FAST_PLAYER_LOAD",
+                                              s_fast_player_load ? "1" : nullptr);
+                    SaveDevFlag("fast_player_load", s_fast_player_load);
+                }
+                ImGui::SetItemTooltip(
+                    "Slurp full .player file content on open + serve "
+                    "subsequent ReadFile/SetFilePointer calls from RAM. "
+                    "Collapses the ~200 syscalls FM2K's character_data_loader "
+                    "issues per character (1 per sound × 100-150 sounds × "
+                    "~150µs kernel ping-pong) into one big read + memcpy. "
+                    "Net: CSS cursor-flick stall drops from 30-60ms to ~5ms "
+                    "cold (NVMe disk read only) or <1ms warm (OS page cache). "
+                    "Hooks ReadFile/SetFilePointer/SetFilePointerEx/CloseHandle "
+                    "globally; non-.player handles fall through unchanged. "
+                    "Off by default until validated. Restart the game after "
+                    "toggling — env var is read at hook init.");
 
                 ImGui::Unindent();
             }
