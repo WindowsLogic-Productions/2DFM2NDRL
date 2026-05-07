@@ -279,12 +279,45 @@ def aggregate_user(user_id: str) -> dict[str, Any]:
     matches = [m for m in load_matches() if m["p1_id"] == user_id or m["p2_id"] == user_id]
     if not matches:
         return {
-            "user_id": user_id, "nick": user_id,
+            "user_id": user_id, "nick": user_id, "aliases": [],
             "total": 0, "wins": 0, "losses": 0, "draws": 0,
             "by_game": [], "by_char": [], "vs_opponents": [],
             "recent": [],
         }
     nick = matches[-1]["p1_nick"] if matches[-1]["p1_id"] == user_id else matches[-1]["p2_nick"]
+
+    # Nick history — Steam-style "also known as" tracking. We key by
+    # the Discord user_id (= persistent identity) so a player can
+    # change launcher nicks freely; their stats stay attributed and
+    # the profile shows every alias they've used.
+    #
+    # Self-vs-self note: dev sessions where the same Discord user runs
+    # two launchers produce matches where p1_id == p2_id; we count
+    # BOTH nicks in that case so a nick used only on the p2 side of
+    # such a match still shows up. Counting only one side would drop
+    # alias rows that exist nowhere else in the log.
+    nick_counts: Counter = Counter()
+    nick_last_seen: dict[str, float] = {}
+    def _bump(n: str, ts: float):
+        if not n: return
+        nick_counts[n] += 1
+        if ts > nick_last_seen.get(n, 0.0):
+            nick_last_seen[n] = ts
+    for m in matches:
+        ts = m["finished_at"]
+        if m["p1_id"] == user_id:
+            _bump(m.get("p1_nick", ""), ts)
+        if m["p2_id"] == user_id:
+            _bump(m.get("p2_nick", ""), ts)
+    # Current nick = most recently used (matches the live launcher).
+    if nick_last_seen:
+        nick = max(nick_last_seen, key=lambda k: nick_last_seen[k])
+    # Aliases = all OTHER nicks, ordered most-used first.
+    aliases = [
+        {"nick": n, "matches": nick_counts[n], "last_seen": nick_last_seen[n]}
+        for n in nick_counts if n != nick
+    ]
+    aliases.sort(key=lambda a: -a["matches"])
 
     wins = losses = draws = 0
     by_game: dict[str, dict[str, int]] = defaultdict(lambda: {"wins": 0, "losses": 0, "draws": 0})
@@ -330,7 +363,7 @@ def aggregate_user(user_id: str) -> dict[str, Any]:
 
     recent = sorted(matches, key=lambda m: -m["finished_at"])[:20]
     return {
-        "user_id": user_id, "nick": nick,
+        "user_id": user_id, "nick": nick, "aliases": aliases,
         "total": len(matches), "wins": wins, "losses": losses, "draws": draws,
         "by_game": by_game_rows[:32],
         "by_char": by_char_rows[:32],

@@ -6,6 +6,11 @@
 <section class="hero hero-user">
   <h1>{{ u.nick }}</h1>
   <p class="subtitle">// PILOT_ID {{ u.user_id[:12] if u.user_id|length > 12 else u.user_id }}</p>
+  {% if u.aliases %}
+  <p class="aliases">// ALSO KNOWN AS:
+    {% for a in u.aliases %}<span class="alias" title="{{ a.matches }} match{{ 'es' if a.matches != 1 else '' }}">{{ a.nick }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+  </p>
+  {% endif %}
 
   <div class="record">
     <div class="cell">

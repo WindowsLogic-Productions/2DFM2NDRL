@@ -336,6 +336,21 @@ a:hover { color: var(--pink); }
   text-transform: uppercase;
 }
 
+/* Steam-style "also known as" alias list under the player name. Same
+ * visual register as .subtitle so the profile header stays cohesive,
+ * with each alias slightly highlighted to read as data not chrome. */
+.hero .aliases {
+  margin: 0.4rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-dim);
+}
+.hero .aliases .alias {
+  color: var(--ink);
+  cursor: help;
+}
+
 .hero .totals {
   list-style: none;
   padding: 0;

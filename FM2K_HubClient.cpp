@@ -631,6 +631,18 @@ void HubClient::IoThread(std::string host, uint16_t port,
         if (!hub_token_.empty()) {
             hello += ",\"hub_token\":\"" + EscapeJsonString(hub_token_) + "\"";
         }
+        // Dev-only: FM2K_DEV_USER_SUFFIX lets a single Discord user run
+        // multiple launcher instances with distinct lobby entries (for
+        // testing). Hub honors this only for accounts on the
+        // HUB_DEV_USER_IDS allowlist; everyone else's suffix is
+        // ignored. Set differently per-launcher (e.g. =a in client A,
+        // =b in client B) to see both in the lobby. Match records still
+        // strip the suffix back to the bare dc_id, so stats aggregate
+        // correctly regardless of how many dev launchers were involved.
+        if (const char* dev_suffix = std::getenv("FM2K_DEV_USER_SUFFIX");
+            dev_suffix && dev_suffix[0]) {
+            hello += ",\"dev_suffix\":\"" + EscapeJsonString(dev_suffix) + "\"";
+        }
         hello += "}";
         DWORD r = WinHttpWebSocketSend(ws_,
             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
