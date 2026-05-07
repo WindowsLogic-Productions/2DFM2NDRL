@@ -19,6 +19,17 @@ i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM2KHook.dll"
 i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM95Hook.dll"
 i686-w64-mingw32-strip --strip-debug "$STAGED_DIR/FM2KUpdater.exe"
 
+# Kill any running launcher / game / updater before overwrite. WSL drvfs
+# doesn't propagate Windows file locks, so cp would silently succeed
+# against a running .exe — disk gets new bytes but the in-memory
+# process is still old, and tests run against the old code. /T cascades
+# to spawned game children. `|| true` keeps a clean machine from failing.
+taskkill.exe /F /T /IM FM2K_RollbackLauncher.exe 2>/dev/null || true
+taskkill.exe /F /T /IM FM2KUpdater.exe           2>/dev/null || true
+taskkill.exe /F /T /IM pkmncc.exe                2>/dev/null || true
+taskkill.exe /F /T /IM CPW.exe                   2>/dev/null || true
+sleep 0.3   # let Windows release file handles before cp
+
 # Launcher distribution dir — both DLLs sit alongside the launcher exe so
 # FM2KGameInstance::GetDLLPath(engine) picks the right one per game.engine.
 cp "$STAGED_DIR/FM2K_RollbackLauncher.exe" \
