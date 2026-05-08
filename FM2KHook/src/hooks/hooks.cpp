@@ -180,7 +180,15 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share,
                     utf8[0] ? utf8 : name);
         ++s_logged;
     }
-    if (FM2K::kIsFM95 && name) {
+    // SJIS -> wide -> CreateFileW path. Required for Japanese-named files in
+    // BOTH FM95 (CPW.exe / ＣＰＷ.kgt) and FM2K (e.g. Otepuri's
+    // 「おてんばプリンセスの大冒険第0話+.exe」 / .kgt). CreateFileA's kernel-side
+    // path conversion uses the SYSTEM ANSI codepage (1252 on US Windows), NOT
+    // our user-mode GetACP hook, so SJIS bytes get reinterpreted as CP1252
+    // and the file lookup fails silently. ASCII paths round-trip through
+    // CP932 unchanged, so this is safe for all callers — and CreateFileA
+    // internally just calls CreateFileW after its own path conversion anyway.
+    if (name) {
         int wlen = MultiByteToWideChar(932, 0, name, -1, nullptr, 0);
         if (wlen > 1) {
             std::vector<wchar_t> wide(static_cast<size_t>(wlen));
@@ -2345,7 +2353,7 @@ bool InitializeHooks() {
     if constexpr (FM2K::kIsFM2K) {
         if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT, (void*)Hook_GetPlayerInput,
                           (void**)&original_get_player_input) != MH_OK ||
-            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
+            MH_QueueEnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook GetPlayerInput");
             return false;
         }
@@ -2357,14 +2365,14 @@ bool InitializeHooks() {
         if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT,    // 0x408AE0 P1
                           (void*)Hook_GetPlayerInput_FM95_P1,
                           (void**)&original_get_player_input_p1) != MH_OK ||
-            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
+            MH_QueueEnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT) != MH_OK) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook get_player_input_p1");
             return false;
         }
         if (MH_CreateHook((void*)FM2K::ADDR_GET_PLAYER_INPUT_P2, // 0x408D60 P2
                           (void*)Hook_GetPlayerInput_FM95_P2,
                           (void**)&original_get_player_input_p2) != MH_OK ||
-            MH_EnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT_P2) != MH_OK) {
+            MH_QueueEnableHook((void*)FM2K::ADDR_GET_PLAYER_INPUT_P2) != MH_OK) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook get_player_input_p2");
             return false;
         }
@@ -2378,7 +2386,7 @@ bool InitializeHooks() {
     // Hook UpdateGameState
     if (MH_CreateHook((void*)FM2K::ADDR_UPDATE_GAME, (void*)Hook_UpdateGameState,
                       (void**)&original_update_game) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_UPDATE_GAME) != MH_OK) {
+        MH_QueueEnableHook((void*)FM2K::ADDR_UPDATE_GAME) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook UpdateGameState");
         return false;
     }
@@ -2386,7 +2394,7 @@ bool InitializeHooks() {
     // Hook RenderGame
     if (MH_CreateHook((void*)FM2K::ADDR_RENDER_GAME, (void*)Hook_RenderGame,
                       (void**)&original_render_game) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_RENDER_GAME) != MH_OK) {
+        MH_QueueEnableHook((void*)FM2K::ADDR_RENDER_GAME) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook RenderGame");
         return false;
     }
@@ -2403,7 +2411,7 @@ bool InitializeHooks() {
     if constexpr (FM2K::kIsFM2K) {
         if (MH_CreateHook((void*)FM2K::ADDR_RUN_GAME_LOOP, (void*)Hook_RunGameLoop,
                           (void**)&original_run_game_loop) != MH_OK ||
-            MH_EnableHook((void*)FM2K::ADDR_RUN_GAME_LOOP) != MH_OK) {
+            MH_QueueEnableHook((void*)FM2K::ADDR_RUN_GAME_LOOP) != MH_OK) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook RunGameLoop");
             return false;
         }
@@ -2421,7 +2429,7 @@ bool InitializeHooks() {
             if (MH_CreateHook((void*)FM2K::ADDR_LOAD_STAGE_FILE_ALT,
                               (void*)Hook_LoadStageFileAlt,
                               (void**)&original_LoadStageFileAlt) != MH_OK ||
-                MH_EnableHook((void*)FM2K::ADDR_LOAD_STAGE_FILE_ALT) != MH_OK) {
+                MH_QueueEnableHook((void*)FM2K::ADDR_LOAD_STAGE_FILE_ALT) != MH_OK) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                     "Hooks: Failed to hook LoadStageFile_alt — vs-mode "
                     "random-stage will not override game's per-character "
@@ -2439,7 +2447,7 @@ bool InitializeHooks() {
     // Hook GameRand
     if (MH_CreateHook((void*)FM2K::ADDR_GAME_RAND, (void*)Hook_GameRand,
                       (void**)&original_game_rand) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_GAME_RAND) != MH_OK) {
+        MH_QueueEnableHook((void*)FM2K::ADDR_GAME_RAND) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook GameRand");
         return false;
     }
@@ -2447,7 +2455,7 @@ bool InitializeHooks() {
     // Hook ProcessGameInputs
     if (MH_CreateHook((void*)FM2K::ADDR_PROCESS_INPUTS, (void*)Hook_ProcessGameInputs,
                       (void**)&original_process_game_inputs) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_PROCESS_INPUTS) != MH_OK) {
+        MH_QueueEnableHook((void*)FM2K::ADDR_PROCESS_INPUTS) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook ProcessGameInputs");
         return false;
     }
@@ -2459,7 +2467,7 @@ bool InitializeHooks() {
     if (MH_CreateHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND,
                       (void*)Hook_DispatchScriptSoundCommand,
                       (void**)&original_dispatch_script_sound) != MH_OK ||
-        MH_EnableHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND) != MH_OK) {
+        MH_QueueEnableHook((void*)FM2K::ADDR_DISPATCH_SCRIPT_SOUND) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "Hooks: Failed to hook DispatchScriptSoundCommand");
         return false;
@@ -2500,7 +2508,7 @@ bool InitializeHooks() {
         if (real_timeGetTime) {
             if (MH_CreateHook(real_timeGetTime, (void*)Hook_timeGetTime,
                               (void**)&original_timeGetTime) != MH_OK ||
-                MH_EnableHook(real_timeGetTime) != MH_OK) {
+                MH_QueueEnableHook(real_timeGetTime) != MH_OK) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Hooks: Failed to hook timeGetTime");
                 return false;
@@ -2523,7 +2531,7 @@ bool InitializeHooks() {
         if (real_CreateFileA) {
             if (MH_CreateHook(real_CreateFileA, (void*)Hook_CreateFileA,
                               (void**)&original_CreateFileA) != MH_OK ||
-                MH_EnableHook(real_CreateFileA) != MH_OK) {
+                MH_QueueEnableHook(real_CreateFileA) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook CreateFileA");
             } else {
@@ -2534,7 +2542,7 @@ bool InitializeHooks() {
         if (real_CreateFileW) {
             if (MH_CreateHook(real_CreateFileW, (void*)Hook_CreateFileW,
                               (void**)&original_CreateFileW) != MH_OK ||
-                MH_EnableHook(real_CreateFileW) != MH_OK) {
+                MH_QueueEnableHook(real_CreateFileW) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook CreateFileW");
             } else {
@@ -2564,7 +2572,7 @@ bool InitializeHooks() {
         if (real_ReadFile) {
             if (MH_CreateHook(real_ReadFile, (void*)Hook_ReadFile,
                               (void**)&original_ReadFile) != MH_OK ||
-                MH_EnableHook(real_ReadFile) != MH_OK) {
+                MH_QueueEnableHook(real_ReadFile) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook ReadFile");
             }
@@ -2572,7 +2580,7 @@ bool InitializeHooks() {
         if (real_SetFilePointer) {
             if (MH_CreateHook(real_SetFilePointer, (void*)Hook_SetFilePointer,
                               (void**)&original_SetFilePointer) != MH_OK ||
-                MH_EnableHook(real_SetFilePointer) != MH_OK) {
+                MH_QueueEnableHook(real_SetFilePointer) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook SetFilePointer");
             }
@@ -2580,7 +2588,7 @@ bool InitializeHooks() {
         if (real_SetFilePointerEx) {
             if (MH_CreateHook(real_SetFilePointerEx, (void*)Hook_SetFilePointerEx,
                               (void**)&original_SetFilePointerEx) != MH_OK ||
-                MH_EnableHook(real_SetFilePointerEx) != MH_OK) {
+                MH_QueueEnableHook(real_SetFilePointerEx) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook SetFilePointerEx");
             }
@@ -2588,7 +2596,7 @@ bool InitializeHooks() {
         if (real_CloseHandle) {
             if (MH_CreateHook(real_CloseHandle, (void*)Hook_CloseHandle,
                               (void**)&original_CloseHandle) != MH_OK ||
-                MH_EnableHook(real_CloseHandle) != MH_OK) {
+                MH_QueueEnableHook(real_CloseHandle) != MH_OK) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                             "Hooks: Failed to hook CloseHandle");
             }
@@ -2596,6 +2604,16 @@ bool InitializeHooks() {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Hooks: FM2K_FAST_PLAYER_LOAD=%s (ReadFile/SetFP/CloseHandle hooked)",
                     g_fast_player_load ? "1 (active)" : "0 (passthrough)");
+    }
+
+    // Single thread-freeze for every hook queued during this function and by
+    // InstallLocaleSpoof/RoundEvents_Install/CssAutoConfirm_Install. One call
+    // beats ~12 individual MH_EnableHook(target) freezes (~80–120ms each).
+    MH_STATUS apply = MH_ApplyQueued();
+    if (apply != MH_OK) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Hooks: MH_ApplyQueued failed: %d", (int)apply);
+        return false;
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: All hooks installed successfully");

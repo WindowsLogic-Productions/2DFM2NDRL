@@ -24,18 +24,21 @@ static bool    g_in_modal_loop   = false;
 
 // Original window title captured at install time. We append " [FF]" when
 // the user toggles fast-forward via F12 in spectator mode and restore the
-// plain title on toggle off. ANSI titles only — FM2K windows are ASCII.
-static char    g_original_title[256] = {};
+// plain title on toggle off. Stored as wide so JP titles round-trip
+// without loss across the FF toggle (the locale-spoof wrapper promoted
+// the window to Unicode at create time — ANSI snapshot here would
+// hard-fold JP chars to '?' via the system codepage).
+static wchar_t g_original_title[256] = {};
 
 static void UpdateSpectatorTitle() {
     if (!g_hwnd || !g_spectator_mode) return;
-    char buf[320] = {};
+    wchar_t buf[320] = {};
     if (g_spectator_ff_user) {
-        std::snprintf(buf, sizeof(buf), "%s [FF]", g_original_title);
+        _snwprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%ls [FF]", g_original_title);
     } else {
-        std::snprintf(buf, sizeof(buf), "%s", g_original_title);
+        _snwprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%ls", g_original_title);
     }
-    SetWindowTextA(g_hwnd, buf);
+    SetWindowTextW(g_hwnd, buf);
 }
 
 static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
@@ -153,7 +156,11 @@ static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
             break;
         }
     }
-    return CallWindowProc(g_orig_wndproc, hwnd, msg, wparam, lparam);
+    // CallWindowProcW handles W→A conversion if g_orig_wndproc was
+    // registered as ANSI; the locale-spoof wrapper sits between us and
+    // any actual ANSI proc so text-content messages are intercepted
+    // there before reaching this layer.
+    return CallWindowProcW(g_orig_wndproc, hwnd, msg, wparam, lparam);
 }
 
 // Find the KGT2KGAME window owned by THIS process. FindWindowA is
@@ -187,7 +194,11 @@ void TryInstall() {
     EnumWindows(FindOwnWindowProc, reinterpret_cast<LPARAM>(&ctx));
     HWND hwnd = ctx.result;
     if (hwnd == nullptr) return;          // window not yet up; try again later
-    WNDPROC prev = (WNDPROC)SetWindowLongPtrA(
+    // SetWindowLongPtrW keeps the window flagged Unicode (the locale-spoof
+    // wrapper promoted it at creation). Switching to A here would flip
+    // the flag back, which would re-introduce the W→A bridge that mangles
+    // JP titles via CP_ACP.
+    WNDPROC prev = (WNDPROC)SetWindowLongPtrW(
         hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SubclassProc));
     if (prev == nullptr) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -198,9 +209,10 @@ void TryInstall() {
     g_hwnd         = hwnd;
     g_orig_wndproc = prev;
 
-    // Snapshot the original title so the F12 spectator FF toggle can
-    // append/strip "[FF]" without losing the game's chosen title text.
-    GetWindowTextA(hwnd, g_original_title, sizeof(g_original_title) - 1);
+    // Snapshot the original title (wide) so the F12 spectator FF toggle
+    // can append/strip "[FF]" without losing JP characters.
+    GetWindowTextW(hwnd, g_original_title,
+                   sizeof(g_original_title) / sizeof(g_original_title[0]) - 1);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "WndProcSubclass: installed on hwnd=%p prev_wndproc=%p "
@@ -214,7 +226,7 @@ void Uninstall() {
         KillTimer(g_hwnd, kModalPumpTimerId);
         g_in_modal_loop = false;
     }
-    SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC,
+    SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC,
                       reinterpret_cast<LONG_PTR>(g_orig_wndproc));
     g_hwnd         = nullptr;
     g_orig_wndproc = nullptr;

@@ -160,13 +160,15 @@ bool CssAutoConfirm_Install() {
             (unsigned)ADDR_GAME_STATE_MANAGER);
         return false;
     }
-    if (MH_EnableHook((void*)ADDR_GAME_STATE_MANAGER) != MH_OK) {
+    // Queue only — InitializeHooks flushes all queued hooks with a single
+    // MH_ApplyQueued (one thread-freeze for the whole boot path).
+    if (MH_QueueEnableHook((void*)ADDR_GAME_STATE_MANAGER) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "CssAutoConfirm: MH_EnableHook(game_state_manager) failed");
+            "CssAutoConfirm: MH_QueueEnableHook(game_state_manager) failed");
         return false;
     }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "CssAutoConfirm: hooked game_state_manager @ 0x%08X (idle until "
+        "CssAutoConfirm: queued game_state_manager @ 0x%08X (idle until "
         "OnReplayMatchStart fires)",
         (unsigned)ADDR_GAME_STATE_MANAGER);
     return true;

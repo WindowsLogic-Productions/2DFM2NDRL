@@ -104,6 +104,11 @@ GetCommandLineA_t            p_GetCommandLineA           = nullptr;
 
 bool g_installed = false;
 
+// Forward decl — installs a wrapper WNDPROC on a freshly-created window so
+// the OS treats it as Unicode and SetWindowTextW preserves wide titles.
+// Defined further down (after the dialog-template translator).
+void InstallLocaleProcOnWindow(HWND hwnd) noexcept;
+
 inline UINT TranslateCodePage(UINT cp) noexcept {
     if (cp == CP_ACP || cp == CP_OEMCP) return kSpoofedCodePage;
     return cp;
@@ -289,7 +294,34 @@ BOOL WINAPI Hook_SetWindowTextA(HWND hwnd, LPCSTR text) {
     if (MultiByteToWideChar(kSpoofedCodePage, 0, text, -1, wide.data(), wlen) <= 0) {
         return p_SetWindowTextA(hwnd, text);
     }
-    return SetWindowTextW(hwnd, wide.data());
+    // One-shot diagnostic: confirm our hook fires with what the game
+    // actually passes, and confirm the window is Unicode at this point
+    // (i.e. our locale wrapper successfully promoted it).
+    static int s_logged = 0;
+    if (s_logged < 4) {
+        char utf8[1024] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, wide.data(), -1, utf8, sizeof(utf8),
+                            nullptr, nullptr);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "LocaleSpoof: SetWindowTextA[%d] hwnd=%p IsUnicode=%d title='%s'",
+            s_logged, (void*)hwnd, IsWindowUnicode(hwnd) ? 1 : 0, utf8);
+        ++s_logged;
+    }
+    // Bypass the WNDPROC chain entirely. SetWindowTextW would post
+    // WM_SETTEXT to the window's current WNDPROC; if a third-party
+    // subclass (e.g. cnc-ddraw via SetWindowLongPtrA in its init path)
+    // has reverted the window's IsUnicode flag, the W→A bridge mangles
+    // wide chars via the SYSTEM CP_ACP (CP1252 on US Windows) — even
+    // though our wrapper would have stored wide correctly, that wrapper
+    // is no longer the top of the WNDPROC chain by the time the game
+    // first sets a title.
+    //
+    // DefWindowProcW(WM_SETTEXT) goes straight to NtUserSetWindowText
+    // with the wide string, storing it verbatim in the kernel window
+    // object regardless of the user-mode A/W flag. The non-client area
+    // gets a redraw automatically.
+    DefWindowProcW(hwnd, WM_SETTEXT, 0, (LPARAM)wide.data());
+    return TRUE;
 }
 
 // --- GDI32 in-game text rendering ---
@@ -389,9 +421,12 @@ HWND WINAPI Hook_CreateWindowExA(DWORD ex_style, LPCSTR class_name,
     bool class_is_atom = ((uintptr_t)class_name < 0x10000);
     if (class_is_atom) {
         // ATOMs only valid in the SAME variant (ExA-registered → ExA call).
-        // Forward to ExA so the lookup succeeds.
-        return p_CreateWindowExA(ex_style, class_name, window_name, style,
-                                 x, y, w, h, parent, menu, inst, lparam);
+        // Forward to ExA so the lookup succeeds, then flip the resulting
+        // window to Unicode so SetWindowTextW preserves wide titles.
+        HWND hwnd = p_CreateWindowExA(ex_style, class_name, window_name, style,
+                                      x, y, w, h, parent, menu, inst, lparam);
+        if (hwnd) InstallLocaleProcOnWindow(hwnd);
+        return hwnd;
     }
 
     std::vector<wchar_t> wclass;
@@ -409,11 +444,89 @@ HWND WINAPI Hook_CreateWindowExA(DWORD ex_style, LPCSTR class_name,
 
     // If we couldn't convert either, fall back to ExA so the call still works.
     if (!wclass_p && !wname_p) {
-        return p_CreateWindowExA(ex_style, class_name, window_name, style,
-                                 x, y, w, h, parent, menu, inst, lparam);
+        HWND hwnd = p_CreateWindowExA(ex_style, class_name, window_name, style,
+                                      x, y, w, h, parent, menu, inst, lparam);
+        if (hwnd) InstallLocaleProcOnWindow(hwnd);
+        return hwnd;
     }
-    return CreateWindowExW(ex_style, wclass_p, wname_p, style,
-                           x, y, w, h, parent, menu, inst, lparam);
+    HWND hwnd = CreateWindowExW(ex_style, wclass_p, wname_p, style,
+                                x, y, w, h, parent, menu, inst, lparam);
+    if (hwnd) {
+        InstallLocaleProcOnWindow(hwnd);
+        // The WM_NCCREATE / WM_CREATE messages fired during CreateWindowExW
+        // were delivered to the (still-ANSI) WNDPROC via the W→A bridge,
+        // which mangled wname_p through the SYSTEM CP_ACP (CP1252 on US
+        // Windows). Now that our wrapper has promoted the window to
+        // Unicode, re-set the title with the correct wide string so the
+        // wrapper's WM_SETTEXT path stores it as wide.
+        if (wname_p) SetWindowTextW(hwnd, wname_p);
+    }
+    return hwnd;
+}
+
+// --- Window Unicode promotion ---
+//
+// FM2K (and FM95) register their window class via RegisterClassA, which
+// marks the class — and every window created from it — as ANSI. When a
+// later SetWindowTextA(hwnd, sjis_bytes) is intercepted by our hook and
+// re-emitted as SetWindowTextW(hwnd, wide), the WM_SETTEXT message has to
+// cross the W→A bridge to reach the ANSI WNDPROC. That bridge uses the
+// SYSTEM ANSI codepage (CP1252 on US Windows), NOT our user-mode GetACP
+// hook — so Japanese chars are destroyed in storage and the title bar
+// renders garbage.
+//
+// Fix: after CreateWindowExW returns, install a W-flavored wrapper WNDPROC
+// via SetWindowLongPtrW. This flips the window to Unicode at the OS level.
+// The wrapper handles WM_SETTEXT / WM_GETTEXT / WM_GETTEXTLENGTH directly
+// via DefWindowProcW so the title is stored as wide chars (correct), and
+// forwards everything else to the original ANSI WNDPROC via
+// CallWindowProcW (the system handles W→A for non-text messages without
+// data loss).
+//
+// Bypassing the game's WNDPROC for text messages is safe: FM2K's
+// main_window_proc (and FM95's equivalent) just forward those to
+// DefWindowProcA — there's no game-side handling to preserve.
+
+constexpr wchar_t kOrigWndProcProp[] = L"FM2KLocaleOrigWP";
+
+LRESULT CALLBACK LocaleSpoofWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SETTEXT:
+        case WM_GETTEXT:
+        case WM_GETTEXTLENGTH:
+            // Wide-native title path — bypass the game's ANSI WNDPROC so
+            // the system never collapses our wide title via CP1252.
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        case WM_NCDESTROY: {
+            // Drop our per-window prop on destroy. We still forward the
+            // message so the original chain can clean up too.
+            HANDLE h = RemovePropW(hwnd, kOrigWndProcProp);
+            WNDPROC orig = (WNDPROC)h;
+            if (orig) return CallWindowProcW(orig, hwnd, msg, wp, lp);
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    }
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, kOrigWndProcProp);
+    if (!orig) return DefWindowProcW(hwnd, msg, wp, lp);
+    // CallWindowProcW handles W→A param conversion if `orig` was
+    // registered as ANSI (the FM2K/FM95 case via RegisterClassA).
+    return CallWindowProcW(orig, hwnd, msg, wp, lp);
+}
+
+void InstallLocaleProcOnWindow(HWND hwnd) noexcept {
+    if (!hwnd) return;
+    if (GetPropW(hwnd, kOrigWndProcProp)) return;  // already installed
+    // Capture the original WNDPROC as ANSI — that's how the game
+    // registered it via RegisterClassA.
+    WNDPROC orig = (WNDPROC)GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+    if (!orig) return;
+    if (!SetPropW(hwnd, kOrigWndProcProp, (HANDLE)orig)) return;
+    // SetWindowLongPtrW marks the window as Unicode at the OS level so
+    // WM_SETTEXT messages stay wide all the way to DefWindowProcW.
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)LocaleSpoofWndProc);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "LocaleSpoof: promoted hwnd=%p to Unicode (orig WNDPROC=%p, IsUnicode=%d)",
+        (void*)hwnd, (void*)orig, IsWindowUnicode(hwnd) ? 1 : 0);
 }
 
 // --- DialogBoxParamA: translate the dialog template resource ---
@@ -650,14 +763,16 @@ bool CreateAndEnableHook(LPCSTR module, LPCSTR symbol, void* detour, T*& trampol
         return false;
     }
     trampoline = reinterpret_cast<T*>(tramp);
-    s = MH_EnableHook(target);
+    // Queue rather than enable: each MH_EnableHook freezes/thaws every thread
+    // in the process via Toolhelp32Snapshot (~80–120ms each). Queue all 24
+    // locale hooks and flush once with MH_ApplyQueued at the end of
+    // InstallLocaleSpoof — single freeze instead of 24, ~2s saved on cold start.
+    s = MH_QueueEnableHook(target);
     if (s != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "LocaleSpoof: MH_EnableHook(%s) failed: %d", symbol, (int)s);
+            "LocaleSpoof: MH_QueueEnableHook(%s) failed: %d", symbol, (int)s);
         return false;
     }
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "LocaleSpoof: hooked %s!%s", module, symbol);
     return true;
 }
 
@@ -720,6 +835,14 @@ bool InstallLocaleSpoof() {
     try_hook("user32.dll",   "SetDlgItemTextA",  (void*)&Hook_SetDlgItemTextA,  p_SetDlgItemTextA);
     try_hook("user32.dll",   "CreateWindowExA",  (void*)&Hook_CreateWindowExA,  p_CreateWindowExA);
     try_hook("user32.dll",   "DialogBoxParamA",  (void*)&Hook_DialogBoxParamA,  p_DialogBoxParamA);
+
+    // Single freeze for all queued hooks (vs one freeze per hook).
+    MH_STATUS apply = MH_ApplyQueued();
+    if (apply != MH_OK) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "LocaleSpoof: MH_ApplyQueued failed: %d", (int)apply);
+        return false;
+    }
 
     g_installed = true;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,

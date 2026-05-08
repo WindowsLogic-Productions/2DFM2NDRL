@@ -645,7 +645,11 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
 
         // Hook WndProc
         if (g_game_window && !oWndProc) {
-            oWndProc = (WNDPROC)SetWindowLongPtr(g_game_window,
+            // SetWindowLongPtrW keeps the window flagged Unicode (the
+            // locale-spoof wrapper promoted it at create time). Switching
+            // to A here would flip the flag back and re-introduce the
+            // W→A bridge that mangles JP titles via CP_ACP.
+            oWndProc = (WNDPROC)SetWindowLongPtrW(g_game_window,
                 GWLP_WNDPROC, (LONG_PTR)Hook_WndProc);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "imgui_overlay: Hook_WndProc=%p installed on hwnd=%p, "
@@ -782,7 +786,7 @@ LRESULT WINAPI Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return true;
         }
     }
-    return CallWindowProc(oWndProc, hWnd, msg, wParam, lParam);
+    return CallWindowProcW(oWndProc, hWnd, msg, wParam, lParam);
 }
 
 DWORD WINAPI DirectXInit(LPVOID lpParameter) {
@@ -857,7 +861,7 @@ void ShutdownImGuiOverlay() {
         g_imgui_initialized = false;
     }
     if (g_game_window && oWndProc) {
-        SetWindowLongPtr(g_game_window, GWLP_WNDPROC, (LONG_PTR)oWndProc);
+        SetWindowLongPtrW(g_game_window, GWLP_WNDPROC, (LONG_PTR)oWndProc);
     }
 }
 

@@ -173,13 +173,16 @@ bool RoundEvents_Install() {
             (void*)ADDR_VS_ROUND_FUNCTION);
         return false;
     }
-    if (MH_EnableHook((void*)ADDR_VS_ROUND_FUNCTION) != MH_OK) {
+    // Queue only — caller (InitializeHooks) flushes all hooks with one
+    // MH_ApplyQueued so we pay ONE thread-freeze cost across the whole boot
+    // path instead of one per hook.
+    if (MH_QueueEnableHook((void*)ADDR_VS_ROUND_FUNCTION) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "RoundEvents: MH_EnableHook(vs_round_function) failed");
+            "RoundEvents: MH_QueueEnableHook(vs_round_function) failed");
         return false;
     }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "RoundEvents: hooked vs_round_function @ 0x%08X for ROUND_START/END emit",
+        "RoundEvents: queued vs_round_function @ 0x%08X for ROUND_START/END emit",
         (unsigned)ADDR_VS_ROUND_FUNCTION);
     return true;
 }
