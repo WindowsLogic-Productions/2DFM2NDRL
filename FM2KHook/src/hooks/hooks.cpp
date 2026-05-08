@@ -1,7 +1,8 @@
 // Simplified hooks - detect battle mode transitions, delegate to netplay
 // Sync barrier: block game until both clients connected (CCCaster-style)
 #include "hooks.h"
-#include "round_events.h"  // C3.5 — vs_round_function detour install
+#include "round_events.h"     // C3.5 — vs_round_function detour install
+#include "css_autoconfirm.h"  // CSS lock-and-confirm for offline replay playback
 #include "globals.h"
 
 #include <cstdlib>
@@ -1773,12 +1774,34 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
 
             if (g_spectator_mode) {
                 size_t qd = SpectatorNode_PendingFrameCount();
-                bool sub = SpectatorNode_IsSubscribedUpstream();
-                snprintf(title, sizeof(title),
-                    "%s | %s %s | %dfps | q:%zu",
-                    s_game_prefix, role,
-                    sub ? "Subscribed" : "Connecting...",
-                    g_current_fps, qd);
+                // Differentiate offline-replay (file-driven, no peer) from
+                // live-spec (subscribed to a host's stream). Replay mode
+                // never has an upstream so "Connecting..." would be a lie
+                // — it's already loaded everything from disk.
+                static int s_replay_cached = -1;
+                if (s_replay_cached < 0) {
+                    const char* rp = std::getenv("FM2K_REPLAY_FILE");
+                    s_replay_cached = (rp && rp[0]) ? 1 : 0;
+                }
+                if (s_replay_cached == 1) {
+                    uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+                    const char* phase =
+                        (mode == 0)                          ? "BOOT" :
+                        (mode == 1000)                       ? "TITLE" :
+                        (mode == 2000)                       ? "CSS" :
+                        (mode >= 3000 && mode < 4000)        ? "BATTLE" :
+                                                               "POST";
+                    snprintf(title, sizeof(title),
+                        "%s | Replay (%s) | %dfps | q:%zu",
+                        s_game_prefix, phase, g_current_fps, qd);
+                } else {
+                    bool sub = SpectatorNode_IsSubscribedUpstream();
+                    snprintf(title, sizeof(title),
+                        "%s | %s %s | %dfps | q:%zu",
+                        s_game_prefix, role,
+                        sub ? "Subscribed" : "Connecting...",
+                        g_current_fps, qd);
+                }
             } else if (active) {
                 GekkoNetworkStats stats = Netplay_GetNetworkStats();
                 float ahead = Netplay_GetFramesAhead();
@@ -2452,6 +2475,18 @@ bool InitializeHooks() {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
             "Hooks: RoundEvents_Install failed — round events will be missing "
             "from session_events / .fm2krep round_offsets");
+    }
+
+    // CSS auto-lock-and-confirm — installs idle, only activates when
+    // SpectatorNode's MATCH_START apply path arms it for offline replay
+    // playback (FM2K_REPLAY_FILE set). Live-spectator paths walk CSS via the
+    // host's full input stream and don't need this. FM95 builds compile to a
+    // no-op (its CSS state machine is structured differently — separate
+    // hand-off).
+    if (!CssAutoConfirm_Install()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "Hooks: CssAutoConfirm_Install failed — offline replay will fall "
+            "back to natural CSS traversal (likely picks wrong chars)");
     }
 
     // Hook timeGetTime (winmm.dll) — make the game's frame-skip pacing

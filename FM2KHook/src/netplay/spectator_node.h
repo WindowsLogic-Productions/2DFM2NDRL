@@ -275,7 +275,8 @@ void SpectatorNode_OnMatchStart(
     uint32_t initial_rng_seed,
     uint32_t initial_state_hash,
     uint8_t p1_char, uint8_t p1_color,
-    uint8_t p2_char, uint8_t p2_color);
+    uint8_t p2_char, uint8_t p2_color,
+    uint8_t stage_id);
 
 // Called once per confirmed (non-rollback) frame. The node buffers the input
 // pair and, every broadcast_interval frames, batches and forwards to all

@@ -913,10 +913,30 @@ static void RunSpectatorTick() {
     // Health: heartbeat send, silence-failover, daisy-chain reconnect.
     SpectatorNode_TickHealth();
 
+    // Cache offline-replay mode once. Several gates downstream behave
+    // differently for replay vs. live spec — replay has no upstream so
+    // jitter-floor / catchup logic is meaningless.
+    static int s_offline_replay_cached = -1;
+    if (s_offline_replay_cached < 0) {
+        const char* rp = std::getenv("FM2K_REPLAY_FILE");
+        s_offline_replay_cached = (rp && rp[0]) ? 1 : 0;
+    }
+    const bool s_offline_replay_env_active = (s_offline_replay_cached == 1);
+
     const size_t qd = SpectatorNode_PendingFrameCount();
-    if (qd < SPECTATOR_LIVE_TARGET) {
+    // Jitter-buffer floor only applies to LIVE spec (waiting on host's next
+    // batch). Offline replay has no upstream — the file is the entire input
+    // stream — so the last ≤8 events (typically post-match INPUTs +
+    // MATCH_END) would be stranded under the LIVE floor. Drain to zero
+    // instead, which lets MATCH_END apply and the playback finishes cleanly.
+    if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active) {
         // Queue starved — hold the current rendered frame. Don't tick sim,
         // don't read inputs, don't run process_game_inputs/update_game.
+        RenderFrameWithSnapshot();
+        return;
+    }
+    if (qd == 0) {
+        // Truly empty — even offline replay has nothing left to do.
         RenderFrameWithSnapshot();
         return;
     }
@@ -979,8 +999,20 @@ static void RunSpectatorTick() {
         const char* v = std::getenv("FM2K_SPECTATOR_ALWAYS_CATCHUP");
         s_always_catchup_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
     }
+    // Offline-replay mode: catchup is meaningless because the entire file
+    // is pre-loaded into pb_queue at startup — without this gate, the
+    // catchup loop drains the whole match at unbounded rate and battle
+    // visibly fast-forwards. We always run at 1 frame per outer tick
+    // instead, matching live-pace 100fps playback. (Offline-replay env-var
+    // detection is hoisted to the top of RunSpectatorTick — same cached
+    // value is reused here.)
     static bool s_initial_catchup_done   = false;
     static bool s_initial_catchup_active = false;
+    if (s_offline_replay_env_active) {
+        // Permanent disable — never engage catchup for offline replay.
+        s_initial_catchup_done = true;
+        s_initial_catchup_active = false;
+    }
 
     // CSS catchup is now allowed. Earlier we suppressed it because catchup
     // ran PGI+UG without render, and CSS character-preview state is heavily

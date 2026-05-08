@@ -6,6 +6,7 @@
 #include "savestate.h"            // SaveState_Save / Peek for snapshot capture
 #include "netplay_state.h"
 #include "../audio/sound_rollback.h"  // Op apply: SOUND_INIT
+#include "../hooks/css_autoconfirm.h" // Replay-mode CSS lock-and-confirm
 #include "../ui/shared_mem.h"         // C10: SharedMem_PublishMatchSession / RoundResult
 #include "gekkonet.h"
 
@@ -189,6 +190,7 @@ struct State {
     uint8_t                   pb_p1_color         = 0;
     uint8_t                   pb_p2_char          = 0;
     uint8_t                   pb_p2_color         = 0;
+    uint8_t                   pb_stage_id         = 0;
     uint16_t                  pb_current_p1       = 0;
     uint16_t                  pb_current_p2       = 0;
 
@@ -921,7 +923,8 @@ void SpectatorNode_OnMatchStart(
     uint32_t initial_rng_seed,
     uint32_t initial_state_hash,
     uint8_t p1_char, uint8_t p1_color,
-    uint8_t p2_char, uint8_t p2_color)
+    uint8_t p2_char, uint8_t p2_color,
+    uint8_t stage_id)
 {
     g_state.broadcasting = true;
     // Flush any unbatched CSS events before the match-start MATCH_START
@@ -950,6 +953,7 @@ void SpectatorNode_OnMatchStart(
     h[30] = p2_char;
     h[31] = p2_color;
     // p1_name / p2_name at h+32 / h+56 left zeroed; filled once UI plumbs them.
+    h[80] = stage_id;
     // frame_count at h+92 stays 0 — subscribers get INPUT_BATCH frames live.
     g_state.initial_match.valid = true;
 
@@ -1826,6 +1830,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 g_state.pb_p1_color      = h[29];
                 g_state.pb_p2_char       = h[30];
                 g_state.pb_p2_color      = h[31];
+                g_state.pb_stage_id      = h[80];
                 // Mirror the legacy INITIAL_MATCH packet path so the
                 // initial-match cache stays valid for relay-to-sub-spectator.
                 std::memcpy(g_state.initial_match.header_bytes, h, 96);
@@ -1833,10 +1838,29 @@ void ApplySessionEvent(const SessionEvent& ev) {
             }
             g_state.playing_back = true;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: applied MATCH_START seed=0x%08X p1=%u/%u p2=%u/%u",
+                "SpectatorNode: applied MATCH_START seed=0x%08X p1=%u/%u p2=%u/%u stage=%u",
                 g_state.pb_initial_seed,
                 g_state.pb_p1_char, g_state.pb_p1_color,
-                g_state.pb_p2_char, g_state.pb_p2_color);
+                g_state.pb_p2_char, g_state.pb_p2_color,
+                g_state.pb_stage_id);
+            // For offline replay (FM2K_REPLAY_FILE set), arm the CSS auto-
+            // lock-and-confirm hook so the local game pins to the recorded
+            // chars/stage when CSS opens. Live-spec (host stream) walks CSS
+            // via the upstream input log and doesn't need this. Cached
+            // once — getenv hits an env block walk every call otherwise.
+            {
+                static int s_offline_replay_cached = -1;
+                if (s_offline_replay_cached < 0) {
+                    const char* v = std::getenv("FM2K_REPLAY_FILE");
+                    s_offline_replay_cached = (v && v[0]) ? 1 : 0;
+                }
+                if (s_offline_replay_cached == 1) {
+                    CssAutoConfirm_OnReplayMatchStart(
+                        g_state.pb_p1_char,
+                        g_state.pb_p2_char,
+                        g_state.pb_stage_id);
+                }
+            }
             break;
         }
         case SessionEventType::MATCH_END: {
@@ -2616,6 +2640,69 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     }
     if (g_state.pb_queue.empty()) return false;
     if (g_state.pb_queue.front().type != SessionEventType::INPUT) return false;
+
+    // Offline-replay gate (FM2K only for now).
+    //
+    // The .fm2krep file is sliced from MATCH_START → MATCH_END — its INPUTs
+    // are battle-phase inputs, not CSS-traversal inputs. If we pop them
+    // during the spectator's own CSS phase (driven by the auto-CSS hook's
+    // direct memory writes rather than these INPUTs), they get applied to
+    // the wrong logical frames and the input timeline misaligns with the
+    // host's recording by the count of frames CSS took (~134 in practice).
+    // Symptom: rounds may coincidentally match (BATTLE_INIT inputs are
+    // mostly neutral), but mid-round positions/scripts are visibly off.
+    //
+    // Live-spec doesn't have this issue: host streams CSS-traversal inputs
+    // from session start, so they consume during the spectator's CSS phase
+    // as intended. Gate only fires when FM2K_REPLAY_FILE is set.
+    //
+    // Pre-battle: feed neutral inputs (p1=p2=0) so PGI+UG still runs and
+    // the local CSS state machine advances under the auto-CSS hook's pins;
+    // the pb_queue's first real INPUT stays at the head until the local
+    // game crosses into mode==3000.
+    if constexpr (FM2K::kIsFM2K) {
+        static int s_offline_replay_cached = -1;
+        if (s_offline_replay_cached < 0) {
+            const char* v = std::getenv("FM2K_REPLAY_FILE");
+            s_offline_replay_cached = (v && v[0]) ? 1 : 0;
+        }
+        if (s_offline_replay_cached == 1) {
+            // Latch: gate is active only UNTIL the first mode==3000 entry.
+            // The gate's purpose is to keep the queue's first INPUT at the
+            // head until the local game crosses into battle so spectator's
+            // bf=0 reads host's bf=0 input. Once we've entered battle once,
+            // misalignment can't happen anymore — and post-match phases
+            // (mode dropping back below 3000 for results / CSS rematch /
+            // game-over screens) need queue inputs to drain so trailing
+            // ROUND_END / MATCH_END / next match's MATCH_START events
+            // can apply. Without this latch, the 6 post-R3 INPUTs in the
+            // file's tail would block MATCH_END from ever applying and
+            // the spec would freeze with q:7 in the queue.
+            static bool s_battle_entered = false;
+            const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+            if (mode >= 3000u) {
+                s_battle_entered = true;
+            }
+            if (!s_battle_entered && mode < 3000u) {
+                // Pre-battle: don't pop the queue. Synthesize a sentinel
+                // input. Title (mode==1000) needs a confirm-button press
+                // edge each frame to advance the menu — alternate
+                // 0x010/0x000 so the edge detector fires repeatedly.
+                // CSS (mode==2000) gets neutral — CssAutoConfirm pins
+                // cursor + action_state directly.
+                uint16_t synthetic = 0;
+                if (mode == 1000u) {
+                    static uint32_t s_title_tick = 0;
+                    synthetic = (s_title_tick++ & 1u) ? 0x010u : 0u;
+                }
+                g_state.pb_current_p1 = synthetic;
+                g_state.pb_current_p2 = synthetic;
+                if (p1_input) *p1_input = synthetic;
+                if (p2_input) *p2_input = synthetic;
+                return true;
+            }
+        }
+    }
 
     const SessionEvent ev = g_state.pb_queue.front();
     g_state.pb_queue.erase(g_state.pb_queue.begin());

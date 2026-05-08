@@ -83,8 +83,9 @@ constexpr uintptr_t ADDR_FRAME_COUNTER     = 0x4456FC;
  *   ADDR_GAME_MODE  = 0x470054 (g_game_mode: 0=boot, 2000=title,
  *                                3000=CSS, 4000=stage, 5000=battle)
  *   ADDR_GAME_TIMER = 0x470044 (g_game_timer per-frame counter)
- *   ADDR_ROUND_TIMER_COUNTER = 0x47008E (post-CSS lock counter; battle
- *                                         starts when > 100)
+ *   ADDR_ROUND_TIMER_COUNTER = 0x424F00 (post-CSS lock counter; battle
+ *                                         starts when > 100; per IDA
+ *                                         game_state_manager @ 0x406FC0)
  * Camera offsets aren't yet mapped in FM2KHook source — parity diff
  * surfaces them as divergences (kgt populates camera_x/y, FM2K side
  * leaves zero until offset is found). */

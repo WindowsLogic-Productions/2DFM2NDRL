@@ -152,6 +152,9 @@ def decode_event(body: bytes, off: int) -> tuple[int, dict]:
         seed = struct.unpack_from("<I", payload, 20)[0]
         state_hash = struct.unpack_from("<I", payload, 24)[0]
         p1_char, p1_color, p2_char, p2_color = struct.unpack_from("<BBBB", payload, 28)
+        # C6: stage_id at offset 80 (h[80]); slot was reserved-zero before
+        # the host-side fix. Old files show stage_id=0 here.
+        stage_id = struct.unpack_from("<B", payload, 80)[0]
         ev.update({
             "magic": f"0x{magic:08x}",
             "version": version,
@@ -160,6 +163,7 @@ def decode_event(body: bytes, off: int) -> tuple[int, dict]:
             "initial_state_hash": state_hash,
             "p1_char/color": f"{p1_char}/{p1_color}",
             "p2_char/color": f"{p2_char}/{p2_color}",
+            "stage_id": stage_id,
         })
     elif name == "MATCH_END":
         winner_idx, rw_p1, rw_p2 = struct.unpack_from("<BBB", payload, 0)
