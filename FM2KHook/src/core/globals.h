@@ -92,6 +92,12 @@ namespace FM2K {
     constexpr uintptr_t ADDR_P1_WIN_COUNTER = 0x5e9914;
     constexpr uintptr_t ADDR_P2_WIN_COUNTER = 0x5e9978;
 
+    // FM2K-only fields (stubbed at 0 on FM95). Mirror of the symmetric
+    // stubs in the FM2K branch — keeps `if constexpr (kIsFM2K) { ... }`
+    // bodies parseable in the FM95 build.
+    constexpr uintptr_t ADDR_P1_ROUNDS_WON  = 0;
+    constexpr uintptr_t ADDR_P2_ROUNDS_WON  = 0;
+
     // Damage-taken / HP-loss scalars — IDA shows
     // vs_round_function case 30 spawning the KO panel when
     // g_p1_damage_taken[0] == g_char_max_hp_table[0]. Same 100-byte
@@ -263,6 +269,16 @@ namespace FM2K {
     constexpr uintptr_t ADDR_P_MAIN_OBJECT_PTR  = 0;
     constexpr uintptr_t ADDR_P1_WIN_COUNTER     = 0;
     constexpr uintptr_t ADDR_P2_WIN_COUNTER     = 0;
+
+    // FM2K round-win counters — IDA-suggested + empirically verified
+    // (v0.2.21 [ROUND-WIN-PROBE] log: P1=0, P2=1 after P2 wins round 1;
+    // P2=2 after round 2). Per-char-slot field at offset -0x18 from HP
+    // (HP at 0x4DFC85, win at 0x4DFC6D). Stride 0xE03F = HP_STRIDE.
+    // Hooks.cpp:680 misnames these `g_match_phase` / `g_round_sub_state`
+    // — they're actually per-slot rounds-won counters. Reset to 0 at
+    // start of new match, increment on each round won by that player.
+    constexpr uintptr_t ADDR_P1_ROUNDS_WON      = 0x4DFC6D;
+    constexpr uintptr_t ADDR_P2_ROUNDS_WON      = 0x4EDCAC;
     constexpr uintptr_t ADDR_P1_DAMAGE_TAKEN    = 0;
     constexpr uintptr_t ADDR_P2_DAMAGE_TAKEN    = 0;
     constexpr uintptr_t ADDR_LOAD_STAGE_FILE_ALT  = 0;
