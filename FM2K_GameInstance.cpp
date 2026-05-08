@@ -506,18 +506,38 @@ bool FM2KGameInstance::SetupProcessForHooking(const std::string& dll_path) {
         return false;
     }
 
-    // Wait for the LoadLibrary remote-thread to return. Poll in 250ms
+    // Wait for the LoadLibrary remote-thread to return. Poll in 250 ms
     // increments instead of one big WaitForSingleObject so we can give
-    // a richer error message on timeout (the most common bug-report
-    // we get is "DLL injection timeout or failed: 258" with no other
-    // detail). On timeout we still TerminateThread to free the slot.
+    // a richer error message on timeout. Total budget is 30 s to absorb
+    // first-load Defender scans, which can run 8-25 s on freshly-built
+    // DLLs and *much* longer in OneDrive / Controlled Folder Access
+    // paths. Original 5 s budget was killing legitimate inject attempts
+    // on every release because each rebuild gets a new file hash and
+    // Defender re-scans from scratch. Logs a progress line every 5 s so
+    // a user staring at the launcher knows it's still working.
+    constexpr int kInjectTimeoutMs = 30000;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Inject: waiting up to 5s for LoadLibrary in target (pid=%lu)…",
+        "Inject: waiting up to %ds for LoadLibrary in target (pid=%lu) "
+        "— if this takes more than a few seconds, Defender is scanning "
+        "the DLL on first load",
+        kInjectTimeoutMs / 1000,
         (unsigned long)::GetProcessId(process_handle_));
     DWORD wait_result = WAIT_TIMEOUT;
-    for (int slept_ms = 0; slept_ms < 5000; slept_ms += 250) {
+    for (int slept_ms = 0; slept_ms < kInjectTimeoutMs; slept_ms += 250) {
         wait_result = WaitForSingleObject(remote_thread, 250);
-        if (wait_result == WAIT_OBJECT_0) break;
+        if (wait_result == WAIT_OBJECT_0) {
+            if (slept_ms > 1000) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Inject: LoadLibrary completed after %.1fs (likely AV scan)",
+                    (slept_ms + 250) / 1000.0);
+            }
+            break;
+        }
+        if ((slept_ms + 250) % 5000 == 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Inject: still waiting on LoadLibrary (%ds elapsed of %ds)…",
+                (slept_ms + 250) / 1000, kInjectTimeoutMs / 1000);
+        }
         // Process still alive?
         if (WaitForSingleObject(process_handle_, 0) == WAIT_OBJECT_0) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -535,7 +555,7 @@ bool FM2KGameInstance::SetupProcessForHooking(const std::string& dll_path) {
     }
     if (wait_result != WAIT_OBJECT_0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "Inject: LoadLibrary in target hung past 5s (wait_result=%lu). "
+            "Inject: LoadLibrary in target hung past 30s (wait_result=%lu). "
             "DllMain is stuck — most common causes:\n"
             "  1. FM2KHook.dll is BLOCKED by Windows. Right-click the DLL in "
             "Explorer → Properties → tick \"Unblock\" → OK. Re-launch.\n"
