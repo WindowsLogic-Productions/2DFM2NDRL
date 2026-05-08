@@ -28,7 +28,6 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay.cpp
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
-    src/netplay/replay.cpp
     src/netplay/spectator_node.cpp
     src/netplay/spectator_tcp.cpp
     src/netplay/nat_traversal.cpp
