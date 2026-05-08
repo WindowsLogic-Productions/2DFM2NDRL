@@ -694,6 +694,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     bool spectate_mode = false;
     std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
     std::string spectate_join_mode = "current";  // --spectate-mode {current,full}
+    std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -724,6 +725,19 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 }
             } else {
                 std::cerr << "Error: --spectate-mode requires {current,full}\n";
+                return SDL_APP_FAILURE;
+            }
+        } else if (arg == "--replay") {
+            // --replay <path-to-.fm2krep-or-.fm2kset>
+            // Launches the game as a spectator instance with no network
+            // connection; the hook reads FM2K_REPLAY_FILE on init and
+            // SpectatorNode_LoadSessionFile populates pb_queue from the
+            // file. Trampoline's RunSpectatorTick consumes events and
+            // drives the sim forward, identical to a live spectator.
+            if (i + 1 < argc) {
+                replay_file_path = argv[++i];
+            } else {
+                std::cerr << "Error: --replay requires <path>\n";
                 return SDL_APP_FAILURE;
             }
         } else if (arg == "--spectate" || arg == "--spec") {
@@ -769,6 +783,66 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!g_launcher->Initialize()) {
         std::cerr << "Failed to initialize launcher\n";
         return SDL_APP_FAILURE;
+    }
+
+    // Replay mode (offline file playback). Skip UI, no network, no peer.
+    // Launches a spectator instance with FM2K_REPLAY_FILE pointing at
+    // the .fm2krep / .fm2kset; the hook's Netplay_InitAsSpectator reads
+    // the env var at init and SpectatorNode_LoadSessionFile drains the
+    // file's events into pb_queue.
+    //
+    // Game-exe lookup: the replay file is always written to
+    // <game_dir>/replays/<timestamp>.fm2krep (see WriteCurrentBattleFile),
+    // so game_dir is the replay's grandparent. We scan that directory
+    // for the .exe directly — no dependency on the async discovery
+    // thread, which hasn't populated yet at this point in startup.
+    if (!replay_file_path.empty()) {
+        std::error_code ec;
+        std::filesystem::path replay_fs = std::filesystem::u8path(replay_file_path);
+        std::filesystem::path canon = std::filesystem::weakly_canonical(replay_fs, ec);
+        if (ec) canon = replay_fs;
+        std::filesystem::path game_dir = canon.parent_path().parent_path();
+
+        // FM2K games always ship with <project>.kgt next to <project>.exe.
+        // Find the .kgt's stem and use it to pick the matching .exe — this
+        // skips bundled helper binaries like antimicrox.exe that are 64-bit
+        // and would fail injection.
+        std::string game_exe_path;
+        if (!game_dir.empty() && std::filesystem::is_directory(game_dir, ec)) {
+            std::filesystem::path kgt_stem;
+            for (const auto& entry : std::filesystem::directory_iterator(game_dir, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                               [](unsigned char c){ return std::tolower(c); });
+                if (ext == ".kgt") {
+                    kgt_stem = entry.path().stem();
+                    break;
+                }
+            }
+            if (!kgt_stem.empty()) {
+                std::filesystem::path candidate = game_dir / kgt_stem;
+                candidate += ".exe";
+                if (std::filesystem::is_regular_file(candidate, ec)) {
+                    game_exe_path = candidate.string();
+                }
+            }
+        }
+        if (game_exe_path.empty()) {
+            std::cerr << "Replay: could not locate game .exe under "
+                      << game_dir.string() << "\n";
+            return SDL_APP_FAILURE;
+        }
+
+        if (!g_launcher->LaunchReplayPlayer(game_exe_path, replay_file_path)) {
+            std::cerr << "Replay: launch failed\n";
+            return SDL_APP_FAILURE;
+        }
+        std::cout << "Replay mode: playing " << replay_file_path
+                  << " (game=" << game_exe_path << ")\n";
+        // Fall through to the launcher's headless main loop so the
+        // replay-instance lifetime is managed normally.
     }
 
     // If direct mode, skip UI and go straight to game launch + network
@@ -972,7 +1046,54 @@ bool FM2KLauncher::Initialize() {
     ui_->on_exit = [this]() {
         running_ = false;
     };
-    
+
+    // C11 — Replay browser dispatch. Resolve the game .exe from the
+    // replay file's grandparent directory (replays/<file>.fm2krep is
+    // always under <game_dir>/replays/) — same logic as the --replay
+    // CLI flag. Then call LaunchReplayPlayer to spawn the game with
+    // FM2K_REPLAY_FILE set.
+    ui_->on_replay_play = [this](const std::string& replay_path) {
+        std::error_code ec;
+        std::filesystem::path replay_fs = std::filesystem::u8path(replay_path);
+        std::filesystem::path canon =
+            std::filesystem::weakly_canonical(replay_fs, ec);
+        if (ec) canon = replay_fs;
+        std::filesystem::path game_dir =
+            canon.parent_path().parent_path();
+
+        std::string game_exe_path;
+        if (!game_dir.empty() &&
+            std::filesystem::is_directory(game_dir, ec)) {
+            std::filesystem::path kgt_stem;
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(game_dir, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                if (ext == ".kgt") {
+                    kgt_stem = entry.path().stem();
+                    break;
+                }
+            }
+            if (!kgt_stem.empty()) {
+                std::filesystem::path candidate = game_dir / kgt_stem;
+                candidate += ".exe";
+                if (std::filesystem::is_regular_file(candidate, ec)) {
+                    game_exe_path = candidate.string();
+                }
+            }
+        }
+        if (game_exe_path.empty()) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "Replay browser: could not locate game .exe under %s",
+                game_dir.string().c_str());
+            return;
+        }
+        LaunchReplayPlayer(game_exe_path, replay_path);
+    };
+
     ui_->on_games_folders_set = [this](const std::vector<std::string>& folders) {
         SetGamesRootPaths(folders);
     };
@@ -2432,6 +2553,52 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Remote spectator launched (PID: %u, port=%d -> host=%s)",
                 spectator_instance_->GetProcessId(), spectator_port, remote_addr.c_str());
+    return true;
+}
+
+bool FM2KLauncher::LaunchReplayPlayer(const std::string& game_path,
+                                      const std::string& replay_path)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Launching replay player: %s (replay=%s)",
+                game_path.c_str(), replay_path.c_str());
+
+    if (spectator_instance_ && spectator_instance_->IsRunning()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Replay player already running");
+        return false;
+    }
+
+    spectator_instance_ = std::make_unique<FM2KGameInstance>();
+    ApplyPendingConfigToInstance(spectator_instance_.get());
+
+    // Replay-mode env vars. Hook reads FM2K_REPLAY_FILE in
+    // Netplay_InitAsSpectator and short-circuits the network setup,
+    // calling SpectatorNode_LoadSessionFile to populate pb_queue from
+    // disk. Trampoline's RunSpectatorTick drains it the same way it
+    // drains live-wire events. PLAYER_INDEX=2 is the spectator sentinel.
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",    "2");
+    spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE",  "1");
+    spectator_instance_->SetEnvironmentVariable("FM2K_REPLAY_FILE",     replay_path);
+    spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
+    spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
+
+    if (!spectator_instance_->Launch(game_path)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch replay player: %s",
+                     game_path.c_str());
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_Delay(100);
+    if (!spectator_instance_->IsRunning()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Replay player process terminated immediately!");
+        spectator_instance_.reset();
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Replay player launched (PID: %u, replay=%s)",
+                spectator_instance_->GetProcessId(), replay_path.c_str());
     return true;
 }
 
