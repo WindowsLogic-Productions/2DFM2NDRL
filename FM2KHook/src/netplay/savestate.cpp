@@ -1711,3 +1711,57 @@ void SaveState_DumpDesyncDiagnostic(int frame, uint32_t local_crc, uint32_t remo
 }
 
 #endif  // !ENGINE_FM95 (FM2K full save/load body)
+
+// =============================================================================
+// SNAPSHOT SERIALIZATION (task #18 phase 2) — engine-agnostic
+// =============================================================================
+//
+// Build-agnostic helpers; both FM2K and FM95 builds compile these. The slot
+// layout differs across builds (sizeof(SaveStateData) ≈ 1 MB on FM2K vs
+// ≈ 45 KB on FM95), but the API contract is the same: caller asks for the
+// size, then peeks the bytes of the most recently Saved slot.
+//
+// Spectator-join wire format will round-trip these bytes through
+// SaveState_LoadFromBytes (added in phase 4) without external interpretation
+// — they're an opaque blob from the spectator's perspective. Both peers
+// must run the same engine variant for SaveState_Load to succeed; mismatches
+// are caught by checksum verification before Load is attempted.
+
+size_t SaveState_GetSlotByteSize() {
+    return sizeof(SaveStateData);
+}
+
+const uint8_t* SaveState_PeekLastSavedSlotBytes() {
+    if (g_last_saved_slot < 0) return nullptr;
+    if (g_last_saved_slot >= MAX_ROLLBACK_FRAMES) return nullptr;
+    return reinterpret_cast<const uint8_t*>(&g_state_buffer[g_last_saved_slot]);
+}
+
+bool SaveState_LoadFromBytes(const uint8_t* bytes, size_t n) {
+    if (!bytes || n != sizeof(SaveStateData)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SaveState_LoadFromBytes: size mismatch (got %zu, want %zu)",
+            n, sizeof(SaveStateData));
+        return false;
+    }
+
+    // Read the blob into a local first so we can pull frame_number out
+    // before deciding which slot to overwrite. The slot index must match
+    // SaveState_Load's `frame % MAX_ROLLBACK_FRAMES` calculation — and it
+    // must hold a state whose frame_number == frame, or Load fails its
+    // sanity check.
+    SaveStateData incoming;
+    std::memcpy(&incoming, bytes, sizeof(incoming));
+
+    const int frame  = (int)incoming.frame_number;
+    const int slot   = ((frame % MAX_ROLLBACK_FRAMES) + MAX_ROLLBACK_FRAMES)
+                       % MAX_ROLLBACK_FRAMES;
+    g_state_buffer[slot] = incoming;
+    g_last_saved_slot    = slot;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SaveState_LoadFromBytes: applying %zu-byte snapshot "
+        "(frame=%d → slot=%d)", n, frame, slot);
+
+    return SaveState_Load(frame);
+}

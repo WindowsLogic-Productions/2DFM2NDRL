@@ -208,12 +208,33 @@ enum class SessionEventType : uint8_t {
     MATCH_START       = 5,
     MATCH_END         = 6,
     FINGERPRINT       = 7,
+    ROUND_START       = 8,
+    ROUND_END         = 9,
+    SESSION_ID        = 10,  // C7
 };
 
 constexpr size_t SESSION_EVENT_MATCH_HDR_SIZE = 96;
 constexpr size_t SESSION_EVENT_MAX_WIRE_SIZE  = 1 + SESSION_EVENT_MATCH_HDR_SIZE;
 
 #pragma pack(push, 1)
+struct RoundStartPayload {
+    uint8_t  round_idx;
+    uint16_t p1_hp_max;
+    uint16_t p2_hp_max;
+    uint16_t timer_seconds;
+};
+struct RoundEndPayload {
+    uint8_t  winner_idx;
+    uint16_t p1_hp_remaining;
+    uint16_t p2_hp_remaining;
+    uint32_t frames_elapsed;
+};
+struct MatchEndPayload {
+    uint8_t  winner_idx;
+    uint8_t  rounds_won_p1;
+    uint8_t  rounds_won_p2;
+    uint32_t frames_total;
+};
 struct SessionEvent {
     SessionEventType type;
     union {
@@ -221,7 +242,11 @@ struct SessionEvent {
         uint32_t                             pin_rng_seed;
         uint32_t                             fingerprint_hash;
         uint16_t                             match_start_idx;
-        uint8_t                              raw[4];
+        RoundStartPayload                    round_start;
+        RoundEndPayload                      round_end;
+        MatchEndPayload                      match_end;
+        uint64_t                             session_id;
+        uint8_t                              raw[9];
     } u;
 };
 #pragma pack(pop)
@@ -239,14 +264,38 @@ size_t WirePayloadSize(SessionEventType t) {
         case SessionEventType::RESET_INPUT_STATE: return 0;
         case SessionEventType::SOUND_INIT:        return 0;
         case SessionEventType::MATCH_START:       return SESSION_EVENT_MATCH_HDR_SIZE;
-        case SessionEventType::MATCH_END:         return 0;
+        case SessionEventType::MATCH_END:         return sizeof(MatchEndPayload);
         case SessionEventType::FINGERPRINT:       return 4;
+        case SessionEventType::ROUND_START:       return sizeof(RoundStartPayload);
+        case SessionEventType::ROUND_END:         return sizeof(RoundEndPayload);
+        case SessionEventType::SESSION_ID:        return 8;
     }
     return SIZE_MAX;
 }
 
 bool IsValidEventTag(uint8_t tag) {
-    return tag >= 1 && tag <= 7;
+    return tag >= 1 && tag <= 10;
+}
+
+size_t EncodeSessionId(uint8_t* out, size_t cap, uint64_t session_id) {
+    if (cap < 9) return 0;
+    out[0] = (uint8_t)SessionEventType::SESSION_ID;
+    std::memcpy(out + 1, &session_id, 8);
+    return 9;
+}
+
+size_t EncodeRoundStart(uint8_t* out, size_t cap, const RoundStartPayload& p) {
+    if (cap < 1 + sizeof(p)) return 0;
+    out[0] = (uint8_t)SessionEventType::ROUND_START;
+    std::memcpy(out + 1, &p, sizeof(p));
+    return 1 + sizeof(p);
+}
+
+size_t EncodeRoundEnd(uint8_t* out, size_t cap, const RoundEndPayload& p) {
+    if (cap < 1 + sizeof(p)) return 0;
+    out[0] = (uint8_t)SessionEventType::ROUND_END;
+    std::memcpy(out + 1, &p, sizeof(p));
+    return 1 + sizeof(p);
 }
 
 size_t EncodeInput(uint8_t* out, size_t cap, uint16_t p1, uint16_t p2) {
@@ -278,10 +327,11 @@ size_t EncodeMatchStart(uint8_t* out, size_t cap, const uint8_t header[96]) {
     std::memcpy(out + 1, header, 96);
     return 1 + 96;
 }
-size_t EncodeMatchEnd(uint8_t* out, size_t cap) {
-    if (cap < 1) return 0;
+size_t EncodeMatchEnd(uint8_t* out, size_t cap, const MatchEndPayload& p) {
+    if (cap < 1 + sizeof(p)) return 0;
     out[0] = (uint8_t)SessionEventType::MATCH_END;
-    return 1;
+    std::memcpy(out + 1, &p, sizeof(p));
+    return 1 + sizeof(p);
 }
 size_t EncodeFingerprint(uint8_t* out, size_t cap, uint32_t hash) {
     if (cap < 5) return 0;
@@ -313,6 +363,18 @@ size_t Decode(const uint8_t* in, size_t in_len, SessionEvent* out_event,
             case SessionEventType::FINGERPRINT:
                 std::memcpy(&out_event->u.fingerprint_hash, in + 1, 4);
                 break;
+            case SessionEventType::ROUND_START:
+                std::memcpy(&out_event->u.round_start, in + 1, sizeof(RoundStartPayload));
+                break;
+            case SessionEventType::ROUND_END:
+                std::memcpy(&out_event->u.round_end, in + 1, sizeof(RoundEndPayload));
+                break;
+            case SessionEventType::MATCH_END:
+                std::memcpy(&out_event->u.match_end, in + 1, sizeof(MatchEndPayload));
+                break;
+            case SessionEventType::SESSION_ID:
+                std::memcpy(&out_event->u.session_id, in + 1, 8);
+                break;
             default: break;
         }
     }
@@ -323,12 +385,16 @@ size_t Decode(const uint8_t* in, size_t in_len, SessionEvent* out_event,
 }
 } // namespace mirror_event
 
-TEST_CASE("SessionEvent struct is exactly 5 bytes packed") {
-    // Critical for memory budget: 1-hour 100 Hz session = 360,000 INPUT
-    // events. At 5 B/event = 1.7 MB. At 8 B (unpacked alignment) it's
-    // 2.7 MB — still fine but the static_assert in production catches
-    // accidental layout drift (e.g. someone adds a wider variant).
-    CHECK(sizeof(mirror_event::SessionEvent) == 5);
+TEST_CASE("SessionEvent struct is exactly 10 bytes packed") {
+    // C3.5 bumped from 5 → 10 to inline RoundEndPayload (9 bytes) without a
+    // side-table. Memory cost: 1-hour 100 Hz session = 360 000 events ×
+    // 10 B = 3.6 MB (was 1.7 MB at 5 B). Still well within budget.
+    CHECK(sizeof(mirror_event::SessionEvent) == 10);
+}
+
+TEST_CASE("RoundStartPayload / RoundEndPayload sizes are stable") {
+    CHECK(sizeof(mirror_event::RoundStartPayload) == 7);
+    CHECK(sizeof(mirror_event::RoundEndPayload)   == 9);
 }
 
 TEST_CASE("SessionEventType wire tag values are stable") {
@@ -339,6 +405,8 @@ TEST_CASE("SessionEventType wire tag values are stable") {
     CHECK((uint8_t)mirror_event::SessionEventType::MATCH_START       == 5);
     CHECK((uint8_t)mirror_event::SessionEventType::MATCH_END         == 6);
     CHECK((uint8_t)mirror_event::SessionEventType::FINGERPRINT       == 7);
+    CHECK((uint8_t)mirror_event::SessionEventType::ROUND_START       == 8);
+    CHECK((uint8_t)mirror_event::SessionEventType::ROUND_END         == 9);
 }
 
 TEST_CASE("Wire payload sizes match the protocol comment") {
@@ -349,8 +417,88 @@ TEST_CASE("Wire payload sizes match the protocol comment") {
     CHECK(WirePayloadSize(T::RESET_INPUT_STATE) == 0);   // 1
     CHECK(WirePayloadSize(T::SOUND_INIT)        == 0);   // 1
     CHECK(WirePayloadSize(T::MATCH_START)       == 96);  // 97
-    CHECK(WirePayloadSize(T::MATCH_END)         == 0);   // 1
+    CHECK(WirePayloadSize(T::MATCH_END)         == 7);   // 8 (C7-enriched)
     CHECK(WirePayloadSize(T::FINGERPRINT)       == 4);   // 5
+    CHECK(WirePayloadSize(T::ROUND_START)       == 7);   // 8 byte event total
+    CHECK(WirePayloadSize(T::ROUND_END)         == 9);   // 10
+    CHECK(WirePayloadSize(T::SESSION_ID)        == 8);   // 9
+}
+
+TEST_CASE("Encode/Decode ROUND_START round-trips") {
+    mirror_event::RoundStartPayload p{};
+    p.round_idx     = 2;
+    p.p1_hp_max     = 800;
+    p.p2_hp_max     = 1100;
+    p.timer_seconds = 99;
+    uint8_t buf[16] = {};
+    size_t w = mirror_event::EncodeRoundStart(buf, sizeof(buf), p);
+    CHECK(w == 8);
+    CHECK(buf[0] == (uint8_t)mirror_event::SessionEventType::ROUND_START);
+
+    mirror_event::SessionEvent ev{};
+    size_t r = mirror_event::Decode(buf, w, &ev, nullptr);
+    CHECK(r == 8);
+    CHECK(ev.type == mirror_event::SessionEventType::ROUND_START);
+    CHECK(ev.u.round_start.round_idx     == 2);
+    CHECK(ev.u.round_start.p1_hp_max     == 800);
+    CHECK(ev.u.round_start.p2_hp_max     == 1100);
+    CHECK(ev.u.round_start.timer_seconds == 99);
+}
+
+TEST_CASE("Encode/Decode ROUND_END round-trips") {
+    mirror_event::RoundEndPayload p{};
+    p.winner_idx       = 1;     // P2
+    p.p1_hp_remaining  = 0;
+    p.p2_hp_remaining  = 380;
+    p.frames_elapsed   = 4200;
+    uint8_t buf[16] = {};
+    size_t w = mirror_event::EncodeRoundEnd(buf, sizeof(buf), p);
+    CHECK(w == 10);
+    CHECK(buf[0] == (uint8_t)mirror_event::SessionEventType::ROUND_END);
+
+    mirror_event::SessionEvent ev{};
+    size_t r = mirror_event::Decode(buf, w, &ev, nullptr);
+    CHECK(r == 10);
+    CHECK(ev.type == mirror_event::SessionEventType::ROUND_END);
+    CHECK(ev.u.round_end.winner_idx       == 1);
+    CHECK(ev.u.round_end.p1_hp_remaining  == 0);
+    CHECK(ev.u.round_end.p2_hp_remaining  == 380);
+    CHECK(ev.u.round_end.frames_elapsed   == 4200);
+}
+
+TEST_CASE("Encode/Decode MATCH_END round-trips (C7 enriched)") {
+    mirror_event::MatchEndPayload p{};
+    p.winner_idx     = 0;       // P1
+    p.rounds_won_p1  = 2;
+    p.rounds_won_p2  = 1;
+    p.frames_total   = 11700;
+    uint8_t buf[16] = {};
+    size_t w = mirror_event::EncodeMatchEnd(buf, sizeof(buf), p);
+    CHECK(w == 8);
+    CHECK(buf[0] == (uint8_t)mirror_event::SessionEventType::MATCH_END);
+
+    mirror_event::SessionEvent ev{};
+    size_t r = mirror_event::Decode(buf, w, &ev, nullptr);
+    CHECK(r == 8);
+    CHECK(ev.type == mirror_event::SessionEventType::MATCH_END);
+    CHECK(ev.u.match_end.winner_idx     == 0);
+    CHECK(ev.u.match_end.rounds_won_p1  == 2);
+    CHECK(ev.u.match_end.rounds_won_p2  == 1);
+    CHECK(ev.u.match_end.frames_total   == 11700u);
+}
+
+TEST_CASE("Encode/Decode SESSION_ID round-trips") {
+    constexpr uint64_t kId = 0x1234567890ABCDEFull;
+    uint8_t buf[16] = {};
+    size_t w = mirror_event::EncodeSessionId(buf, sizeof(buf), kId);
+    CHECK(w == 9);
+    CHECK(buf[0] == (uint8_t)mirror_event::SessionEventType::SESSION_ID);
+
+    mirror_event::SessionEvent ev{};
+    size_t r = mirror_event::Decode(buf, w, &ev, nullptr);
+    CHECK(r == 9);
+    CHECK(ev.type == mirror_event::SessionEventType::SESSION_ID);
+    CHECK(ev.u.session_id == kId);
 }
 
 TEST_CASE("Encode/Decode INPUT round-trips") {
@@ -379,13 +527,11 @@ TEST_CASE("Encode/Decode PIN_RNG round-trips") {
     CHECK(ev.u.pin_rng_seed == 0x12345678u);
 }
 
-TEST_CASE("Encode/Decode zero-payload events round-trip (RESET, SOUND_INIT, MATCH_END)") {
+TEST_CASE("Encode/Decode zero-payload events round-trip (RESET, SOUND_INIT)") {
     uint8_t buf[3] = {};
     size_t w = mirror_event::EncodeResetInputState(buf, sizeof(buf));
     CHECK(w == 1);
     w = mirror_event::EncodeSoundInit(buf + 1, sizeof(buf) - 1);
-    CHECK(w == 1);
-    w = mirror_event::EncodeMatchEnd(buf + 2, sizeof(buf) - 2);
     CHECK(w == 1);
 
     mirror_event::SessionEvent ev{};
@@ -393,8 +539,6 @@ TEST_CASE("Encode/Decode zero-payload events round-trip (RESET, SOUND_INIT, MATC
     CHECK(r == 1);  CHECK(ev.type == mirror_event::SessionEventType::RESET_INPUT_STATE);
     r = mirror_event::Decode(buf + 1, 1, &ev, nullptr);
     CHECK(r == 1);  CHECK(ev.type == mirror_event::SessionEventType::SOUND_INIT);
-    r = mirror_event::Decode(buf + 2, 1, &ev, nullptr);
-    CHECK(r == 1);  CHECK(ev.type == mirror_event::SessionEventType::MATCH_END);
 }
 
 TEST_CASE("Encode/Decode MATCH_START round-trips with 96-byte header copy") {
@@ -437,7 +581,7 @@ TEST_CASE("Decode rejects unknown type tags") {
     buf[0] = 0;  // tag 0 isn't assigned
     CHECK(mirror_event::Decode(buf, sizeof(buf), &ev, nullptr) == 0);
 
-    buf[0] = 8;  // one past the highest assigned tag
+    buf[0] = 10;  // one past the highest assigned tag (ROUND_END = 9)
     CHECK(mirror_event::Decode(buf, sizeof(buf), &ev, nullptr) == 0);
 }
 
@@ -464,7 +608,10 @@ TEST_CASE("Encode returns 0 on insufficient capacity") {
     CHECK(mirror_event::EncodeMatchStart(small, 4, hdr) == 0);
 
     // Zero-cap zero-payload encoders.
-    CHECK(mirror_event::EncodeMatchEnd(small, 0) == 0);
+    {
+        mirror_event::MatchEndPayload zero{};
+        CHECK(mirror_event::EncodeMatchEnd(small, 0, zero) == 0);
+    }
     CHECK(mirror_event::EncodeResetInputState(small, 0) == 0);
     CHECK(mirror_event::EncodeSoundInit(small, 0) == 0);
 }
@@ -486,11 +633,18 @@ TEST_CASE("Mixed-event stream: encode N events, decode them all back in order") 
         REQUIRE(w); p += w;
     }
     w = mirror_event::EncodeFingerprint(p, sizeof(buf) - (p - buf), 0xCAFEBABE);     REQUIRE(w); p += w;
-    w = mirror_event::EncodeMatchEnd(p, sizeof(buf) - (p - buf));                    REQUIRE(w); p += w;
+    {
+        mirror_event::MatchEndPayload me{};
+        me.winner_idx     = 0;
+        me.rounds_won_p1  = 2;
+        me.rounds_won_p2  = 1;
+        me.frames_total   = 11700;
+        w = mirror_event::EncodeMatchEnd(p, sizeof(buf) - (p - buf), me);            REQUIRE(w); p += w;
+    }
 
     const size_t total = (size_t)(p - buf);
-    // 5 + 1 + 1 + 97 + 4*5 + 5 + 1 = 130 bytes
-    CHECK(total == 130);
+    // 5 + 1 + 1 + 97 + 4*5 + 5 + 8 = 137 bytes
+    CHECK(total == 137);
 
     // Walk the stream back.
     size_t off = 0;
@@ -531,6 +685,10 @@ TEST_CASE("Mixed-event stream: encode N events, decode them all back in order") 
 
     r = mirror_event::Decode(buf + off, total - off, &ev, nullptr);    CHECK(r);
     CHECK(ev.type == mirror_event::SessionEventType::MATCH_END);
+    CHECK(ev.u.match_end.winner_idx    == 0);
+    CHECK(ev.u.match_end.rounds_won_p1 == 2);
+    CHECK(ev.u.match_end.rounds_won_p2 == 1);
+    CHECK(ev.u.match_end.frames_total  == 11700u);
     off += r;
 
     CHECK(off == total);
@@ -546,34 +704,61 @@ TEST_CASE("Mixed-event stream: encode N events, decode them all back in order") 
 
 namespace mirror_file {
 constexpr uint32_t SESSION_FILE_MAGIC   = 0x53534D46;
-constexpr uint16_t SESSION_FILE_VERSION = 1;
+constexpr uint16_t SESSION_FILE_VERSION = 2;
 
 #pragma pack(push, 1)
-struct SessionFileHeader {
+// C7 — 256-byte enriched header. Mirrors production
+// FM2KSessionFileHeader (spectator_node.cpp). Carries everything the
+// launcher tree UI needs without re-parsing the body.
+struct FM2KSessionFileHeader {
     uint32_t magic;
     uint16_t version;
-    uint16_t flags;
-    uint64_t unix_timestamp;
+    uint16_t flags;              // bit 0: battle slice, bit 1: has_round_offsets
+    uint64_t started_at_unix;
+    uint64_t finished_at_unix;
     uint32_t event_count;
     uint32_t input_count;
-    uint8_t  reserved[8];
+    char     game_id[32];
+    char     p1_nick[32];
+    char     p2_nick[32];
+    uint8_t  p1_char_id;
+    uint8_t  p2_char_id;
+    uint8_t  p1_color;
+    uint8_t  p2_color;
+    uint8_t  rounds_won_p1;
+    uint8_t  rounds_won_p2;
+    uint8_t  match_count;
+    uint8_t  match_index;
+    uint64_t session_id;
+    uint8_t  round_count;
+    uint8_t  reserved0[3];
+    uint32_t round_offsets[8];
+    uint8_t  reserved[76];
 };
 #pragma pack(pop)
 } // namespace mirror_file
 
-TEST_CASE("SessionFileHeader is exactly 32 bytes") {
-    CHECK(sizeof(mirror_file::SessionFileHeader) == 32);
+TEST_CASE("FM2KSessionFileHeader (v2) is exactly 256 bytes") {
+    CHECK(sizeof(mirror_file::FM2KSessionFileHeader) == 256);
 }
 
-TEST_CASE("SessionFileHeader field offsets are stable") {
-    using H = mirror_file::SessionFileHeader;
-    CHECK(offsetof(H, magic)          == 0);
-    CHECK(offsetof(H, version)        == 4);
-    CHECK(offsetof(H, flags)          == 6);
-    CHECK(offsetof(H, unix_timestamp) == 8);
-    CHECK(offsetof(H, event_count)    == 16);
-    CHECK(offsetof(H, input_count)    == 20);
-    CHECK(offsetof(H, reserved)       == 24);
+TEST_CASE("FM2KSessionFileHeader field offsets are stable") {
+    using H = mirror_file::FM2KSessionFileHeader;
+    CHECK(offsetof(H, magic)             == 0);
+    CHECK(offsetof(H, version)           == 4);
+    CHECK(offsetof(H, flags)             == 6);
+    CHECK(offsetof(H, started_at_unix)   == 8);
+    CHECK(offsetof(H, finished_at_unix)  == 16);
+    CHECK(offsetof(H, event_count)       == 24);
+    CHECK(offsetof(H, input_count)       == 28);
+    CHECK(offsetof(H, game_id)           == 32);
+    CHECK(offsetof(H, p1_nick)           == 64);
+    CHECK(offsetof(H, p2_nick)           == 96);
+    CHECK(offsetof(H, p1_char_id)        == 128);
+    CHECK(offsetof(H, session_id)        == 136);
+    CHECK(offsetof(H, round_count)       == 144);
+    CHECK(offsetof(H, round_offsets)     == 148);
+    CHECK(offsetof(H, reserved)          == 180);
 }
 
 TEST_CASE("SESSION_FILE_MAGIC is 'FMSS' little-endian (distinct from REPLAY_MAGIC)") {
@@ -602,20 +787,31 @@ TEST_CASE("Session file format: write events → read events round-trips byte-id
                         (uint16_t)(0x100 + i), (uint16_t)(0x200 + i));
         REQUIRE(w); append(buf, w);
     }
-    w = EncodeMatchEnd(buf, sizeof(buf));                                       REQUIRE(w); append(buf, w);
+    {
+        MatchEndPayload me{};
+        me.winner_idx     = 0;
+        me.rounds_won_p1  = 2;
+        me.rounds_won_p2  = 0;
+        me.frames_total   = 6000;
+        w = EncodeMatchEnd(buf, sizeof(buf), me);                              REQUIRE(w); append(buf, w);
+    }
 
     // Total events: PIN_RNG + RESET + SOUND_INIT + MATCH_START + 100*INPUT + MATCH_END = 105.
     constexpr uint32_t EXPECTED_EVENT_COUNT = 105;
     constexpr uint32_t EXPECTED_INPUT_COUNT = 100;
 
-    // Compose the file: 32-byte header + body bytes.
-    mirror_file::SessionFileHeader h = {};
-    h.magic          = mirror_file::SESSION_FILE_MAGIC;
-    h.version        = mirror_file::SESSION_FILE_VERSION;
-    h.flags          = 0;
-    h.unix_timestamp = 0;
-    h.event_count    = EXPECTED_EVENT_COUNT;
-    h.input_count    = EXPECTED_INPUT_COUNT;
+    // Compose the file: 256-byte v2 header + body bytes.
+    mirror_file::FM2KSessionFileHeader h = {};
+    h.magic            = mirror_file::SESSION_FILE_MAGIC;
+    h.version          = mirror_file::SESSION_FILE_VERSION;
+    h.flags            = 0;
+    h.started_at_unix  = 0;
+    h.finished_at_unix = 0;
+    h.event_count      = EXPECTED_EVENT_COUNT;
+    h.input_count      = EXPECTED_INPUT_COUNT;
+    h.session_id       = 0xCAFEBABEDEADBEEFull;
+    h.match_count      = 1;
+    h.match_index      = 1;
 
     std::vector<uint8_t> file;
     file.resize(sizeof(h));
@@ -624,12 +820,13 @@ TEST_CASE("Session file format: write events → read events round-trips byte-id
 
     // ---- Decode back ---------------------------------------------------
     REQUIRE(file.size() >= sizeof(h));
-    mirror_file::SessionFileHeader h_back;
+    mirror_file::FM2KSessionFileHeader h_back;
     std::memcpy(&h_back, file.data(), sizeof(h));
     CHECK(h_back.magic       == mirror_file::SESSION_FILE_MAGIC);
-    CHECK(h_back.version     == 1);
+    CHECK(h_back.version     == 2);
     CHECK(h_back.event_count == EXPECTED_EVENT_COUNT);
     CHECK(h_back.input_count == EXPECTED_INPUT_COUNT);
+    CHECK(h_back.session_id  == 0xCAFEBABEDEADBEEFull);
 
     const uint8_t* body = file.data() + sizeof(h);
     const size_t   body_len = file.size() - sizeof(h);
@@ -783,4 +980,110 @@ TEST_CASE("EVENT_BATCH wire tag is stable on the wire (SpecDataType::EVENT_BATCH
         EVENT_BATCH   = 5,
     };
     CHECK((uint8_t)SpecDataType::EVENT_BATCH == 5);
+}
+
+// =============================================================================
+// Snapshot-join wire types (task #18 phase 1)
+// =============================================================================
+//
+// CCCaster-style "jump to current match" support. Spectator declares mode
+// preference in SPEC_JOIN_REQ; if the host has a SaveState snapshot for the
+// current match it ships SNAPSHOT_BEGIN/CHUNK/END packets instead of
+// replaying session_events from frame 0. Phase 1 reserves the wire types
+// and JOIN_REQ payload field so a future host/spectator pair can
+// interoperate without breaking older builds.
+
+namespace mirror_snapshot {
+
+enum class SpecJoinMode : uint8_t {
+    FULL_SESSION  = 0,
+    CURRENT_MATCH = 1,
+};
+
+enum class SpecDataType : uint8_t {
+    INITIAL_MATCH  = 1,
+    INPUT_BATCH    = 2,
+    MATCH_END      = 3,
+    INPUT_REQUEST  = 4,
+    EVENT_BATCH    = 5,
+    SNAPSHOT_BEGIN = 6,
+    SNAPSHOT_CHUNK = 7,
+    SNAPSHOT_END   = 8,
+};
+
+constexpr uint16_t SPECTATOR_SNAPSHOT_VERSION     = 1;
+constexpr size_t   SPECTATOR_SNAPSHOT_CHUNK_BYTES = 16384;
+
+#pragma pack(push, 1)
+struct SnapshotMetadata {
+    uint16_t version;
+    uint16_t reserved0;
+    uint32_t total_bytes;
+    uint32_t match_index;
+    uint32_t reserved1;
+};
+#pragma pack(pop)
+
+}  // namespace mirror_snapshot
+
+TEST_CASE("SpecJoinMode enum values are stable") {
+    // Default is FULL_SESSION (legacy replay-from-frame-0 path) so a
+    // zero-init CtrlPacket payload = back-compat. Don't reorder.
+    CHECK((uint8_t)mirror_snapshot::SpecJoinMode::FULL_SESSION  == 0);
+    CHECK((uint8_t)mirror_snapshot::SpecJoinMode::CURRENT_MATCH == 1);
+}
+
+TEST_CASE("SpecDataType snapshot tags are stable") {
+    CHECK((uint8_t)mirror_snapshot::SpecDataType::SNAPSHOT_BEGIN == 6);
+    CHECK((uint8_t)mirror_snapshot::SpecDataType::SNAPSHOT_CHUNK == 7);
+    CHECK((uint8_t)mirror_snapshot::SpecDataType::SNAPSHOT_END   == 8);
+}
+
+TEST_CASE("SnapshotMetadata is exactly 16 bytes") {
+    // Sent as the SNAPSHOT_BEGIN payload. Layout pinned so that a
+    // future-versioned spectator parsing an older host's BEGIN doesn't
+    // misalign on the trailing reserved fields.
+    CHECK(sizeof(mirror_snapshot::SnapshotMetadata) == 16);
+}
+
+TEST_CASE("SnapshotMetadata field offsets are stable") {
+    using H = mirror_snapshot::SnapshotMetadata;
+    CHECK(offsetof(H, version)     == 0);
+    CHECK(offsetof(H, reserved0)   == 2);
+    CHECK(offsetof(H, total_bytes) == 4);
+    CHECK(offsetof(H, match_index) == 8);
+    CHECK(offsetof(H, reserved1)   == 12);
+}
+
+TEST_CASE("Snapshot constants are sane") {
+    // ~16KB chunks → ~4 chunks for a typical 50KB FM2K SaveState blob.
+    // Keeps a single CHUNK packet's payload byte count fitting in
+    // SpecDataHeader.flags (16-bit). 16384 < 65535. Fine.
+    CHECK(mirror_snapshot::SPECTATOR_SNAPSHOT_CHUNK_BYTES <= 0xFFFFu);
+    CHECK(mirror_snapshot::SPECTATOR_SNAPSHOT_VERSION == 1);
+}
+
+TEST_CASE("SPEC_JOIN_REQ payload mode field layout (8-byte struct)") {
+    // CtrlPacket.data.spec_join_req struct: 1 byte mode + 7 bytes
+    // reserved padding. Receiver-side back-compat: an old spectator
+    // sending no payload zero-fills the bytes → mode reads as
+    // FULL_SESSION (0). New spectators write mode=1 explicitly for
+    // CURRENT_MATCH.
+    #pragma pack(push, 1)
+    struct SpecJoinReq {
+        uint8_t mode;
+        uint8_t reserved[7];
+    };
+    #pragma pack(pop)
+    CHECK(sizeof(SpecJoinReq) == 8);
+    CHECK(offsetof(SpecJoinReq, mode)     == 0);
+    CHECK(offsetof(SpecJoinReq, reserved) == 1);
+
+    // Round-trip: zero-init resolves to FULL_SESSION.
+    SpecJoinReq zero = {};
+    CHECK(zero.mode == (uint8_t)mirror_snapshot::SpecJoinMode::FULL_SESSION);
+
+    // Explicit current-match.
+    SpecJoinReq live = { (uint8_t)mirror_snapshot::SpecJoinMode::CURRENT_MATCH, {} };
+    CHECK(live.mode == 1);
 }

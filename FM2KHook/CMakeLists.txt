@@ -22,6 +22,7 @@ set(FM2KHOOK_SOURCES
     src/hooks/hooks.cpp
     src/hooks/input.cpp
     src/hooks/game_patches.cpp
+    src/hooks/round_events.cpp
     src/hooks/wndproc_subclass.cpp
     # Netplay
     src/netplay/netplay.cpp

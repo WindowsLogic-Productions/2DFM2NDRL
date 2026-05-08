@@ -620,9 +620,11 @@ private:
     // Launch a local spectator pointing at the host (client1) on host_port.
     // Spectator-mode hook will SPEC_JOIN_REQ the host and start replaying
     // the streamed input history (CSS + battle).
+    // mode: "current" (default; CCCaster-style snapshot join) or "full".
     bool LaunchLocalSpectator(const std::string& game_path,
                               int spectator_port,
-                              int host_port);
+                              int host_port,
+                              const std::string& mode = "current");
     // Daisy-chain test: launches a second spectator that subscribes to the
     // first spectator instead of the host. Verifies relay-node forwarding.
     bool LaunchLocalSpectator2(const std::string& game_path,
@@ -634,11 +636,12 @@ public:
     // active match to watch it" path AND the --spectate CLI flag for e2e
     // testing. spectator_port is local UDP bind; host_ip:host_port is where
     // the spectator's FM2K_REMOTE_ADDR points and SpectatorNode JOIN_REQ
-    // is sent.
+    // is sent. mode: "current" (default) or "full".
     bool LaunchRemoteSpectator(const std::string& game_path,
                                int spectator_port,
                                const std::string& host_ip,
-                               int host_port);
+                               int host_port,
+                               const std::string& mode = "current");
 private:
     bool TerminateAllClients();
     

@@ -179,6 +179,41 @@ bool SaveState_Save(int frame);
 bool SaveState_Load(int frame);
 uint32_t SaveState_GetLastChecksum(int frame);
 
+// Snapshot serialization (task #18 phase 2). After SaveState_Save populates
+// a slot, copy its raw bytes to a caller-supplied buffer for transmission
+// to a spectator. Returns bytes written, or 0 if no slot has been saved yet.
+//
+// SaveState_GetSlotByteSize() reports the per-slot byte count up-front
+// (= sizeof(SaveStateData)) so callers can size their buffer correctly.
+// On FM2K with the full save layout that's around 1 MB; FM95's lean layout
+// is ~45 KB. The actual bytes are an opaque blob — they round-trip through
+// SaveState_LoadFromBytes (added in phase 4) without external interpretation.
+//
+// The pointer returned by SaveState_PeekLastSavedSlotBytes is valid only
+// until the next SaveState_Save call — callers that need to keep the bytes
+// around must memcpy. Returns nullptr if no Save has run yet.
+size_t         SaveState_GetSlotByteSize();
+const uint8_t* SaveState_PeekLastSavedSlotBytes();
+
+// Round-trip counterpart to PeekLastSavedSlotBytes: copy `bytes` into the
+// rollback-buffer slot indicated by the embedded frame_number, register
+// it as the "last saved slot," and apply it to live memory by invoking
+// SaveState_Load on the same frame. The blob is opaque from the caller's
+// perspective — it must have come from PeekLastSavedSlotBytes on the same
+// engine variant (FM2K vs FM95) and the same build (slot layout is not
+// version-stable).
+//
+// Returns true on success. Failure modes:
+//   - bytes == nullptr or n != SaveState_GetSlotByteSize()
+//   - SaveState_Load's internal frame_number sanity check fails (would
+//     mean the blob's frame_number was somehow corrupted between Peek
+//     and Load, which shouldn't happen on a single sender → single
+//     receiver path)
+//
+// Callers (spectator-join SNAPSHOT_END handler) should fall back to
+// FULL_SESSION replay if this returns false.
+bool           SaveState_LoadFromBytes(const uint8_t* bytes, size_t n);
+
 // Back-patch the most-recently-saved slot's rng_seed with the post-render
 // value of g_random_seed. SaveEvent fires BEFORE render in GekkoNet's per-
 // frame event order, so SaveState_Save captures the pre-render rng. Render

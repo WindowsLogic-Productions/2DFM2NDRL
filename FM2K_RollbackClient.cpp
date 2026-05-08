@@ -692,7 +692,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     NetworkConfig config;
     bool direct_mode = false;
     bool spectate_mode = false;
-    std::string spectate_target_addr;  // "host_ip:host_port" for --spectate
+    std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
+    std::string spectate_join_mode = "current";  // --spectate-mode {current,full}
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -707,6 +708,22 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 direct_mode = true;
             } else {
                 std::cerr << "Error: --connect requires an address\n";
+                return SDL_APP_FAILURE;
+            }
+        } else if (arg == "--spectate-mode") {
+            // --spectate-mode {current,full}
+            //   current = CURRENT_MATCH (default; CCCaster-style snapshot join)
+            //   full    = FULL_SESSION  (replay from frame 0)
+            if (i + 1 < argc) {
+                std::string m = argv[++i];
+                if (m == "current" || m == "full") {
+                    spectate_join_mode = m;
+                } else {
+                    std::cerr << "Error: --spectate-mode must be 'current' or 'full', got: " << m << "\n";
+                    return SDL_APP_FAILURE;
+                }
+            } else {
+                std::cerr << "Error: --spectate-mode requires {current,full}\n";
                 return SDL_APP_FAILURE;
             }
         } else if (arg == "--spectate" || arg == "--spec") {
@@ -781,12 +798,14 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
             if (!g_launcher->LaunchRemoteSpectator(game_to_launch.exe_path,
                                                     spectator_port,
-                                                    host_ip, host_port)) {
+                                                    host_ip, host_port,
+                                                    spectate_join_mode)) {
                 std::cerr << "Spectate: launch failed\n";
                 return SDL_APP_FAILURE;
             }
             std::cout << "Direct spectate mode: dialing " << host_ip << ":" << host_port
-                      << " on local port " << spectator_port << "\n";
+                      << " on local port " << spectator_port
+                      << " (mode=" << spectate_join_mode << ")\n";
         } else {
             // Start regular host/client network session
             NetworkConfig online_config = config;
@@ -2306,7 +2325,8 @@ bool FM2KLauncher::LaunchLocalClient(const std::string& game_path, bool is_host,
 
 bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
                                         int spectator_port,
-                                        int host_port)
+                                        int host_port,
+                                        const std::string& mode)
 {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Launching local spectator: %s (port=%d -> host_port=%d)",
@@ -2331,6 +2351,11 @@ bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
     spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    {
+        const std::string normalized =
+            (mode == "full" || mode == "FULL" || mode == "FULL_SESSION") ? "full" : "current";
+        spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATE_MODE", normalized);
+    }
     if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
         spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
             "c:/games/2dfm/wanwan/parity_p3.pty");
@@ -2358,11 +2383,13 @@ bool FM2KLauncher::LaunchLocalSpectator(const std::string& game_path,
 bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
                                          int spectator_port,
                                          const std::string& host_ip,
-                                         int host_port)
+                                         int host_port,
+                                         const std::string& mode)
 {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Launching remote spectator: %s (port=%d -> %s:%d)",
-                game_path.c_str(), spectator_port, host_ip.c_str(), host_port);
+                "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s)",
+                game_path.c_str(), spectator_port, host_ip.c_str(), host_port,
+                mode.c_str());
 
     if (spectator_instance_ && spectator_instance_->IsRunning()) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
@@ -2380,6 +2407,11 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
     spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    {
+        const std::string normalized =
+            (mode == "full" || mode == "FULL" || mode == "FULL_SESSION") ? "full" : "current";
+        spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATE_MODE", normalized);
+    }
     spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
         "c:/games/2dfm/wanwan/parity_p3.pty");
 

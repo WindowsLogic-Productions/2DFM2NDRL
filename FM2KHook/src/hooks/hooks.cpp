@@ -1,6 +1,7 @@
 // Simplified hooks - detect battle mode transitions, delegate to netplay
 // Sync barrier: block game until both clients connected (CCCaster-style)
 #include "hooks.h"
+#include "round_events.h"  // C3.5 — vs_round_function detour install
 #include "globals.h"
 
 #include <cstdlib>
@@ -2441,6 +2442,17 @@ bool InitializeHooks() {
         return false;
     }
     SoundRollback::SetOriginalDispatcher(original_dispatch_script_sound);
+
+    // C3.5 — vs_round_function detour. Emits ROUND_START / ROUND_END
+    // SessionEvents at the round-state-machine substate edges (host only;
+    // FM95 builds compile to a no-op). Best-effort install: if the hook
+    // fails we keep going so the rest of the engine works (round events
+    // are diagnostic, not load-bearing).
+    if (!RoundEvents_Install()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "Hooks: RoundEvents_Install failed — round events will be missing "
+            "from session_events / .fm2krep round_offsets");
+    }
 
     // Hook timeGetTime (winmm.dll) — make the game's frame-skip pacing
     // deterministic across peers. See comment on Hook_timeGetTime for the
