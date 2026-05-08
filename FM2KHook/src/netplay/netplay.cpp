@@ -1973,7 +1973,16 @@ void Netplay_EndBattle() {
     // Per-battle .fm2krep — slice the SessionEvent log between the most
     // recent MATCH_START and the just-appended MATCH_END. Same on-disk
     // shape as .fm2kset (full session); is_battle_slice flag distinguishes.
-    {
+    //
+    // HOST-ONLY: round_events.cpp's vs_round_function detour gates emit
+    // on g_player_index == 0, so non-host peers' session_events lacks
+    // ROUND_START/END entries. Writing both peers' files at battle end
+    // would race on the same `replays/<ts>.fm2krep` filename and the
+    // (possibly later) non-host write would clobber the authoritative
+    // host file with one missing round events + missing session_id.
+    // The host's file is canonical. Spectators that record their own
+    // local files use a separate code path.
+    if (g_player_index == 0) {
         char ts[64] = {};
         std::time_t now = std::time(nullptr);
         std::tm tm_buf{};
