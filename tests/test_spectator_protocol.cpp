@@ -875,6 +875,156 @@ TEST_CASE("Session file format: write events → read events round-trips byte-id
 }
 
 // =============================================================================
+// C8 — seek-with-fast-forward via round_offsets[]
+// =============================================================================
+//
+// Mirrors the production two-pass body walk in SpectatorNode_LoadSessionFile.
+// Pass 1 walks body[0..anchor) keeping only state-init events (PIN_RNG,
+// RESET_INPUT_STATE, SOUND_INIT, MATCH_START, SESSION_ID); Pass 2 walks
+// body[anchor..end) keeping everything. The pb_queue contents that result
+// drive the spectator's local FM2K from the ROUND_START anchor without
+// replaying the prior rounds' INPUTs (those run via the C5.5 catch-up drain
+// in production at unbounded rate, but the queue contents are the same).
+
+namespace mirror_seek {
+using namespace mirror_event;
+
+static bool IsStateInitForSeek(SessionEventType t) {
+    return t == SessionEventType::PIN_RNG
+        || t == SessionEventType::RESET_INPUT_STATE
+        || t == SessionEventType::SOUND_INIT
+        || t == SessionEventType::MATCH_START
+        || t == SessionEventType::SESSION_ID;
+}
+
+// Returns the simulated pb_queue contents for a load with seek anchor at
+// `anchor_offset`. anchor_offset == 0 is "no seek".
+struct LoadResult {
+    std::vector<SessionEvent> pb_queue;
+    uint32_t pre_anchor_skipped = 0;
+    uint32_t inputs_after_anchor = 0;
+};
+
+LoadResult SimulateLoad(const std::vector<uint8_t>& body, size_t anchor_offset) {
+    LoadResult out;
+    size_t off = 0;
+    while (off < anchor_offset) {
+        SessionEvent ev{};
+        uint8_t hdr_buf[96] = {};
+        size_t r = Decode(body.data() + off, body.size() - off, &ev, hdr_buf);
+        REQUIRE(r > 0);
+        REQUIRE(off + r <= anchor_offset);  // anchor must land on event boundary
+        if (IsStateInitForSeek(ev.type)) out.pb_queue.push_back(ev);
+        else                              ++out.pre_anchor_skipped;
+        off += r;
+    }
+    while (off < body.size()) {
+        SessionEvent ev{};
+        uint8_t hdr_buf[96] = {};
+        size_t r = Decode(body.data() + off, body.size() - off, &ev, hdr_buf);
+        REQUIRE(r > 0);
+        out.pb_queue.push_back(ev);
+        if (ev.type == SessionEventType::INPUT) ++out.inputs_after_anchor;
+        off += r;
+    }
+    return out;
+}
+
+} // namespace mirror_seek
+
+TEST_CASE("C8 seek=ROUND_START 2: pre-anchor INPUTs skipped, post-anchor stream intact") {
+    // Synthesize a 2-round battle slice:
+    //   PIN_RNG, RESET_INPUT_STATE, SOUND_INIT, MATCH_START,
+    //   ROUND_START(1), INPUT*5, ROUND_END(P1),
+    //   ROUND_START(2), INPUT*5, ROUND_END(P2),
+    //   MATCH_END
+    //
+    // Seek to ROUND_START 2: result pb_queue should contain
+    //   [PIN_RNG, RESET, SOUND_INIT, MATCH_START,
+    //    ROUND_START(2), INPUT*5, ROUND_END(P2), MATCH_END]
+    // (the 5 INPUTs from round 1 + the round 1 markers are dropped).
+    using namespace mirror_event;
+
+    std::vector<uint8_t> body;
+    auto append = [&](const uint8_t* b, size_t n) { body.insert(body.end(), b, b + n); };
+    uint8_t buf[SESSION_EVENT_MAX_WIRE_SIZE];
+    size_t w;
+
+    // State-init prefix
+    w = EncodePinRng(buf, sizeof(buf), 0x12345678);          REQUIRE(w); append(buf, w);
+    w = EncodeResetInputState(buf, sizeof(buf));             REQUIRE(w); append(buf, w);
+    w = EncodeSoundInit(buf, sizeof(buf));                   REQUIRE(w); append(buf, w);
+    uint8_t hdr96[96] = {};
+    w = EncodeMatchStart(buf, sizeof(buf), hdr96);           REQUIRE(w); append(buf, w);
+
+    // Round 1: ROUND_START(1) + 5 INPUTs + ROUND_END(P1)
+    {
+        RoundStartPayload rs{};
+        rs.round_idx = 1; rs.p1_hp_max = 800; rs.p2_hp_max = 1000; rs.timer_seconds = 99;
+        w = EncodeRoundStart(buf, sizeof(buf), rs);          REQUIRE(w); append(buf, w);
+    }
+    for (int i = 0; i < 5; i++) {
+        w = EncodeInput(buf, sizeof(buf), 0x100 + i, 0x200 + i);  REQUIRE(w); append(buf, w);
+    }
+    {
+        RoundEndPayload re{};
+        re.winner_idx = 0; re.frames_elapsed = 5;
+        w = EncodeRoundEnd(buf, sizeof(buf), re);            REQUIRE(w); append(buf, w);
+    }
+
+    // Round 2: ROUND_START(2) + 5 INPUTs + ROUND_END(P2)
+    const size_t round2_anchor = body.size();  // body offset of round 2's tag
+    {
+        RoundStartPayload rs{};
+        rs.round_idx = 2; rs.p1_hp_max = 800; rs.p2_hp_max = 1000; rs.timer_seconds = 99;
+        w = EncodeRoundStart(buf, sizeof(buf), rs);          REQUIRE(w); append(buf, w);
+    }
+    for (int i = 0; i < 5; i++) {
+        w = EncodeInput(buf, sizeof(buf), 0x300 + i, 0x400 + i);  REQUIRE(w); append(buf, w);
+    }
+    {
+        RoundEndPayload re{};
+        re.winner_idx = 1; re.frames_elapsed = 5;
+        w = EncodeRoundEnd(buf, sizeof(buf), re);            REQUIRE(w); append(buf, w);
+    }
+
+    // MATCH_END payload
+    {
+        MatchEndPayload me{};
+        me.winner_idx = 1; me.rounds_won_p1 = 1; me.rounds_won_p2 = 1; me.frames_total = 10;
+        w = EncodeMatchEnd(buf, sizeof(buf), me);            REQUIRE(w); append(buf, w);
+    }
+
+    // ---- No-seek baseline ----
+    auto baseline = mirror_seek::SimulateLoad(body, /*anchor=*/0);
+    CHECK(baseline.pre_anchor_skipped == 0);
+    CHECK(baseline.inputs_after_anchor == 10);  // both rounds' INPUTs
+
+    // ---- Seek to round 2 ----
+    auto result = mirror_seek::SimulateLoad(body, round2_anchor);
+    // pre-anchor non-state-init events: 1 ROUND_START + 5 INPUT + 1 ROUND_END = 7
+    CHECK(result.pre_anchor_skipped == 7);
+    // post-anchor INPUTs: only round 2's 5
+    CHECK(result.inputs_after_anchor == 5);
+
+    // Verify queue ordering: prefix [PIN_RNG, RESET, SOUND_INIT, MATCH_START]
+    // followed by [ROUND_START(2), INPUT*5, ROUND_END, MATCH_END]
+    REQUIRE(result.pb_queue.size() == 4 + 1 + 5 + 1 + 1);
+    CHECK(result.pb_queue[0].type == SessionEventType::PIN_RNG);
+    CHECK(result.pb_queue[1].type == SessionEventType::RESET_INPUT_STATE);
+    CHECK(result.pb_queue[2].type == SessionEventType::SOUND_INIT);
+    CHECK(result.pb_queue[3].type == SessionEventType::MATCH_START);
+    CHECK(result.pb_queue[4].type == SessionEventType::ROUND_START);
+    CHECK(result.pb_queue[4].u.round_start.round_idx == 2);
+    for (int i = 0; i < 5; i++) {
+        CHECK(result.pb_queue[5 + i].type == SessionEventType::INPUT);
+        CHECK(result.pb_queue[5 + i].u.input.p1 == (uint16_t)(0x300 + i));
+    }
+    CHECK(result.pb_queue[10].type == SessionEventType::ROUND_END);
+    CHECK(result.pb_queue[11].type == SessionEventType::MATCH_END);
+}
+
+// =============================================================================
 // Fletcher-32 (C9) — must match production SpectatorFingerprint_Compute
 // =============================================================================
 //

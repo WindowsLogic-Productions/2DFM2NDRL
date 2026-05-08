@@ -420,7 +420,32 @@ bool SpectatorNode_WriteCurrentBattleFile(const char* path);
 //
 // Returns true on successful parse + queue. False on file open failure,
 // magic/version mismatch, or truncated body.
-bool SpectatorNode_LoadSessionFile(const char* path);
+
+// C8 — seek-target struct for round-level "jump into a replay at round N"
+// playback. Reads the v2 header's round_offsets[] to locate the body byte
+// position of the requested ROUND_START event, then does a two-pass body
+// walk: Pass 1 emits ONLY state-init events (PIN_RNG, RESET_INPUT_STATE,
+// SOUND_INIT, MATCH_START, SESSION_ID) up to that offset — rebuilds engine
+// state without sim work. Pass 2 streams normally from the offset onward.
+// The existing C5.5 catchup drain in RunSpectatorTick fast-forwards the
+// pre-anchor INPUT events (skipped in Pass 1) at unbounded sim rate.
+//
+// kind == NONE → play from start (legacy behavior, identical to single-arg
+// LoadSessionFile call). kind == ROUND_START + idx is 1-based; idx==1 means
+// "start at round 1" (effectively MATCH_START since no INPUTs precede it).
+enum class SeekEventKind : uint8_t {
+    NONE        = 0,
+    ROUND_START = 1,
+    // MATCH_START reserved for .fm2kset multi-match seek (future).
+};
+
+struct SeekTarget {
+    SeekEventKind kind = SeekEventKind::NONE;
+    uint16_t      idx  = 0;   // 1-based for ROUND_START
+};
+
+bool SpectatorNode_LoadSessionFile(const char* path,
+                                   const SeekTarget& seek = {});
 
 // =============================================================================
 // FINGERPRINT DIAGNOSTIC (C9)

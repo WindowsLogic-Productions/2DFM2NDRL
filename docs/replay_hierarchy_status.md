@@ -222,7 +222,7 @@ spectator failover reconnect, and now replay seek. One code path.
 |---|---|---|
 | ~~**C7** — `round_offsets[]` + enriched header~~ | shipped | 256 B `FM2KSessionFileHeader`; `round_offsets[8]` populated at write time; v1 fallback in loader. |
 | ~~**MATCH_END payload extension**~~ | shipped | `MatchEndPayload` (7 B) carries winner / per-side rounds / frames_total. |
-| **C8** — `Replay_LoadSessionFile(path, seek_target)` | replicated-crafting-blum.md C8 | Reuses C5.5 drain. Loader's v2 path now exposes `round_offsets[]`; seek pass needs to ingest a `seek_target` and use those offsets. |
+| ~~**C8** — `Replay_LoadSessionFile(path, seek_target)`~~ | shipped | `SeekTarget{kind, idx}` + two-pass body walk. Pass 1 keeps state-init events only; Pass 2 streams from anchor. Round-trip Catch2 test asserts queue contents for `seek={ROUND_START, 2}`. C5.5 drain handles the fast-forward at runtime. |
 | **C10** — hub schema v2 | replicated-crafting-blum.md C10 | Forward captured `RoundEndPayload` through 0xCC outcome message into `matches.json` `rounds[]`. Adds `session_id` + `match_index_in_session` to records. Backwards-compat: schema-version-gated. |
 | **C11** — launcher Replay browser tree UI | replicated-crafting-blum.md C11 | Pure launcher work; reads C7 headers via the index.json cache. Click→`Replay_LoadSessionFile` with seek. |
 | **FM95 ROUND_START/ROUND_END emit** | new hand-off | Find the equivalent of `vs_round_function` in FM95; same SessionEvent emit pattern. Separate IDA recon needed. |
@@ -246,15 +246,18 @@ pulls it from there.
 
 ## Where to pick up
 
-C8 is next. Surface area is small:
+C7 + C8 shipped. Next two are independent and can land in parallel:
 
-1. New entry point `Replay_LoadSessionFile(path, seek_target)` where
-   `seek_target = std::optional<{event_kind, idx}>`. When set, the loader
-   reads the v2 header's `round_offsets[]`, picks the requested anchor,
-   does a two-pass body walk (Pass 1: state-init events only up to the
-   anchor; Pass 2: stream from anchor forward into pb_queue), and engages
-   the existing C5.5 catch-up drain.
-2. Catch2 round-trip test asserting "open .fm2krep with `seek={ROUND_START,
-   2}` lands at round 2's expected pb_queue position".
+- **C10** — hub schema v2. Extend the 0xCC outcome wire payload (the
+  one the launcher already forwards to hub.py at match end) with
+  `session_id` + `RoundResult[]`. Hub's match-finished handler writes
+  them to matches.json as `session_id` + `rounds[]`. Stats site adds a
+  session-grouped view. Migration: gate on a `"schema": 2` field.
+- **C11** — launcher Replay browser tree. Pure launcher work; reads v2
+  headers from `%APPDATA%/FM2K_Rollback/replays/` + `sessions/`, builds
+  an index.json cache by mtime, renders TreeNode hierarchy, click-to-seek
+  via `Replay_LoadSessionFile(path, seek_target)`.
 
-Then C10 + C11 can land in parallel — independent agents.
+#18 Phase 6 (snapshot-join robustness — JIT live snapshot, rollback-frame
+guard, multi-match refresh test) and FM95 round-events emit are smaller
+follow-ups that can slot in any time.

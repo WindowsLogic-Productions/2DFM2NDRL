@@ -1489,7 +1489,23 @@ bool SpectatorNode_WriteCurrentBattleFile(const char* path) {
                                 /*is_battle_slice=*/true);
 }
 
-bool SpectatorNode_LoadSessionFile(const char* path) {
+// State-init event types — emitted unconditionally during a Pass-1 walk
+// up to the seek anchor. These rebuild engine state (RNG seed, input ring
+// reset, sound layer init, match header) so playback resumes correctly at
+// the anchor without replaying every prior INPUT. ROUND_END is included
+// so the post-round banner clean-up state is consistent at the moment the
+// next ROUND_START fires; ROUND_START itself is what the seek lands on,
+// so it's NOT emitted in Pass 1 (Pass 2 starts at the ROUND_START tag and
+// pushes it as the first event).
+static bool IsStateInitForSeek(SessionEventType t) {
+    return t == SessionEventType::PIN_RNG
+        || t == SessionEventType::RESET_INPUT_STATE
+        || t == SessionEventType::SOUND_INIT
+        || t == SessionEventType::MATCH_START
+        || t == SessionEventType::SESSION_ID;
+}
+
+bool SpectatorNode_LoadSessionFile(const char* path, const SeekTarget& seek) {
     FILE* fp = std::fopen(path, "rb");
     if (!fp) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1517,6 +1533,31 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
             path, hdr.version, SESSION_FILE_VERSION);
         return false;
     }
+
+    // Resolve the seek anchor against header round_offsets[] before
+    // touching pb_queue. If the seek is unsatisfiable (round idx out of
+    // range, header missing round table, etc.) bail without disturbing
+    // playback state — caller can retry without seek.
+    size_t anchor_offset = 0;  // 0 = no seek, walk from body start
+    if (seek.kind == SeekEventKind::ROUND_START) {
+        if (hdr.round_count == 0 ||
+            (hdr.flags & (1u << 1)) == 0) {
+            std::fclose(fp);
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: %s has no round_offsets — seek unavailable",
+                path);
+            return false;
+        }
+        if (seek.idx == 0 || seek.idx > hdr.round_count) {
+            std::fclose(fp);
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: %s seek round=%u out of range (have %u)",
+                path, seek.idx, hdr.round_count);
+            return false;
+        }
+        anchor_offset = hdr.round_offsets[seek.idx - 1];
+    }
+
     const uint32_t reported_event_count = hdr.event_count;
     const uint64_t loaded_session_id    = hdr.session_id;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1541,6 +1582,13 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
     }
     std::fclose(fp);
 
+    if (anchor_offset > body_len) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: %s anchor offset %zu past body end %zu",
+            path, anchor_offset, body_len);
+        return false;
+    }
+
     // Fresh playback: clear receiver state, then walk events.
     g_state.pb_queue.clear();
     g_state.pb_match_headers.clear();
@@ -1551,19 +1599,7 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
     g_state.playing_back = true;
     if (loaded_session_id != 0) g_state.session_id = loaded_session_id;
 
-    size_t off = 0;
-    uint32_t pushed_inputs = 0;
-    while (off < body_len) {
-        SessionEvent ev{};
-        uint8_t hdr_buf[SESSION_EVENT_MATCH_HDR_SIZE] = {};
-        size_t r = SessionEvent_Decode(body.data() + off, body_len - off,
-                                       &ev, hdr_buf);
-        if (r == 0) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: %s decode failed at off=%zu (left=%zu)",
-                path, off, body_len - off);
-            return false;
-        }
+    auto push_event = [&](SessionEvent& ev, const uint8_t* hdr_buf) {
         if (ev.type == SessionEventType::MATCH_START) {
             MatchHeader hdr_copy;
             std::memcpy(hdr_copy.data(), hdr_buf, hdr_copy.size());
@@ -1572,13 +1608,70 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
                 static_cast<uint16_t>(g_state.pb_match_headers.size() - 1);
         }
         g_state.pb_queue.push_back(ev);
+    };
+
+    size_t off = 0;
+    uint32_t pushed_inputs = 0;
+    uint32_t pre_anchor_skipped = 0;
+
+    // Pass 1 — body[0..anchor_offset). Emit only state-init events
+    // (skipped if anchor_offset == 0, i.e. no-seek).
+    while (off < anchor_offset) {
+        SessionEvent ev{};
+        uint8_t hdr_buf[SESSION_EVENT_MATCH_HDR_SIZE] = {};
+        size_t r = SessionEvent_Decode(body.data() + off, body_len - off,
+                                       &ev, hdr_buf);
+        if (r == 0) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: %s pass1 decode failed at off=%zu",
+                path, off);
+            return false;
+        }
+        if (off + r > anchor_offset) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: %s anchor offset %zu mid-event "
+                "(event ends at %zu)",
+                path, anchor_offset, off + r);
+            return false;
+        }
+        if (IsStateInitForSeek(ev.type)) {
+            push_event(ev, hdr_buf);
+        } else {
+            ++pre_anchor_skipped;
+        }
+        off += r;
+    }
+
+    // Pass 2 — body[anchor_offset..body_len). Emit everything.
+    while (off < body_len) {
+        SessionEvent ev{};
+        uint8_t hdr_buf[SESSION_EVENT_MATCH_HDR_SIZE] = {};
+        size_t r = SessionEvent_Decode(body.data() + off, body_len - off,
+                                       &ev, hdr_buf);
+        if (r == 0) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: %s pass2 decode failed at off=%zu",
+                path, off);
+            return false;
+        }
+        push_event(ev, hdr_buf);
         if (ev.type == SessionEventType::INPUT) ++pushed_inputs;
         off += r;
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "SpectatorNode: loaded %s — %u events (%u INPUTs) into pb_queue",
-        path, reported_event_count, pushed_inputs);
+    if (seek.kind == SeekEventKind::ROUND_START) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: loaded %s — seek=ROUND_START %u, "
+            "%u state-init kept + %u skipped pre-anchor, "
+            "%u INPUTs queued post-anchor (%u total events)",
+            path, seek.idx,
+            (uint32_t)(g_state.pb_queue.size() - pushed_inputs),
+            pre_anchor_skipped, pushed_inputs, reported_event_count);
+    } else {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: loaded %s — %u events (%u INPUTs) into pb_queue",
+            path, reported_event_count, pushed_inputs);
+    }
     return true;
 }
 
