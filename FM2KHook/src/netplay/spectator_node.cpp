@@ -6,6 +6,7 @@
 #include "savestate.h"            // SaveState_Save / Peek for snapshot capture
 #include "netplay_state.h"
 #include "../audio/sound_rollback.h"  // Op apply: SOUND_INIT
+#include "../ui/shared_mem.h"         // C10: SharedMem_PublishMatchSession / RoundResult
 #include "gekkonet.h"
 
 #include <SDL3/SDL_log.h>
@@ -1071,6 +1072,11 @@ static uint32_t s_round_start_input_frame = 0;
 static uint8_t s_last_seen_rounds_won_p1 = 0;
 static uint8_t s_last_seen_rounds_won_p2 = 0;
 
+// C10 — 1-based per-session match counter. Bumped at every
+// AppendMatchStart. Reset to 0 in SpectatorNode_AppendSessionId so a
+// new session restarts numbering at 1 for its first match.
+static uint8_t s_match_index_in_session = 0;
+
 void SpectatorNode_AppendRoundStart(uint8_t  round_idx,
                                     uint16_t p1_hp_max,
                                     uint16_t p2_hp_max,
@@ -1111,6 +1117,11 @@ void SpectatorNode_AppendRoundEnd(uint8_t  winner_idx,
     // counters before Netplay_EndBattle's read fires.
     s_last_seen_rounds_won_p1 = (uint8_t)*(uint32_t*)0x4DFC6D;
     s_last_seen_rounds_won_p2 = (uint8_t)*(uint32_t*)0x4EDCAC;
+
+    // C10 — also push this round's result into SharedMem so the launcher
+    // can include it in the hub match_result JSON's "rounds[]" array.
+    SharedMem_PublishRoundResult(winner_idx, p1_hp_remaining,
+                                 p2_hp_remaining, frames);
 }
 
 // =============================================================================
@@ -1206,6 +1217,12 @@ void SpectatorNode_AppendMatchStart(const uint8_t header[96]) {
     }
     g_state.last_pre_match_init_idx = static_cast<int64_t>(pre_init_idx);
 
+    // C10 — bump the per-session match index and publish to SharedMem
+    // so the launcher can include {session_id, match_index_in_session}
+    // in its match_result JSON to the hub.
+    if (s_match_index_in_session < 255) ++s_match_index_in_session;
+    SharedMem_PublishMatchSession(g_state.session_id, s_match_index_in_session);
+
     AppendOpAndFlush(ev);
 }
 
@@ -1238,6 +1255,9 @@ void SpectatorNode_AppendMatchEnd(const MatchEndPayload& p) {
 
 void SpectatorNode_AppendSessionId(uint64_t session_id) {
     g_state.session_id = session_id;
+    // C10 — new session, restart match numbering. The first
+    // AppendMatchStart for this session bumps to 1.
+    s_match_index_in_session = 0;
     SessionEvent ev{};
     ev.type          = SessionEventType::SESSION_ID;
     ev.u.session_id  = session_id;

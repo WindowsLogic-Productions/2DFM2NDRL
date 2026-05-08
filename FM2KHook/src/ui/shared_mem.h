@@ -9,10 +9,14 @@
 // ============================================================================
 
 constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
-// v9 (2026-05-06): adds the in-game HUD state block (scores,
-// spectator count, system-message slot). Slice E will append chat
-// state on top under v10.
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 9;
+// v10 (2026-05-08): C10 hub-schema-v2 plumbing — adds match_session_id +
+// match_index_in_session + match_rounds_count + match_rounds[8]. The
+// launcher includes these in its `match_result` JSON to the hub so
+// matches.json records (schema: 2) can carry per-match round
+// breakdowns + session grouping.
+// v9 (2026-05-06): in-game HUD state block (scores, spectator count,
+// system-message slot).
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 10;
 
 // Maximum bytes for a UTF-8-encoded character name in the shared mem
 // outcome payload. FM2K stores .player filenames as 256-byte CP932
@@ -24,6 +28,28 @@ constexpr size_t   FM2K_MATCH_CHAR_NAME_MAX = 96;
 // Match outcome enum, sent hook → launcher when a battle session ends.
 // Launcher forwards as a `match_result` message to the hub. See
 // docs/dev/launcher_followups.md for the W-L-D protocol.
+// Per-round summary, one entry written into match_rounds[] at every
+// ROUND_END. Launcher reads on match-end alongside outcome and forwards
+// to the hub in the match_result JSON's "rounds" array. Matches the
+// hub-schema-v2 RoundResult shape spec'd in
+// docs/roadmaps/replay_hierarchy.md.
+//
+// 12 bytes packed. Field order chosen so each field lands on its natural
+// alignment without trailing padding (frames_elapsed first to keep
+// natural u32 alignment, hp pair next at u16 alignment, winner+reserved
+// last). Layout matches the wire format spec'd in
+// docs/roadmaps/replay_hierarchy.md.
+#pragma pack(push, 1)
+struct FM2KRoundResult {
+    uint32_t frames_elapsed;       // sim frames the round took
+    uint16_t p1_hp_remaining;
+    uint16_t p2_hp_remaining;
+    uint8_t  winner_idx;           // 0=P1, 1=P2, 2=draw
+    uint8_t  _reserved[3];
+};
+static_assert(sizeof(FM2KRoundResult) == 12, "FM2KRoundResult must be 12 bytes");
+#pragma pack(pop)
+
 enum FM2KMatchOutcome : uint8_t {
     FM2K_MATCH_OUTCOME_NONE        = 0,  // no outcome reported yet
     FM2K_MATCH_OUTCOME_SELF_WON    = 1,
@@ -152,6 +178,26 @@ struct FM2KSharedMemData {
     uint32_t hud_system_message_seq;
     uint32_t hud_system_message_expiry_tick;  // GetTickCount() value
     char     hud_system_message[160];         // UTF-8, NUL-terminated
+
+    // ─── C10: Hub schema v2 — session grouping + per-round results ───
+    //
+    // Hook populates these as battle progresses; launcher reads on
+    // match_outcome_seq bump and includes them in the match_result JSON
+    // to the hub. session_id ties matches together (one session_id per
+    // peer connection), match_index_in_session is 1-based per session.
+    //
+    // match_rounds[] is filled at every AppendRoundEnd in
+    // spectator_node.cpp; match_rounds_count tracks how many entries
+    // are valid (0..8). Reset to 0 at MATCH_START so back-to-back
+    // matches don't carry over previous match's rounds.
+    //
+    // session_id == 0 / match_index_in_session == 0 mean "not yet
+    // populated" — launcher omits them from the JSON in that case.
+    uint64_t match_session_id;
+    uint8_t  match_index_in_session;   // 1-based; 0 if not yet known
+    uint8_t  match_rounds_count;       // valid entries in match_rounds[]
+    uint8_t  _pad_match_c10[6];        // align match_rounds[] to 8-byte
+    FM2KRoundResult match_rounds[8];   // 96 bytes, indexed [0..count-1]
 };
 
 // Bumped to 1024 to fit the v9 HUD block. Still under 4 KB which is
@@ -194,6 +240,25 @@ void SharedMem_PublishMatchChars(uint32_t p1_char_id, uint32_t p2_char_id,
 // alongside char_ids/names and forwards as part of the hub match_result.
 // Pass 0xFFFFFFFF to clear / mark unknown.
 void SharedMem_PublishMatchStage(uint32_t stage_id);
+
+// C10 hub-schema-v2 helpers. Writes are no-ops if the shared mem
+// mapping isn't initialized yet (host-side first-match window).
+//
+// PublishMatchSession: called at MATCH_START (Netplay_StartBattle's
+// AppendMatchStart path). session_id is the host-generated u64 from
+// SpectatorNode_GetSessionId(); match_index is the 1-based per-session
+// counter. Also resets match_rounds_count to 0 for the upcoming match.
+void SharedMem_PublishMatchSession(uint64_t session_id,
+                                   uint8_t  match_index_in_session);
+
+// PublishRoundResult: called at every ROUND_END
+// (SpectatorNode_AppendRoundEnd) to append one entry into
+// match_rounds[]. Caps at 8 rounds (excess silently dropped — far
+// more than any sane best-of-N format).
+void SharedMem_PublishRoundResult(uint8_t  winner_idx,
+                                  uint16_t p1_hp_remaining,
+                                  uint16_t p2_hp_remaining,
+                                  uint32_t frames_elapsed);
 
 // Launcher-side write hook for the v6 stats feed. The launcher process
 // opens the same FM2K_SharedMem_<pid> mapping read-write and stuffs

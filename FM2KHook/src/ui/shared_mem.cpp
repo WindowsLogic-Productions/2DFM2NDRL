@@ -149,6 +149,32 @@ void SharedMem_PublishMatchStage(uint32_t stage_id) {
     g_shared_mem->match_chars_seq += 1;
 }
 
+void SharedMem_PublishMatchSession(uint64_t session_id,
+                                   uint8_t  match_index_in_session) {
+    if (!g_shared_mem) return;
+    g_shared_mem->match_session_id = session_id;
+    g_shared_mem->match_index_in_session = match_index_in_session;
+    g_shared_mem->match_rounds_count = 0;  // fresh match, fresh rounds
+}
+
+void SharedMem_PublishRoundResult(uint8_t  winner_idx,
+                                  uint16_t p1_hp_remaining,
+                                  uint16_t p2_hp_remaining,
+                                  uint32_t frames_elapsed) {
+    if (!g_shared_mem) return;
+    const uint8_t i = g_shared_mem->match_rounds_count;
+    if (i >= 8) return;  // ring is bounded — silently drop overflow
+    FM2KRoundResult& r = g_shared_mem->match_rounds[i];
+    r.frames_elapsed   = frames_elapsed;
+    r.p1_hp_remaining  = p1_hp_remaining;
+    r.p2_hp_remaining  = p2_hp_remaining;
+    r.winner_idx       = winner_idx;
+    r._reserved[0]     = 0;
+    r._reserved[1]     = 0;
+    r._reserved[2]     = 0;
+    g_shared_mem->match_rounds_count = i + 1;
+}
+
 void SharedMem_PublishHudScores(uint16_t p1, uint16_t p2) {
     if (!g_shared_mem) return;
     g_shared_mem->hud_score_p1 = p1;
