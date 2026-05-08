@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Sessions · 2DFM HUB{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>Sessions</h1>
+  <p class="lede">
+    Matches grouped by play-session (one connection between two
+    players, all matches they played until disconnect).
+    <strong>{{ sessions|length }}</strong> session{{ '' if sessions|length == 1 else 's' }} shown,
+    newest first.
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <h2>Session Feed</h2>
+    <span class="count">// SESSION-GROUPED</span>
+  </div>
+  {% if sessions %}
+  <div class="vs-feed">
+    {% for s in sessions %}
+    {% set p1_won_session = s.p1_match_wins > s.p2_match_wins %}
+    {% set p2_won_session = s.p2_match_wins > s.p1_match_wins %}
+    {% set is_draw = s.p1_match_wins == s.p2_match_wins %}
+    <div class="vs-card">
+      <div class="side p1 {{ 'win' if p1_won_session else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ s.p1_id }}">{{ s.p1_nick }}</a></div>
+        <div class="stat">{{ s.p1_match_wins }}</div>
+      </div>
+      <div class="vs">
+        <div class="vs-text">SESSION</div>
+        <div class="game"><a href="/g/{{ s.game_id }}">{{ friendly_name(s.game_id) }}</a></div>
+        <div class="when">{{ format_iso(s.finished_at) }}</div>
+        <div class="when">{{ s.matches|length }} match{{ '' if s.matches|length == 1 else 'es' }}</div>
+      </div>
+      <div class="side p2 {{ 'win' if p2_won_session else ('draw' if is_draw else 'loss') }}">
+        <div class="nick"><a href="/u/{{ s.p2_id }}">{{ s.p2_nick }}</a></div>
+        <div class="stat">{{ s.p2_match_wins }}</div>
+      </div>
+    </div>
+
+    {# Per-session match list — collapsed by default; click the
+       session header to expand. Each match shows its rounds[] grid. #}
+    <details class="session-detail">
+      <summary>view {{ s.matches|length }} match{{ '' if s.matches|length == 1 else 'es' }}</summary>
+      <ul class="session-matches">
+        {% for m in s.matches %}
+        {% set p1_won  = m.winner_id == m.p1_id %}
+        {% set m_draw  = not m.winner_id %}
+        <li class="session-match">
+          <div class="match-line">
+            <span class="match-idx">#{{ m.match_index_in_session or loop.index }}</span>
+            <span class="match-p1 {{ 'win' if p1_won else ('draw' if m_draw else 'loss') }}">
+              {{ m.p1_nick }} ({{ char_label(m.p1_char_name, m.p1_char_id) }})
+            </span>
+            <span class="match-vs">vs</span>
+            <span class="match-p2 {{ 'win' if (not p1_won and not m_draw) else ('draw' if m_draw else 'loss') }}">
+              {{ m.p2_nick }} ({{ char_label(m.p2_char_name, m.p2_char_id) }})
+            </span>
+            <span class="match-when">{{ format_iso(m.finished_at) }}</span>
+          </div>
+          {% if m.rounds %}
+          <table class="rounds-table">
+            <thead>
+              <tr><th>R</th><th>winner</th><th>p1 hp</th><th>p2 hp</th><th>frames</th></tr>
+            </thead>
+            <tbody>
+              {% for r in m.rounds %}
+              <tr>
+                <td>{{ loop.index }}</td>
+                <td class="winner-{{ r.winner }}">{{ r.winner|upper }}</td>
+                <td>{{ r.p1_hp_left }}</td>
+                <td>{{ r.p2_hp_left }}</td>
+                <td>{{ r.frames }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">
+    No session-grouped matches yet — sessions only appear once the launcher
+    has played at least one match with the C10 schema-2 wire format
+    (session_id + rounds[] reporting). Older matches still show up under
+    <a href="/recent">/recent</a>.
+  </p>
+  {% endif %}
+</section>
+{% endblock %}

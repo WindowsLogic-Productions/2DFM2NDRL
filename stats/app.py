@@ -133,7 +133,7 @@ def load_matches() -> list[dict[str, Any]]:
             continue
         # Whitelist fields. Notably excludes p1_dc_id / p2_dc_id —
         # those exist on disk for ops correlation but are not rendered.
-        out.append({
+        rec: dict[str, Any] = {
             "id":            r.get("id"),
             "p1_id":         r.get("p1_id"),
             "p1_nick":       r.get("p1_nick", "anon"),
@@ -143,11 +143,40 @@ def load_matches() -> list[dict[str, Any]]:
             "p2_char_id":    r.get("p2_char_id"),
             "p1_char_name":  r.get("p1_char_name"),
             "p2_char_name":  r.get("p2_char_name"),
+            "stage_id":      r.get("stage_id"),
+            "stage_name":    r.get("stage_name"),
             "game_id":       r.get("game_id", ""),
             "winner_id":     r.get("winner_id", ""),
             "started_at":    r.get("started_at"),
             "finished_at":   r.get("finished_at", r.get("started_at")),
-        })
+        }
+        # Schema 2 (C10): session_id correlates matches into a single
+        # session, match_index_in_session is 1-based ordering, rounds[]
+        # is per-round mini-records. Default schema 1 = these fields
+        # absent. Whitelist + sanitize the rounds[] payload so a
+        # malformed entry can't crash the renderer.
+        if r.get("schema") == 2:
+            rec["schema"]                = 2
+            rec["session_id"]            = r.get("session_id") or ""
+            rec["match_index_in_session"] = (
+                r.get("match_index_in_session") or 0)
+            raw_rounds = r.get("rounds")
+            clean_rounds: list[dict[str, Any]] = []
+            if isinstance(raw_rounds, list):
+                for rr in raw_rounds[:8]:
+                    if not isinstance(rr, dict):
+                        continue
+                    w = rr.get("winner")
+                    if w not in ("p1", "p2", "draw"):
+                        continue
+                    clean_rounds.append({
+                        "winner":     w,
+                        "frames":     int(rr.get("frames") or 0),
+                        "p1_hp_left": int(rr.get("p1_hp_left") or 0),
+                        "p2_hp_left": int(rr.get("p2_hp_left") or 0),
+                    })
+            rec["rounds"] = clean_rounds
+        out.append(rec)
     return out
 
 
@@ -589,6 +618,66 @@ def recent_page(request: Request, limit: int = 100):
     matches = sorted(matches, key=lambda m: -m["finished_at"])[:limit]
     return templates.TemplateResponse("recent.html",
         {"request": request, "matches": matches,
+         "char_label": char_label, "format_iso": format_iso})
+
+
+def _sessions_grid_data(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate schema-2 matches by session_id. Each session row carries
+    the participants, game, total matches, score (rounds_won totals across
+    matches), and the first/last finished_at for sorting + display.
+    Schema-1 records (no session_id) are excluded — they pre-date the
+    session-tracking rollout and have nothing to group.
+
+    Sort: most-recent finished_at first."""
+    by_session: dict[str, dict[str, Any]] = {}
+    for m in matches:
+        sid = m.get("session_id")
+        if not sid:
+            continue  # legacy schema-1 row
+        s = by_session.get(sid)
+        if s is None:
+            s = {
+                "session_id":  sid,
+                "p1_id":       m["p1_id"],
+                "p1_nick":     m["p1_nick"],
+                "p2_id":       m["p2_id"],
+                "p2_nick":     m["p2_nick"],
+                "game_id":     m["game_id"],
+                "matches":     [],
+                "p1_match_wins": 0,
+                "p2_match_wins": 0,
+                "draws":       0,
+                "started_at":  m["started_at"],
+                "finished_at": m["finished_at"],
+            }
+            by_session[sid] = s
+        s["matches"].append(m)
+        if m["winner_id"] == m["p1_id"]:
+            s["p1_match_wins"] += 1
+        elif m["winner_id"] == m["p2_id"]:
+            s["p2_match_wins"] += 1
+        else:
+            s["draws"] += 1
+        s["started_at"]  = min(s["started_at"], m["started_at"])
+        s["finished_at"] = max(s["finished_at"], m["finished_at"])
+    # Per-session match list ordered by match_index_in_session (falls back
+    # to finished_at when index is missing/zero) so the rendered tree
+    # shows match 1 → match N in temporal order.
+    for s in by_session.values():
+        s["matches"].sort(key=lambda mm: (
+            mm.get("match_index_in_session") or 0,
+            mm["finished_at"]))
+    return sorted(by_session.values(),
+                  key=lambda s: -s["finished_at"])
+
+
+@app.get("/sessions", response_class=HTMLResponse)
+def sessions_page(request: Request, limit: int = 50):
+    limit = max(1, min(limit, 200))
+    matches = load_matches()
+    sessions = _sessions_grid_data(matches)[:limit]
+    return templates.TemplateResponse("sessions.html",
+        {"request": request, "sessions": sessions,
          "char_label": char_label, "format_iso": format_iso})
 
 
