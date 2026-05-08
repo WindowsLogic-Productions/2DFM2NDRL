@@ -492,6 +492,78 @@ void HubClient::MatchResult(const std::string& match_id,
     EnqueueOut(std::move(m));
 }
 
+void HubClient::MatchResult(const std::string& match_id,
+                            const std::string& outcome,
+                            uint32_t p1_char_id, uint32_t p2_char_id,
+                            const std::string& p1_char_name,
+                            const std::string& p2_char_name,
+                            uint32_t stage_id,
+                            const std::string& stage_name,
+                            uint64_t session_id,
+                            uint8_t  match_index_in_session,
+                            const std::vector<RoundJson>& rounds) {
+    // Fall back to schema-1 if no session metadata. Keeps the wire light
+    // for legacy paths (e.g. early hook builds where session_id == 0).
+    if (session_id == 0 && match_index_in_session == 0 && rounds.empty()) {
+        MatchResult(match_id, outcome, p1_char_id, p2_char_id,
+                    p1_char_name, p2_char_name, stage_id, stage_name);
+        return;
+    }
+
+    std::string m = "{\"type\":\"match_result\",\"schema\":2,\"match_id\":\"" +
+                    EscapeJsonString(match_id) + "\",\"outcome\":\"" +
+                    EscapeJsonString(outcome) + "\"";
+    if (p1_char_id != 0xFFFFFFFFu) {
+        m += ",\"p1_char_id\":" + std::to_string(p1_char_id);
+    }
+    if (p2_char_id != 0xFFFFFFFFu) {
+        m += ",\"p2_char_id\":" + std::to_string(p2_char_id);
+    }
+    if (!p1_char_name.empty()) {
+        m += ",\"p1_char_name\":\"" + EscapeJsonString(p1_char_name) + "\"";
+    }
+    if (!p2_char_name.empty()) {
+        m += ",\"p2_char_name\":\"" + EscapeJsonString(p2_char_name) + "\"";
+    }
+    if (stage_id != 0xFFFFFFFFu) {
+        m += ",\"stage_id\":" + std::to_string(stage_id);
+    }
+    if (!stage_name.empty()) {
+        m += ",\"stage_name\":\"" + EscapeJsonString(stage_name) + "\"";
+    }
+    // session_id as a 16-char hex string for compactness + readability in
+    // the matches.json log (the high 32 bits are unix epoch seconds, low
+    // 32 bits a random nonce — see SpectatorNode_AppendSessionId).
+    char sid_buf[32];
+    std::snprintf(sid_buf, sizeof(sid_buf), "%016llx",
+                  static_cast<unsigned long long>(session_id));
+    m += ",\"session_id\":\"";
+    m += sid_buf;
+    m += "\"";
+    if (match_index_in_session > 0) {
+        m += ",\"match_index_in_session\":" +
+             std::to_string(static_cast<unsigned>(match_index_in_session));
+    }
+    if (!rounds.empty()) {
+        m += ",\"rounds\":[";
+        for (size_t i = 0; i < rounds.size(); ++i) {
+            if (i > 0) m += ",";
+            const RoundJson& r = rounds[i];
+            const char* who = (r.winner_idx == 0) ? "p1"
+                            : (r.winner_idx == 1) ? "p2" : "draw";
+            m += "{\"winner\":\"";
+            m += who;
+            m += "\",\"frames\":" + std::to_string(r.frames_elapsed);
+            m += ",\"p1_hp_left\":" + std::to_string(r.p1_hp_remaining);
+            m += ",\"p2_hp_left\":" + std::to_string(r.p2_hp_remaining);
+            m += "}";
+        }
+        m += "]";
+    }
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
 void HubClient::QueryRecord(const std::string& opponent_id,
                             const std::string& game_id) {
     std::string m = "{\"type\":\"query_record\"";

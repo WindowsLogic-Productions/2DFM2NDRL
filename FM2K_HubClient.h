@@ -325,6 +325,29 @@ public:
                      uint32_t stage_id,
                      const std::string& stage_name);
 
+    // C10 — schema-2 overload. Adds session correlation + per-round results.
+    // session_id is the 64-bit token generated at peer-connect time on the
+    // host (shared across every match this pair plays until disconnect);
+    // match_index_in_session is 1-based (1 = first match of the session).
+    // rounds[] carries per-round mini-records sized to the actual count
+    // (FM2K caps rounds at 8). Pass session_id == 0 to fall back to the
+    // schema-1 wire shape (omits all session/round fields).
+    struct RoundJson {
+        uint8_t  winner_idx;       // 0=p1, 1=p2, 2=draw
+        uint16_t p1_hp_remaining;
+        uint16_t p2_hp_remaining;
+        uint32_t frames_elapsed;
+    };
+    void MatchResult(const std::string& match_id, const std::string& outcome,
+                     uint32_t p1_char_id, uint32_t p2_char_id,
+                     const std::string& p1_char_name,
+                     const std::string& p2_char_name,
+                     uint32_t stage_id,
+                     const std::string& stage_name,
+                     uint64_t session_id,
+                     uint8_t  match_index_in_session,
+                     const std::vector<RoundJson>& rounds);
+
     // Ask hub for our W/L/D record. Both args optional — pass empty
     // string to omit. Hub responds with K::RecordReceived carrying
     // wins/losses/draws + per-opponent breakdown.

@@ -642,6 +642,14 @@ public:
                                const std::string& host_ip,
                                int host_port,
                                const std::string& mode = "current");
+
+    // Offline replay player. Launches the game with FM2K_SPECTATOR_MODE=1
+    // + FM2K_REPLAY_FILE=<replay_path>; the hook reads the env var in
+    // Netplay_InitAsSpectator, calls SpectatorNode_LoadSessionFile to
+    // populate pb_queue, and the trampoline's RunSpectatorTick drives
+    // playback. No network, no peer, no STUN — just the file.
+    bool LaunchReplayPlayer(const std::string& game_path,
+                            const std::string& replay_path);
 private:
     bool TerminateAllClients();
     
@@ -699,6 +707,13 @@ public:
     std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
+    // C11 — replay browser dispatch. Called when the user clicks a row in
+    // the Replays panel; should call FM2KLauncher::LaunchReplayPlayer with
+    // the absolute path to a .fm2krep / .fm2kset file. Game .exe is
+    // resolved from the file's grandparent directory (replays/<f>.fm2krep
+    // is always under <game_dir>/replays/) — matches the same logic the
+    // CLI --replay flag uses.
+    std::function<void(const std::string& replay_path)> on_replay_play;
     // Fired when the user adds, removes, or otherwise reorders the
     // configured games-root list. The full new list is passed by value so
     // the launcher can persist it atomically; the UI keeps its own copy
@@ -1010,6 +1025,7 @@ private:
     bool show_hub_server_      = false;
     bool show_games_folders_   = false;
     bool show_recent_matches_  = false;
+    bool show_replay_browser_  = false;
     bool input_binder_initialized_ = false;
 
     // Settings → Display state. `ddraw_cfg_` is loaded once on first
@@ -1074,4 +1090,41 @@ public:
     // Save state inspection
     int selected_inspection_slot_ = -1;
     bool show_slot_inspection_ = false;
-}; 
+
+    // C11 — Replay browser. Lazily-populated cache of .fm2krep / .fm2kset
+    // files found across configured games-root paths. Each entry mirrors
+    // the FM2KSessionFileHeader fields the tree UI displays. Sessions
+    // group entries by session_id; matches inside each session order by
+    // match_index_in_session.
+    struct ReplayMeta {
+        std::string path;             // absolute path
+        bool        is_battle_slice;  // .fm2krep (true) vs .fm2kset (false)
+        uint64_t    started_at_unix;
+        uint64_t    finished_at_unix;
+        uint32_t    event_count;
+        uint32_t    input_count;
+        char        game_id[32];      // null-padded
+        char        p1_nick[32];
+        char        p2_nick[32];
+        uint8_t     p1_char_id;
+        uint8_t     p2_char_id;
+        uint8_t     rounds_won_p1;
+        uint8_t     rounds_won_p2;
+        uint8_t     match_count;
+        uint8_t     match_index;
+        uint64_t    session_id;
+        uint8_t     round_count;
+    };
+    std::vector<ReplayMeta> replays_cache_;
+    bool                    replays_cache_dirty_ = true;  // first-render rescan
+
+    // Build replays_cache_ from games_root_paths_. Walks each root for
+    // <game>/replays/*.fm2krep — sniffs the 256-byte FM2KSessionFileHeader
+    // off the front of each file. Cheap (<200ms for ~1000 files); called
+    // lazily on Replay panel open or after a refresh button.
+    void ScanReplays();
+
+    // ImGui body for the Replays window. Renders Session → Match tree.
+    // Click a row → on_replay_play(path).
+    void RenderReplayBrowser();
+};

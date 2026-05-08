@@ -6,6 +6,7 @@
 #include "version_local.h"
 #include "FM2KHook/src/ui/input_binder.h"
 #include "FM2KHook/src/ui/shared_mem.h"
+#include "FM2KHook/src/util/pii_scrub.h"
 #include "FM2K_GameIni.h"
 #include "FM2K_DDrawRedirect.h"
 #include "FM2K_CncDDraw.h"
@@ -739,7 +740,10 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
     
-    // Setup our logging to capture SDL logs
+    // Setup our logging to capture SDL logs. Init the PII scrubber
+    // BEFORE the first SDL_Log so even the "Launcher UI Initialized"
+    // line goes through redaction.
+    fm2k::pii::Init();
     SDL_GetLogOutputFunction(&original_log_function_, &original_log_userdata_);
     SDL_SetLogOutputFunction(SDLCustomLogOutput, this);
 
@@ -943,6 +947,10 @@ void LauncherUI::RenderMenuBar() {
             }
             if (ImGui::MenuItem(T("hub_signin_ellipsis"), nullptr, show_discord_auth_)) {
                 show_discord_auth_ = !show_discord_auth_;
+            }
+            if (ImGui::MenuItem("Replays…", nullptr, show_replay_browser_)) {
+                show_replay_browser_ = !show_replay_browser_;
+                if (show_replay_browser_) replays_cache_dirty_ = true;
             }
             ImGui::Separator();
             // Audio mutes — write to %APPDATA%\FM2K_Rollback\audio.ini.
@@ -1200,6 +1208,12 @@ void LauncherUI::RenderMenuBar() {
     if (show_hub_server_)     RenderHubServerWindow();
     if (show_games_folders_)  RenderGamesFoldersWindow();
     if (show_recent_matches_) RenderRecentMatchesWindow();
+    if (show_replay_browser_) {
+        if (ImGui::Begin("Replays", &show_replay_browser_)) {
+            RenderReplayBrowser();
+        }
+        ImGui::End();
+    }
 }
 
 // Settings → Hub Server… window. Lets the user point the launcher at a
@@ -1533,6 +1547,226 @@ void LauncherUI::RenderRecentMatchesWindow() {
     }
     RenderRecentMatchesBody();
     ImGui::End();
+}
+
+// C11 — Replay browser. Walks configured games-root paths once
+// (replays_cache_dirty_ → ScanReplays), then renders Session → Match tree.
+// Click a row to dispatch via on_replay_play. Future iterations: filter
+// chips (game/date/nick), right-click context menu (open file location,
+// export round-as-standalone, copy share link), round-level seek.
+void LauncherUI::ScanReplays() {
+    replays_cache_.clear();
+    replays_cache_dirty_ = false;
+
+    // 256-byte FM2KSessionFileHeader (mirrors spectator_node.cpp's struct).
+    // We read off the front of each file by offset rather than declaring
+    // the struct here so the launcher and hook stay decoupled — a hook
+    // schema bump would break the launcher's struct cast otherwise.
+    constexpr uint32_t MAGIC_FMSS = 0x53534D46;  // 'FMSS' little-endian
+    constexpr uint16_t VERSION_V2 = 2;
+    constexpr size_t   HEADER_SIZE = 256;
+
+    std::error_code ec;
+    auto try_load_file = [&](const std::filesystem::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return;
+        uint8_t buf[HEADER_SIZE] = {};
+        f.read(reinterpret_cast<char*>(buf), HEADER_SIZE);
+        if (!f || f.gcount() < (std::streamsize)HEADER_SIZE) return;
+
+        uint32_t magic;   std::memcpy(&magic,   buf + 0, 4);
+        uint16_t version; std::memcpy(&version, buf + 4, 2);
+        uint16_t flags;   std::memcpy(&flags,   buf + 6, 2);
+        if (magic != MAGIC_FMSS || version != VERSION_V2) return;
+
+        ReplayMeta m{};
+        m.path = p.string();
+        m.is_battle_slice = (flags & 0x0001) != 0;
+        std::memcpy(&m.started_at_unix,  buf + 8,  8);
+        std::memcpy(&m.finished_at_unix, buf + 16, 8);
+        std::memcpy(&m.event_count,      buf + 24, 4);
+        std::memcpy(&m.input_count,      buf + 28, 4);
+        std::memcpy(m.game_id,           buf + 32, 32);
+        std::memcpy(m.p1_nick,           buf + 64, 32);
+        std::memcpy(m.p2_nick,           buf + 96, 32);
+        m.p1_char_id    = buf[128];
+        m.p2_char_id    = buf[129];
+        // colors at 130/131 — not displayed in the tree
+        m.rounds_won_p1 = buf[132];
+        m.rounds_won_p2 = buf[133];
+        m.match_count   = buf[134];
+        m.match_index   = buf[135];
+        std::memcpy(&m.session_id,       buf + 136, 8);
+        m.round_count   = buf[144];
+        replays_cache_.push_back(std::move(m));
+    };
+
+    for (const auto& root : games_root_paths_) {
+        if (root.empty()) continue;
+        std::filesystem::path root_fs = std::filesystem::u8path(root);
+        if (!std::filesystem::is_directory(root_fs, ec)) continue;
+        // Each game lives directly under root; replays/ is one level deeper.
+        // Use recursive_directory_iterator with a depth cap so we don't walk
+        // user-installed game subdirs unnecessarily.
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 root_fs,
+                 std::filesystem::directory_options::skip_permission_denied,
+                 ec);
+             it != std::filesystem::recursive_directory_iterator{};
+             it.increment(ec))
+        {
+            if (ec) break;
+            if (it.depth() > 5) { it.disable_recursion_pending(); continue; }
+            const auto& entry = *it;
+            if (!entry.is_regular_file(ec)) continue;
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if (ext == ".fm2krep" || ext == ".fm2kset") {
+                try_load_file(entry.path());
+            }
+        }
+    }
+
+    // Sort: newest finished first.
+    std::sort(replays_cache_.begin(), replays_cache_.end(),
+        [](const ReplayMeta& a, const ReplayMeta& b) {
+            return a.finished_at_unix > b.finished_at_unix;
+        });
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "ReplayBrowser: scanned %zu replay file(s) across %zu games root(s)",
+        replays_cache_.size(), games_root_paths_.size());
+}
+
+void LauncherUI::RenderReplayBrowser() {
+    if (replays_cache_dirty_) ScanReplays();
+
+    if (ImGui::Button("Refresh")) {
+        replays_cache_dirty_ = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu file(s) — newest first",
+                        replays_cache_.size());
+    ImGui::Separator();
+
+    if (replays_cache_.empty()) {
+        ImGui::TextWrapped("No .fm2krep / .fm2kset files found under any "
+                           "configured games-root path. Play a netplay "
+                           "match to create one (replays auto-save to "
+                           "<game>/replays/<timestamp>.fm2krep).");
+        return;
+    }
+
+    // Group by session_id. Sessions with session_id==0 are legacy files
+    // (pre-C7 headers) — render them as standalone rows under a synthetic
+    // "Legacy (no session id)" header.
+    struct SessionGroup {
+        uint64_t session_id;
+        std::vector<size_t> indices;  // into replays_cache_
+        std::string         p1_nick, p2_nick, game_id;
+        uint64_t            latest_finished;
+    };
+    std::vector<SessionGroup> groups;
+    {
+        std::unordered_map<uint64_t, size_t> group_by_sid;
+        for (size_t i = 0; i < replays_cache_.size(); ++i) {
+            const auto& r = replays_cache_[i];
+            uint64_t sid = r.session_id;
+            auto [it, inserted] = group_by_sid.try_emplace(sid, groups.size());
+            if (inserted) {
+                groups.push_back({});
+                auto& g = groups.back();
+                g.session_id      = sid;
+                g.p1_nick         = r.p1_nick;
+                g.p2_nick         = r.p2_nick;
+                g.game_id         = r.game_id;
+                g.latest_finished = r.finished_at_unix;
+            }
+            auto& g = groups[it->second];
+            g.indices.push_back(i);
+            g.latest_finished =
+                std::max(g.latest_finished, r.finished_at_unix);
+        }
+        std::sort(groups.begin(), groups.end(),
+            [](const SessionGroup& a, const SessionGroup& b) {
+                return a.latest_finished > b.latest_finished;
+            });
+        // Order indices within each group by match_index ascending so the
+        // tree shows match 1 → match N in temporal order.
+        for (auto& g : groups) {
+            std::sort(g.indices.begin(), g.indices.end(),
+                [&](size_t i, size_t j) {
+                    const auto& a = replays_cache_[i];
+                    const auto& b = replays_cache_[j];
+                    if (a.match_index != b.match_index)
+                        return a.match_index < b.match_index;
+                    return a.finished_at_unix < b.finished_at_unix;
+                });
+        }
+    }
+
+    auto fmt_unix = [](uint64_t t) -> std::string {
+        if (t == 0) return "?";
+        time_t tt = static_cast<time_t>(t);
+        std::tm lt = {};
+        localtime_s(&lt, &tt);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &lt);
+        return buf;
+    };
+
+    for (const auto& g : groups) {
+        char hdr[256];
+        if (g.session_id == 0) {
+            std::snprintf(hdr, sizeof(hdr),
+                "Legacy (no session id) — %zu file%s###leg_%p",
+                g.indices.size(),
+                g.indices.size() == 1 ? "" : "s",
+                (void*)&g);
+        } else {
+            std::snprintf(hdr, sizeof(hdr),
+                "%s vs %s — %s — %s — %zu match%s###sid_%016llx",
+                g.p1_nick[0] ? g.p1_nick.c_str() : "?",
+                g.p2_nick[0] ? g.p2_nick.c_str() : "?",
+                fmt_unix(g.latest_finished).c_str(),
+                g.game_id[0] ? g.game_id.c_str() : "?",
+                g.indices.size(),
+                g.indices.size() == 1 ? "" : "es",
+                (unsigned long long)g.session_id);
+        }
+        if (ImGui::TreeNodeEx(hdr,
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+            for (size_t idx : g.indices) {
+                const auto& r = replays_cache_[idx];
+                char row[512];
+                if (r.is_battle_slice) {
+                    std::snprintf(row, sizeof(row),
+                        "Match %u — char %u vs %u — wins %u-%u — %u INPUTs — %s",
+                        (unsigned)r.match_index,
+                        (unsigned)r.p1_char_id, (unsigned)r.p2_char_id,
+                        (unsigned)r.rounds_won_p1, (unsigned)r.rounds_won_p2,
+                        (unsigned)r.input_count,
+                        fmt_unix(r.finished_at_unix).c_str());
+                } else {
+                    std::snprintf(row, sizeof(row),
+                        "Session — %u match%s — %u INPUTs — %s",
+                        (unsigned)r.match_count,
+                        r.match_count == 1 ? "" : "es",
+                        (unsigned)r.input_count,
+                        fmt_unix(r.finished_at_unix).c_str());
+                }
+                ImGui::PushID(static_cast<int>(idx));
+                ImGui::Bullet();
+                ImGui::TextUnformatted(row);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Watch")) {
+                    if (on_replay_play) on_replay_play(r.path);
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+    }
 }
 
 // Live-matches lobby panel. Fed by MatchInProgressStarted/Updated/Ended
@@ -3715,18 +3949,47 @@ void LauncherUI::PollMatchOutcome() {
                                         p1_char_id, p2_char_id,
                                         p1_char_name, p2_char_name);
 
+                    // C10 schema-2: pull session_id + match_index +
+                    // rounds[] from shared mem v10. Fields are 0/empty
+                    // on legacy hook builds and the schema-2 overload
+                    // automatically falls back to schema-1 wire shape
+                    // when session_id == 0 && rounds.empty().
+                    const uint64_t session_id =
+                        data->match_session_id;
+                    const uint8_t  match_index =
+                        data->match_index_in_session;
+                    std::vector<fm2k::HubClient::RoundJson> rounds_json;
+                    const uint8_t rc =
+                        std::min<uint8_t>(data->match_rounds_count, 8);
+                    rounds_json.reserve(rc);
+                    for (uint8_t i = 0; i < rc; ++i) {
+                        const FM2KRoundResult& r = data->match_rounds[i];
+                        rounds_json.push_back(fm2k::HubClient::RoundJson{
+                            r.winner_idx,
+                            r.p1_hp_remaining,
+                            r.p2_hp_remaining,
+                            r.frames_elapsed,
+                        });
+                    }
+
                     hs.client.MatchResult(hs.current_match_token, outcome_str,
                                           p1_char_id, p2_char_id,
                                           p1_char_name, p2_char_name,
-                                          stage_id, stage_name);
+                                          stage_id, stage_name,
+                                          session_id, match_index,
+                                          rounds_json);
                     hs.match_result_sent = true;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Hub: match_result sent token=%.8s... outcome=%s "
-                        "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") pid=%lu seq=%u",
+                        "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") "
+                        "session=0x%016llx match_idx=%u rounds=%u "
+                        "pid=%lu seq=%u",
                         hs.current_match_token.c_str(), outcome_str,
                         p1_char_id, p1_char_name.c_str(),
                         p2_char_id, p2_char_name.c_str(),
                         stage_id, stage_name.c_str(),
+                        (unsigned long long)session_id,
+                        (unsigned)match_index, (unsigned)rc,
                         (unsigned long)pid, (unsigned)seq);
                     // Refresh our cached W/L/D so the UI updates
                     // immediately for the next room render. Also
@@ -6088,13 +6351,23 @@ void LauncherUI::SDLCustomLogOutput(void* userdata, int category, SDL_LogPriorit
         return;
     }
 
+    // Run the message through the PII scrubber so anything copied out
+    // of the launcher's log window (or written to console / a future
+    // disk log) is already redacted. The scrubbed buffer is what gets
+    // both chained to the original SDL logger AND added to the in-UI
+    // buffer — so any attempt the user makes to share it (right-click
+    // copy, "save log" button, screenshot) sees the redacted form.
+    char scrubbed[2048];
+    fm2k::pii::ScrubInto(message ? message : "",
+                         scrubbed, sizeof(scrubbed));
+
     // Chain to the original logger to keep console output
     if (ui->original_log_function_) {
-        ui->original_log_function_(ui->original_log_userdata_, category, priority, message);
+        ui->original_log_function_(ui->original_log_userdata_, category, priority, scrubbed);
     }
-    
+
     // Add to our internal buffer for the UI
-    ui->AddLog(message);
+    ui->AddLog(scrubbed);
 }
 
 void LauncherUI::AddLog(const char* message) {
