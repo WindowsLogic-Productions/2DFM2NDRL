@@ -712,6 +712,18 @@ bool Load() {
     FILE* f = std::fopen(g_config_path.c_str(), "r");
     if (!f) return false;
 
+    // The config file exists → clear alt slots before parsing so missing
+    // ".alt" keys mean "empty alt", not "XInput defaults from Init". Without
+    // this, every pre-v0.2.16 config (no .alt keys ever written) silently
+    // gets its alt slots populated with the auto-defaults — which OR with
+    // the user's custom primary bindings and fire wrong bits when they
+    // press a face button. Fresh installs (no config file) skip this branch
+    // and keep the Init-time defaults; that's the intended path for new
+    // users wanting "pad just works out of the box".
+    for (int p = 0; p < kPlayers; ++p) {
+        for (auto& b : g_players[p].bits_alt) b = Binding{};
+    }
+
     int section = -1;  // -1 = none, 0/1 = player slot
     char line[512];
     while (std::fgets(line, sizeof(line), f)) {
