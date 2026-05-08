@@ -129,6 +129,17 @@ size_t PayloadLenForType(const SpecDataHeader& hdr) {
             // FlushBatch). frame_count carries the INPUT count for the
             // receiver's dedup gate but doesn't size the payload.
             return static_cast<size_t>(hdr.flags);
+
+        // Snapshot join (task #18). All three carry their payload byte
+        // count in hdr.flags so the framer can size the receive without
+        // peeking. Phase 1: framer accepts them so the connection
+        // doesn't drop on "unknown SpecDataType=N", but the receive
+        // dispatch in spectator_node still no-ops these. Phase 4 wires
+        // up assembly + SaveState_Load.
+        case SpecDataType::SNAPSHOT_BEGIN:
+        case SpecDataType::SNAPSHOT_CHUNK:
+        case SpecDataType::SNAPSHOT_END:
+            return static_cast<size_t>(hdr.flags);
     }
     return SIZE_MAX;  // unknown tag
 }

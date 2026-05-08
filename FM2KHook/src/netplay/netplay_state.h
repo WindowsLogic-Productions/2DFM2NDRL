@@ -202,6 +202,20 @@ struct CtrlPacket {
             uint16_t host_tcp_port;
         } spec_join_ack;
 
+        // SPEC_JOIN_REQ — viewer's mode preference.
+        //   mode = 0 (FULL_SESSION):  legacy default, replay from session
+        //                             frame 0 (streamer / archivist mode).
+        //   mode = 1 (CURRENT_MATCH): CCCaster-style snapshot join, host
+        //                             ships its most recent SaveState blob
+        //                             so the spectator skips all previous
+        //                             matches. Default for live viewers.
+        // Older spectator builds send this struct as zeros, which lands
+        // on FULL_SESSION — the back-compat path.
+        struct {
+            uint8_t mode;          // SpecJoinMode value
+            uint8_t reserved[7];
+        } spec_join_req;
+
         // HOST_CONFIG — host's authoritative match settings, mirrored to
         // client + spectators so everyone runs with identical rules. All
         // fields are advisory: 0xFF / 0 means "leave at default; don't write."

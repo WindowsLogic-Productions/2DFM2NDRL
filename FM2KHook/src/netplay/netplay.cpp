@@ -22,6 +22,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <ctime>
+#include <random>
 #include <cstdio>
 #include <cstring>
 
@@ -454,7 +455,20 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
         }
 
         case CtrlMsg::SPEC_JOIN_REQ:
-            SpectatorNode_HandleJoinReq(from);
+            // Older spectator builds send no payload (zero-init bytes), which
+            // resolves to mode=FULL_SESSION — the existing replay-from-frame-0
+            // path. New builds set mode explicitly. Range-clamp anything
+            // beyond the highest known enum value back to FULL_SESSION so a
+            // future-versioned spectator pointed at this older host stays on
+            // the safe path.
+            {
+                const uint8_t mode_byte = packet->data.spec_join_req.mode;
+                const SpecJoinMode mode =
+                    (mode_byte == static_cast<uint8_t>(SpecJoinMode::CURRENT_MATCH))
+                        ? SpecJoinMode::CURRENT_MATCH
+                        : SpecJoinMode::FULL_SESSION;
+                SpectatorNode_HandleJoinReq(from, mode);
+            }
             break;
 
         case CtrlMsg::SPEC_JOIN_ACK:
@@ -652,9 +666,21 @@ bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
     extern void SpectatorNode_SetRootAddr(const sockaddr_in& root);
     SpectatorNode_SetRootAddr(*upstream);
 
-    SpectatorNode_RequestJoin(*upstream);
+    // Phase 5: launcher controls the join mode via FM2K_SPECTATE_MODE env var.
+    //   "current" → CURRENT_MATCH (CCCaster-style snapshot join, default)
+    //   "full"    → FULL_SESSION  (replay-from-frame-0)
+    // Anything else (or unset) defaults to CURRENT_MATCH — the user-facing
+    // intent for live spectating; FULL_SESSION is opt-in for streamers.
+    SpecJoinMode mode = SpecJoinMode::CURRENT_MATCH;
+    if (const char* env = std::getenv("FM2K_SPECTATE_MODE")) {
+        if (env[0] == 'f' || env[0] == 'F') {
+            mode = SpecJoinMode::FULL_SESSION;
+        }
+    }
+    SpectatorNode_RequestJoin(*upstream, mode);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay (spectator): SPEC_JOIN_REQ sent to host");
+                "Netplay (spectator): SPEC_JOIN_REQ sent to host (mode=%s)",
+                mode == SpecJoinMode::CURRENT_MATCH ? "CURRENT_MATCH" : "FULL_SESSION");
     return true;
 }
 
@@ -1716,6 +1742,20 @@ bool Netplay_StartBattle() {
         /*p1_char*/           0, /*p1_color*/ 0, /*p1_name*/ nullptr,
         /*p2_char*/           0, /*p2_color*/ 0, /*p2_name*/ nullptr);
 
+    // C7 — emit the host's session_id once at the very first match of the
+    // connection. Generated lazily on first call: high 32 bits = unix epoch
+    // seconds (so files sort chronologically + collisions are bounded to
+    // intra-second), low 32 bits = a random nonce for uniqueness even within
+    // the same second across machines. Subsequent matches in the same
+    // session reuse the cached value via SpectatorNode_GetSessionId().
+    if (g_player_index == 0 && SpectatorNode_GetSessionId() == 0) {
+        const uint64_t epoch = (uint64_t)std::time(nullptr);
+        std::random_device rd;
+        const uint64_t nonce = ((uint64_t)rd() << 32) | (uint64_t)rd();
+        const uint64_t session_id = (epoch << 32) ^ nonce;
+        SpectatorNode_AppendSessionId(session_id);
+    }
+
     // Notify the spectator tree: start of a new match, push INITIAL_MATCH to
     // any currently-subscribed viewers so they reset and follow this match.
     SpectatorNode_OnMatchStart(
@@ -1724,6 +1764,20 @@ bool Netplay_StartBattle() {
         /*initial_state_hash*/initial_state_hash,
         /*p1_char*/0, /*p1_color*/0,
         /*p2_char*/0, /*p2_color*/0);
+
+    // C3.5 — reset the intra-match round counter so the first ROUND_START
+    // emitted from vs_round_function lands as round_idx=1.
+    extern void RoundEvents_OnMatchStart();
+    RoundEvents_OnMatchStart();
+
+    // Task #18 phase 2: capture a SaveState snapshot RIGHT NOW so a
+    // CURRENT_MATCH-mode spectator joining mid-set can SaveState_Load
+    // directly to this match's start instead of replaying every previous
+    // battle. Order matters: must run AFTER OnMatchStart (which appends
+    // the MATCH_START SessionEvent — we want our snapshot's input_frame
+    // anchor to count from after that op) and AFTER the pin/init sites
+    // above (snapshot reflects the canonical pristine match-start state).
+    SpectatorNode_StashSnapshot();
 
     // Re-broadcast host config so any setting changes (host clicked a
     // different stage between matches, switched SOCD mode, etc.) propagate
@@ -1807,6 +1861,12 @@ void Netplay_EndBattle() {
     // both peers' reports for stats. Only meaningful for actual
     // GekkoGameSessions (player vs player); spectate sessions and
     // stress runs skip the publish.
+    // C7 — capture winner / per-side round wins for both the launcher's
+    // SharedMem outcome publish AND the SessionEvent MATCH_END payload that
+    // ships to subscribers + replay files. Same data, two consumers.
+    uint8_t  match_winner_idx  = 2;  // 0=P1, 1=P2, 2=draw / unknown
+    uint8_t  match_rounds_p1   = 0;
+    uint8_t  match_rounds_p2   = 0;
     if (g_session && g_session_kind == SessionKind::BATTLE) {
         FM2KMatchOutcome outcome = FM2K_MATCH_OUTCOME_NONE;
         if constexpr (FM2K::kIsFM2K) {
@@ -1816,14 +1876,28 @@ void Netplay_EndBattle() {
             // can't decide and log as draw).
             const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
             const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
-            if (p1_hp == 0 && p2_hp == 0)        outcome = FM2K_MATCH_OUTCOME_DRAW;
-            else if (p1_hp > 0 && p2_hp == 0)    outcome = (g_player_index == 0)
-                                                            ? FM2K_MATCH_OUTCOME_SELF_WON
-                                                            : FM2K_MATCH_OUTCOME_PEER_WON;
-            else if (p2_hp > 0 && p1_hp == 0)    outcome = (g_player_index == 1)
-                                                            ? FM2K_MATCH_OUTCOME_SELF_WON
-                                                            : FM2K_MATCH_OUTCOME_PEER_WON;
-            else                                  outcome = FM2K_MATCH_OUTCOME_DRAW;
+            if (p1_hp == 0 && p2_hp == 0) {
+                outcome = FM2K_MATCH_OUTCOME_DRAW;
+                match_winner_idx = 2;
+            } else if (p1_hp > 0 && p2_hp == 0) {
+                outcome = (g_player_index == 0)
+                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                            : FM2K_MATCH_OUTCOME_PEER_WON;
+                match_winner_idx = 0;
+            } else if (p2_hp > 0 && p1_hp == 0) {
+                outcome = (g_player_index == 1)
+                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                            : FM2K_MATCH_OUTCOME_PEER_WON;
+                match_winner_idx = 1;
+            } else {
+                outcome = FM2K_MATCH_OUTCOME_DRAW;
+                match_winner_idx = 2;
+            }
+            // Round-win counters, IDA-verified at globals.h:92-93. Set at
+            // round end (vs_round_function ROUND_END_BANNER), zeroed only
+            // at the start of a new match.
+            match_rounds_p1 = (uint8_t)*(uint32_t*)FM2K::ADDR_P1_WIN_COUNTER;
+            match_rounds_p2 = (uint8_t)*(uint32_t*)FM2K::ADDR_P2_WIN_COUNTER;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: match outcome p1_hp=%u p2_hp=%u outcome=%d",
                 p1_hp, p2_hp, (int)outcome);
@@ -1839,13 +1913,22 @@ void Netplay_EndBattle() {
             // the time we get here on a peer-disconnect path).
             const uint32_t p1_wins = *(uint32_t*)FM2K::ADDR_P1_WIN_COUNTER;
             const uint32_t p2_wins = *(uint32_t*)FM2K::ADDR_P2_WIN_COUNTER;
-            if (p1_wins > p2_wins)        outcome = (g_player_index == 0)
-                                                    ? FM2K_MATCH_OUTCOME_SELF_WON
-                                                    : FM2K_MATCH_OUTCOME_PEER_WON;
-            else if (p2_wins > p1_wins)   outcome = (g_player_index == 1)
-                                                    ? FM2K_MATCH_OUTCOME_SELF_WON
-                                                    : FM2K_MATCH_OUTCOME_PEER_WON;
-            else                           outcome = FM2K_MATCH_OUTCOME_DRAW;
+            if (p1_wins > p2_wins) {
+                outcome = (g_player_index == 0)
+                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                            : FM2K_MATCH_OUTCOME_PEER_WON;
+                match_winner_idx = 0;
+            } else if (p2_wins > p1_wins) {
+                outcome = (g_player_index == 1)
+                            ? FM2K_MATCH_OUTCOME_SELF_WON
+                            : FM2K_MATCH_OUTCOME_PEER_WON;
+                match_winner_idx = 1;
+            } else {
+                outcome = FM2K_MATCH_OUTCOME_DRAW;
+                match_winner_idx = 2;
+            }
+            match_rounds_p1 = (uint8_t)p1_wins;
+            match_rounds_p2 = (uint8_t)p2_wins;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: match outcome p1_wins=%u p2_wins=%u outcome=%d",
                 p1_wins, p2_wins, (int)outcome);
@@ -1867,7 +1950,28 @@ void Netplay_EndBattle() {
 
     // Tell the spectator tree the match is over — subscribers receive
     // MATCH_END and go idle until the next SpectatorNode_OnMatchStart.
-    SpectatorNode_OnMatchEnd();
+    // C7: payload carries winner + per-side rounds + frames_total for
+    // self-describing .fm2krep files. frames_total is computed inside
+    // SpectatorNode_AppendMatchEnd via session-input-frame delta against
+    // the most-recent MATCH_START — host-side bookkeeping, no caller
+    // input needed for that field.
+    MatchEndPayload match_end_payload = {};
+    match_end_payload.winner_idx     = match_winner_idx;
+    match_end_payload.rounds_won_p1  = match_rounds_p1;
+    match_end_payload.rounds_won_p2  = match_rounds_p2;
+    match_end_payload.frames_total   = 0;  // filled inside Append
+    SpectatorNode_OnMatchEnd(match_end_payload);
+
+    // Refresh the snapshot cache to the post-match state. Without this,
+    // a CURRENT_MATCH spectator joining during the next CSS would receive
+    // the previous battle's start-of-match snapshot and replay the entire
+    // prior match before reaching the live edge. With it, the cache reflects
+    // the post-MATCH_END state — joiner loads "the moment match 1 ended" and
+    // replays only the CSS cursor inputs that have accumulated since.
+    // SaveState_Save(0) writes slot 0 with the current live state; gekkonet
+    // will overwrite slot 0 naturally as battle 2's frames advance, so the
+    // ring's correctness for rollback in the next match is unaffected.
+    SpectatorNode_StashSnapshot();
 
     // C7: per-battle .fm2krep — slice the SessionEvent log between the most
     // recent MATCH_START and the just-appended MATCH_END. Same on-disk

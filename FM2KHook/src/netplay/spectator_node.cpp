@@ -3,6 +3,7 @@
 #include "control_channel.h"
 #include "netplay.h"
 #include "replay.h"
+#include "savestate.h"            // SaveState_Save / Peek for snapshot capture
 #include "netplay_state.h"
 #include "../audio/sound_rollback.h"  // Op apply: SOUND_INIT
 #include "gekkonet.h"
@@ -41,13 +42,17 @@ constexpr size_t REDUNDANCY_WINDOW = 32;
 
 // Subscriber entry from the host's perspective.
 struct Subscriber {
-    sockaddr_in addr;
-    uint64_t    last_seen_ms;
-    uint32_t    ack_frame;    // Last frame we know this subscriber has. TODO: fill on SPEC_ACK.
-    bool        tcp_bound;    // True once SpectatorTCP::RegisterAcceptedClient(addr)
-                              // has paired this sub with an accepted TCP socket.
-                              // Until then, INITIAL_MATCH + backfill are deferred —
-                              // any send before binding silently drops on the floor.
+    sockaddr_in  addr;
+    uint64_t     last_seen_ms;
+    uint32_t     ack_frame;    // Last frame we know this subscriber has. TODO: fill on SPEC_ACK.
+    bool         tcp_bound;    // True once SpectatorTCP::RegisterAcceptedClient(addr)
+                               // has paired this sub with an accepted TCP socket.
+                               // Until then, INITIAL_MATCH + backfill are deferred —
+                               // any send before binding silently drops on the floor.
+    SpecJoinMode join_mode;    // Backfill preference declared in SPEC_JOIN_REQ.
+                               // Phase 1: stored only; phase 3 branches on it
+                               // (CURRENT_MATCH ships snapshot+tail instead of
+                               // SendSessionBackfillTo from frame 0).
 };
 
 // Cached initial-match metadata so new joiners get a consistent handoff.
@@ -91,6 +96,25 @@ struct State {
     // -1 sentinel = no MATCH_START emitted in this session yet.
     int64_t                   last_match_start_idx   = -1;
 
+    // Snapshot cache (task #18 phase 2). Refreshed by StashSnapshot at
+    // every Netplay_StartBattle. When a spectator joins with mode=
+    // CURRENT_MATCH, the host's TickHostMaintenance bind path will (in
+    // phase 3) send this blob via SNAPSHOT_BEGIN/CHUNK/END instead of
+    // calling SendSessionBackfillTo from frame 0. Spectator's
+    // SaveState_Load on receipt skips every prior match.
+    //
+    // Empty / invalid before the first match starts. New session_events
+    // accumulating during pre-battle CSS don't disturb the previous
+    // snapshot — it just goes stale until the next StashSnapshot
+    // overwrites it.
+    struct SnapshotCache {
+        std::vector<uint8_t> blob;
+        uint32_t             input_frame  = 0;
+        uint32_t             match_index  = 0;
+        uint32_t             checksum     = 0;
+        bool                 valid        = false;
+    } current_snapshot;
+
     // ─── VIEWER SIDE: playback queue ───────────────────────────────────
     // Populated by HandleSpecData (decodes incoming EVENT_BATCH /
     // INPUT_BATCH); consumed by RunSpectatorTick. Mirrors the host's
@@ -100,6 +124,22 @@ struct State {
     // the apply paths.
     std::vector<SessionEvent> pb_queue;
     std::vector<MatchHeader>  pb_match_headers;
+
+    // Snapshot reassembly buffer (task #18 phase 4). Filled across
+    // SNAPSHOT_BEGIN → SNAPSHOT_CHUNK*N → SNAPSHOT_END from the upstream's
+    // CURRENT_MATCH bind path. Applied once via SaveState_LoadFromBytes
+    // when END validates; cleared on apply or on protocol error.
+    //
+    // anchor_frame = SNAPSHOT_BEGIN's start_frame, replayed into
+    // next_expected_frame at apply time so the EVENT_BATCH stream that
+    // follows resumes exactly where the host stashed the snapshot.
+    struct SnapshotInbox {
+        std::vector<uint8_t> blob;
+        SnapshotMetadata     meta            = {};
+        uint32_t             anchor_frame    = 0;
+        size_t               bytes_received  = 0;
+        bool                 active          = false;
+    } pb_snapshot_inbox;
 
     // Viewer-side state (this node subscribed upstream).
     bool                      subscribed_upstream = false;
@@ -139,9 +179,39 @@ struct State {
     uint8_t                   pb_p2_color         = 0;
     uint16_t                  pb_current_p1       = 0;
     uint16_t                  pb_current_p2       = 0;
+
+    // C7 — host's session_id for this peer connection. Generated lazily
+    // (first AppendSessionId call) and stays stable until the SpectatorNode
+    // is shut down or the next AppendSessionId overwrites it. The wire
+    // event sources g_state.session_events; the file writer sources this
+    // field; spectator-side application copies the wire payload here so
+    // a spectator's own .fm2kset/.fm2krep recordings carry the same id
+    // as the upstream's.
+    uint64_t                  session_id           = 0;
 };
 
 State g_state;
+
+// Classic Fletcher-32 over a byte buffer. Used both by the C9 desync
+// fingerprint and the task-#18 snapshot-blob checksum. Self-contained so
+// the test-side mirror can verify by replicating the algorithm without
+// pulling in any production headers.
+uint32_t Fletcher32(const uint8_t* data, size_t len) {
+    uint32_t sum1 = 0xFFFF, sum2 = 0xFFFF;
+    size_t i = 0;
+    while (i + 1 < len) {
+        uint16_t w = (uint16_t)data[i] | ((uint16_t)data[i + 1] << 8);
+        sum1 = (sum1 + w)    % 0xFFFFu;
+        sum2 = (sum2 + sum1) % 0xFFFFu;
+        i += 2;
+    }
+    if (i < len) {
+        uint16_t w = data[i];
+        sum1 = (sum1 + w)    % 0xFFFFu;
+        sum2 = (sum2 + sum1) % 0xFFFFu;
+    }
+    return (sum2 << 16) | sum1;
+}
 
 // =============================================================================
 // UDP HELPERS
@@ -199,10 +269,19 @@ void AppendEventToWire(std::vector<uint8_t>& out, const SessionEvent& ev,
             }
             break;
         case SessionEventType::MATCH_END:
-            w = SessionEvent_EncodeMatchEnd(buf, sizeof(buf));
+            w = SessionEvent_EncodeMatchEnd(buf, sizeof(buf), ev.u.match_end);
             break;
         case SessionEventType::FINGERPRINT:
             w = SessionEvent_EncodeFingerprint(buf, sizeof(buf), ev.u.fingerprint_hash);
+            break;
+        case SessionEventType::ROUND_START:
+            w = SessionEvent_EncodeRoundStart(buf, sizeof(buf), ev.u.round_start);
+            break;
+        case SessionEventType::ROUND_END:
+            w = SessionEvent_EncodeRoundEnd(buf, sizeof(buf), ev.u.round_end);
+            break;
+        case SessionEventType::SESSION_ID:
+            w = SessionEvent_EncodeSessionId(buf, sizeof(buf), ev.u.session_id);
             break;
     }
     if (w > 0) out.insert(out.end(), buf, buf + w);
@@ -288,22 +367,33 @@ void FlushBatch() {
 // session_events traversal.
 constexpr size_t BACKFILL_CHUNK_BYTES = 1024;
 
-void SendSessionBackfillTo(const sockaddr_in& to) {
+// Walk session_events from a given index/INPUT-frame anchor and stream
+// chunked EVENT_BATCH datagrams to a single subscriber. The legacy
+// "from frame 0" backfill is just (first_event_idx=0,
+// start_input_frame=session_start_frame); the snapshot-join path
+// (task #18 phase 3) calls with the snapshot's anchor — events emitted
+// reflect "everything from the snapshot's frame onward," not the
+// preceding history we already shipped via SNAPSHOT_*.
+void SendSessionEventsTo(const sockaddr_in& to,
+                         size_t   first_event_idx,
+                         uint32_t start_input_frame) {
     const size_t total_events = g_state.session_events.size();
-    if (total_events == 0) return;
+    if (first_event_idx >= total_events) return;
 
     char addr_buf[48] = {};
     FormatAddr(to, addr_buf, sizeof(addr_buf));
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: backfilling %zu events (%u INPUTs) to %s",
-                total_events, g_state.total_input_count, addr_buf);
+                "SpectatorNode: streaming events [%zu..%zu) (%u INPUTs total in session) "
+                "to %s, anchor INPUT-frame=%u",
+                first_event_idx, total_events, g_state.total_input_count,
+                addr_buf, start_input_frame);
 
     // Walk session_events, packing into chunks bounded by BACKFILL_CHUNK_BYTES.
     // For each chunk, hdr.start_frame is the INPUT-frame index of the first
     // INPUT *in the chunk*. If a chunk is non-INPUT-only (rare; trailing
     // ops at session tail), use the running input cursor.
-    size_t   ev_idx          = 0;
-    uint32_t cursor_inputs   = g_state.session_start_frame;  // INPUT-frame idx of session_events[0]
+    size_t   ev_idx          = first_event_idx;
+    uint32_t cursor_inputs   = start_input_frame;
 
     while (ev_idx < total_events) {
         std::vector<uint8_t> payload;
@@ -343,11 +433,24 @@ void SendSessionBackfillTo(const sockaddr_in& to) {
                     }
                     break;
                 case SessionEventType::MATCH_END:
-                    one_w = SessionEvent_EncodeMatchEnd(one, sizeof(one));
+                    one_w = SessionEvent_EncodeMatchEnd(one, sizeof(one),
+                                                        ev.u.match_end);
                     break;
                 case SessionEventType::FINGERPRINT:
                     one_w = SessionEvent_EncodeFingerprint(one, sizeof(one),
                                                            ev.u.fingerprint_hash);
+                    break;
+                case SessionEventType::ROUND_START:
+                    one_w = SessionEvent_EncodeRoundStart(one, sizeof(one),
+                                                          ev.u.round_start);
+                    break;
+                case SessionEventType::ROUND_END:
+                    one_w = SessionEvent_EncodeRoundEnd(one, sizeof(one),
+                                                        ev.u.round_end);
+                    break;
+                case SessionEventType::SESSION_ID:
+                    one_w = SessionEvent_EncodeSessionId(one, sizeof(one),
+                                                         ev.u.session_id);
                     break;
             }
             if (one_w == 0) { ++ev_idx; continue; }   // unknown / unencodable
@@ -392,6 +495,151 @@ void SendSessionBackfillTo(const sockaddr_in& to) {
     }
 }
 
+// Legacy entry point: ships ALL session_events from frame 0. Used by
+// FULL_SESSION-mode subscribers and as the back-compat fallback when
+// CURRENT_MATCH was requested but no snapshot has been captured yet
+// (e.g. JOIN_REQ landed mid-CSS before any battle started).
+void SendSessionBackfillTo(const sockaddr_in& to) {
+    SendSessionEventsTo(to, 0, g_state.session_start_frame);
+}
+
+// Phase 3 entry point: ships only events at-or-after the given INPUT-frame
+// anchor. Paired with SendSnapshotTo for CURRENT_MATCH-mode subscribers —
+// the snapshot covers state up to its anchor frame, then this fills in
+// the events from there to live edge.
+//
+// Linear scan over session_events to find the first event whose
+// session-relative INPUT-frame index >= anchor_frame. Non-INPUT events
+// (PIN_RNG / RESET / SOUND_INIT / MATCH_START / MATCH_END / FINGERPRINT)
+// don't have an explicit frame number; they belong to "the INPUT that
+// follows them" so we keep them grouped. We therefore find the FIRST
+// INPUT >= anchor and back up to include any preceding non-INPUT ops in
+// the same group.
+void SendSessionBackfillFromFrame(const sockaddr_in& to,
+                                  uint32_t anchor_input_frame) {
+    const size_t total = g_state.session_events.size();
+    if (total == 0) return;
+
+    // Walk session_events tracking the running input-frame cursor; find
+    // the first INPUT event whose cursor value == anchor_input_frame.
+    uint32_t cursor = g_state.session_start_frame;
+    size_t   first_idx = total;   // sentinel: nothing matched
+    for (size_t i = 0; i < total; ++i) {
+        const SessionEvent& ev = g_state.session_events[i];
+        if (ev.type == SessionEventType::INPUT) {
+            if (cursor >= anchor_input_frame) {
+                first_idx = i;
+                break;
+            }
+            ++cursor;
+        }
+    }
+
+    if (first_idx >= total) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: no events at-or-after INPUT-frame=%u "
+            "(total INPUTs=%u, snapshot is at the live edge)",
+            anchor_input_frame, g_state.total_input_count);
+        return;
+    }
+
+    // Back up over any non-INPUT ops immediately preceding first_idx
+    // so they belong to the SAME chunk as their following INPUT (the
+    // spectator's drain semantic applies them just before that INPUT
+    // pops). Without this, ops would land in the previous chunk that
+    // we're skipping → spectator misses PIN_RNG/etc that should fire
+    // at the snapshot's anchor frame.
+    while (first_idx > 0 &&
+           g_state.session_events[first_idx - 1].type != SessionEventType::INPUT) {
+        --first_idx;
+    }
+
+    SendSessionEventsTo(to, first_idx, anchor_input_frame);
+}
+
+// Phase 3: ship the cached SaveState blob to a single subscriber as a
+// SNAPSHOT_BEGIN / SNAPSHOT_CHUNK*N / SNAPSHOT_END sequence. Spectator
+// reassembles in HandleSpecData (phase 4) and calls SaveState_Load on
+// END. After this, host must call SendSessionBackfillFromFrame with the
+// snapshot's input_frame anchor so the spectator's pb_queue picks up at
+// the same point the loaded state expects.
+//
+// Idempotent and side-effect-free on g_state. Caller is responsible for
+// ordering this BEFORE BroadcastToAll re-engages for the new sub
+// (TickHostMaintenance handles that via the backfill_done fence).
+void SendSnapshotTo(const sockaddr_in& to) {
+    const auto& cache = g_state.current_snapshot;
+    if (!cache.valid || cache.blob.empty()) return;
+
+    char addr_buf[48] = {};
+    FormatAddr(to, addr_buf, sizeof(addr_buf));
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: shipping snapshot to %s "
+                "(match=%u, %zu bytes, anchor INPUT-frame=%u)",
+                addr_buf, cache.match_index, cache.blob.size(), cache.input_frame);
+
+    // ---- SNAPSHOT_BEGIN ----------------------------------------------
+    {
+        SnapshotMetadata meta = {};
+        meta.version     = SPECTATOR_SNAPSHOT_VERSION;
+        meta.total_bytes = (uint32_t)cache.blob.size();
+        meta.match_index = cache.match_index;
+
+        std::vector<uint8_t> buf(sizeof(SpecDataHeader) + sizeof(meta));
+        SpecDataHeader hdr = {};
+        hdr.magic       = SPEC_DATA_MAGIC;
+        hdr.type        = SpecDataType::SNAPSHOT_BEGIN;
+        hdr.start_frame = cache.input_frame;       // anchor for spectator's next_expected_frame
+        hdr.frame_count = 0;
+        hdr.flags       = (uint16_t)sizeof(meta);  // 16 — payload byte count
+        std::memcpy(buf.data(), &hdr, sizeof(hdr));
+        std::memcpy(buf.data() + sizeof(hdr), &meta, sizeof(meta));
+        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+    }
+
+    // ---- SNAPSHOT_CHUNK xN -------------------------------------------
+    size_t emitted = 0;
+    while (emitted < cache.blob.size()) {
+        const size_t remaining = cache.blob.size() - emitted;
+        const size_t chunk_n   = std::min(remaining, SPECTATOR_SNAPSHOT_CHUNK_BYTES);
+
+        std::vector<uint8_t> buf(sizeof(SpecDataHeader) + chunk_n);
+        SpecDataHeader hdr = {};
+        hdr.magic       = SPEC_DATA_MAGIC;
+        hdr.type        = SpecDataType::SNAPSHOT_CHUNK;
+        hdr.start_frame = (uint32_t)emitted;       // byte offset (running)
+        hdr.frame_count = 0;
+        hdr.flags       = (uint16_t)chunk_n;
+        std::memcpy(buf.data(), &hdr, sizeof(hdr));
+        std::memcpy(buf.data() + sizeof(hdr),
+                    cache.blob.data() + emitted, chunk_n);
+        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+
+        emitted += chunk_n;
+    }
+
+    // ---- SNAPSHOT_END -------------------------------------------------
+    {
+        std::vector<uint8_t> buf(sizeof(SpecDataHeader) + sizeof(uint32_t));
+        SpecDataHeader hdr = {};
+        hdr.magic       = SPEC_DATA_MAGIC;
+        hdr.type        = SpecDataType::SNAPSHOT_END;
+        hdr.start_frame = 0;
+        hdr.frame_count = 0;
+        hdr.flags       = (uint16_t)sizeof(uint32_t);  // 4
+        std::memcpy(buf.data(), &hdr, sizeof(hdr));
+        std::memcpy(buf.data() + sizeof(hdr), &cache.checksum, sizeof(uint32_t));
+        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: snapshot shipped (%zu bytes in %zu chunks, fletcher32=0x%08X)",
+                cache.blob.size(),
+                (cache.blob.size() + SPECTATOR_SNAPSHOT_CHUNK_BYTES - 1) /
+                    SPECTATOR_SNAPSHOT_CHUNK_BYTES,
+                cache.checksum);
+}
+
 // Legacy SendMatchEndToAll / MATCH_END packet path removed in C12.
 // MATCH_END flows as a SessionEvent op (see SpectatorNode_AppendMatchEnd).
 
@@ -423,15 +671,18 @@ size_t WirePayloadSize(SessionEventType t) {
         case SessionEventType::RESET_INPUT_STATE: return 0;
         case SessionEventType::SOUND_INIT:        return 0;
         case SessionEventType::MATCH_START:       return SESSION_EVENT_MATCH_HDR_SIZE;
-        case SessionEventType::MATCH_END:         return 0;
+        case SessionEventType::MATCH_END:         return sizeof(MatchEndPayload);    // 7  (was 0 in v1)
         case SessionEventType::FINGERPRINT:       return 4;   // u32
+        case SessionEventType::ROUND_START:       return sizeof(RoundStartPayload);  // 7
+        case SessionEventType::ROUND_END:         return sizeof(RoundEndPayload);    // 9
+        case SessionEventType::SESSION_ID:        return 8;   // u64
     }
     return SIZE_MAX;  // unknown tag — caller treats as malformed
 }
 
 bool IsValidEventTag(uint8_t tag) {
     return tag >= static_cast<uint8_t>(SessionEventType::INPUT)
-        && tag <= static_cast<uint8_t>(SessionEventType::FINGERPRINT);
+        && tag <= static_cast<uint8_t>(SessionEventType::SESSION_ID);
 }
 
 } // namespace
@@ -474,10 +725,36 @@ size_t SessionEvent_EncodeMatchStart(uint8_t* out, size_t cap,
     return need;
 }
 
-size_t SessionEvent_EncodeMatchEnd(uint8_t* out, size_t cap) {
-    if (cap < 1) return 0;
+size_t SessionEvent_EncodeMatchEnd(uint8_t* out, size_t cap, const MatchEndPayload& p) {
+    constexpr size_t need = 1 + sizeof(MatchEndPayload);
+    if (cap < need) return 0;
     out[0] = static_cast<uint8_t>(SessionEventType::MATCH_END);
-    return 1;
+    std::memcpy(out + 1, &p, sizeof(p));
+    return need;
+}
+
+size_t SessionEvent_EncodeSessionId(uint8_t* out, size_t cap, uint64_t session_id) {
+    constexpr size_t need = 1 + 8;
+    if (cap < need) return 0;
+    out[0] = static_cast<uint8_t>(SessionEventType::SESSION_ID);
+    std::memcpy(out + 1, &session_id, 8);
+    return need;
+}
+
+size_t SessionEvent_EncodeRoundStart(uint8_t* out, size_t cap, const RoundStartPayload& p) {
+    constexpr size_t need = 1 + sizeof(RoundStartPayload);
+    if (cap < need) return 0;
+    out[0] = static_cast<uint8_t>(SessionEventType::ROUND_START);
+    std::memcpy(out + 1, &p, sizeof(p));
+    return need;
+}
+
+size_t SessionEvent_EncodeRoundEnd(uint8_t* out, size_t cap, const RoundEndPayload& p) {
+    constexpr size_t need = 1 + sizeof(RoundEndPayload);
+    if (cap < need) return 0;
+    out[0] = static_cast<uint8_t>(SessionEventType::ROUND_END);
+    std::memcpy(out + 1, &p, sizeof(p));
+    return need;
 }
 
 size_t SessionEvent_EncodeFingerprint(uint8_t* out, size_t cap, uint32_t hash) {
@@ -519,9 +796,20 @@ size_t SessionEvent_Decode(const uint8_t* in, size_t in_len,
                 // u.match_start_idx left at 0 — caller assigns when appending
                 // to its match_headers side table.
                 break;
+            case SessionEventType::ROUND_START:
+                std::memcpy(&out_event->u.round_start, in + 1, sizeof(RoundStartPayload));
+                break;
+            case SessionEventType::ROUND_END:
+                std::memcpy(&out_event->u.round_end, in + 1, sizeof(RoundEndPayload));
+                break;
+            case SessionEventType::MATCH_END:
+                std::memcpy(&out_event->u.match_end, in + 1, sizeof(MatchEndPayload));
+                break;
+            case SessionEventType::SESSION_ID:
+                std::memcpy(&out_event->u.session_id, in + 1, 8);
+                break;
             case SessionEventType::RESET_INPUT_STATE:
             case SessionEventType::SOUND_INIT:
-            case SessionEventType::MATCH_END:
                 break;
         }
     }
@@ -688,7 +976,7 @@ void SpectatorNode_OnFrameConfirmed(uint16_t p1_input, uint16_t p2_input) {
     }
 }
 
-void SpectatorNode_OnMatchEnd() {
+void SpectatorNode_OnMatchEnd(const MatchEndPayload& p) {
     if (!g_state.broadcasting) return;
     // Flush whatever's left in the pending event window so viewers see the
     // final frames before MATCH_END.
@@ -696,10 +984,12 @@ void SpectatorNode_OnMatchEnd() {
     // MATCH_END flows in-band as a SessionEvent op; the apply-at-head drain
     // on the receiver flips playing_back=false at the same logical frame
     // the host appended. (Legacy MATCH_END packet was retired in C12.)
-    SpectatorNode_AppendMatchEnd();
+    SpectatorNode_AppendMatchEnd(p);
     g_state.broadcasting = false;
     g_state.initial_match.valid = false;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SpectatorNode: Match end broadcast");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: Match end broadcast (winner=%u rounds=%u-%u frames=%u)",
+        p.winner_idx, p.rounds_won_p1, p.rounds_won_p2, p.frames_total);
 }
 
 // -----------------------------------------------------------------------------
@@ -757,6 +1047,41 @@ void SpectatorNode_AppendFingerprint(uint32_t hash) {
     AppendOpAndFlush(ev);
 }
 
+// C3.5 — round events. Snapshot input-frame at ROUND_START so AppendRoundEnd
+// can compute frames_elapsed without the hook needing access to the private
+// total_input_count counter.
+static uint32_t s_round_start_input_frame = 0;
+
+void SpectatorNode_AppendRoundStart(uint8_t  round_idx,
+                                    uint16_t p1_hp_max,
+                                    uint16_t p2_hp_max,
+                                    uint16_t timer_seconds) {
+    s_round_start_input_frame = g_state.total_input_count;
+    SessionEvent ev{};
+    ev.type = SessionEventType::ROUND_START;
+    ev.u.round_start.round_idx     = round_idx;
+    ev.u.round_start.p1_hp_max     = p1_hp_max;
+    ev.u.round_start.p2_hp_max     = p2_hp_max;
+    ev.u.round_start.timer_seconds = timer_seconds;
+    AppendOpAndFlush(ev);
+}
+
+void SpectatorNode_AppendRoundEnd(uint8_t  winner_idx,
+                                  uint16_t p1_hp_remaining,
+                                  uint16_t p2_hp_remaining) {
+    const uint32_t frames =
+        (g_state.total_input_count >= s_round_start_input_frame)
+            ? (g_state.total_input_count - s_round_start_input_frame)
+            : 0;
+    SessionEvent ev{};
+    ev.type = SessionEventType::ROUND_END;
+    ev.u.round_end.winner_idx       = winner_idx;
+    ev.u.round_end.p1_hp_remaining  = p1_hp_remaining;
+    ev.u.round_end.p2_hp_remaining  = p2_hp_remaining;
+    ev.u.round_end.frames_elapsed   = frames;
+    AppendOpAndFlush(ev);
+}
+
 // =============================================================================
 // FINGERPRINT (C9) — diagnostic state hash for desync detection
 // =============================================================================
@@ -807,27 +1132,13 @@ uint32_t SpectatorFingerprint_Compute() {
     s.p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
     s.p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
 
-    // Classic Fletcher-32 over the packed sample. Keep this implementation
-    // self-contained (rather than reusing savestate.cpp's xxhash wrapper)
-    // so the test mirror in test_spectator_protocol.cpp can match byte-
-    // for-byte without pulling xxhash into the test build.
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(&s);
-    const size_t   len  = sizeof(s);
-    uint32_t sum1 = 0xFFFF, sum2 = 0xFFFF;
-    size_t i = 0;
-    while (i + 1 < len) {
-        uint16_t w = (uint16_t)data[i] | ((uint16_t)data[i + 1] << 8);
-        sum1 = (sum1 + w)    % 0xFFFFu;
-        sum2 = (sum2 + sum1) % 0xFFFFu;
-        i += 2;
-    }
-    if (i < len) {
-        uint16_t w = data[i];
-        sum1 = (sum1 + w)    % 0xFFFFu;
-        sum2 = (sum2 + sum1) % 0xFFFFu;
-    }
-    return (sum2 << 16) | sum1;
+    return Fletcher32(reinterpret_cast<const uint8_t*>(&s), sizeof(s));
 }
+
+// Snapshot at MATCH_START for the C7 frames_total computation in
+// AppendMatchEnd. Reset on every MATCH_START so back-to-back matches
+// each get an accurate per-match input-frame delta.
+static uint32_t s_match_start_input_frame = 0;
 
 void SpectatorNode_AppendMatchStart(const uint8_t header[96]) {
     // Stash the 96-byte header in the side table and reference it by index
@@ -835,6 +1146,8 @@ void SpectatorNode_AppendMatchStart(const uint8_t header[96]) {
     MatchHeader hdr_copy;
     std::memcpy(hdr_copy.data(), header, hdr_copy.size());
     g_state.match_headers.push_back(hdr_copy);
+
+    s_match_start_input_frame = g_state.total_input_count;
 
     SessionEvent ev{};
     ev.type = SessionEventType::MATCH_START;
@@ -845,10 +1158,101 @@ void SpectatorNode_AppendMatchStart(const uint8_t header[96]) {
     AppendOpAndFlush(ev);
 }
 
-void SpectatorNode_AppendMatchEnd() {
+void SpectatorNode_AppendMatchEnd(const MatchEndPayload& p) {
     SessionEvent ev{};
-    ev.type = SessionEventType::MATCH_END;
+    ev.type        = SessionEventType::MATCH_END;
+    ev.u.match_end = p;
+    // Caller passes frames_total=0; we compute the actual value here so
+    // hook code (Netplay_EndBattle) doesn't need access to the private
+    // total_input_count counter.
+    ev.u.match_end.frames_total =
+        (g_state.total_input_count >= s_match_start_input_frame)
+            ? (g_state.total_input_count - s_match_start_input_frame)
+            : 0;
     AppendOpAndFlush(ev);
+}
+
+void SpectatorNode_AppendSessionId(uint64_t session_id) {
+    g_state.session_id = session_id;
+    SessionEvent ev{};
+    ev.type          = SessionEventType::SESSION_ID;
+    ev.u.session_id  = session_id;
+    AppendOpAndFlush(ev);
+}
+
+uint64_t SpectatorNode_GetSessionId() {
+    return g_state.session_id;
+}
+
+// =============================================================================
+// SNAPSHOT CACHE (task #18 phase 2)
+// =============================================================================
+//
+// Capture a fresh SaveState blob at battle entry so a CURRENT_MATCH-mode
+// spectator joining mid-set can SaveState_Load directly to the current
+// match's start instead of replaying every previous battle's events.
+//
+// Why call SaveState_Save(0) ourselves: the GekkoNet driver normally
+// triggers Save in its first AdvanceEvent (a few sim frames after
+// Netplay_StartBattle), but we want the snapshot CAPTURED at the same
+// logical instant the host emitted MATCH_START — before any battle
+// frame has run, so the spectator's state on Load is "match just
+// starting, frame 0 input pending." That keeps the wire-anchor clean:
+// snapshot.input_frame == g_state.total_input_count, and the very next
+// INPUT event the host appends becomes the spectator's first popped
+// frame after Load.
+
+void SpectatorNode_StashSnapshot() {
+    // Force a Save to populate the rollback buffer's slot 0 with the
+    // current FM2K state. Sets g_initial_sync_done in savestate.cpp;
+    // GekkoNet's later first-Save is a no-op for the initial-sync reset.
+    if (!SaveState_Save(0)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: StashSnapshot — SaveState_Save(0) failed; "
+            "snapshot cache stays %s",
+            g_state.current_snapshot.valid ? "the previous match's" : "empty");
+        return;
+    }
+
+    const uint8_t* slot_bytes = SaveState_PeekLastSavedSlotBytes();
+    const size_t   slot_size  = SaveState_GetSlotByteSize();
+    if (!slot_bytes || slot_size == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: StashSnapshot — slot bytes unavailable post-Save");
+        return;
+    }
+
+    auto& cache = g_state.current_snapshot;
+    cache.blob.assign(slot_bytes, slot_bytes + slot_size);
+    cache.input_frame = g_state.total_input_count;
+    // match_index = 0-based count of MATCH_STARTs emitted so far.
+    // AppendMatchStart pushes to match_headers BEFORE StashSnapshot
+    // is called (Netplay_StartBattle calls OnMatchStart → AppendMatchStart
+    // → THEN StashSnapshot), so size already reflects this match.
+    cache.match_index = g_state.match_headers.empty() ? 0u
+                        : (uint32_t)(g_state.match_headers.size() - 1);
+    cache.checksum    = Fletcher32(cache.blob.data(), cache.blob.size());
+    cache.valid       = true;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: snapshot cached (match=%u, %zu bytes, "
+        "input_frame=%u, fletcher32=0x%08X)",
+        cache.match_index, cache.blob.size(),
+        cache.input_frame, cache.checksum);
+}
+
+bool SpectatorNode_HasSnapshot() {
+    return g_state.current_snapshot.valid;
+}
+
+SpectatorSnapshotInfo SpectatorNode_GetSnapshotInfo() {
+    SpectatorSnapshotInfo out = {};
+    if (!g_state.current_snapshot.valid) return out;
+    out.input_frame = g_state.current_snapshot.input_frame;
+    out.match_index = g_state.current_snapshot.match_index;
+    out.total_bytes = (uint32_t)g_state.current_snapshot.blob.size();
+    out.checksum    = g_state.current_snapshot.checksum;
+    return out;
 }
 
 // =============================================================================
@@ -866,36 +1270,124 @@ void SpectatorNode_AppendMatchEnd() {
 namespace {
 
 constexpr uint32_t SESSION_FILE_MAGIC   = 0x53534D46;  // 'FMSS' little-endian
-constexpr uint16_t SESSION_FILE_VERSION = 1;
+constexpr uint16_t SESSION_FILE_VERSION = 2;           // 256 B header (C7)
 
 #pragma pack(push, 1)
-struct SessionFileHeader {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t flags;            // bit 0: 1=battle slice, 0=full session
-    uint64_t unix_timestamp;
+// C7 — 256 B enriched header.
+//
+// Carries everything the launcher's replay-browser tree needs without
+// rescanning the body bytes: nicks, character/color, winner + per-side
+// rounds_won, session grouping (session_id + match_index), and a
+// round_offsets[] table of byte positions so round-level seek is a
+// single fread+fseek instead of a body walk.
+//
+// Body layout unchanged: same packed SessionEvent[] bytes after the header.
+struct FM2KSessionFileHeader {
+    // wire envelope (preserves first 8 bytes from v1 layout)
+    uint32_t magic;              // 'FMSS' (0x53534D46)
+    uint16_t version;            // = 2
+    uint16_t flags;              // bit 0: 1=battle slice (.fm2krep), 0=full session (.fm2kset)
+                                 // bit 1: 1=round_offsets[] populated
+
+    // descriptive
+    uint64_t started_at_unix;
+    uint64_t finished_at_unix;
     uint32_t event_count;
     uint32_t input_count;
-    uint8_t  reserved[8];
+    char     game_id[32];        // e.g. "pkmncc"
+    char     p1_nick[32];
+    char     p2_nick[32];
+
+    // character / outcome
+    uint8_t  p1_char_id;
+    uint8_t  p2_char_id;
+    uint8_t  p1_color;
+    uint8_t  p2_color;
+    uint8_t  rounds_won_p1;      // from latest MATCH_END payload
+    uint8_t  rounds_won_p2;
+    uint8_t  match_count;        // .fm2kset: total in session; .fm2krep: 1
+    uint8_t  match_index;        // .fm2krep: 1-based; .fm2kset: 0
+    uint64_t session_id;         // shared across .fm2krep slices of one .fm2kset
+
+    // seek anchors — body-relative byte offsets pointing at ROUND_START
+    // tag bytes. Unused slots = 0. Capped at 8 (best-of-15 doesn't exist).
+    uint8_t  round_count;        // 0..8
+    uint8_t  reserved0[3];
+    uint32_t round_offsets[8];
+
+    // future-proofing — all zeros for v2 readers
+    uint8_t  reserved[76];
 };
-static_assert(sizeof(SessionFileHeader) == 32, "SessionFileHeader must be 32 bytes");
+static_assert(sizeof(FM2KSessionFileHeader) == 256,
+              "FM2KSessionFileHeader must be 256 bytes");
 #pragma pack(pop)
 
 // Encode events[first..last) into a vector<uint8_t> of packed wire bytes.
 // MATCH_START events look up their 96-byte header from the host's
-// match_headers side table.
+// match_headers side table. While encoding, record the body-relative byte
+// offset of each ROUND_START tag we emit so the C7 header can populate
+// round_offsets[].
 void EncodeEventSliceToBytes(const std::vector<SessionEvent>& events,
                              const std::vector<MatchHeader>& headers,
                              size_t first, size_t last,
                              std::vector<uint8_t>& out_bytes,
-                             uint32_t& out_input_count) {
+                             uint32_t& out_input_count,
+                             std::vector<uint32_t>& out_round_offsets) {
     out_input_count = 0;
+    out_round_offsets.clear();
     out_bytes.reserve((last - first) * SESSION_EVENT_MAX_WIRE_SIZE);
     for (size_t i = first; i < last; i++) {
         const SessionEvent& ev = events[i];
+        const size_t off_pre = out_bytes.size();
         AppendEventToWire(out_bytes, ev, headers);
         if (ev.type == SessionEventType::INPUT) ++out_input_count;
+        if (ev.type == SessionEventType::ROUND_START) {
+            out_round_offsets.push_back(static_cast<uint32_t>(off_pre));
+        }
     }
+}
+
+// Locate the most-recent MATCH_START event preceding the given index in the
+// slice and return its 96-byte header bytes (empty if none in slice). Used
+// at write time to populate the C7 header's char IDs.
+bool ResolveMatchHeader(const std::vector<SessionEvent>& events,
+                        const std::vector<MatchHeader>& headers,
+                        size_t first, size_t last,
+                        MatchHeader& out_hdr) {
+    for (size_t i = last; i-- > first; ) {
+        const SessionEvent& ev = events[i];
+        if (ev.type == SessionEventType::MATCH_START &&
+            ev.u.match_start_idx < headers.size()) {
+            out_hdr = headers[ev.u.match_start_idx];
+            return true;
+        }
+    }
+    return false;
+}
+
+// Find the most-recent MATCH_END payload in the slice (used to populate the
+// header's winner / per-side rounds_won fields for .fm2krep). For .fm2kset
+// (full session) this is the LAST match's MATCH_END which is the right
+// summary for the session.
+bool ResolveLatestMatchEnd(const std::vector<SessionEvent>& events,
+                           size_t first, size_t last,
+                           MatchEndPayload& out) {
+    for (size_t i = last; i-- > first; ) {
+        if (events[i].type == SessionEventType::MATCH_END) {
+            out = events[i].u.match_end;
+            return true;
+        }
+    }
+    return false;
+}
+
+uint8_t CountMatchesInSlice(const std::vector<SessionEvent>& events,
+                            size_t first, size_t last) {
+    size_t n = 0;
+    for (size_t i = first; i < last; i++) {
+        if (events[i].type == SessionEventType::MATCH_START) ++n;
+    }
+    return n > 255 ? (uint8_t)255 : (uint8_t)n;
 }
 
 bool WriteSessionFileImpl(const char* path,
@@ -908,16 +1400,54 @@ bool WriteSessionFileImpl(const char* path,
 
     std::vector<uint8_t> body;
     uint32_t input_count = 0;
-    EncodeEventSliceToBytes(events, headers, first, last, body, input_count);
+    std::vector<uint32_t> round_offsets;
+    EncodeEventSliceToBytes(events, headers, first, last,
+                            body, input_count, round_offsets);
     if (body.empty()) return false;
 
-    SessionFileHeader hdr = {};
-    hdr.magic           = SESSION_FILE_MAGIC;
-    hdr.version         = SESSION_FILE_VERSION;
-    hdr.flags           = is_battle_slice ? 1u : 0u;
-    hdr.unix_timestamp  = static_cast<uint64_t>(std::time(nullptr));
-    hdr.event_count     = static_cast<uint32_t>(last - first);
-    hdr.input_count     = input_count;
+    FM2KSessionFileHeader hdr = {};
+    hdr.magic            = SESSION_FILE_MAGIC;
+    hdr.version          = SESSION_FILE_VERSION;
+    hdr.flags            = is_battle_slice ? 1u : 0u;
+    if (!round_offsets.empty()) hdr.flags |= (1u << 1);
+
+    const uint64_t now_unix = static_cast<uint64_t>(std::time(nullptr));
+    hdr.started_at_unix  = now_unix;   // best-effort: use write time as
+    hdr.finished_at_unix = now_unix;   //   both anchors when .fm2kset is
+                                       //   written at session end.
+                                       //   (Full session walks already
+                                       //   emit at shutdown — close enough
+                                       //   for chronological sort.)
+    hdr.event_count      = static_cast<uint32_t>(last - first);
+    hdr.input_count      = input_count;
+
+    // Char/color from the most-recent MATCH_START header in this slice.
+    MatchHeader mh;
+    if (ResolveMatchHeader(events, headers, first, last, mh)) {
+        hdr.p1_char_id = mh[28];
+        hdr.p1_color   = mh[29];
+        hdr.p2_char_id = mh[30];
+        hdr.p2_color   = mh[31];
+    }
+
+    // Latest MATCH_END payload populates winner + per-side rounds.
+    MatchEndPayload me{};
+    if (ResolveLatestMatchEnd(events, first, last, me)) {
+        hdr.rounds_won_p1 = me.rounds_won_p1;
+        hdr.rounds_won_p2 = me.rounds_won_p2;
+    }
+
+    hdr.match_count  = is_battle_slice ? 1
+                                       : CountMatchesInSlice(events, first, last);
+    hdr.match_index  = is_battle_slice ? 1 : 0;
+    hdr.session_id   = g_state.session_id;
+
+    const size_t n_rounds = std::min<size_t>(round_offsets.size(),
+                                             sizeof(hdr.round_offsets) / sizeof(hdr.round_offsets[0]));
+    hdr.round_count = static_cast<uint8_t>(n_rounds);
+    for (size_t i = 0; i < n_rounds; i++) {
+        hdr.round_offsets[i] = round_offsets[i];
+    }
 
     FILE* fp = std::fopen(path, "wb");
     if (!fp) {
@@ -929,8 +1459,11 @@ bool WriteSessionFileImpl(const char* path,
     std::fwrite(body.data(), 1, body.size(), fp);
     std::fclose(fp);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "SpectatorNode: wrote %s (%u events, %u INPUTs, %zu bytes, %s)",
-        path, hdr.event_count, hdr.input_count, sizeof(hdr) + body.size(),
+        "SpectatorNode: wrote %s v2 (%u events, %u INPUTs, %u rounds, "
+        "session=0x%016llX, %zu bytes, %s)",
+        path, hdr.event_count, hdr.input_count, hdr.round_count,
+        (unsigned long long)hdr.session_id,
+        sizeof(hdr) + body.size(),
         is_battle_slice ? "battle slice" : "full session");
     return true;
 }
@@ -964,7 +1497,7 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
         return false;
     }
 
-    SessionFileHeader hdr = {};
+    FM2KSessionFileHeader hdr = {};
     if (std::fread(&hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) {
         std::fclose(fp);
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -977,13 +1510,19 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
             "SpectatorNode: %s bad magic 0x%08X", path, hdr.magic);
         return false;
     }
-    if (hdr.version > SESSION_FILE_VERSION) {
+    if (hdr.version != SESSION_FILE_VERSION) {
         std::fclose(fp);
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "SpectatorNode: %s version %u not supported (max %u)",
+            "SpectatorNode: %s unsupported version %u (expected %u)",
             path, hdr.version, SESSION_FILE_VERSION);
         return false;
     }
+    const uint32_t reported_event_count = hdr.event_count;
+    const uint64_t loaded_session_id    = hdr.session_id;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: %s loading v2 (events=%u, %u rounds, session=0x%016llX)",
+        path, hdr.event_count, hdr.round_count,
+        (unsigned long long)hdr.session_id);
 
     std::fseek(fp, 0, SEEK_END);
     long total = std::ftell(fp);
@@ -992,7 +1531,7 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
         return false;
     }
     const size_t body_len = static_cast<size_t>(total) - sizeof(hdr);
-    std::fseek(fp, sizeof(hdr), SEEK_SET);
+    std::fseek(fp, static_cast<long>(sizeof(hdr)), SEEK_SET);
     std::vector<uint8_t> body(body_len);
     if (std::fread(body.data(), 1, body_len, fp) != body_len) {
         std::fclose(fp);
@@ -1010,6 +1549,7 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
     g_state.have_frame_baseline = false;
     g_state.next_expected_frame = 0;
     g_state.playing_back = true;
+    if (loaded_session_id != 0) g_state.session_id = loaded_session_id;
 
     size_t off = 0;
     uint32_t pushed_inputs = 0;
@@ -1038,7 +1578,7 @@ bool SpectatorNode_LoadSessionFile(const char* path) {
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "SpectatorNode: loaded %s — %u events (%u INPUTs) into pb_queue",
-        path, hdr.event_count, pushed_inputs);
+        path, reported_event_count, pushed_inputs);
     return true;
 }
 
@@ -1112,15 +1652,21 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 g_state.pb_p2_char, g_state.pb_p2_color);
             break;
         }
-        case SessionEventType::MATCH_END:
+        case SessionEventType::MATCH_END: {
             // Don't clear pb_queue — let queued post-MATCH_END frames drain
             // (they render the final battle frames). The next MATCH_START
             // resets metadata and flips playing_back back on.
             g_state.playing_back = false;
+            const auto& p = ev.u.match_end;
+            const char* who = (p.winner_idx == 0) ? "P1"
+                            : (p.winner_idx == 1) ? "P2" : "DRAW";
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: applied MATCH_END (queued frames=%zu)",
+                "SpectatorNode: applied MATCH_END winner=%s rounds=%u-%u "
+                "frames=%u (queued=%zu)",
+                who, p.rounds_won_p1, p.rounds_won_p2, p.frames_total,
                 g_state.pb_queue.size());
             break;
+        }
         case SessionEventType::FINGERPRINT: {
             // C9: diagnostic mismatch detection. Host emits its hash here;
             // spectator computes the same hash on its current state and
@@ -1142,6 +1688,36 @@ void ApplySessionEvent(const SessionEvent& ev) {
             }
             break;
         }
+        case SessionEventType::ROUND_START: {
+            // C3.5 — informational on the spectator. Simulation drives banner
+            // and round-reset state from INPUT events; ROUND_START is a marker
+            // for replay-file slicing (round_offsets[]) and overlay diagnostics.
+            const auto& p = ev.u.round_start;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: ROUND_START round=%u p1_hp_max=%u p2_hp_max=%u timer=%us",
+                p.round_idx, p.p1_hp_max, p.p2_hp_max, p.timer_seconds);
+            break;
+        }
+        case SessionEventType::ROUND_END: {
+            const auto& p = ev.u.round_end;
+            const char* who = (p.winner_idx == 0) ? "P1"
+                            : (p.winner_idx == 1) ? "P2" : "DRAW";
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: ROUND_END winner=%s p1_hp=%u p2_hp=%u frames=%u",
+                who, p.p1_hp_remaining, p.p2_hp_remaining, p.frames_elapsed);
+            break;
+        }
+        case SessionEventType::SESSION_ID:
+            // C7 — informational on the spectator. The host's session_id
+            // already lives at the head of the event stream by the time
+            // we apply this; nothing else to do beyond logging. Spectator
+            // recordings (.fm2kset / .fm2krep) will inherit this id when
+            // C7's writer pulls it from g_state.
+            g_state.session_id = ev.u.session_id;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: applied SESSION_ID=0x%016llX",
+                (unsigned long long)ev.u.session_id);
+            break;
         case SessionEventType::INPUT:
             // Should not reach here — INPUT is handled by the pop path in
             // PopFrameInputs, not the drain.
@@ -1155,7 +1731,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
 // JOIN / REDIRECT
 // -----------------------------------------------------------------------------
 
-void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
+void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
@@ -1221,11 +1797,14 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from) {
         sub.last_seen_ms = GetTickCount64();
         sub.ack_frame    = 0;
         sub.tcp_bound    = false;
+        sub.join_mode    = mode;
         g_state.subscribers.push_back(sub);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: Accepted subscriber %s (%zu/%zu) — "
+                    "SpectatorNode: Accepted subscriber %s (%zu/%zu, mode=%s) — "
                     "deferring INITIAL_MATCH until TCP binds",
-                    addr_buf, g_state.subscribers.size(), g_state.capacity);
+                    addr_buf, g_state.subscribers.size(), g_state.capacity,
+                    mode == SpecJoinMode::CURRENT_MATCH ? "CURRENT_MATCH"
+                                                       : "FULL_SESSION");
 
         CtrlPacket ack = BuildJoinAck();
         ControlChannel_SendTo(ack, from);
@@ -1325,7 +1904,7 @@ std::vector<sockaddr_in> SpectatorNode_GetSubscriberAddrs() {
 // VIEWER-SIDE
 // -----------------------------------------------------------------------------
 
-bool SpectatorNode_RequestJoin(const sockaddr_in& upstream) {
+bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
     g_state.upstream_addr       = upstream;
     g_state.subscribed_upstream = false;
     g_state.join_req_pending    = true;  // Gates HandleJoinAck so a stray
@@ -1333,7 +1912,9 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream) {
                                          // promote a non-spectator client
                                          // into spectator mode.
     CtrlPacket req = {};
-    req.header.type = CtrlMsg::SPEC_JOIN_REQ;
+    req.header.type            = CtrlMsg::SPEC_JOIN_REQ;
+    req.data.spec_join_req.mode = static_cast<uint8_t>(mode);
+    // reserved bytes are zero from the {} init above.
     ControlChannel_SendTo(req, upstream);
     return true;
 }
@@ -1496,6 +2077,162 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // SessionEvent::MATCH_END op flowing through EVENT_BATCH
             // handles match-end on the new path.
             break;
+        case SpecDataType::SNAPSHOT_BEGIN: {
+            // CURRENT_MATCH-mode bind path opener. Wire layout (see
+            // SendSnapshotTo): hdr.start_frame = anchor INPUT-frame for
+            // the post-snapshot event stream, hdr.flags = sizeof(meta) =
+            // 16, payload = SnapshotMetadata.
+            if (payload_len < sizeof(SnapshotMetadata)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_BEGIN truncated (payload=%zu, need %zu)",
+                    payload_len, sizeof(SnapshotMetadata));
+                g_state.pb_snapshot_inbox = State::SnapshotInbox{};
+                break;
+            }
+            SnapshotMetadata meta = {};
+            std::memcpy(&meta, payload, sizeof(meta));
+
+            if (meta.version != SPECTATOR_SNAPSHOT_VERSION) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_BEGIN version mismatch "
+                    "(got %u, want %u) — dropping snapshot, peer must "
+                    "rejoin with FULL_SESSION",
+                    meta.version, SPECTATOR_SNAPSHOT_VERSION);
+                g_state.pb_snapshot_inbox = State::SnapshotInbox{};
+                break;
+            }
+
+            const size_t expected_slot_size = SaveState_GetSlotByteSize();
+            if (meta.total_bytes == 0 ||
+                meta.total_bytes != expected_slot_size) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_BEGIN size mismatch "
+                    "(blob=%u, slot=%zu) — engine variant mismatch?",
+                    meta.total_bytes, expected_slot_size);
+                g_state.pb_snapshot_inbox = State::SnapshotInbox{};
+                break;
+            }
+
+            auto& inbox = g_state.pb_snapshot_inbox;
+            if (inbox.active) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_BEGIN restart "
+                    "(prior inbox had %zu/%u bytes, dropping)",
+                    inbox.bytes_received, inbox.meta.total_bytes);
+            }
+            inbox.meta           = meta;
+            inbox.anchor_frame   = hdr.start_frame;
+            inbox.bytes_received = 0;
+            inbox.blob.assign(meta.total_bytes, 0);
+            inbox.active         = true;
+
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: SNAPSHOT_BEGIN match=%u, %u bytes, "
+                "anchor INPUT-frame=%u",
+                meta.match_index, meta.total_bytes, inbox.anchor_frame);
+            break;
+        }
+        case SpecDataType::SNAPSHOT_CHUNK: {
+            // hdr.start_frame = byte offset, hdr.flags = chunk byte count.
+            auto& inbox = g_state.pb_snapshot_inbox;
+            if (!inbox.active) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_CHUNK without active inbox — dropping");
+                break;
+            }
+            const size_t   off     = hdr.start_frame;
+            const size_t   chunk_n = hdr.flags;
+            if (chunk_n == 0 || chunk_n > payload_len) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_CHUNK bad length (flags=%zu, payload=%zu)",
+                    chunk_n, payload_len);
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+            if (off + chunk_n > inbox.blob.size()) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_CHUNK overruns blob "
+                    "(off=%zu chunk=%zu, total=%zu)",
+                    off, chunk_n, inbox.blob.size());
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+            std::memcpy(inbox.blob.data() + off, payload, chunk_n);
+            inbox.bytes_received += chunk_n;
+            break;
+        }
+        case SpecDataType::SNAPSHOT_END: {
+            // hdr.flags = 4, payload = uint32 fletcher32 over the host's blob.
+            auto& inbox = g_state.pb_snapshot_inbox;
+            if (!inbox.active) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_END without active inbox — dropping");
+                break;
+            }
+            if (payload_len < sizeof(uint32_t)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_END truncated (payload=%zu)",
+                    payload_len);
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+            uint32_t expected_checksum = 0;
+            std::memcpy(&expected_checksum, payload, sizeof(uint32_t));
+
+            if (inbox.bytes_received != inbox.meta.total_bytes) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_END byte-count mismatch "
+                    "(received %zu, want %u) — discarding",
+                    inbox.bytes_received, inbox.meta.total_bytes);
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+            const uint32_t local_checksum =
+                Fletcher32(inbox.blob.data(), inbox.blob.size());
+            if (local_checksum != expected_checksum) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_END checksum mismatch "
+                    "(local=0x%08X, expected=0x%08X) — discarding",
+                    local_checksum, expected_checksum);
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+
+            const uint32_t anchor = inbox.anchor_frame;
+            if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SaveState_LoadFromBytes failed "
+                    "(match=%u, %zu bytes) — discarding snapshot",
+                    inbox.meta.match_index, inbox.blob.size());
+                inbox = State::SnapshotInbox{};
+                break;
+            }
+
+            // Anchor the EVENT_BATCH stream cursor at the snapshot's
+            // INPUT-frame position. Subsequent batches start at this
+            // frame index — see SendSessionBackfillFromFrame on the
+            // host side. have_frame_baseline=true short-circuits the
+            // first-batch baseline-init in the EVENT_BATCH handler.
+            // Drop any pb_queue contents that may have arrived prior to
+            // the snapshot (CURRENT_MATCH bind path doesn't pre-send
+            // events, but FULL_SESSION → CURRENT_MATCH renegotiation
+            // could have stale ones cached).
+            g_state.pb_queue.clear();
+            g_state.pb_match_headers.clear();
+            g_state.have_frame_baseline = true;
+            g_state.next_expected_frame = anchor;
+            g_state.highest_consumed_frame = 0;
+            g_state.playing_back        = true;
+
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: SNAPSHOT_END applied (match=%u, "
+                "%zu bytes, fletcher32=0x%08X) — anchor INPUT-frame=%u",
+                inbox.meta.match_index, inbox.blob.size(),
+                local_checksum, anchor);
+
+            inbox = State::SnapshotInbox{};
+            break;
+        }
         case SpecDataType::EVENT_BATCH: {
             // Primary C2+ ingest. Payload is a packed SessionEvent[] stream
             // (1-byte tag + variant payload per event). Walk the stream
@@ -1611,8 +2348,25 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                                 SpectatorNode_AppendMatchStart(hdr_buf);
                                 break;
                             case SessionEventType::MATCH_END:
-                                SpectatorNode_AppendMatchEnd();
+                                SpectatorNode_AppendMatchEnd(ev.u.match_end);
                                 break;
+                            case SessionEventType::SESSION_ID:
+                                SpectatorNode_AppendSessionId(ev.u.session_id);
+                                break;
+                            case SessionEventType::ROUND_START: {
+                                const auto& p = ev.u.round_start;
+                                SpectatorNode_AppendRoundStart(
+                                    p.round_idx, p.p1_hp_max, p.p2_hp_max,
+                                    p.timer_seconds);
+                                break;
+                            }
+                            case SessionEventType::ROUND_END: {
+                                const auto& p = ev.u.round_end;
+                                SpectatorNode_AppendRoundEnd(
+                                    p.winner_idx, p.p1_hp_remaining,
+                                    p.p2_hp_remaining);
+                                break;
+                            }
                             default:
                                 break;
                         }
@@ -1808,21 +2562,47 @@ void SpectatorNode_TickHostMaintenance() {
         if (SpectatorTCP::RegisterAcceptedClient(sub.addr)) {
             sub.tcp_bound = true;
             char buf[48] = {}; FormatAddr(sub.addr, buf, sizeof(buf));
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "SpectatorNode: TCP bound for %s — sending INITIAL_MATCH + backfill",
-                        buf);
+
             // C5 backfill ordering fence:
-            //   1. SendSessionBackfillTo iterates session_events, encoding
-            //      every event (including the historic MATCH_START at the
-            //      head of the current match) into chunked EVENT_BATCH
-            //      datagrams. Refreshes sub.last_seen_ms per chunk so the
+            //   1. Send the chosen backfill payload (EVENT_BATCH chunks
+            //      and/or SNAPSHOT_BEGIN/CHUNK/END). Refreshes
+            //      sub.last_seen_ms post-completion so the
             //      SUBSCRIBER_EXPIRY_MS sweep can't reap mid-backfill.
-            //   2. MarkBackfillComplete flips the TCP-layer fence so future
-            //      BroadcastToAll calls finally include this subscriber.
-            // Until step 2 fires, BroadcastToAll skips this sub — any live
-            // FlushBatch firing in this gap is silently elided for this sub
-            // and the sub catches up via the backfill chunks instead.
-            SendSessionBackfillTo(sub.addr);
+            //   2. MarkBackfillComplete flips the TCP-layer fence so
+            //      future BroadcastToAll calls finally include this sub.
+            // Until step 2 fires, BroadcastToAll skips this sub — any
+            // live FlushBatch firing in this gap is silently elided and
+            // the sub catches up via the backfill instead.
+
+            // Phase 3 branch: CURRENT_MATCH-mode sub WITH a valid cached
+            // snapshot → ship snapshot + tail events from snapshot's
+            // anchor frame. Otherwise (FULL_SESSION, OR no snapshot yet
+            // because this is the first match before its StashSnapshot
+            // ran) fall back to legacy from-frame-0 backfill.
+            const bool use_snapshot =
+                sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
+                g_state.current_snapshot.valid;
+
+            if (use_snapshot) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: TCP bound for %s — CURRENT_MATCH "
+                    "(snapshot match=%u + tail from INPUT-frame=%u)",
+                    buf, g_state.current_snapshot.match_index,
+                    g_state.current_snapshot.input_frame);
+                SendSnapshotTo(sub.addr);
+                SendSessionBackfillFromFrame(sub.addr,
+                    g_state.current_snapshot.input_frame);
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: TCP bound for %s — %s "
+                    "(legacy from-frame-0 backfill)",
+                    buf,
+                    sub.join_mode == SpecJoinMode::CURRENT_MATCH
+                        ? "CURRENT_MATCH requested but no snapshot yet"
+                        : "FULL_SESSION");
+                SendSessionBackfillTo(sub.addr);
+            }
+
             sub.last_seen_ms = now;            // post-backfill liveness anchor
             SpectatorTCP::MarkBackfillComplete(sub.addr);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
