@@ -29,9 +29,20 @@ constexpr uintptr_t ADDR_VS_ROUND_FUNCTION = 0x004086A0;
 constexpr uintptr_t ADDR_G_OBJECT_DATA_PTR = 0x004CFA00;
 constexpr ptrdiff_t OFF_ROUND_SUBSTATE     = 0x152;  // 338
 
-// Substate values for edge detection
-constexpr int RSS_BATTLE_INIT      = 100;
-constexpr int RSS_ROUND_ANNOUNCE   = 101;  // post value after BATTLE_INIT body
+// Substate values for edge detection.
+//
+// ROUND_START fires at 112 → 200 (the FIGHT_LATCH → ACTIVE edge).
+// Why not the earlier 100→110 (BATTLE_INIT → ANNOUNCE_WAIT)? Case 100's
+// body resets every char-slot's hp_max to placeholder=1 (per IDA decompile
+// `*(slot_hp_ptr + 0Ch) = 1`); the real per-character hp_max only gets
+// re-populated by the fighter type-4 object's init on subsequent frames.
+// Empirically (v0.2.25 [HP-VERIFY] probe): hp_max=38/39 at *→900 round end,
+// but =1 at 100→110 round start. By 112→200 the fighter init has run +
+// the announce intro is done — hp_max + timer are both correct, and the
+// "fight has begun" moment is a more useful seek anchor for replay
+// viewing than the round-init init frame.
+constexpr int RSS_FIGHT_LATCH      = 112;
+constexpr int RSS_ACTIVE           = 200;
 constexpr int RSS_ROUND_END_BANNER = 900;
 
 // ROUND_START payload sources
@@ -53,6 +64,20 @@ static VsRoundFunc_t orig_vs_round_function = nullptr;
 // idx=1. NOT derived from result_kind/round_wins because draws bump both
 // win counters and break the formula.
 static uint8_t s_round_idx_counter = 0;
+
+// Alternation guard. The pre→post substate edge fires multiple times per
+// logical round transition because gekkonet's rollback re-simulates
+// frames (runahead=4 means 1 forward + 4 replay = 5 fires per logical
+// edge). The g_is_rolling_back gate at the top of Hook_vs_round_function
+// is supposed to suppress replay fires but apparently isn't being set
+// during gekkonet replay — separate issue to track down.
+//
+// Belt-and-suspenders dedup: enforce strict START→END→START→END
+// alternation. After a START fires, only an END can fire next; vice
+// versa. Each round's edge can only emit once regardless of how many
+// duplicate fires the rollback machinery produces. Reset on match start.
+enum class LastEmit : uint8_t { NONE, ROUND_START, ROUND_END };
+static LastEmit s_last_emit = LastEmit::NONE;
 
 static int ReadSubstate() {
     void* slot = *(void**)ADDR_G_OBJECT_DATA_PTR;
@@ -79,9 +104,13 @@ static char __cdecl Hook_vs_round_function() {
 
     const int post = ReadSubstate();
 
-    // ROUND_START — RSS_BATTLE_INIT body just ran, advanced to RSS_ROUND_ANNOUNCE.
-    if (pre == RSS_BATTLE_INIT && post == RSS_ROUND_ANNOUNCE) {
+    // ROUND_START — fires at RSS_FIGHT_LATCH → RSS_ACTIVE (the "FIGHT!" →
+    // battle becomes interactive moment). HP_max is populated by then (see
+    // constexpr block above for the rationale).
+    if (pre == RSS_FIGHT_LATCH && post == RSS_ACTIVE &&
+        s_last_emit != LastEmit::ROUND_START) {
         ++s_round_idx_counter;
+        s_last_emit = LastEmit::ROUND_START;
         const uint16_t p1_hp_max     = (uint16_t)*(uint32_t*)ADDR_P1_HP_MAX;
         const uint16_t p2_hp_max     = (uint16_t)*(uint32_t*)ADDR_P2_HP_MAX;
         const int32_t  score         = *(int32_t*)ADDR_SCORE_VAL;
@@ -90,11 +119,16 @@ static char __cdecl Hook_vs_round_function() {
             : (uint16_t)0;
         SpectatorNode_AppendRoundStart(
             s_round_idx_counter, p1_hp_max, p2_hp_max, timer_seconds);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[ROUND-START] round=%u p1_hp_max=%u p2_hp_max=%u timer=%us",
+            s_round_idx_counter, p1_hp_max, p2_hp_max, timer_seconds);
     }
 
     // ROUND_END — substate just transitioned to RSS_ROUND_END_BANNER from
     // any of the win-tail paths. result_kind / HP are already populated.
-    if (pre != RSS_ROUND_END_BANNER && post == RSS_ROUND_END_BANNER) {
+    if (pre != RSS_ROUND_END_BANNER && post == RSS_ROUND_END_BANNER &&
+        s_last_emit != LastEmit::ROUND_END) {
+        s_last_emit = LastEmit::ROUND_END;
         const uint32_t r1_kind = *(uint32_t*)ADDR_P1_RESULT_KIND;
         const uint32_t r2_kind = *(uint32_t*)ADDR_P2_RESULT_KIND;
         const uint8_t winner_idx = (r1_kind == 1) ? 0
@@ -103,6 +137,28 @@ static char __cdecl Hook_vs_round_function() {
         const uint16_t p1_hp = (uint16_t)*(uint32_t*)ADDR_P1_HP;
         const uint16_t p2_hp = (uint16_t)*(uint32_t*)ADDR_P2_HP;
         SpectatorNode_AppendRoundEnd(winner_idx, p1_hp, p2_hp);
+
+        // Host-side diagnostic log so a normal P1+P2 match (no spectator
+        // attached) still produces a per-round trail in the .log file.
+        // Spectator-side ApplySessionEvent has its own log when a viewer
+        // is connected; this duplicates it for the host's own log so
+        // grep'ing logs/FM2K_P*_Debug.log shows round outcomes inline.
+        const uint32_t p1_wins   = *(uint32_t*)0x4DFC6D;
+        const uint32_t p2_wins   = *(uint32_t*)0x4EDCAC;
+        const int32_t  score_val = *(int32_t*)ADDR_SCORE_VAL;
+        const uint16_t timer_remaining = (score_val >= 0)
+            ? (uint16_t)((score_val + 1) / 100)
+            : (uint16_t)0;
+        const char* who = (winner_idx == 0) ? "P1"
+                        : (winner_idx == 1) ? "P2" : "DRAW";
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[ROUND-END] round=%u winner=%s rounds_won=%u-%u "
+            "p1_hp=%u p2_hp=%u timer_remaining=%us "
+            "(r1_kind=%u r2_kind=%u)",
+            s_round_idx_counter, who,
+            p1_wins, p2_wins,
+            p1_hp, p2_hp, timer_remaining,
+            r1_kind, r2_kind);
     }
 
     return ret;
@@ -130,6 +186,7 @@ bool RoundEvents_Install() {
 
 void RoundEvents_OnMatchStart() {
     s_round_idx_counter = 0;
+    s_last_emit         = LastEmit::NONE;
 }
 
 #else  // ENGINE_FM95
