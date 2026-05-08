@@ -1052,11 +1052,27 @@ void SpectatorNode_AppendFingerprint(uint32_t hash) {
 // total_input_count counter.
 static uint32_t s_round_start_input_frame = 0;
 
+// Most-recent rounds_won values seen at AppendRoundEnd time. Cached
+// because Netplay_EndBattle's read of FM2K::ADDR_P1/P2_ROUNDS_WON fires
+// AFTER vs_round_function's match-over branch creates the type=10
+// match-end object, whose update sometimes resets the live counters
+// before the read. ROUND_END's read is reliably accurate (verified
+// empirically), so AppendMatchEnd overrides the (potentially stale)
+// values Netplay_EndBattle passed in with these.
+static uint8_t s_last_seen_rounds_won_p1 = 0;
+static uint8_t s_last_seen_rounds_won_p2 = 0;
+
 void SpectatorNode_AppendRoundStart(uint8_t  round_idx,
                                     uint16_t p1_hp_max,
                                     uint16_t p2_hp_max,
                                     uint16_t timer_seconds) {
     s_round_start_input_frame = g_state.total_input_count;
+    // New round starting — clear stale rounds_won cache from a possibly
+    // earlier match. AppendRoundEnd repopulates it as rounds tick by.
+    if (round_idx == 1) {
+        s_last_seen_rounds_won_p1 = 0;
+        s_last_seen_rounds_won_p2 = 0;
+    }
     SessionEvent ev{};
     ev.type = SessionEventType::ROUND_START;
     ev.u.round_start.round_idx     = round_idx;
@@ -1080,6 +1096,12 @@ void SpectatorNode_AppendRoundEnd(uint8_t  winner_idx,
     ev.u.round_end.p2_hp_remaining  = p2_hp_remaining;
     ev.u.round_end.frames_elapsed   = frames;
     AppendOpAndFlush(ev);
+
+    // Cache live rounds_won AT THIS MOMENT — accurate snapshot for
+    // AppendMatchEnd to use later. The match-over path resets these
+    // counters before Netplay_EndBattle's read fires.
+    s_last_seen_rounds_won_p1 = (uint8_t)*(uint32_t*)0x4DFC6D;
+    s_last_seen_rounds_won_p2 = (uint8_t)*(uint32_t*)0x4EDCAC;
 }
 
 // =============================================================================
@@ -1162,6 +1184,19 @@ void SpectatorNode_AppendMatchEnd(const MatchEndPayload& p) {
     SessionEvent ev{};
     ev.type        = SessionEventType::MATCH_END;
     ev.u.match_end = p;
+    // Override caller's rounds_won with the cached values from the most
+    // recent ROUND_END. Netplay_EndBattle reads from the live FM2K
+    // counters but those get reset by the match-over object's update
+    // before the read. Take the max of (cache, passed) — the cache is
+    // reliable, but if for any reason the cache is stale (no
+    // AppendRoundEnd fired yet) we fall back to whatever Netplay
+    // passed.
+    if (s_last_seen_rounds_won_p1 > p.rounds_won_p1) {
+        ev.u.match_end.rounds_won_p1 = s_last_seen_rounds_won_p1;
+    }
+    if (s_last_seen_rounds_won_p2 > p.rounds_won_p2) {
+        ev.u.match_end.rounds_won_p2 = s_last_seen_rounds_won_p2;
+    }
     // Caller passes frames_total=0; we compute the actual value here so
     // hook code (Netplay_EndBattle) doesn't need access to the private
     // total_input_count counter.
