@@ -1962,16 +1962,15 @@ void Netplay_EndBattle() {
     match_end_payload.frames_total   = 0;  // filled inside Append
     SpectatorNode_OnMatchEnd(match_end_payload);
 
-    // Refresh the snapshot cache to the post-match state. Without this,
-    // a CURRENT_MATCH spectator joining during the next CSS would receive
-    // the previous battle's start-of-match snapshot and replay the entire
-    // prior match before reaching the live edge. With it, the cache reflects
-    // the post-MATCH_END state — joiner loads "the moment match 1 ended" and
-    // replays only the CSS cursor inputs that have accumulated since.
-    // SaveState_Save(0) writes slot 0 with the current live state; gekkonet
-    // will overwrite slot 0 naturally as battle 2's frames advance, so the
-    // ring's correctness for rollback in the next match is unaffected.
-    SpectatorNode_StashSnapshot();
+    // (Removed in v0.2.20: post-MATCH_END SpectatorNode_StashSnapshot. It
+    // crashed users on the first 3000→2000 transition — likely SaveState_Save
+    // running its replay-diff scan against torn-down FM2K state after
+    // gekko_destroy. CURRENT_MATCH-mode spectator joining mid-CSS still
+    // receives the start-of-match snapshot from Netplay_StartBattle's
+    // StashSnapshot — they replay the prior match's frames, which is
+    // suboptimal but correct. Phase 6 robustness pass can re-add a
+    // between-match cache freshen with a JIT live-peek (no SaveState_Save)
+    // path that doesn't trigger the replay-diff scan.)
 
     // C7: per-battle .fm2krep — slice the SessionEvent log between the most
     // recent MATCH_START and the just-appended MATCH_END. Same on-disk
