@@ -40,7 +40,16 @@ struct Binding {
 };
 
 struct PlayerBindings {
-    Binding bits[static_cast<size_t>(Bit::COUNT)];
+    // Two parallel slots per FM2K bit. Sample() OR's them together,
+    // so a single bit can fire from EITHER source — typical use cases:
+    //   primary = keyboard, alt = gamepad (covers most users)
+    //   primary = stick axis, alt = dpad button (CXL-style: both
+    //   gamepad inputs route to the same in-game direction)
+    //   primary = keyboard, alt = NONE (no gamepad / single-source)
+    // Save/Load round-trips both via "<bit>" and "<bit>.alt" INI keys
+    // so old configs still load (alt defaults to NONE if missing).
+    Binding bits    [static_cast<size_t>(Bit::COUNT)];
+    Binding bits_alt[static_cast<size_t>(Bit::COUNT)];
 };
 
 // Initialize: opens any visible gamepads and loads bindings from

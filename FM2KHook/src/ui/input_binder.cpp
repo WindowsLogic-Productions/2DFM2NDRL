@@ -40,6 +40,7 @@ struct CaptureCtx {
     bool active        = false;
     int  player        = -1;
     int  bit           = -1;
+    bool alt           = false;  // false = primary slot, true = alt slot
     bool armed         = false;  // wait for all buttons released first
 };
 CaptureCtx g_capture;
@@ -119,9 +120,45 @@ void ApplyDefaultsP2(PlayerBindings& pb) {
 
 void ApplyDefaults(int player) {
     PlayerBindings& pb = g_players[player];
-    for (auto& s : pb.bits) s = Binding{};
+    for (auto& s : pb.bits)     s = Binding{};
+    for (auto& s : pb.bits_alt) s = Binding{};
     if (player == 0)      ApplyDefaultsP1(pb);
     else if (player == 1) ApplyDefaultsP2(pb);
+    // Default gamepad layout in the alt slots so a connected pad
+    // "just works" without rebinding. Directionals get the LEFT
+    // analog stick (matches most fighting-game muscle memory); the
+    // dpad is intentionally LEFT EMPTY so a user who wants stick+dpad
+    // simultaneously (CXL pattern) can drop the dpad in the primary
+    // slot without overwriting a keyboard binding they want to keep.
+    // Buttons map to the standard XInput-style face/shoulder layout.
+    const int gp_idx = (player == 0) ? 0 : 1;
+    auto axis = [&](Bit b, SDL_GamepadAxis a, int dir) {
+        Binding& s = pb.bits_alt[(size_t)b];
+        s.source = Binding::Source::GAMEPAD_AXIS;
+        s.code = (int)a;
+        s.axis_dir = dir;
+        s.gamepad_index = gp_idx;
+    };
+    auto btn = [&](Bit b, SDL_GamepadButton gb) {
+        Binding& s = pb.bits_alt[(size_t)b];
+        s.source = Binding::Source::GAMEPAD_BUTTON;
+        s.code = (int)gb;
+        s.axis_dir = 0;
+        s.gamepad_index = gp_idx;
+    };
+    axis(Bit::LEFT,  SDL_GAMEPAD_AXIS_LEFTX, -1);
+    axis(Bit::RIGHT, SDL_GAMEPAD_AXIS_LEFTX, +1);
+    axis(Bit::UP,    SDL_GAMEPAD_AXIS_LEFTY, -1);
+    axis(Bit::DOWN,  SDL_GAMEPAD_AXIS_LEFTY, +1);
+    // Standard XInput face-button layout: A=south (X on PS), B=east
+    // (○), C=west (□), D=north (△), E=L1, F=R1, START=Start.
+    btn(Bit::A,     SDL_GAMEPAD_BUTTON_SOUTH);
+    btn(Bit::B,     SDL_GAMEPAD_BUTTON_EAST);
+    btn(Bit::C,     SDL_GAMEPAD_BUTTON_WEST);
+    btn(Bit::D,     SDL_GAMEPAD_BUTTON_NORTH);
+    btn(Bit::E,     SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    btn(Bit::F,     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    btn(Bit::START, SDL_GAMEPAD_BUTTON_START);
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +692,14 @@ bool Save() {
         std::fprintf(f, "[Player%d]\n", p);
         for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
             WriteBinding(f, kBitNames[i], g_players[p].bits[i]);
+            // Alt slot — emit only when set so legacy single-source
+            // configs round-trip without picking up a noisy ".alt = NONE"
+            // for every bit.
+            if (g_players[p].bits_alt[i].source != Binding::Source::NONE) {
+                char alt_key[64];
+                std::snprintf(alt_key, sizeof(alt_key), "%s.alt", kBitNames[i]);
+                WriteBinding(f, alt_key, g_players[p].bits_alt[i]);
+            }
         }
         std::fprintf(f, "\n");
     }
@@ -694,10 +739,43 @@ bool Load() {
                 ParseBinding(val, g_players[section].bits[i]);
                 break;
             }
+            // ".alt" suffix → secondary slot for the same bit.
+            // Old configs without this key leave bits_alt at NONE
+            // (set by ApplyDefaults' loop pre-load), which is fine.
+            char alt_key[64];
+            std::snprintf(alt_key, sizeof(alt_key), "%s.alt", kBitNames[i]);
+            if (key == alt_key) {
+                ParseBinding(val, g_players[section].bits_alt[i]);
+                break;
+            }
         }
     }
     std::fclose(f);
     return true;
+}
+
+// Single-binding sampler used by Sample() — pulled out of the per-bit
+// switch so the caller can OR primary + alt slots through the same code
+// path. Empty / NONE bindings return false (no contribution to mask).
+static bool SampleOne_SDL(const Binding& b, const bool* ks, int nkeys) {
+    switch (b.source) {
+        case Binding::Source::NONE:
+            return false;
+        case Binding::Source::KEYBOARD:
+            return ks && b.code >= 0 && b.code < nkeys && ks[b.code];
+        case Binding::Source::GAMEPAD_BUTTON: {
+            SDL_Gamepad* gp = GamepadAt(b.gamepad_index);
+            return gp && SDL_GetGamepadButton(gp, (SDL_GamepadButton)b.code);
+        }
+        case Binding::Source::GAMEPAD_AXIS: {
+            SDL_Gamepad* gp = GamepadAt(b.gamepad_index);
+            if (!gp) return false;
+            Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)b.code);
+            return (b.axis_dir < 0) ? (v < -kAxisSampleThreshold)
+                                    : (v >  kAxisSampleThreshold);
+        }
+    }
+    return false;
 }
 
 uint16_t Sample(int player_slot) {
@@ -709,29 +787,8 @@ uint16_t Sample(int player_slot) {
 
     uint16_t mask = 0;
     for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
-        const Binding& b = pb.bits[i];
-        bool pressed = false;
-        switch (b.source) {
-            case Binding::Source::NONE:
-                break;
-            case Binding::Source::KEYBOARD:
-                if (ks && b.code >= 0 && b.code < nkeys) pressed = ks[b.code];
-                break;
-            case Binding::Source::GAMEPAD_BUTTON: {
-                SDL_Gamepad* gp = GamepadAt(b.gamepad_index);
-                if (gp) pressed = SDL_GetGamepadButton(gp, (SDL_GamepadButton)b.code);
-                break;
-            }
-            case Binding::Source::GAMEPAD_AXIS: {
-                SDL_Gamepad* gp = GamepadAt(b.gamepad_index);
-                if (gp) {
-                    Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)b.code);
-                    if (b.axis_dir < 0) pressed = (v < -kAxisSampleThreshold);
-                    else                pressed = (v >  kAxisSampleThreshold);
-                }
-                break;
-            }
-        }
+        const bool pressed = SampleOne_SDL(pb.bits[i],     ks, nkeys)
+                          || SampleOne_SDL(pb.bits_alt[i], ks, nkeys);
         if (pressed) mask |= (uint16_t)(1u << i);
     }
     return mask & 0x7FF;
@@ -887,65 +944,62 @@ uint16_t Sample_Win32(int player_slot) {
         return xs_ok[idx] ? &xs[idx] : nullptr;
     };
 
-    uint16_t mask = 0;
-    for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
-        const Binding& b = pb.bits[i];
-        bool pressed = false;
+    // Per-binding sampler. Defined as a lambda so it captures sdl_gp /
+    // get_xinput without re-threading them through a static helper.
+    // Called twice per bit (primary + alt) and OR'd, so a single
+    // direction can fire from stick AND dpad simultaneously.
+    auto sample_one = [&](const Binding& b) -> bool {
         switch (b.source) {
             case Binding::Source::NONE:
-                break;
+                return false;
             case Binding::Source::KEYBOARD: {
                 int vk = Sdl3ScancodeToVk(b.code);
-                if (vk != 0) {
-                    pressed = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                }
-                break;
+                return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
             }
             case Binding::Source::GAMEPAD_BUTTON: {
-                // Try SDL3 first — covers DInput / HIDAPI sticks.
-                // The launcher's binder captures via SDL3 too, so the
-                // saved button code is the SDL_GamepadButton enum
-                // (b.code is the SDL value, not an XInput bit).
                 if (SDL_Gamepad* gp = sdl_gp(b.gamepad_index)) {
-                    pressed = SDL_GetGamepadButton(
-                        gp, (SDL_GamepadButton)b.code) != 0;
-                }
-                // Fallback: XInput, for sticks SDL doesn't see (rare
-                // — shouldn't happen now, but cheap to keep).
-                if (!pressed) {
-                    if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
-                        WORD xbit = SdlGamepadButtonToXInputBit(b.code);
-                        pressed = xbit != 0 && (st->Gamepad.wButtons & xbit) != 0;
+                    if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b.code) != 0) {
+                        return true;
                     }
                 }
-                break;
+                if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
+                    WORD xbit = SdlGamepadButtonToXInputBit(b.code);
+                    return xbit != 0 && (st->Gamepad.wButtons & xbit) != 0;
+                }
+                return false;
             }
             case Binding::Source::GAMEPAD_AXIS: {
                 if (SDL_Gamepad* gp = sdl_gp(b.gamepad_index)) {
                     Sint16 v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)b.code);
-                    if (b.axis_dir < 0) pressed = (v < -kAxisSampleThreshold);
-                    else                pressed = (v >  kAxisSampleThreshold);
+                    bool ok = (b.axis_dir < 0) ? (v < -kAxisSampleThreshold)
+                                               : (v >  kAxisSampleThreshold);
+                    if (ok) return true;
                 }
-                if (!pressed) {
-                    if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
-                        SHORT v = 0;
-                        switch (b.code) {
-                            case SDL_GAMEPAD_AXIS_LEFTX:        v = st->Gamepad.sThumbLX; break;
-                            case SDL_GAMEPAD_AXIS_LEFTY:        v = (SHORT)-st->Gamepad.sThumbLY; break;
-                            case SDL_GAMEPAD_AXIS_RIGHTX:       v = st->Gamepad.sThumbRX; break;
-                            case SDL_GAMEPAD_AXIS_RIGHTY:       v = (SHORT)-st->Gamepad.sThumbRY; break;
-                            case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = (SHORT)(st->Gamepad.bLeftTrigger * 128); break;
-                            case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = (SHORT)(st->Gamepad.bRightTrigger * 128); break;
-                            default: break;
-                        }
-                        if (b.axis_dir < 0) pressed = (v < -kAxisSampleThreshold);
-                        else                pressed = (v >  kAxisSampleThreshold);
+                if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
+                    SHORT v = 0;
+                    switch (b.code) {
+                        case SDL_GAMEPAD_AXIS_LEFTX:        v = st->Gamepad.sThumbLX; break;
+                        case SDL_GAMEPAD_AXIS_LEFTY:        v = (SHORT)-st->Gamepad.sThumbLY; break;
+                        case SDL_GAMEPAD_AXIS_RIGHTX:       v = st->Gamepad.sThumbRX; break;
+                        case SDL_GAMEPAD_AXIS_RIGHTY:       v = (SHORT)-st->Gamepad.sThumbRY; break;
+                        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = (SHORT)(st->Gamepad.bLeftTrigger * 128); break;
+                        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = (SHORT)(st->Gamepad.bRightTrigger * 128); break;
+                        default: break;
                     }
+                    return (b.axis_dir < 0) ? (v < -kAxisSampleThreshold)
+                                            : (v >  kAxisSampleThreshold);
                 }
-                break;
+                return false;
             }
         }
-        if (pressed) mask |= (uint16_t)(1u << i);
+        return false;
+    };
+
+    uint16_t mask = 0;
+    for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
+        if (sample_one(pb.bits[i]) || sample_one(pb.bits_alt[i])) {
+            mask |= (uint16_t)(1u << i);
+        }
     }
     return mask & 0x7FF;
 #endif
@@ -995,14 +1049,19 @@ bool RenderBody(int player_slot) {
     // ------------------------------------------------------------------
     {
         // Discover this player's CURRENT primary gamepad index by looking
-        // at the first gamepad-sourced binding (capture sets all of them
-        // to the same index when the user changes the dropdown).
+        // at the first gamepad-sourced binding across BOTH primary and
+        // alt slots — alt now defaults to gamepad on a fresh init, so
+        // even a brand-new "keyboard primary" config has the gamepad
+        // index present in the alt array.
         int current_idx = -1;  // -1 = keyboard only
-        for (const auto& b : pb.bits) {
-            if (b.source == Binding::Source::GAMEPAD_BUTTON ||
-                b.source == Binding::Source::GAMEPAD_AXIS) {
-                current_idx = b.gamepad_index;
-                break;
+        for (size_t i = 0; i < (size_t)Bit::COUNT && current_idx < 0; ++i) {
+            for (const Binding* arr : { pb.bits + 0, pb.bits_alt + 0 }) {
+                const Binding& b = arr[i];
+                if (b.source == Binding::Source::GAMEPAD_BUTTON ||
+                    b.source == Binding::Source::GAMEPAD_AXIS) {
+                    current_idx = b.gamepad_index;
+                    break;
+                }
             }
         }
         // If no gamepad bindings exist on this player, surface the slot's
@@ -1035,18 +1094,19 @@ bool RenderBody(int player_slot) {
             // Keyboard only entry — clears gamepad bindings on this player.
             bool sel = (current_idx < 0);
             if (ImGui::Selectable("Keyboard only", sel)) {
-                // Convert any gamepad-bound rows back to NONE so the
-                // user explicitly re-binds via capture if they want
-                // gamepad input on this player.
-                for (auto& b : pb.bits) {
+                // Convert any gamepad-bound rows back to NONE in BOTH
+                // slots so the user explicitly re-binds via capture if
+                // they want gamepad input on this player. Keep keyboard
+                // rows but reset their gamepad_index hint.
+                auto clear_gp = [](Binding& b) {
                     if (b.source == Binding::Source::GAMEPAD_BUTTON ||
                         b.source == Binding::Source::GAMEPAD_AXIS) {
                         b = Binding{};
                     }
-                    // Update keyboard rows' gamepad_index too so any
-                    // future gamepad capture starts from a known state.
                     b.gamepad_index = -1;
-                }
+                };
+                for (auto& b : pb.bits)     clear_gp(b);
+                for (auto& b : pb.bits_alt) clear_gp(b);
                 changed = true;
             }
             // One row per available SDL gamepad.
@@ -1057,11 +1117,10 @@ bool RenderBody(int player_slot) {
                 bool sel_i = (current_idx == i);
                 if (ImGui::Selectable(row, sel_i)) {
                     // Propagate to all of this player's gamepad-sourced
-                    // bindings AND to the per-player default index used
-                    // when the user adds a new gamepad capture.
-                    for (auto& b : pb.bits) {
-                        b.gamepad_index = i;
-                    }
+                    // bindings (both slots) AND to the per-player
+                    // default index used by future captures.
+                    for (auto& b : pb.bits)     b.gamepad_index = i;
+                    for (auto& b : pb.bits_alt) b.gamepad_index = i;
                     changed = true;
                 }
                 if (sel_i) ImGui::SetItemDefaultFocus();
@@ -1183,13 +1242,29 @@ bool RenderBody(int player_slot) {
 
     ImGui::Separator();
 
-    // Compute conflicts within this player.
-    bool conflict[(size_t)Bit::COUNT] = {};
+    // Compute conflicts within this player. Each slot (primary + alt)
+    // can independently conflict with another bit's primary or alt, so
+    // we walk the cross-product per-slot. A bit's row goes red when
+    // EITHER slot collides with anything.
+    bool conflict_pri[(size_t)Bit::COUNT] = {};
+    bool conflict_alt[(size_t)Bit::COUNT] = {};
+    auto check_pair = [&](size_t i, bool i_alt, size_t j, bool j_alt) {
+        const Binding& a = i_alt ? pb.bits_alt[i] : pb.bits[i];
+        const Binding& b = j_alt ? pb.bits_alt[j] : pb.bits[j];
+        if (BindingsConflict(a, b)) {
+            (i_alt ? conflict_alt : conflict_pri)[i] = true;
+            (j_alt ? conflict_alt : conflict_pri)[j] = true;
+        }
+    };
     for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
+        // Same-bit primary vs. alt isn't a conflict — that's the WHOLE
+        // POINT (stick + dpad on the same direction). Skip i==j entirely
+        // and only flag cross-bit collisions.
         for (size_t j = i + 1; j < (size_t)Bit::COUNT; ++j) {
-            if (BindingsConflict(pb.bits[i], pb.bits[j])) {
-                conflict[i] = conflict[j] = true;
-            }
+            check_pair(i, false, j, false);
+            check_pair(i, false, j, true);
+            check_pair(i, true,  j, false);
+            check_pair(i, true,  j, true);
         }
     }
 
@@ -1214,25 +1289,80 @@ bool RenderBody(int player_slot) {
                     (int)cap.source, cap.code, cap.axis_dir, cap.gamepad_index,
                     g_capture.player, g_capture.bit);
                 if (!cancel) {
-                    pb.bits[g_capture.bit] = cap;
+                    if (g_capture.alt) pb.bits_alt[g_capture.bit] = cap;
+                    else               pb.bits[g_capture.bit]     = cap;
                     changed = true;
                 }
                 g_capture.active = false;
                 g_capture.armed = false;
                 g_capture.player = -1;
                 g_capture.bit = -1;
+                g_capture.alt = false;
             }
         }
     }
 
-    // Bindings table
-    if (ImGui::BeginTable("bindings", 3,
+    // Bindings table — primary AND alt slot per bit. Both slots OR
+    // together at sample time so a single direction can fire from
+    // EITHER source. CXL-style stick+dpad: drop the dpad in primary
+    // and the stick axis in alt (or vice-versa); both work in-game.
+    // Typical user keeps primary = keyboard, alt = gamepad.
+    if (ImGui::BeginTable("bindings", 5,
             ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Bit",   ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Bound", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Bit",     ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Alt",     ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 130.0f);
         ImGui::TableHeadersRow();
+
+        // Per-slot row renderer. col_label/col_btns are the table column
+        // indices for the slot's text + buttons; alt_slot picks which
+        // member of pb to read/write.
+        auto render_slot = [&](size_t i, bool alt_slot,
+                               int col_label, int col_btns) {
+            const Binding& cur = alt_slot ? pb.bits_alt[i] : pb.bits[i];
+            const bool conflict = (alt_slot ? conflict_alt : conflict_pri)[i];
+            const bool waiting = g_capture.active &&
+                                 g_capture.player == player_slot &&
+                                 g_capture.bit == (int)i &&
+                                 g_capture.alt == alt_slot;
+
+            ImGui::TableSetColumnIndex(col_label);
+            if (waiting) {
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                                   "Press a key/button... (Cancel to abort)");
+            } else if (conflict) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
+                                   BindingLabel(cur).c_str());
+            } else {
+                ImGui::TextUnformatted(BindingLabel(cur).c_str());
+            }
+
+            ImGui::TableSetColumnIndex(col_btns);
+            ImGui::PushID(alt_slot ? "a" : "p");
+            if (waiting) {
+                if (ImGui::Button("Cancel", ImVec2(60, 0))) {
+                    g_capture = CaptureCtx{};
+                }
+            } else {
+                if (ImGui::Button("Bind", ImVec2(60, 0))) {
+                    g_capture.active = true;
+                    g_capture.armed = false;
+                    g_capture.player = player_slot;
+                    g_capture.bit = (int)i;
+                    g_capture.alt = alt_slot;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear", ImVec2(60, 0))) {
+                if (alt_slot) pb.bits_alt[i] = Binding{};
+                else          pb.bits[i]     = Binding{};
+                changed = true;
+            }
+            ImGui::PopID();
+        };
 
         for (size_t i = 0; i < (size_t)Bit::COUNT; ++i) {
             ImGui::TableNextRow();
@@ -1241,41 +1371,9 @@ bool RenderBody(int player_slot) {
             ImGui::TableSetColumnIndex(0);
             ImGui::TextUnformatted(kBitNames[i]);
 
-            ImGui::TableSetColumnIndex(1);
-            const bool waiting = g_capture.active &&
-                                 g_capture.player == player_slot &&
-                                 g_capture.bit == (int)i;
-            if (waiting) {
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-                                   "Press a key/button... (click Cancel to abort)");
-            } else if (conflict[i]) {
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
-                                   BindingLabel(pb.bits[i]).c_str());
-            } else {
-                ImGui::TextUnformatted(BindingLabel(pb.bits[i]).c_str());
-            }
+            render_slot(i, /*alt=*/false, /*col_label=*/1, /*col_btns=*/2);
+            render_slot(i, /*alt=*/true,  /*col_label=*/3, /*col_btns=*/4);
 
-            ImGui::TableSetColumnIndex(2);
-            if (waiting) {
-                if (ImGui::Button("Cancel", ImVec2(60, 0))) {
-                    g_capture.active = false;
-                    g_capture.armed = false;
-                    g_capture.player = -1;
-                    g_capture.bit = -1;
-                }
-            } else {
-                if (ImGui::Button("Bind", ImVec2(60, 0))) {
-                    g_capture.active = true;
-                    g_capture.armed = false;  // wait for release
-                    g_capture.player = player_slot;
-                    g_capture.bit = (int)i;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Clear", ImVec2(60, 0))) {
-                pb.bits[i] = Binding{};
-                changed = true;
-            }
             ImGui::PopID();
         }
         ImGui::EndTable();
