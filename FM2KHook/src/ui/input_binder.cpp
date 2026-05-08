@@ -118,20 +118,12 @@ void ApplyDefaultsP2(PlayerBindings& pb) {
     kb(Bit::START, SDL_SCANCODE_KP_ENTER);
 }
 
-void ApplyDefaults(int player) {
-    PlayerBindings& pb = g_players[player];
-    for (auto& s : pb.bits)     s = Binding{};
-    for (auto& s : pb.bits_alt) s = Binding{};
-    if (player == 0)      ApplyDefaultsP1(pb);
-    else if (player == 1) ApplyDefaultsP2(pb);
-    // Default gamepad layout in the alt slots so a connected pad
-    // "just works" without rebinding. Directionals get the LEFT
-    // analog stick (matches most fighting-game muscle memory); the
-    // dpad is intentionally LEFT EMPTY so a user who wants stick+dpad
-    // simultaneously (CXL pattern) can drop the dpad in the primary
-    // slot without overwriting a keyboard binding they want to keep.
-    // Buttons map to the standard XInput-style face/shoulder layout.
-    const int gp_idx = (player == 0) ? 0 : 1;
+// Fill the alt slot with the standard XInput-style gamepad layout
+// (left stick + face/shoulder buttons). Used by ApplyGamepadDefaults() and
+// the device-picker swap path. CXL pattern: user picks gamepad as their
+// primary device, gets stick auto-bound to the alt slot, then manually
+// binds the dpad to the primary slot — both fire the same direction.
+static void FillAltAsGamepad(PlayerBindings& pb, int gp_idx) {
     auto axis = [&](Bit b, SDL_GamepadAxis a, int dir) {
         Binding& s = pb.bits_alt[(size_t)b];
         s.source = Binding::Source::GAMEPAD_AXIS;
@@ -150,8 +142,6 @@ void ApplyDefaults(int player) {
     axis(Bit::RIGHT, SDL_GAMEPAD_AXIS_LEFTX, +1);
     axis(Bit::UP,    SDL_GAMEPAD_AXIS_LEFTY, -1);
     axis(Bit::DOWN,  SDL_GAMEPAD_AXIS_LEFTY, +1);
-    // Standard XInput face-button layout: A=south (X on PS), B=east
-    // (○), C=west (□), D=north (△), E=L1, F=R1, START=Start.
     btn(Bit::A,     SDL_GAMEPAD_BUTTON_SOUTH);
     btn(Bit::B,     SDL_GAMEPAD_BUTTON_EAST);
     btn(Bit::C,     SDL_GAMEPAD_BUTTON_WEST);
@@ -159,6 +149,45 @@ void ApplyDefaults(int player) {
     btn(Bit::E,     SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
     btn(Bit::F,     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
     btn(Bit::START, SDL_GAMEPAD_BUTTON_START);
+}
+
+// Fill the primary slot with the standard XInput-style gamepad layout
+// (dpad + face/shoulder buttons). Inverse of FillAltAsGamepad — used
+// when the user picks a gamepad as their primary device.
+static void FillPrimaryAsGamepad(PlayerBindings& pb, int gp_idx) {
+    auto btn = [&](Bit b, SDL_GamepadButton gb) {
+        Binding& s = pb.bits[(size_t)b];
+        s.source = Binding::Source::GAMEPAD_BUTTON;
+        s.code = (int)gb;
+        s.axis_dir = 0;
+        s.gamepad_index = gp_idx;
+    };
+    btn(Bit::LEFT,  SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+    btn(Bit::RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+    btn(Bit::UP,    SDL_GAMEPAD_BUTTON_DPAD_UP);
+    btn(Bit::DOWN,  SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+    btn(Bit::A,     SDL_GAMEPAD_BUTTON_SOUTH);
+    btn(Bit::B,     SDL_GAMEPAD_BUTTON_EAST);
+    btn(Bit::C,     SDL_GAMEPAD_BUTTON_WEST);
+    btn(Bit::D,     SDL_GAMEPAD_BUTTON_NORTH);
+    btn(Bit::E,     SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    btn(Bit::F,     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    btn(Bit::START, SDL_GAMEPAD_BUTTON_START);
+}
+
+void ApplyDefaults(int player) {
+    PlayerBindings& pb = g_players[player];
+    for (auto& s : pb.bits)     s = Binding{};
+    for (auto& s : pb.bits_alt) s = Binding{};
+    // Defaults are KEYBOARD-ONLY. One device per player. Users who want a
+    // gamepad pick it via the device dropdown — that swaps primary to
+    // dpad+face-button layout AND fills alt with stick+face-button layout
+    // (CXL stick+dpad pattern). Never auto-bind a second device behind
+    // the user's back: dual-device bindings are how Muffin's parry
+    // moved across slots when v0.2.16 stomped his alt with XInput
+    // defaults while his primary kept his keyboard layout.
+    if (player == 0)      ApplyDefaultsP1(pb);
+    else if (player == 1) ApplyDefaultsP2(pb);
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,19 +1135,12 @@ bool RenderBody(int player_slot) {
             // Keyboard only entry — clears gamepad bindings on this player.
             bool sel = (current_idx < 0);
             if (ImGui::Selectable("Keyboard only", sel)) {
-                // Convert any gamepad-bound rows back to NONE in BOTH
-                // slots so the user explicitly re-binds via capture if
-                // they want gamepad input on this player. Keep keyboard
-                // rows but reset their gamepad_index hint.
-                auto clear_gp = [](Binding& b) {
-                    if (b.source == Binding::Source::GAMEPAD_BUTTON ||
-                        b.source == Binding::Source::GAMEPAD_AXIS) {
-                        b = Binding{};
-                    }
-                    b.gamepad_index = -1;
-                };
-                for (auto& b : pb.bits)     clear_gp(b);
-                for (auto& b : pb.bits_alt) clear_gp(b);
+                // Switch this player to keyboard-only. Reset to the
+                // keyboard defaults (P1 arrows / P2 numpad) and clear
+                // alt entirely. One device per player; if the user
+                // wants a second binding from the SAME keyboard for
+                // a bit (rare), they can manually capture into alt.
+                ApplyDefaults(player_slot);
                 changed = true;
             }
             // One row per available SDL gamepad.
@@ -1128,11 +1150,18 @@ bool RenderBody(int player_slot) {
                               i, GamepadNameAt(i));
                 bool sel_i = (current_idx == i);
                 if (ImGui::Selectable(row, sel_i)) {
-                    // Propagate to all of this player's gamepad-sourced
-                    // bindings (both slots) AND to the per-player
-                    // default index used by future captures.
-                    for (auto& b : pb.bits)     b.gamepad_index = i;
-                    for (auto& b : pb.bits_alt) b.gamepad_index = i;
+                    // Switch this player to gamepad i. Primary gets
+                    // the dpad+buttons layout, alt gets the stick+
+                    // buttons layout — that way stick AND dpad both
+                    // move the character (CXL pattern) without any
+                    // manual binding. User can clear/rebind any slot
+                    // they want afterwards. Keyboard rows are wiped
+                    // so we don't accidentally read kb input on a
+                    // pad-configured player.
+                    for (auto& b : pb.bits)     b = Binding{};
+                    for (auto& b : pb.bits_alt) b = Binding{};
+                    FillPrimaryAsGamepad(pb, i);
+                    FillAltAsGamepad(pb, i);
                     changed = true;
                 }
                 if (sel_i) ImGui::SetItemDefaultFocus();
