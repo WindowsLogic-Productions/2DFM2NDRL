@@ -1893,11 +1893,13 @@ void Netplay_EndBattle() {
                 outcome = FM2K_MATCH_OUTCOME_DRAW;
                 match_winner_idx = 2;
             }
-            // Round-win counters, IDA-verified at globals.h:92-93. Set at
-            // round end (vs_round_function ROUND_END_BANNER), zeroed only
-            // at the start of a new match.
-            match_rounds_p1 = (uint8_t)*(uint32_t*)FM2K::ADDR_P1_WIN_COUNTER;
-            match_rounds_p2 = (uint8_t)*(uint32_t*)FM2K::ADDR_P2_WIN_COUNTER;
+            // FM2K round-win counters (v0.2.21 probe-verified). Per-char-slot
+            // field at offset -0x18 from HP. 0 at match start, increments
+            // each round the player wins. Hooks.cpp's `g_match_phase` /
+            // `g_round_sub_state` labels at the same addresses are
+            // misleading — those are per-slot rounds-won, not phase fields.
+            match_rounds_p1 = (uint8_t)*(uint32_t*)FM2K::ADDR_P1_ROUNDS_WON;
+            match_rounds_p2 = (uint8_t)*(uint32_t*)FM2K::ADDR_P2_ROUNDS_WON;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay: match outcome p1_hp=%u p2_hp=%u outcome=%d",
                 p1_hp, p2_hp, (int)outcome);
