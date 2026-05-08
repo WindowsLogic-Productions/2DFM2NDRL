@@ -152,6 +152,16 @@ struct State {
         uint32_t             anchor_frame    = 0;
         size_t               bytes_received  = 0;
         bool                 active          = false;
+        // Set by SNAPSHOT_END once the blob has been validated (size +
+        // fletcher32) but the SaveState_LoadFromBytes call is held back
+        // because the local game hasn't booted past mode 0 yet.
+        // SpectatorNode_ApplyPendingSnapshot polls each spec tick, sees
+        // game_mode > 0, and runs the actual apply. Without this gate the
+        // raw memcpy lands during the engine's pre-WinMain init and the
+        // next render tick reads from corrupted state → crash. Observed
+        // on Vanguard Princess (1.08 MB snapshots arrived 12ms after
+        // JOIN_ACK, before mode flipped 0→1000).
+        bool                 pending_apply   = false;
     } pb_snapshot_inbox;
 
     // Viewer-side state (this node subscribed upstream).
@@ -1291,6 +1301,22 @@ uint64_t SpectatorNode_GetSessionId() {
 // frame after Load.
 
 void SpectatorNode_StashSnapshot() {
+    // Skip during a rollback rewind — the FM2K state at this moment isn't
+    // the canonical battle-start state we want to capture. In practice
+    // StashSnapshot is called from Netplay_StartBattle which is the seam
+    // frame between CSS and battle (no preceding battle inputs to roll
+    // back), so g_is_rolling_back should never be true here. Belt-and-
+    // suspenders: if a future caller invokes us mid-battle, this gate
+    // prevents handing spectators a partially-rewound state. Match cache
+    // stays as the previous match's (or empty if first match).
+    if (g_is_rolling_back) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: StashSnapshot skipped — called during rollback "
+            "rewind (snapshot cache stays %s)",
+            g_state.current_snapshot.valid ? "previous match's" : "empty");
+        return;
+    }
+
     // Force a Save to populate the rollback buffer's slot 0 with the
     // current FM2K state. Sets g_initial_sync_done in savestate.cpp;
     // GekkoNet's later first-Save is a no-op for the initial-sync reset.
@@ -1331,6 +1357,66 @@ void SpectatorNode_StashSnapshot() {
 
 bool SpectatorNode_HasSnapshot() {
     return g_state.current_snapshot.valid;
+}
+
+void SpectatorNode_ApplyPendingSnapshot() {
+    auto& inbox = g_state.pb_snapshot_inbox;
+    if (!inbox.pending_apply) return;
+
+    // Wait until the spectator's local engine has reached battle phase
+    // (game_mode >= 3000). The savestate captures BATTLE state — object
+    // pool with battle objects, character data with the recorded chars'
+    // .player file data, etc. Loading it before the local engine has
+    // performed its own battle-init (mode 1000=title, 2000=CSS) lands
+    // battle bytes into structurally-incompatible memory:
+    //   - DDraw/D3D9 surfaces sized for title rather than battle layout
+    //   - Audio sample handles for title BGM, not battle SFX
+    //   - Char-data block has wrong .player file content, broken pointers
+    // Symptom: spectator crashes on the next render frame after apply.
+    //
+    // By waiting for mode >= 3000 the local engine has already done its
+    // own battle-init; the apply just overlays dynamic state (RNG, HP,
+    // positions, frame counter) on top of an initialized battle. Cost:
+    // spectator briefly walks through title + CSS before "jumping" to
+    // host's live state via the apply. Future task: arm CssAutoConfirm
+    // with chars from a metadata payload so CSS auto-locks instead of
+    // walking randomly via leaked battle inputs.
+    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    if (game_mode < 3000u) return;
+
+    if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: SaveState_LoadFromBytes failed at deferred "
+            "apply (match=%u, %zu bytes, mode=%u) — discarding snapshot",
+            inbox.meta.match_index, inbox.blob.size(), game_mode);
+        inbox = State::SnapshotInbox{};
+        return;
+    }
+
+    const uint32_t anchor = inbox.anchor_frame;
+
+    // Anchor the EVENT_BATCH stream cursor at the snapshot's INPUT-frame
+    // position. Subsequent batches start at this frame index — see
+    // SendSessionBackfillFromFrame on the host side.
+    // have_frame_baseline=true short-circuits the first-batch baseline-
+    // init in the EVENT_BATCH handler. Drop any pb_queue contents that
+    // may have arrived prior to the snapshot (CURRENT_MATCH bind path
+    // doesn't pre-send events, but FULL_SESSION → CURRENT_MATCH
+    // renegotiation could have stale ones cached).
+    g_state.pb_queue.clear();
+    g_state.pb_match_headers.clear();
+    g_state.have_frame_baseline    = true;
+    g_state.next_expected_frame    = anchor;
+    g_state.highest_consumed_frame = 0;
+    g_state.playing_back           = true;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: SNAPSHOT applied (match=%u, %zu bytes) — "
+        "anchor INPUT-frame=%u, local game_mode=%u",
+        inbox.meta.match_index, inbox.blob.size(),
+        anchor, game_mode);
+
+    inbox = State::SnapshotInbox{};
 }
 
 SpectatorSnapshotInfo SpectatorNode_GetSnapshotInfo() {
@@ -1989,13 +2075,30 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
             addr_str);
     };
 
-    // Already subscribed? Idempotent ACK. INITIAL_MATCH/backfill are
-    // deferred until the spectator's TCP socket binds (see TickHealth).
-    for (const auto& sub : g_state.subscribers) {
+    // Already subscribed? Reset the slot's TCP-bound state so the new
+    // JOIN_REQ re-fires the bind + backfill path. Without this, a previous
+    // spectator session whose TCP read-errored leaves the slot with
+    // tcp_bound=true; the next JOIN_REQ from same UDP source treats it as
+    // a duplicate and never re-ships snapshot/backfill — symptom is the
+    // spectator's silence-failover triggering every 5s in a reconnect
+    // loop with the host accepting TCP but never sending data.
+    //
+    // Also refreshes join_mode in case the spectator switched modes (e.g.
+    // CURRENT_MATCH on first connect, FULL_SESSION on retry after fallback)
+    // and bumps last_seen_ms so the host's own subscriber-expiry sweep
+    // doesn't cull this slot mid-rebind.
+    for (auto& sub : g_state.subscribers) {
         if (AddrEqual(sub.addr, from)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "SpectatorNode: JOIN_REQ from existing subscriber %s — re-ACKing",
-                        addr_buf);
+                        "SpectatorNode: JOIN_REQ from existing subscriber %s — "
+                        "resetting bind state for fresh backfill (mode=%s)",
+                        addr_buf,
+                        mode == SpecJoinMode::CURRENT_MATCH ? "CURRENT_MATCH"
+                                                            : "FULL_SESSION");
+            sub.tcp_bound    = false;
+            sub.ack_frame    = 0;
+            sub.join_mode    = mode;
+            sub.last_seen_ms = GetTickCount64();
             CtrlPacket ack = BuildJoinAck();
             ControlChannel_SendTo(ack, from);
             return;
@@ -2409,39 +2512,22 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 break;
             }
 
-            const uint32_t anchor = inbox.anchor_frame;
-            if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: SaveState_LoadFromBytes failed "
-                    "(match=%u, %zu bytes) — discarding snapshot",
-                    inbox.meta.match_index, inbox.blob.size());
-                inbox = State::SnapshotInbox{};
-                break;
-            }
-
-            // Anchor the EVENT_BATCH stream cursor at the snapshot's
-            // INPUT-frame position. Subsequent batches start at this
-            // frame index — see SendSessionBackfillFromFrame on the
-            // host side. have_frame_baseline=true short-circuits the
-            // first-batch baseline-init in the EVENT_BATCH handler.
-            // Drop any pb_queue contents that may have arrived prior to
-            // the snapshot (CURRENT_MATCH bind path doesn't pre-send
-            // events, but FULL_SESSION → CURRENT_MATCH renegotiation
-            // could have stale ones cached).
-            g_state.pb_queue.clear();
-            g_state.pb_match_headers.clear();
-            g_state.have_frame_baseline = true;
-            g_state.next_expected_frame = anchor;
-            g_state.highest_consumed_frame = 0;
-            g_state.playing_back        = true;
+            // Validation passed. DON'T apply SaveState_LoadFromBytes yet —
+            // the spectator's local game may still be in pre-WinMain init
+            // (game_mode == 0). Smashing battle-state bytes into uninit'd
+            // engine memory crashes the next frame's render. Mark the inbox
+            // pending_apply; ApplyPendingSnapshot polls each spec tick and
+            // runs the actual apply once the engine has progressed past
+            // mode 0. inbox.blob + meta + anchor stay populated until then.
+            inbox.pending_apply = true;
+            inbox.active        = false;  // assembly is done; no more chunks
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: SNAPSHOT_END applied (match=%u, "
-                "%zu bytes, fletcher32=0x%08X) — anchor INPUT-frame=%u",
+                "SpectatorNode: SNAPSHOT_END validated (match=%u, "
+                "%zu bytes, fletcher32=0x%08X) — anchor INPUT-frame=%u "
+                "(deferred apply pending game-mode != 0)",
                 inbox.meta.match_index, inbox.blob.size(),
-                local_checksum, anchor);
-
-            inbox = State::SnapshotInbox{};
+                local_checksum, inbox.anchor_frame);
             break;
         }
         case SpecDataType::EVENT_BATCH: {

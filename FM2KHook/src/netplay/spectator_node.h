@@ -378,6 +378,15 @@ struct SpectatorSnapshotInfo {
 };
 SpectatorSnapshotInfo SpectatorNode_GetSnapshotInfo();
 
+// Spectator-side: lazily apply a snapshot whose SNAPSHOT_END validation
+// completed but whose SaveState_LoadFromBytes was deferred because the
+// local engine hadn't progressed past pre-WinMain bootup (game_mode == 0).
+// Polled every spec tick from RunSpectatorTick; no-op when nothing is
+// pending or when game_mode is still 0. Once mode flips to 1000+ (title
+// or beyond) the held blob is loaded, pb_queue is anchored at the
+// snapshot's INPUT-frame, and live broadcasts can resume.
+void SpectatorNode_ApplyPendingSnapshot();
+
 // =============================================================================
 // SESSION REPLAY FILE WRITERS (C7)
 // =============================================================================

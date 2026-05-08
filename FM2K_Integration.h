@@ -573,7 +573,12 @@ public:
 
     // Starts a background SDL thread that will run DiscoverGames() and notify the main
     // thread when done. Implemented in FM2K_RollbackClient.cpp.
-    void StartAsyncDiscovery();
+    //
+    // `show_spinner` toggles the UI's "Scanning for games…" indicator. Pass
+    // false when the cache already populated the games list — the user
+    // shouldn't see a spinner if the displayed list is already correct;
+    // the background walk is just an "anything new?" check at that point.
+    void StartAsyncDiscovery(bool show_spinner = true);
     
     // Scan progress accessors for UI
     void SetScanning(bool scanning);
@@ -620,11 +625,14 @@ private:
     // Launch a local spectator pointing at the host (client1) on host_port.
     // Spectator-mode hook will SPEC_JOIN_REQ the host and start replaying
     // the streamed input history (CSS + battle).
-    // mode: "current" (default; CCCaster-style snapshot join) or "full".
+    // mode: "full" (default; replay-from-session-start input log) or
+    // "current" (CCCaster-style snapshot join — code path exists but has
+    // structural issues; see task #18). Default flipped to "full" 2026-05-08
+    // so the live-spec button works while CURRENT_MATCH bakes.
     bool LaunchLocalSpectator(const std::string& game_path,
                               int spectator_port,
                               int host_port,
-                              const std::string& mode = "current");
+                              const std::string& mode = "full");
     // Daisy-chain test: launches a second spectator that subscribes to the
     // first spectator instead of the host. Verifies relay-node forwarding.
     bool LaunchLocalSpectator2(const std::string& game_path,
@@ -636,12 +644,13 @@ public:
     // active match to watch it" path AND the --spectate CLI flag for e2e
     // testing. spectator_port is local UDP bind; host_ip:host_port is where
     // the spectator's FM2K_REMOTE_ADDR points and SpectatorNode JOIN_REQ
-    // is sent. mode: "current" (default) or "full".
+    // is sent. mode: "full" (default) or "current". See LaunchLocalSpectator
+    // above for the rationale on the "full" default.
     bool LaunchRemoteSpectator(const std::string& game_path,
                                int spectator_port,
                                const std::string& host_ip,
                                int host_port,
-                               const std::string& mode = "current");
+                               const std::string& mode = "full");
 
     // Offline replay player. Launches the game with FM2K_SPECTATOR_MODE=1
     // + FM2K_REPLAY_FILE=<replay_path>; the hook reads the env var in

@@ -913,6 +913,14 @@ static void RunSpectatorTick() {
     // Health: heartbeat send, silence-failover, daisy-chain reconnect.
     SpectatorNode_TickHealth();
 
+    // Apply any deferred SNAPSHOT_END that landed before the local engine
+    // had finished its pre-WinMain init. Snapshot blobs that arrive within
+    // ms of the spectator process starting (very common with the host
+    // sitting in a fast loopback connect) will land in pb_snapshot_inbox
+    // with pending_apply=true; this drains them on the first spec tick
+    // where game_mode != 0. No-op when nothing is pending.
+    SpectatorNode_ApplyPendingSnapshot();
+
     // Cache offline-replay mode once. Several gates downstream behave
     // differently for replay vs. live spec — replay has no upstream so
     // jitter-floor / catchup logic is meaningless.
