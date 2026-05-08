@@ -25,6 +25,18 @@ extern void NeuterFullscreenTogglesForCncDdraw();
 #include <cctype>
 #include <string>
 
+// Quill — async logging backend. SDL_Log call sites stay unchanged; our
+// SDLCustomLogOutput function (LogOutputFunction below) routes the formatted
+// message into a quill Logger which the backend thread writes to disk
+// asynchronously. Fixes the "fprintf + fflush per log line" stall that was
+// noticeable on the spectator under SPEC-FP / ROLLBACK-stats cadence.
+#include "quill/Backend.h"
+#include "quill/Frontend.h"
+#include "quill/LogMacros.h"
+#include "quill/Logger.h"
+#include "quill/sinks/FileSink.h"
+#include "quill/core/PatternFormatterOptions.h"
+
 // =============================================================================
 // LOG-FILE PATH HELPER
 // =============================================================================
@@ -46,9 +58,23 @@ bool Fm2k_BuildLogPath(char* out, size_t out_size, const char* filename) {
 }
 
 // =============================================================================
-// FILE LOGGING
+// FILE LOGGING (quill async backend)
 // =============================================================================
-static FILE* g_log_file = nullptr;
+//
+// Pre-quill: each SDL_Log call → LogOutputFunction → fprintf(g_log_file,
+// ...) + fflush(). Synchronous file I/O on the sim thread; under heavy
+// log volume (~3 lines/sec SPEC-FP plus ROLLBACK stats plus SoundRollback
+// chatter) the per-line WriteFile + fflush adds up to visible jitter.
+//
+// Now: SDL_Log → LogOutputFunction formats the line → LOG_INFO into a
+// quill Logger. Quill's backend thread drains the queue and writes to
+// disk async on its own thread, so the sim never blocks on disk.
+//
+// We use a custom PatternFormatter ("%(message)") that emits the raw
+// formatted message verbatim — no quill-prefixed timestamp/level dup,
+// since LogOutputFunction already builds the "[hh:mm:ss.mmm] [P1] [INFO]"
+// prefix in the same shape the user/CI grep tools expect.
+static quill::Logger* g_quill_logger = nullptr;
 
 static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPriority priority, const char* message) {
     // Get timestamp
@@ -98,9 +124,18 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
             fflush(stdout);
         }
     }
-    if (g_log_file) {
-        fprintf(g_log_file, "%s", formatted);
-        fflush(g_log_file);
+
+    // Quill async path: one snprintf'd line per call, hands off to the
+    // backend thread for actual disk I/O. Pattern is "%(message)" so the
+    // line lands in the file verbatim — same byte stream as the prior
+    // fprintf path, just async. Strip the trailing \n we added since
+    // quill always appends one of its own.
+    if (g_quill_logger) {
+        size_t len = std::strlen(formatted);
+        if (len > 0 && formatted[len - 1] == '\n') {
+            formatted[len - 1] = '\0';
+        }
+        LOG_INFO(g_quill_logger, "{}", formatted);
     }
 }
 
@@ -119,27 +154,68 @@ static void InitFileLogging() {
         snprintf(filename, sizeof(filename), "%s", base_name);
     }
 
-    g_log_file = fopen(filename, "w");
-    if (g_log_file) {
-        // Write header
+    // Start quill's backend writer thread (idempotent — std::call_once
+    // inside Backend::start handles double-init from FM2K + FM95 builds
+    // co-loaded into the same process).
+    quill::BackendOptions backend_opts;
+    quill::Backend::start(backend_opts);
+
+    // FileSink: open in "w" mode so each new game session truncates the
+    // prior log (matches the previous fopen(... "w") behavior).
+    quill::FileSinkConfig sink_cfg;
+    sink_cfg.set_open_mode('w');
+    auto file_sink = quill::Frontend::create_or_get_sink<quill::FileSink>(
+        std::string(filename), sink_cfg);
+
+    // PatternFormatter that emits the message body verbatim — our
+    // LogOutputFunction has already built the full "[hh:mm:ss.mmm] [P1]
+    // [INFO] ..." prefix in the same shape the existing log-grep tooling
+    // (parity diff scripts, e2e harnesses) expects. Quill's default
+    // pattern would double-prefix.
+    quill::PatternFormatterOptions fmt_opts(
+        /*format_pattern=*/"%(message)",
+        /*timestamp_pattern=*/"%H:%M:%S.%Qns",
+        /*timestamp_timezone=*/quill::Timezone::LocalTime,
+        /*add_metadata_to_multi_line_logs=*/false);
+
+    g_quill_logger = quill::Frontend::create_or_get_logger(
+        "fm2k_hook", std::move(file_sink), fmt_opts);
+
+    if (g_quill_logger) {
+        // Header lines go through the same async path. Three lines
+        // matching the previous synchronous header so log readers /
+        // parity tools find the exact same byte sequence at file start.
         SYSTEMTIME st;
         GetLocalTime(&st);
-        fprintf(g_log_file, "=== FM2K Hook Debug Log - Player %d ===\n", g_player_index + 1);
-        fprintf(g_log_file, "Session started: %04d-%02d-%02d %02d:%02d:%02d\n",
-                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-        fprintf(g_log_file, "==========================================\n");
-        fflush(g_log_file);
+        char header[256];
+        snprintf(header, sizeof(header),
+                 "=== FM2K Hook Debug Log - Player %d ===",
+                 g_player_index + 1);
+        LOG_INFO(g_quill_logger, "{}", header);
+        snprintf(header, sizeof(header),
+                 "Session started: %04d-%02d-%02d %02d:%02d:%02d",
+                 st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond);
+        LOG_INFO(g_quill_logger, "{}", header);
+        LOG_INFO(g_quill_logger,
+                 "{}",
+                 "==========================================");
     }
 
-    // Set SDL log callback
+    // Wire SDL's logger to dispatch through our function so each
+    // SDL_LogInfo / Warn / Error call site (~150 across the hook) reaches
+    // the quill backend without changing call-site code.
     SDL_SetLogOutputFunction(LogOutputFunction, nullptr);
 }
 
 static void ShutdownFileLogging() {
-    if (g_log_file) {
-        fprintf(g_log_file, "=== Session ended ===\n");
-        fclose(g_log_file);
-        g_log_file = nullptr;
+    if (g_quill_logger) {
+        LOG_INFO(g_quill_logger, "{}", "=== Session ended ===");
+        // Don't stop the backend thread here — quill's Backend::start
+        // installs a std::atexit handler that drains + stops cleanly on
+        // normal process exit. Stopping early could swallow pending log
+        // lines from late shutdown paths (gekko_destroy etc).
+        g_quill_logger = nullptr;
     }
 }
 

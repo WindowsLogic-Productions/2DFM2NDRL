@@ -64,6 +64,7 @@ set(FM2KHOOK_INCLUDES
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/include
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/GekkoLib/include
     ${CMAKE_SOURCE_DIR}/vendored/imgui
+    ${CMAKE_SOURCE_DIR}/vendored/quill/include
     # kgtengine parity-snapshot header (sibling repo at /mnt/c/dev/kgtengine).
     ${CMAKE_CURRENT_SOURCE_DIR}/../../kgtengine/include
 )
