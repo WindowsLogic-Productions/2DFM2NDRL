@@ -4821,16 +4821,20 @@ void LauncherUI::RenderHubPanel() {
     // computed pick. Manual override persists across matches via the
     // FM2K_LOCAL_DELAY env var; "computed" clears the var so the hook
     // falls back to the auto path.
-    static int s_delay_override = 0;  // 0 = computed, 1..16 = manual frames
+    // s_delay_override: 0 = "computed" (use auto-pick), 1..17 = manual
+    // frames N-1 (so index 1 = manual 0 frames, index 2 = manual 1, ...,
+    // index 17 = manual 16).
+    static int s_delay_override = 0;
     {
-        // Manual delay range: 1..16 (was 1..8). Bumped because some
-        // intercontinental matches need delay >8 to ride out the worst-
-        // case RTT spikes without rollback churn. 16 frames at 100 Hz
-        // = 160 ms — past that the input lag is bad enough that nobody
-        // wants to play anyway, so capping there is fine.
+        // Manual delay range: 0..16. 0 is opt-in for sub-1ms LAN /
+        // loopback / hot-seat play — GekkoNet's prediction-0 mode applies
+        // input same frame, but ANY jitter on the link will rollback
+        // every frame. Users on actual internet should leave this on
+        // computed. 16 = 160 ms, basically the upper limit of playable
+        // delay-only netcode.
         const char* delay_items[] = {
             "computed",
-            "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+            "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
             "9", "10", "11", "12", "13", "14", "15", "16",
         };
         ImGui::PushItemWidth(-120);
@@ -4839,14 +4843,16 @@ void LauncherUI::RenderHubPanel() {
         ImGui::PopItemWidth();
         ImGui::SetItemTooltip(
             "Input delay (frames at 100 Hz). \"computed\" applies a "
-            "CCCaster-style pick at match start: ceil(worst_one_way_ms "
-            "/ 10) + 1, clamped [2, 15] — covers the worst spike since "
-            "the prior match. Pin 1..16 to override and ride a fixed "
-            "delay instead. 16 = 160 ms, basically the upper limit of "
-            "playable delay-only netcode.");
+            "CCCaster-style pick at match start: ceil(mean_one_way_ms "
+            "/ 10), clamped [2, 15] — covers the worst spike since "
+            "the prior match. Pin 0..16 to override and ride a fixed "
+            "delay instead. 0 = same-frame input, only safe on "
+            "near-zero-latency links (LAN / loopback / hotseat). "
+            "16 = 160 ms, upper limit of playable delay-only netcode.");
         if (s_delay_override > 0) {
+            // Manual override: index 1 -> "0", index 2 -> "1", ...
             char buf[8];
-            std::snprintf(buf, sizeof(buf), "%d", s_delay_override);
+            std::snprintf(buf, sizeof(buf), "%d", s_delay_override - 1);
             ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", buf);
         } else {
             ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", nullptr);

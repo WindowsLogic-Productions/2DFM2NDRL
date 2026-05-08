@@ -1621,20 +1621,28 @@ bool Netplay_StartBattle() {
     // Floor of 2 keeps GekkoNet's prediction window happy on
     // sub-millisecond loopback.
     //
-    // FM2K_LOCAL_DELAY env var set to 1..15 forces a manual value (UI
+    // FM2K_LOCAL_DELAY env var set to 0..16 forces a manual value (UI
     // override). Manual override is checked every battle so the user
     // can flip the override mid-session; AUTO is pinned for the
     // connection lifetime.
-    int  local_delay = 0;
+    //
+    // 0 is a valid manual choice for sub-1ms LAN / loopback / hot-seat
+    // play — GekkoNet's prediction-0 mode handles delay=0 cleanly,
+    // input is applied same frame. The COMPUTED branch below clamps
+    // to >= 2 because that path is for over-the-internet matches where
+    // any RTT spike requires headroom; manual 0 is opt-in by users
+    // who know they're on near-zero latency.
+    int  local_delay = -1;  // -1 sentinel = no manual override
     enum DelaySource { DS_MANUAL, DS_COMPUTED, DS_CACHED } delay_source = DS_COMPUTED;
     if (const char* env = std::getenv("FM2K_LOCAL_DELAY"); env && env[0]) {
         int v = std::atoi(env);
-        if (v >= 1 && v <= 15) { local_delay = v; delay_source = DS_MANUAL; }
+        if (v >= 0 && v <= 16) { local_delay = v; delay_source = DS_MANUAL; }
     }
     const uint32_t rtt_mean_ms  = ControlChannel_GetRttMs();
     const uint32_t rtt_worst_ms = ControlChannel_GetWorstRttMs();
     const uint32_t mean_one_way = rtt_mean_ms / 2;
-    if (local_delay == 0) {
+    if (local_delay < 0) {
+        // No manual override — fall through to cached or compute.
         if (g_session_delay_cache_valid) {
             local_delay  = g_session_delay_cached;
             delay_source = DS_CACHED;
