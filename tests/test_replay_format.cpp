@@ -1,9 +1,12 @@
 // Replay format wire-layout tests.
 //
-// Pins the on-disk / on-wire layout of ReplayHeader + ReplayFrame so a future
-// edit (adding a field, reordering, padding change) can't silently break
-// existing .fm2krep files or the spectator INITIAL_MATCH packet — both depend
-// on the exact byte offsets defined here.
+// Pins the on-disk / on-wire layout of ReplayHeader so a future edit
+// (adding a field, reordering, padding change) can't silently break the
+// MATCH_START SessionEvent's 96-byte payload — spectator-side decoders
+// pull fields by hard-coded offset (seed @ 20, state_hash @ 24, char
+// selects @ 28-31). v0.2.27 retired the legacy .fm2krep file format
+// owned by replay.cpp; only the header struct survives as the
+// MATCH_START wire-payload schema.
 
 #include "doctest.h"
 
@@ -22,12 +25,6 @@ TEST_CASE("ReplayHeader is exactly 96 bytes") {
     // state_hash @ 24, char selects @ 28-31). Any size change without
     // matching offset rewrite breaks spectators.
     CHECK(sizeof(ReplayHeader) == 96);
-}
-
-TEST_CASE("ReplayFrame is exactly 4 bytes (p1 u16, p2 u16)") {
-    CHECK(sizeof(ReplayFrame) == 4);
-    CHECK(offsetof(ReplayFrame, p1_input) == 0);
-    CHECK(offsetof(ReplayFrame, p2_input) == 2);
 }
 
 TEST_CASE("ReplayHeader field offsets match the spectator-node parser's expectations") {
@@ -83,32 +80,3 @@ TEST_CASE("Header roundtrips through a 96-byte byte buffer unchanged") {
     CHECK(std::strcmp(reinterpret_cast<const char*>(rt.p2_name), "Player2") == 0);
 }
 
-TEST_CASE("ReplayFrame array layout is contiguous (no per-element padding)") {
-    // Spectator INPUT_BATCH parser reads N consecutive 4-byte (p1,p2) pairs
-    // out of the datagram payload via memcpy. If the compiler ever inserts
-    // padding between ReplayFrame elements this fails and the parser breaks.
-    ReplayFrame frames[3] = {{0x100, 0x200}, {0x300, 0x400}, {0x500, 0x600}};
-    CHECK(sizeof(frames) == 12);
-
-    uint8_t buf[12];
-    std::memcpy(buf, frames, sizeof(buf));
-
-    // First frame
-    uint16_t got_p1, got_p2;
-    std::memcpy(&got_p1, buf + 0, 2);
-    std::memcpy(&got_p2, buf + 2, 2);
-    CHECK(got_p1 == 0x100);
-    CHECK(got_p2 == 0x200);
-
-    // Second frame
-    std::memcpy(&got_p1, buf + 4, 2);
-    std::memcpy(&got_p2, buf + 6, 2);
-    CHECK(got_p1 == 0x300);
-    CHECK(got_p2 == 0x400);
-
-    // Third
-    std::memcpy(&got_p1, buf + 8,  2);
-    std::memcpy(&got_p2, buf + 10, 2);
-    CHECK(got_p1 == 0x500);
-    CHECK(got_p2 == 0x600);
-}

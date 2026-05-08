@@ -921,11 +921,9 @@ void SpectatorNode_OnMatchStart(
     // already be at the higher index → indefinite gap.
     FlushBatch();
 
-    // Stash the initial-match metadata as a 96-byte payload identical to
-    // Replay::ReplayHeader's on-disk layout, so a subscriber can feed it
-    // directly into Replay_LoadFromBuffer. We reconstruct the layout here
-    // (can't pull from Replay because that header is per-file with a
-    // post-match frame_count — spectators get frame_count=0, streaming).
+    // Stash the initial-match metadata as a 96-byte payload that's the
+    // canonical MATCH_START event body (layout pinned by Replay::ReplayHeader
+    // in replay.h — kept stable so the wire schema doesn't churn).
     uint8_t* h = g_state.initial_match.header_bytes;
     std::memset(h, 0, 96);
     uint32_t magic   = 0x52504D46;  // Replay::REPLAY_MAGIC

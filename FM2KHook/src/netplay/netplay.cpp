@@ -7,7 +7,6 @@
 #include "game_hash.h"
 #include "input.h"
 #include "savestate.h"
-#include "replay.h"
 #include "spectator_node.h"
 #include "nat_traversal.h"
 #include "globals.h"
@@ -1727,20 +1726,17 @@ bool Netplay_StartBattle() {
     SpectatorNode_AppendResetInputState();
     SpectatorNode_AppendSoundInit();
 
-    // Start recording a replay of this match. Captures initial RNG +
-    // char selects + per-frame inputs; on battle end we flush to disk and
-    // cache for spectator streaming. Character slots / colors are read from
-    // CSS state — TODO once CSS exposes them; pass 0s for now so replays
-    // still work, just without char metadata.
+    // Per-battle replay capture is owned by SpectatorNode (v2 .fm2krep
+    // file format). The legacy Replay::Replay_BeginRecording call here was
+    // retired in v0.2.27 — its 96-byte ReplayHeader + raw ReplayFrame[]
+    // body has been a strict subset of the v2 SessionEvent stream since
+    // C6 landed. Initial RNG seed + state hash are captured below for
+    // SpectatorNode_OnMatchStart, which inlines them into the
+    // MATCH_START event's 96-byte payload (byte-compatible with the old
+    // ReplayHeader so the wire schema stays stable).
     const uint32_t initial_seed = 0x12345678;
     const uint32_t initial_state_hash =
         SaveState_GetRegionChecksums().gameplay_fingerprint;
-    Replay::Replay_BeginRecording(
-        /*game_hash*/         0,  // TODO: plumb FM2K variant hash
-        /*initial_rng_seed*/  initial_seed,
-        /*initial_state_hash*/initial_state_hash,
-        /*p1_char*/           0, /*p1_color*/ 0, /*p1_name*/ nullptr,
-        /*p2_char*/           0, /*p2_color*/ 0, /*p2_name*/ nullptr);
 
     // C7 — emit the host's session_id once at the very first match of the
     // connection. Generated lazily on first call: high 32 bits = unix epoch
@@ -1946,9 +1942,9 @@ void Netplay_EndBattle() {
         g_session_kind  = SessionKind::NONE;
     }
 
-    // Finalize replay file for this match and cache the in-memory copy for
-    // spectator streaming. No-op if recording wasn't active.
-    Replay::Replay_EndRecording();
+    // (Legacy Replay::Replay_EndRecording call retired in v0.2.27 — the
+    // SpectatorNode_WriteCurrentBattleFile call below writes the v2
+    // .fm2krep file that supersedes the legacy 96-byte-header format.)
 
     // Tell the spectator tree the match is over — subscribers receive
     // MATCH_END and go idle until the next SpectatorNode_OnMatchStart.
@@ -1974,19 +1970,15 @@ void Netplay_EndBattle() {
     // between-match cache freshen with a JIT live-peek (no SaveState_Save)
     // path that doesn't trigger the replay-diff scan.)
 
-    // C7: per-battle .fm2krep — slice the SessionEvent log between the most
+    // Per-battle .fm2krep — slice the SessionEvent log between the most
     // recent MATCH_START and the just-appended MATCH_END. Same on-disk
     // shape as .fm2kset (full session); is_battle_slice flag distinguishes.
-    // The legacy Replay_EndRecording above writes the older 96-byte-header
-    // .fm2krep format; this writes the new SessionEvent-based variant
-    // alongside under a distinct timestamped filename. Keeps both path
-    // active during the C8 transition.
     {
         char ts[64] = {};
         std::time_t now = std::time(nullptr);
         std::tm tm_buf{};
         localtime_s(&tm_buf, &now);
-        std::strftime(ts, sizeof(ts), "replays/%Y-%m-%d_%H%M%S.battle.fm2krep", &tm_buf);
+        std::strftime(ts, sizeof(ts), "replays/%Y-%m-%d_%H%M%S.fm2krep", &tm_buf);
         CreateDirectoryA("replays", nullptr);
         SpectatorNode_WriteCurrentBattleFile(ts);
     }
@@ -2478,7 +2470,10 @@ bool Netplay_ProcessBattleInputPhase() {
                             p1_hp, p2_hp);
                     }
 
-                    Replay::Replay_RecordFrame(g_p1_input, g_p2_input);
+                    // (Legacy Replay::Replay_RecordFrame call retired in
+                    // v0.2.27 — SpectatorNode_OnFrameConfirmed below pushes
+                    // the same frame data into the v2 .fm2krep event stream
+                    // via the SessionEvent log.)
                     // Spectator input forwarding: gate is here because this
                     // site is already !rolling_back && !running_ahead &&
                     // new_frame — the dedup we need to avoid runahead /

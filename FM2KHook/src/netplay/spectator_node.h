@@ -268,8 +268,8 @@ void SpectatorNode_Shutdown();
 // HOST-SIDE (match is running on this node)
 // =============================================================================
 
-// Called at battle start (alongside Replay_BeginRecording). Captures the
-// initial-match metadata that gets handed to every new subscriber.
+// Called at battle start. Captures the initial-match metadata that gets
+// handed to every new subscriber + persisted in the .fm2krep file.
 void SpectatorNode_OnMatchStart(
     uint32_t game_hash,
     uint32_t initial_rng_seed,
@@ -390,8 +390,7 @@ SpectatorSnapshotInfo SpectatorNode_GetSnapshotInfo();
 // Path format:
 //   replays/<timestamp>.fm2krep   — per-battle slice
 //   sessions/<timestamp>.fm2kset  — full session
-// (Relative to the game's working directory; matches existing `replays/`
-//  layout used by Replay_BeginRecording.)
+// (Relative to the game's working directory.)
 //
 // Returns true on successful write. False if there's no usable data
 // (empty session, MATCH_START not seen yet, etc.) or the file open failed.
@@ -555,10 +554,12 @@ void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,
                                       uint32_t redirect_ip,
                                       uint16_t redirect_port);
 
-// Handle an inbound 0xCE datagram. Parses the SpecDataHeader and routes into
-// the replay-playback input queue (Replay_LoadFromBuffer for INITIAL_MATCH;
-// append for INPUT_BATCH; match-end for MATCH_END). Called by the UDP poll
-// path in control_channel.cpp when it sees SPEC_DATA_MAGIC.
+// Handle an inbound 0xCE datagram. Parses the SpecDataHeader and routes
+// into the playback queue: SessionEvent_Decode walks the EVENT_BATCH
+// payload, MATCH_START / round events / inputs flow into pb_queue; the
+// SNAPSHOT_BEGIN/CHUNK/END group runs SaveState_LoadFromBytes on
+// completion. Called by the UDP poll path in control_channel.cpp when
+// it sees SPEC_DATA_MAGIC.
 void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                                   const sockaddr_in& from);
 
