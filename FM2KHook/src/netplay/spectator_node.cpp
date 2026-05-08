@@ -2678,14 +2678,24 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                     gap_first, expected_at_entry,
                     hdr.start_frame, hdr.frame_count, pushed_inputs, skipped_inputs);
             }
-            static uint32_t last_log_tick = 0;
-            uint32_t now = (uint32_t)GetTickCount64();
-            if (now - last_log_tick > 1000) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: pb_queue=%zu (batch inputs=%u, start=%u, subs=%zu)",
-                    g_state.pb_queue.size(), hdr.frame_count, hdr.start_frame,
-                    g_state.subscribers.size());
-                last_log_tick = now;
+            // pb_queue / batch / subs status — debug only (gated on
+            // FM2K_SPECTATOR_DEBUG=1). Used to diagnose backpressure
+            // / drain rate during catchup; release builds don't need it.
+            static int s_pq_debug_env = -1;
+            if (s_pq_debug_env < 0) {
+                const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
+                s_pq_debug_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+            }
+            if (s_pq_debug_env == 1) {
+                static uint32_t last_log_tick = 0;
+                uint32_t now = (uint32_t)GetTickCount64();
+                if (now - last_log_tick > 1000) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: pb_queue=%zu (batch inputs=%u, start=%u, subs=%zu)",
+                        g_state.pb_queue.size(), hdr.frame_count, hdr.start_frame,
+                        g_state.subscribers.size());
+                    last_log_tick = now;
+                }
             }
             break;
         }
