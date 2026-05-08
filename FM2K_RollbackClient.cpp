@@ -832,10 +832,43 @@ namespace Utils {
 extern "C" {
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    // Hide the console window for release. The launcher EXE is currently
+    // console-subsystem (so it gets a console handle inherited by the
+    // game subprocesses we spawn) but the user-facing window is the SDL
+    // ImGui app — the black console alongside is purely visual noise +
+    // the synchronous WriteFile pacing on a Windows console actively
+    // lags printf-heavy code paths.
+    //
+    // Strategy: keep the console subsystem (so child processes can
+    // inherit a usable stdout/stderr if needed) but hide the WINDOW
+    // immediately. Then redirect our own stdout/stderr to NUL so any
+    // legacy printf still goes somewhere safe instead of trying to
+    // write to a hidden console (which can wedge with SetConsoleMode
+    // edge cases). FM2K_DEV_MODE=1 keeps the console visible for
+    // diagnostic runs.
+    {
+        const char* dev = std::getenv("FM2K_DEV_MODE");
+        const bool show_console = (dev && dev[0] == '1' && dev[1] == '\0');
+        if (!show_console) {
+            if (HWND con = GetConsoleWindow()) {
+                ShowWindow(con, SW_HIDE);
+            }
+            // Detach our own stdio from the (now hidden) console. Child
+            // processes still have their own handles via inheritance —
+            // this only affects the launcher's printf/cout. Redirect to
+            // NUL so any leftover prints don't block.
+            FILE* dummy = nullptr;
+            freopen_s(&dummy, "NUL", "w", stdout);
+            freopen_s(&dummy, "NUL", "w", stderr);
+        } else {
+            SetConsoleTitleA("FM2K Rollback Launcher (DEV)");
+        }
+    }
     // Rename the console window we get for the console-subsystem EXE.
     // Default title is the full EXE path or, on some launches, the
     // MinGW-w64 toolchain string ("POSIX WinThreads") inherited from
-    // the runtime. Override with something meaningful.
+    // the runtime. Override with something meaningful (only visible
+    // when FM2K_DEV_MODE=1 keeps the console window up).
     SetConsoleTitleA("FM2K Rollback Launcher");
 
     // Pin the AppUserModelID for this process. Without an explicit AUMID
