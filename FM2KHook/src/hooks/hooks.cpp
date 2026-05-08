@@ -211,6 +211,54 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share,
     if (h != INVALID_HANDLE_VALUE && name) {
         MaybeRegisterPlayerVFileA(h, name);
     }
+
+    // KGT fallback: if both the W and A paths failed for a *.kgt request,
+    // scan the same directory for any *.kgt and open that. Handles the
+    // case where the exe has a hardcoded kgt filename baked in by the
+    // FM2K editor (e.g. "Bishi Bashi Touhou 1.kgt") but the user's local
+    // copy was renamed to a JP basename ("びしばし東方.kgt"). Single-kgt
+    // FM2K installs are the norm, so picking the first match is safe.
+    if (h == INVALID_HANDLE_VALUE && name) {
+        size_t name_len = SDL_strlen(name);
+        bool is_kgt = (name_len >= 4 && name[name_len - 4] == '.' &&
+                       (name[name_len - 3] == 'k' || name[name_len - 3] == 'K') &&
+                       (name[name_len - 2] == 'g' || name[name_len - 2] == 'G') &&
+                       (name[name_len - 1] == 't' || name[name_len - 1] == 'T'));
+        if (is_kgt) {
+            int wlen = MultiByteToWideChar(932, 0, name, -1, nullptr, 0);
+            if (wlen > 1) {
+                std::vector<wchar_t> wpath(static_cast<size_t>(wlen));
+                if (MultiByteToWideChar(932, 0, name, -1, wpath.data(), wlen) > 0) {
+                    // Carve off the directory component, default to "" (CWD).
+                    std::wstring dir(wpath.data());
+                    size_t sep = dir.find_last_of(L"\\/");
+                    dir = (sep != std::wstring::npos) ? dir.substr(0, sep + 1)
+                                                      : std::wstring(L"");
+                    std::wstring search = dir + L"*.kgt";
+                    WIN32_FIND_DATAW fd = {};
+                    HANDLE find = FindFirstFileW(search.c_str(), &fd);
+                    if (find != INVALID_HANDLE_VALUE) {
+                        std::wstring alt = dir + fd.cFileName;
+                        FindClose(find);
+                        HANDLE h2 = CreateFileW(alt.c_str(), access,
+                                                share | kRelaxedShareMode,
+                                                sa, disp, flags, tmpl);
+                        if (h2 != INVALID_HANDLE_VALUE) {
+                            char utf8[1024] = {0};
+                            WideCharToMultiByte(CP_UTF8, 0, alt.c_str(), -1,
+                                                utf8, sizeof(utf8), nullptr, nullptr);
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "KgtFallback: '%s' not found, opened '%s' instead",
+                                name, utf8);
+                            extern void MaybeRegisterPlayerVFile(HANDLE, LPCWSTR);
+                            MaybeRegisterPlayerVFile(h2, alt.c_str());
+                            return h2;
+                        }
+                    }
+                }
+            }
+        }
+    }
     return h;
 }
 
@@ -1725,17 +1773,28 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
             // Cache the game-name prefix once. Use the .exe's stem so it
             // works for any FM2K game, not just WonderfulWorld. Strips
             // the directory, drops the ".exe" suffix.
-            static char s_game_prefix[64] = {};
+            //
+            // Stored as UTF-8 because the rest of the title-format code
+            // (peer nicks from shm, the final MultiByteToWideChar at the
+            // bottom) assumes UTF-8. Going through GetModuleFileNameW
+            // first avoids the SJIS-vs-UTF-8 mojibake we'd hit if we
+            // pulled bytes directly via GetModuleFileNameA — those bytes
+            // are SJIS (our locale spoof preserves SJIS via
+            // WC_NO_BEST_FIT_CHARS) and re-interpreting them as UTF-8
+            // turns JP names into garbage in the title bar.
+            static char s_game_prefix[256] = {};
             if (s_game_prefix[0] == '\0') {
-                char buf[MAX_PATH];
-                DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+                wchar_t wbuf[MAX_PATH];
+                DWORD n = GetModuleFileNameW(nullptr, wbuf, MAX_PATH);
                 if (n > 0 && n < MAX_PATH) {
-                    char* slash = strrchr(buf, '\\');
-                    if (!slash) slash = strrchr(buf, '/');
-                    const char* stem = slash ? slash + 1 : buf;
-                    char* dot = strrchr((char*)stem, '.');
-                    if (dot) *dot = '\0';
-                    snprintf(s_game_prefix, sizeof(s_game_prefix), "%s", stem);
+                    wchar_t* wslash = wcsrchr(wbuf, L'\\');
+                    if (!wslash) wslash = wcsrchr(wbuf, L'/');
+                    wchar_t* wstem = wslash ? wslash + 1 : wbuf;
+                    wchar_t* wdot = wcsrchr(wstem, L'.');
+                    if (wdot) *wdot = L'\0';
+                    WideCharToMultiByte(CP_UTF8, 0, wstem, -1,
+                                        s_game_prefix, sizeof(s_game_prefix),
+                                        nullptr, nullptr);
                 }
                 if (s_game_prefix[0] == '\0') {
                     snprintf(s_game_prefix, sizeof(s_game_prefix), "FM2K");
@@ -1863,8 +1922,15 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
             int wn = MultiByteToWideChar(CP_UTF8, 0, title, -1,
                                          wtitle,
                                          (int)(sizeof(wtitle) / sizeof(wtitle[0])));
-            if (wn > 0) SetWindowTextW(game_window, wtitle);
-            else        SetWindowTextA(game_window, title);  // shouldn't happen
+            if (wn > 0) {
+                // DefWindowProcW(WM_SETTEXT) bypasses the WNDPROC chain so
+                // a third-party subclass (cnc-ddraw) that reverted the
+                // window's IsUnicode flag can't apply a CP_ACP=1252 W→A
+                // bridge here and destroy JP chars on the way to storage.
+                DefWindowProcW(game_window, WM_SETTEXT, 0, (LPARAM)wtitle);
+            } else {
+                SetWindowTextA(game_window, title);  // shouldn't happen
+            }
         }
     }
 }
