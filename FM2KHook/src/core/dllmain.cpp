@@ -7,6 +7,7 @@
 #include "shared_mem.h"
 #include "../ui/screenshot.h"
 #include "../locale/locale_spoof.h"
+#include "../util/pii_scrub.h"
 
 // Forward-declare just the new patch function. We can't include
 // game_patches.h here because dllmain.cpp keeps static duplicates of
@@ -65,11 +66,19 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
         default: break;
     }
 
+    // PII scrub on the message body BEFORE we splice it into the
+    // output line. We don't scrub the whole formatted string because
+    // the prefix (`[hh:mm:ss.mmm] [P1] [INFO]`) has no user data and
+    // running regex on a smaller buffer is cheaper.
+    char scrubbed_msg[2048];
+    fm2k::pii::ScrubInto(message ? message : "",
+                         scrubbed_msg, sizeof(scrubbed_msg));
+
     // Format: [HH:MM:SS.mmm] [PRIORITY] message
     char formatted[2048];
     snprintf(formatted, sizeof(formatted), "[%02d:%02d:%02d.%03d] [P%d] [%s] %s\n",
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-             g_player_index + 1, priority_str, message);
+             g_player_index + 1, priority_str, scrubbed_msg);
 
     // File-only for player clients (SoundRollback / ROLLBACK stats / BATTLE
     // STATUS spam too noisy on console). For the spectator instance we DO
@@ -86,6 +95,10 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
 }
 
 static void InitFileLogging() {
+    // Capture USERNAME etc. before the first SDL_Log call hits the
+    // scrubber. Idempotent — the launcher's logger init also calls this.
+    fm2k::pii::Init();
+
     char base_name[64];
     snprintf(base_name, sizeof(base_name), "FM2K_P%d_Debug.log", g_player_index + 1);
     char filename[MAX_PATH];
@@ -418,19 +431,34 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                     "single-instance determinism check, no network");
             }
 
-            // Spectator mode: passive viewer subscribing to a remote host.
+            // Spectator mode: passive viewer subscribing to a remote host
+            // OR offline-replay file player. Both share the same hook init
+            // path (SpectatorNode + pb_queue drain), but the wire/log
+            // messaging differs — replay has no network, no peer, no
+            // JOIN_REQ. Distinguish via FM2K_REPLAY_FILE.
             char* env_spectator = getenv("FM2K_SPECTATOR_MODE");
             g_spectator_mode = (env_spectator && strcmp(env_spectator, "1") == 0);
+            const char* env_replay = getenv("FM2K_REPLAY_FILE");
+            const bool is_offline_replay =
+                g_spectator_mode && env_replay && env_replay[0];
             if (g_spectator_mode) {
                 g_offline_mode = false;
                 g_stress_mode  = false;
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Spectator mode ENABLED — will SPEC_JOIN_REQ host on startup");
+                if (is_offline_replay) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Replay mode ENABLED — playing %s (no network, no peer)",
+                                env_replay);
+                } else {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Spectator mode ENABLED — will SPEC_JOIN_REQ host on startup");
+                }
             }
 
             if (g_spectator_mode) {
                 // Spectator path: socket + control callback + SpectatorNode.
-                // Skips the player-mode HELLO handshake.
+                // Replay mode short-circuits inside Netplay_InitAsSpectator
+                // (no network setup), so the port/host config is unused but
+                // we still pass valid placeholders to keep the call shape.
                 char* env_port   = getenv("FM2K_LOCAL_PORT");
                 char* env_remote = getenv("FM2K_REMOTE_ADDR");
                 g_local_port = env_port ? (uint16_t)atoi(env_port) : 7002;
@@ -439,11 +467,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 } else {
                     snprintf(g_remote_addr, sizeof(g_remote_addr), "127.0.0.1:7000");
                 }
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Spectator config: port=%u host=%s", g_local_port, g_remote_addr);
+                if (!is_offline_replay) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Spectator config: port=%u host=%s",
+                                g_local_port, g_remote_addr);
+                }
                 if (!Netplay_InitAsSpectator(g_local_port, g_remote_addr)) {
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                                 "Spectator init failed — falling back to offline");
+                                 "%s init failed — falling back to offline",
+                                 is_offline_replay ? "Replay" : "Spectator");
                     g_spectator_mode = false;
                     g_offline_mode   = true;
                 }

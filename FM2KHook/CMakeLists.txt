@@ -23,6 +23,7 @@ set(FM2KHOOK_SOURCES
     src/hooks/input.cpp
     src/hooks/game_patches.cpp
     src/hooks/round_events.cpp
+    src/hooks/css_autoconfirm.cpp
     src/hooks/wndproc_subclass.cpp
     # Netplay
     src/netplay/netplay.cpp
@@ -44,6 +45,8 @@ set(FM2KHOOK_SOURCES
     src/parity/parity_recorder.cpp
     # Locale spoofing for Japanese-only games (CPW etc.)
     src/locale/locale_spoof.cpp
+    # Shared PII scrubber for log lines (hook + launcher both use it).
+    src/util/pii_scrub.cpp
 )
 
 set(FM2KHOOK_INCLUDES

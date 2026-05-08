@@ -207,8 +207,11 @@ namespace FM2K {
     constexpr uintptr_t ADDR_P1_ACTION_STATE = 0x47019C;  // g_p1_action_state
     constexpr uintptr_t ADDR_P2_ACTION_STATE = 0x4701A0;  // g_p2_action_state
 
-    // Round timer counter: frames since both players locked (>100 triggers battle)
-    constexpr uintptr_t ADDR_ROUND_TIMER_COUNTER = 0x47008E;  // g_round_timer_counter
+    // Round timer counter: frames since both players locked (>100 triggers battle).
+    // Verified 2026-05-08 via IDA xref of game_state_manager @ 0x406FC0 — there are
+    // 7 reads/writes from there. The legacy 0x47008E address had zero xrefs (dead);
+    // it predates the IDA pass and never actually drove the CSS->battle transition.
+    constexpr uintptr_t ADDR_ROUND_TIMER_COUNTER = 0x424F00;  // g_round_timer_counter
 
     // Internal game timer - equivalent to CCCaster's CC_WORLD_TIMER_ADDR
     constexpr uintptr_t ADDR_GAME_TIMER = 0x470044;  // g_game_timer (increments every game frame)

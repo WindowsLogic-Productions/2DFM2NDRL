@@ -625,14 +625,35 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
 }
 
 bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay (spectator): Init port=%u host=%s", local_port, host_addr ? host_addr : "(null)");
-
     g_player_index = 2;  // sentinel — not a player slot
     g_simple_state = SimpleState::CONNECTED;  // skip handshake; spectators don't HELLO
     g_session = nullptr;
     g_session_ready = false;
     g_netplay_frame = 0;
+
+    // Replay-from-file mode (no peer, no network). When FM2K_REPLAY_FILE
+    // is set, skip the network init + JOIN_REQ entirely and load the
+    // .fm2krep / .fm2kset file directly into pb_queue. The trampoline's
+    // RunSpectatorTick consumes events from pb_queue identically to a
+    // live spectator, so playback Just Works through the same driver.
+    if (const char* replay_path = std::getenv("FM2K_REPLAY_FILE");
+        replay_path && replay_path[0]) {
+        SpectatorNode_Init();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Replay: loading %s", replay_path);
+        if (!SpectatorNode_LoadSessionFile(replay_path, {})) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "Replay: file load failed: %s", replay_path);
+            return false;
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Replay: loaded — trampoline will drive playback");
+        return true;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay (spectator): Init port=%u host=%s",
+                local_port, host_addr ? host_addr : "(null)");
 
     // Wire up the control-channel callback. OnControlMessage already
     // dispatches SPEC_JOIN_ACK / SPEC_JOIN_REDIRECT / SPEC_HEARTBEAT / SPEC_LEAVE
@@ -1754,12 +1775,26 @@ bool Netplay_StartBattle() {
 
     // Notify the spectator tree: start of a new match, push INITIAL_MATCH to
     // any currently-subscribed viewers so they reset and follow this match.
+    // C6: chars/stage read from the same addresses SharedMem_PublishMatchChars
+    // / PublishMatchStage above use. Cast to uint8 — char/stage IDs are well
+    // under 256 (FM2K rosters cap at 50, stages at ~50). No FM2K-side palette/
+    // costume select, so colors stay 0; the slot exists in the wire schema
+    // for FM95-era games that may add it.
+    const uint8_t mp1_char = static_cast<uint8_t>(
+        *(const uint32_t*)FM2K::ADDR_P1_SELECTED_CHAR);
+    const uint8_t mp2_char = static_cast<uint8_t>(
+        *(const uint32_t*)FM2K::ADDR_P2_SELECTED_CHAR);
+    const uint8_t mstage_id =
+        (FM2K::ADDR_SELECTED_STAGE != 0)
+            ? static_cast<uint8_t>(*(const uint32_t*)FM2K::ADDR_SELECTED_STAGE)
+            : 0;
     SpectatorNode_OnMatchStart(
         /*game_hash*/         0,
         /*initial_rng_seed*/  initial_seed,
         /*initial_state_hash*/initial_state_hash,
-        /*p1_char*/0, /*p1_color*/0,
-        /*p2_char*/0, /*p2_color*/0);
+        /*p1_char*/mp1_char, /*p1_color*/0,
+        /*p2_char*/mp2_char, /*p2_color*/0,
+        /*stage_id*/mstage_id);
 
     // C3.5 — reset the intra-match round counter so the first ROUND_START
     // emitted from vs_round_function lands as round_idx=1.
@@ -2602,7 +2637,7 @@ bool Netplay_ProcessBattleInputPhase() {
                             g_netplay_frame,
                             *(uint32_t*)0x41FB1C,
                             *(uint32_t*)0x470044,
-                            *(uint32_t*)0x47008E,
+                            *(uint32_t*)0x424F00,
                             *(uint32_t*)0x4456FC);
                     }
                 }
