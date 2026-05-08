@@ -4204,15 +4204,51 @@ void LauncherUI::RenderHubPanel() {
                     // Inherited via CreateProcess in
                     // FM2KGameInstance::Launch.
                     //
-                    // Use the same FM2K_HUB_HOST override as the WS
-                    // Connect above. nat_traversal does its own DNS
-                    // resolve on this string — it's not required to be
-                    // a literal IP.
+                    // Pre-resolve the hub host to a dotted-quad IP here
+                    // so the in-game hook's Netplay_Init -> SendStunProbe
+                    // -> ResolveHostA path short-circuits instead of
+                    // doing DNS inside DllMain. DllMain DNS lookups can
+                    // hang for 5-15 s on flaky resolvers / IPv6-fallback
+                    // paths, which blows past the inject timeout and
+                    // looks like a Defender block. Doing the lookup in
+                    // the launcher (a normal thread, not a loader-lock
+                    // context) lets us survive slow DNS without timing
+                    // out the inject. Falls back to the hostname only
+                    // if resolution fails — at least then the hook gets
+                    // its own attempt.
                     const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
-                    const std::string hub_udp =
-                        std::string(hub_host_env && hub_host_env[0]
-                                    ? hub_host_env : "hub.2dfm.org")
-                        + ":7711";
+                    const std::string hub_host_str =
+                        (hub_host_env && hub_host_env[0])
+                            ? hub_host_env : "hub.2dfm.org";
+                    std::string hub_udp;
+                    {
+                        addrinfo hints{};
+                        hints.ai_family   = AF_INET;
+                        hints.ai_socktype = SOCK_DGRAM;
+                        addrinfo* res = nullptr;
+                        if (getaddrinfo(hub_host_str.c_str(), nullptr,
+                                        &hints, &res) == 0 && res) {
+                            char ip_str[INET_ADDRSTRLEN] = {};
+                            const sockaddr_in* sin =
+                                reinterpret_cast<const sockaddr_in*>(res->ai_addr);
+                            if (inet_ntop(AF_INET, &sin->sin_addr,
+                                          ip_str, sizeof(ip_str))) {
+                                hub_udp = std::string(ip_str) + ":7711";
+                                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Hub: pre-resolved %s -> %s for FM2K_HUB_UDP_ADDR "
+                                    "(keeps DllMain off the DNS path)",
+                                    hub_host_str.c_str(), ip_str);
+                            }
+                            freeaddrinfo(res);
+                        }
+                        if (hub_udp.empty()) {
+                            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Hub: getaddrinfo('%s') failed; passing hostname "
+                                "to game (hook will retry, may stall DllMain)",
+                                hub_host_str.c_str());
+                            hub_udp = hub_host_str + ":7711";
+                        }
+                    }
                     ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   hub_udp.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
