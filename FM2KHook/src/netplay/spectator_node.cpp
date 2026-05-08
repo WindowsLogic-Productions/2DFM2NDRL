@@ -96,6 +96,17 @@ struct State {
     // -1 sentinel = no MATCH_START emitted in this session yet.
     int64_t                   last_match_start_idx   = -1;
 
+    // Index of the FIRST state-init event in the contiguous init block
+    // immediately preceding the most recent MATCH_START. Set in
+    // SpectatorNode_AppendMatchStart by backward-scanning from
+    // last_match_start_idx through PIN_RNG / RESET_INPUT_STATE /
+    // SOUND_INIT / SESSION_ID events until a non-init event is hit.
+    // WriteCurrentBattleFile slices from THIS index instead of
+    // last_match_start_idx so the .fm2krep file is fully self-replayable
+    // (RNG seed re-pin, input ring reset, sound layer init all included).
+    // Defaults to last_match_start_idx if no init block precedes it.
+    int64_t                   last_pre_match_init_idx = -1;
+
     // Snapshot cache (task #18 phase 2). Refreshed by StashSnapshot at
     // every Netplay_StartBattle. When a spectator joins with mode=
     // CURRENT_MATCH, the host's TickHostMaintenance bind path will (in
@@ -1173,8 +1184,28 @@ void SpectatorNode_AppendMatchStart(const uint8_t header[96]) {
     ev.type = SessionEventType::MATCH_START;
     ev.u.match_start_idx =
         static_cast<uint16_t>(g_state.match_headers.size() - 1);
-    g_state.last_match_start_idx =
-        static_cast<int64_t>(g_state.session_events.size());
+    const size_t match_start_idx = g_state.session_events.size();
+    g_state.last_match_start_idx = static_cast<int64_t>(match_start_idx);
+
+    // Backward-scan through PIN_RNG / RESET_INPUT_STATE / SOUND_INIT /
+    // SESSION_ID events that precede this MATCH_START, so the per-battle
+    // .fm2krep slice can include the full state-init prefix and play
+    // back without depending on prior state. Stops at the first
+    // non-state-init event (typically the last CSS-phase INPUT, but
+    // could also be the prior match's MATCH_END / final ROUND_END).
+    auto is_pre_match_init = [](SessionEventType t) {
+        return t == SessionEventType::PIN_RNG
+            || t == SessionEventType::RESET_INPUT_STATE
+            || t == SessionEventType::SOUND_INIT
+            || t == SessionEventType::SESSION_ID;
+    };
+    size_t pre_init_idx = match_start_idx;
+    while (pre_init_idx > 0 &&
+           is_pre_match_init(g_state.session_events[pre_init_idx - 1].type)) {
+        --pre_init_idx;
+    }
+    g_state.last_pre_match_init_idx = static_cast<int64_t>(pre_init_idx);
+
     AppendOpAndFlush(ev);
 }
 
@@ -1513,7 +1544,17 @@ bool SpectatorNode_WriteSessionFile(const char* path) {
 
 bool SpectatorNode_WriteCurrentBattleFile(const char* path) {
     if (g_state.last_match_start_idx < 0) return false;
-    const size_t first = static_cast<size_t>(g_state.last_match_start_idx);
+    // Slice from the start of the state-init prefix (PIN_RNG / RESET /
+    // SOUND_INIT / SESSION_ID block immediately preceding MATCH_START)
+    // not from MATCH_START itself. Without the prefix the file isn't
+    // self-replayable: a spectator that loads it would inherit stale
+    // RNG seed / input edge state / sound layer state from whatever
+    // ran in their FM2K before the load. With the prefix, the events
+    // drain through ApplySessionEvent and rebuild the engine to the
+    // exact state the host had at battle entry.
+    const size_t first = (g_state.last_pre_match_init_idx >= 0)
+        ? static_cast<size_t>(g_state.last_pre_match_init_idx)
+        : static_cast<size_t>(g_state.last_match_start_idx);
     const size_t last  = g_state.session_events.size();
     return WriteSessionFileImpl(path,
                                 g_state.session_events,
