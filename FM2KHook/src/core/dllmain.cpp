@@ -80,13 +80,23 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
              g_player_index + 1, priority_str, scrubbed_msg);
 
-    // File-only for player clients (SoundRollback / ROLLBACK stats / BATTLE
-    // STATUS spam too noisy on console). For the spectator instance we DO
-    // mirror to console — its console is otherwise empty and tracing the
-    // spectator-tree protocol live is the whole point of running it locally.
+    // File-only by default — fputs to stdout is synchronous and lags the
+    // sim under heavy log volume (SoundRollback / ROLLBACK stats /
+    // BATTLE STATUS / SPEC-FP cadence). Spectator instances historically
+    // mirrored to console for live protocol tracing; gated now behind
+    // FM2K_SPECTATOR_DEBUG=1 so release-mode spectators stay quiet (per-
+    // session log file is still on disk for post-hoc inspection).
     if (g_spectator_mode) {
-        fputs(formatted, stdout);
-        fflush(stdout);
+        static int s_console_mirror_env = -1;
+        if (s_console_mirror_env < 0) {
+            const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
+            s_console_mirror_env =
+                (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+        }
+        if (s_console_mirror_env == 1) {
+            fputs(formatted, stdout);
+            fflush(stdout);
+        }
     }
     if (g_log_file) {
         fprintf(g_log_file, "%s", formatted);

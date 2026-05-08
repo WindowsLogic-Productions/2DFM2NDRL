@@ -836,7 +836,15 @@ static bool SpectatorSimOneFrame() {
     if (original_update_game)         original_update_game();
     ParityRecorder::Capture();
 
-    if (s_spec_trace_in_battle && s_spec_trace_bf < 100) {
+    // [SPEC-TRACE] is per-frame for the first 100 battle frames — very
+    // spammy. Gate on FM2K_SPECTATOR_DEBUG so release builds stay quiet.
+    static int s_spec_debug_env = -1;
+    if (s_spec_debug_env < 0) {
+        const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
+        s_spec_debug_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    if (s_spec_debug_env == 1 &&
+        s_spec_trace_in_battle && s_spec_trace_bf < 100) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "[SPEC-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
             "p1=0x%03X p2=0x%03X",
@@ -863,7 +871,11 @@ static bool SpectatorSimOneFrame() {
                 s_battle_frame_at_entry = s_pop_count;
             }
             const uint32_t bf = s_pop_count - s_battle_frame_at_entry;
-            if ((bf % 30) == 0) {
+            // [SPEC-FP] every 30 frames was ~3 lines/sec for the entire
+            // battle — release builds stay quiet, debug builds opt in via
+            // FM2K_SPECTATOR_DEBUG=1. Reuses the env-var cache from the
+            // SPEC-TRACE block above.
+            if (s_spec_debug_env == 1 && (bf % 30) == 0) {
                 const uint32_t rng     = *(uint32_t*)0x41FB1C;
                 const uint32_t buf_idx = *(uint32_t*)0x447EE0;
                 const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;

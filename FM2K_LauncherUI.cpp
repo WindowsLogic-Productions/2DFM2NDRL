@@ -1641,7 +1641,7 @@ void LauncherUI::ScanReplays() {
 void LauncherUI::RenderReplayBrowser() {
     if (replays_cache_dirty_) ScanReplays();
 
-    if (ImGui::Button("Refresh")) {
+    if (ImGui::Button("Refresh##replay_browser")) {
         replays_cache_dirty_ = true;
     }
     ImGui::SameLine();
