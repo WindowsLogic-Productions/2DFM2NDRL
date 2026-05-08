@@ -251,25 +251,67 @@ namespace Utils {
     }
 
     // -------------------------------------------------------------
-    // Skip-validation cache.
+    // Discovery result cache.
     //
-    // Cache key is the (canonical_exe_path, file_size, mtime) triple.
-    // When a fresh scan finds an exe candidate whose size+mtime match the
-    // cached entry, we reuse the previous validation result without
-    // re-running the FM2K signature/header check. This keeps warm
-    // rescans cheap on libraries with 50+ exes.
+    // Stores the FULL parsed result for each previously-discovered game so
+    // a warm rescan reads zero bytes from disk per game. On a hit we skip:
+    //   - Utils::HashFileXXH64        (full exe read for xxhash)
+    //   - fm2k::ParseKgtSummary       (kgt header + name table parse)
+    //   - Utils::SniffEngineFromStrings (256 KB exe head read)
+    //   - Utils::FindKnownExe         (registry lookup)
+    //   - Utils::DetectPackerFromPE   (PE section sniff)
     //
-    // File format (one record per line, '|'-separated):
-    //   exe_path|dll_path|size|mtime
+    // Cache validity: per-game, cached entry is reused iff BOTH the exe's
+    // (size, mtime) and the kgt's (size, mtime) match the on-disk values.
+    // If either changed, the entry is treated as a miss and rebuilt.
     //
-    // Lines that fail to parse are skipped silently (forward-compat).
+    // File format (binary, little-endian):
+    //   magic[4]      = "FM2K"
+    //   version       = u32 (currently 2)
+    //   entry_count   = u32
+    //   per entry:
+    //     str exe_path           (str = u32 length + bytes, no NUL)
+    //     str dll_path
+    //     u64 exe_size
+    //     i64 exe_mtime
+    //     u64 exe_xxh64
+    //     u32 engine             (FM2K::Engine cast)
+    //     str clean_label
+    //     str packer_label
+    //     u8  is_clean
+    //     u8  kgt_present        (0/1; 0 for FM95 .player-only games)
+    //     u64 kgt_size           (0 if absent)
+    //     i64 kgt_mtime          (0 if absent)
+    //     u8  kgt_valid          (0/1; only meaningful if kgt_present)
+    //     str kgt_project_name
+    //     u32 player_count + that many strings
+    //     u32 stage_count  + that many strings
+    //     u32 demo_count   + that many strings
+    //
+    // Old text-format caches fail the "FM2K" magic check on read and are
+    // silently dropped — first warm rescan after the upgrade pays the full
+    // cost once, then writes the new binary format. No migration needed.
     // -------------------------------------------------------------
 
     struct GameCacheEntry {
         std::string exe_path;
         std::string dll_path;
-        uint64_t    size  = 0;
-        int64_t     mtime = 0;
+        // exe stat — used for invalidation
+        uint64_t    size       = 0;
+        int64_t     mtime      = 0;
+        // exe identification — populated on cache hit, skips re-hash + sniff
+        uint64_t    exe_xxh64  = 0;
+        FM2K::Engine engine    = FM2K::Engine::FM2K;
+        std::string clean_label;
+        std::string packer_label;
+        bool        is_clean   = false;
+        // kgt stat — separate from exe so kgt edits invalidate independently.
+        // kgt_present=false for FM95 .player-only games (no .kgt file).
+        bool        kgt_present = false;
+        uint64_t    kgt_size    = 0;
+        int64_t     kgt_mtime   = 0;
+        // Parsed kgt summary — replaces fm2k::ParseKgtSummary on hit
+        fm2k::KgtSummary kgt;
     };
 
     static std::string GetCacheFilePath() {
@@ -488,62 +530,179 @@ namespace Utils {
         return WideToUtf8_(canon.generic_wstring());
     }
 
+    // ── Binary cache I/O helpers ─────────────────────────────────────
+    // Native little-endian on Windows x86 — the cache is local to the user
+    // and never moves between machines, so endian conversion would be
+    // overhead with no payoff.
+
+    static void WriteU8 (std::ofstream& o, uint8_t  v) { o.write((const char*)&v, 1); }
+    static void WriteU32(std::ofstream& o, uint32_t v) { o.write((const char*)&v, 4); }
+    static void WriteU64(std::ofstream& o, uint64_t v) { o.write((const char*)&v, 8); }
+    static void WriteI64(std::ofstream& o, int64_t  v) { o.write((const char*)&v, 8); }
+    static void WriteStr(std::ofstream& o, const std::string& s) {
+        WriteU32(o, (uint32_t)s.size());
+        if (!s.empty()) o.write(s.data(), (std::streamsize)s.size());
+    }
+
+    static bool ReadU8 (std::ifstream& i, uint8_t&  v) { return (bool)i.read((char*)&v, 1); }
+    static bool ReadU32(std::ifstream& i, uint32_t& v) { return (bool)i.read((char*)&v, 4); }
+    static bool ReadU64(std::ifstream& i, uint64_t& v) { return (bool)i.read((char*)&v, 8); }
+    static bool ReadI64(std::ifstream& i, int64_t&  v) { return (bool)i.read((char*)&v, 8); }
+    static bool ReadStr(std::ifstream& i, std::string& s, uint32_t cap = 16 * 1024 * 1024) {
+        uint32_t n = 0;
+        if (!ReadU32(i, n)) return false;
+        if (n > cap) return false;            // sanity cap — refuse > 16 MB strings
+        s.assign(n, '\0');
+        if (n == 0) return true;
+        return (bool)i.read(s.data(), (std::streamsize)n);
+    }
+
+    static constexpr char     kCacheMagic[4] = {'F','M','2','K'};
+    static constexpr uint32_t kCacheVersion  = 2;
+
     void SaveGameCache(const std::vector<FM2K::FM2KGameInfo>& games) {
-        std::ofstream out(GetCacheFilePath(), std::ios::trunc);
+        // Atomic-ish: write to .tmp then rename, so a crash mid-write
+        // doesn't leave a half-cooked cache that fails the magic check
+        // on the next launch (cosmetic — we'd just rebuild — but the
+        // rename is cheap insurance).
+        std::string final_path = GetCacheFilePath();
+        std::string tmp_path   = final_path + ".tmp";
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to write game cache");
             return;
         }
 
+        out.write(kCacheMagic, 4);
+        WriteU32(out, kCacheVersion);
+        WriteU32(out, (uint32_t)games.size());
+
         for (const auto& g : games) {
-            uint64_t size = 0;
-            int64_t  mtime = 0;
-            StatFile(g.exe_path, size, mtime);
-            out << g.exe_path << "|" << g.dll_path << "|"
-                << size << "|" << mtime << "\n";
+            uint64_t exe_size = 0;
+            int64_t  exe_mtime = 0;
+            StatFile(g.exe_path, exe_size, exe_mtime);
+
+            WriteStr(out, g.exe_path);
+            WriteStr(out, g.dll_path);
+            WriteU64(out, exe_size);
+            WriteI64(out, exe_mtime);
+            WriteU64(out, g.xxh64);
+            WriteU32(out, (uint32_t)g.engine);
+            WriteStr(out, g.clean_label);
+            WriteStr(out, g.packer_label);
+            WriteU8 (out, g.is_clean ? 1 : 0);
+
+            // KGT stat: only meaningful when the game has a .kgt file.
+            // FM2KGameInfo::dll_path stores the .kgt path (legacy field name);
+            // empty for FM95 .player-only fallback.
+            const bool kgt_present = !g.dll_path.empty();
+            WriteU8(out, kgt_present ? 1 : 0);
+            if (kgt_present) {
+                uint64_t kgt_size = 0;
+                int64_t  kgt_mtime = 0;
+                StatFile(g.dll_path, kgt_size, kgt_mtime);
+                WriteU64(out, kgt_size);
+                WriteI64(out, kgt_mtime);
+            } else {
+                WriteU64(out, 0);
+                WriteI64(out, 0);
+            }
+
+            // Parsed kgt summary
+            WriteU8 (out, g.kgt.valid ? 1 : 0);
+            WriteStr(out, g.kgt.project_name);
+            WriteU32(out, (uint32_t)g.kgt.player_names.size());
+            for (const auto& n : g.kgt.player_names) WriteStr(out, n);
+            WriteU32(out, (uint32_t)g.kgt.stage_names.size());
+            for (const auto& n : g.kgt.stage_names) WriteStr(out, n);
+            WriteU32(out, (uint32_t)g.kgt.demo_names.size());
+            for (const auto& n : g.kgt.demo_names) WriteStr(out, n);
+        }
+        out.close();
+
+        // Best-effort atomic replace.
+        std::error_code ec;
+        std::filesystem::rename(std::filesystem::u8path(tmp_path),
+                                std::filesystem::u8path(final_path), ec);
+        if (ec) {
+            // Rename failed (e.g. cross-device, locked). Fall back to a
+            // remove+rename so we still end up with a valid cache.
+            std::filesystem::remove(std::filesystem::u8path(final_path), ec);
+            std::filesystem::rename(std::filesystem::u8path(tmp_path),
+                                    std::filesystem::u8path(final_path), ec);
         }
     }
 
     // Load the on-disk cache as a map keyed by canonical exe path. The
-    // discovery walker uses this to skip validation on unchanged files.
+    // discovery walker uses this to skip ALL per-file work on unchanged
+    // entries (xxh64, kgt parse, engine sniff, packer sniff).
     std::unordered_map<std::string, GameCacheEntry> LoadGameCacheMap() {
         std::unordered_map<std::string, GameCacheEntry> map;
-        std::ifstream in(GetCacheFilePath());
+        std::ifstream in(GetCacheFilePath(), std::ios::binary);
         if (!in) return map;
 
-        std::string line;
-        while (std::getline(in, line)) {
-            // Strip trailing CR.
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-                line.pop_back();
-            }
-            if (line.empty()) continue;
+        char magic[4] = {0};
+        if (!in.read(magic, 4) ||
+            magic[0] != kCacheMagic[0] || magic[1] != kCacheMagic[1] ||
+            magic[2] != kCacheMagic[2] || magic[3] != kCacheMagic[3]) {
+            // Old text-format or unknown: treat as no cache. Silently
+            // ignored — next save overwrites with the new binary format.
+            return map;
+        }
+        uint32_t version = 0;
+        if (!ReadU32(in, version) || version != kCacheVersion) {
+            return map;  // future format — rebuild
+        }
+        uint32_t entry_count = 0;
+        if (!ReadU32(in, entry_count) || entry_count > 100000) {
+            return map;  // sanity cap — refuse pathological counts
+        }
 
-            // Split on '|' into up to 4 fields.
-            size_t s1 = line.find('|');
-            if (s1 == std::string::npos) continue;
-            size_t s2 = line.find('|', s1 + 1);
-            if (s2 == std::string::npos) continue;
-            size_t s3 = line.find('|', s2 + 1);
-
+        for (uint32_t i = 0; i < entry_count; ++i) {
             GameCacheEntry e;
-            e.exe_path = line.substr(0, s1);
-            e.dll_path = line.substr(s1 + 1, s2 - s1 - 1);
-            if (s3 == std::string::npos) {
-                // Old (path-only) format — treat as a stale entry; size/mtime
-                // mismatch will force re-validation on first hit.
-                e.size  = 0;
-                e.mtime = 0;
-            } else {
-                std::string size_str  = line.substr(s2 + 1, s3 - s2 - 1);
-                std::string mtime_str = line.substr(s3 + 1);
-                try {
-                    e.size  = static_cast<uint64_t>(std::stoull(size_str));
-                    e.mtime = static_cast<int64_t>(std::stoll(mtime_str));
-                } catch (...) {
-                    e.size  = 0;
-                    e.mtime = 0;
-                }
+            uint8_t  is_clean_b = 0;
+            uint8_t  kgt_present_b = 0;
+            uint8_t  kgt_valid_b = 0;
+            uint32_t engine_u32 = 0;
+
+            if (!ReadStr(in, e.exe_path))    return map;
+            if (!ReadStr(in, e.dll_path))    return map;
+            if (!ReadU64(in, e.size))        return map;
+            if (!ReadI64(in, e.mtime))       return map;
+            if (!ReadU64(in, e.exe_xxh64))   return map;
+            if (!ReadU32(in, engine_u32))    return map;
+            if (!ReadStr(in, e.clean_label)) return map;
+            if (!ReadStr(in, e.packer_label))return map;
+            if (!ReadU8 (in, is_clean_b))    return map;
+            if (!ReadU8 (in, kgt_present_b)) return map;
+            if (!ReadU64(in, e.kgt_size))    return map;
+            if (!ReadI64(in, e.kgt_mtime))   return map;
+            if (!ReadU8 (in, kgt_valid_b))   return map;
+
+            e.engine      = (FM2K::Engine)engine_u32;
+            e.is_clean    = (is_clean_b != 0);
+            e.kgt_present = (kgt_present_b != 0);
+            e.kgt.valid   = (kgt_valid_b != 0);
+
+            if (!ReadStr(in, e.kgt.project_name)) return map;
+
+            uint32_t pcount = 0;
+            if (!ReadU32(in, pcount) || pcount > 1024) return map;
+            e.kgt.player_names.resize(pcount);
+            for (uint32_t j = 0; j < pcount; ++j) {
+                if (!ReadStr(in, e.kgt.player_names[j])) return map;
+            }
+            uint32_t scount = 0;
+            if (!ReadU32(in, scount) || scount > 1024) return map;
+            e.kgt.stage_names.resize(scount);
+            for (uint32_t j = 0; j < scount; ++j) {
+                if (!ReadStr(in, e.kgt.stage_names[j])) return map;
+            }
+            uint32_t dcount = 0;
+            if (!ReadU32(in, dcount) || dcount > 1024) return map;
+            e.kgt.demo_names.resize(dcount);
+            for (uint32_t j = 0; j < dcount; ++j) {
+                if (!ReadStr(in, e.kgt.demo_names[j])) return map;
             }
 
             std::string key = CanonicalizePath(e.exe_path);
@@ -552,24 +711,39 @@ namespace Utils {
         return map;
     }
 
-    // Legacy entry point used to seed the UI before async discovery
-    // completes. Validates each cached entry's paths still exist; the full
-    // size/mtime skip-validation lives in the discovery path.
+    // Cache-first UI seed. Loads every cached game's FULL identification
+    // (xxh64, engine, clean/packer labels, parsed kgt summary) so the UI
+    // shows a populated games list — including character/stage dropdowns —
+    // BEFORE the async directory walk runs. Net effect: the launcher feels
+    // instant on warm starts; the background walk only matters when the
+    // user has actually added or removed a game since the last run.
+    //
+    // Cheap existence check per entry — skip games whose exe was deleted
+    // since the cache was written. Stat mismatches (rebuild, kgt edit)
+    // aren't filtered here; the async pass picks those up and updates
+    // them transparently.
     std::vector<FM2K::FM2KGameInfo> LoadGameCache() {
         std::vector<FM2K::FM2KGameInfo> cached;
         auto map = LoadGameCacheMap();
         cached.reserve(map.size());
         for (auto& kv : map) {
-            const auto& e = kv.second;
-            if (SDL_GetPathInfo(e.exe_path.c_str(), nullptr) &&
-                SDL_GetPathInfo(e.dll_path.c_str(), nullptr)) {
-                FM2K::FM2KGameInfo game;
-                game.exe_path = e.exe_path;
-                game.dll_path = e.dll_path;
-                game.is_host  = true;
-                game.process_id = 0;
-                cached.push_back(std::move(game));
-            }
+            auto& e = kv.second;  // moved-from below
+            if (!SDL_GetPathInfo(e.exe_path.c_str(), nullptr)) continue;
+            if (e.kgt_present && !e.dll_path.empty() &&
+                !SDL_GetPathInfo(e.dll_path.c_str(), nullptr)) continue;
+
+            FM2K::FM2KGameInfo game;
+            game.exe_path     = std::move(e.exe_path);
+            game.dll_path     = std::move(e.dll_path);
+            game.is_host      = true;
+            game.process_id   = 0;
+            game.engine       = e.engine;
+            game.is_clean     = e.is_clean;
+            game.clean_label  = std::move(e.clean_label);
+            game.packer_label = std::move(e.packer_label);
+            game.xxh64        = e.exe_xxh64;
+            game.kgt          = std::move(e.kgt);
+            cached.push_back(std::move(game));
         }
         return cached;
     }
@@ -693,7 +867,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     bool direct_mode = false;
     bool spectate_mode = false;
     std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
-    std::string spectate_join_mode = "current";  // --spectate-mode {current,full}
+    std::string spectate_join_mode = "full";     // --spectate-mode {current,full}; default flipped 2026-05-08 (CURRENT_MATCH baking)
     std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
 
     // Parse command line arguments
@@ -1391,14 +1565,25 @@ bool FM2KLauncher::Initialize() {
         }
     }
 
-    // Kick-off background discovery so the UI stays responsive. The results
-    // will be delivered via the custom SDL event handled in HandleEvent().
+    // Cache-first display: load the full cached game list (xxh64, engine,
+    // kgt summary, …) so the UI is fully populated immediately. Async
+    // discovery still runs to catch newly installed/removed games, but
+    // it's invisible to the user when nothing has changed.
+    bool seeded_from_cache = false;
     {
         auto cached_games = Utils::LoadGameCache();
-        ui_->SetGames(cached_games);
-        ui_->SetGamesRootPaths(games_root_paths_);  // Update UI with current paths
+        if (!cached_games.empty()) {
+            ui_->SetGames(cached_games);
+            // Mirror into our internal state so FindKgtByGameId / launch
+            // paths see the cached games before async discovery completes.
+            discovered_games_ = std::move(cached_games);
+            seeded_from_cache = true;
+        }
+        ui_->SetGamesRootPaths(games_root_paths_);
     }
-    StartAsyncDiscovery();
+    // Suppress the "Scanning…" spinner when the cache already filled the
+    // list — the background walk just verifies nothing changed.
+    StartAsyncDiscovery(/*show_spinner=*/!seeded_from_cache);
     
     //SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Launcher initialized successfully");
     //SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Found %d FM2K games", (int)discovered_games_.size());
@@ -1763,7 +1948,7 @@ void FM2KLauncher::Shutdown() {
     MH_Uninitialize();
 }
 
-void FM2KLauncher::StartAsyncDiscovery() {
+void FM2KLauncher::StartAsyncDiscovery(bool show_spinner) {
     // Prevent overlapping scans
     if (discovery_in_progress_) {
         SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "Discovery already in progress ? ignoring new request");
@@ -1771,7 +1956,7 @@ void FM2KLauncher::StartAsyncDiscovery() {
     }
 
     discovery_in_progress_ = true;
-    if (ui_) ui_->SetScanning(true);
+    if (ui_ && show_spinner) ui_->SetScanning(true);
 
     // If a previous thread handle exists (shouldn't) ensure it is cleaned up.
     if (discovery_thread_) {
@@ -1804,22 +1989,43 @@ struct DiscoveryWalkCtx {
 
 static SDL_EnumerationResult DirectoryEnumerator(void* userdata, const char* origdir, const char* name);
 
-// Look up an exe path in the cache. Returns true if the cache has an
-// entry whose size+mtime match the on-disk file — the caller can then
-// reuse the cached record without re-running validation.
+// Look up an exe path in the cache and validate that BOTH the exe and
+// the kgt (if present) have not changed since the cache was written.
+// `kgt_path` may be empty for FM95 .player-only games — in that case the
+// kgt-stat check is skipped.
+//
+// Returns true on a full hit; the caller can then populate FM2KGameInfo
+// directly from `out` and skip xxh64, kgt parse, engine sniff, packer
+// sniff — i.e. zero file I/O for this game.
 static bool TryUseCachedEntry(
     const std::unordered_map<std::string, Utils::GameCacheEntry>* cache,
     const std::string& exe_path,
+    const std::string& kgt_path,
     Utils::GameCacheEntry& out)
 {
     if (!cache || cache->empty()) return false;
     std::string key = Utils::CanonicalizePath(exe_path);
     auto it = cache->find(key);
     if (it == cache->end()) return false;
-    uint64_t size = 0;
-    int64_t  mtime = 0;
-    if (!Utils::StatFile(exe_path, size, mtime)) return false;
-    if (it->second.size != size || it->second.mtime != mtime) return false;
+
+    uint64_t exe_size = 0;
+    int64_t  exe_mtime = 0;
+    if (!Utils::StatFile(exe_path, exe_size, exe_mtime)) return false;
+    if (it->second.size != exe_size || it->second.mtime != exe_mtime) return false;
+
+    // KGT validation: presence + stat must match. If the cache says no kgt
+    // and now there IS one (or vice versa), force a re-scan.
+    const bool now_has_kgt = !kgt_path.empty();
+    if (it->second.kgt_present != now_has_kgt) return false;
+    if (now_has_kgt) {
+        uint64_t kgt_size = 0;
+        int64_t  kgt_mtime = 0;
+        if (!Utils::StatFile(kgt_path, kgt_size, kgt_mtime)) return false;
+        if (it->second.kgt_size != kgt_size || it->second.kgt_mtime != kgt_mtime) {
+            return false;
+        }
+    }
+
     out = it->second;
     return true;
 }
@@ -1853,55 +2059,67 @@ static void ScanDirForGames(const std::string& dir,
             std::string kgt_path = dir + "/" + kgt_name;
             SDL_free(exe_name);
 
-            // Cache hit: reuse previous validation result without restating.
-            // We still hash the exe so engine detection stays accurate even
-            // for cached entries — the cache only skips stat, not identity.
+            // Full cache hit: reuse the parsed summary, hash, engine, and
+            // packer label without reading a single byte of either file.
             Utils::GameCacheEntry cached_entry;
-            bool cache_hit = TryUseCachedEntry(cache, exe_path, cached_entry);
+            bool cache_hit = TryUseCachedEntry(cache, exe_path, kgt_path, cached_entry);
             if (!cache_hit && !SDL_GetPathInfo(exe_path.c_str(), nullptr)) {
                 continue;  // exe missing
             }
 
             FM2K::FM2KGameInfo info{exe_path, kgt_path, 0, true};
-            info.xxh64 = Utils::HashFileXXH64(exe_path);
 
-            // Parse the .kgt for player/stage/demo name lists so the UI can
-            // populate dropdowns pre-launch. Failure is non-fatal: we still
-            // surface the game; the dropdowns just fall back to indices.
-            if (!fm2k::ParseKgtSummary(std::filesystem::u8path(kgt_path), info.kgt)) {
-                SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
-                             "KGT parse failed for '%s' — dropdowns will be empty",
-                             kgt_path.c_str());
-            }
-
-            // Engine detection cascade (best signal first):
-            //   1. exact-hash registry match -> known build, friendly label
-            //   2. KGT2KGAME / KGT95GAME string sniff -> exact engine
-            //   3. file-size heuristic (1.1-1.7 MB FM2K, <600 KB FM95)
-            // Then PE-section sniff for actual packers — only THIS produces a UI warning.
-            if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
-                info.engine      = known->engine;
-                info.clean_label = known->label;
-            } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
-                info.engine = *sniffed;
+            if (cache_hit) {
+                info.xxh64        = cached_entry.exe_xxh64;
+                info.engine       = cached_entry.engine;
+                info.clean_label  = cached_entry.clean_label;
+                info.packer_label = cached_entry.packer_label;
+                info.is_clean     = cached_entry.is_clean;
+                info.kgt          = cached_entry.kgt;
             } else {
-                uint64_t sz = 0; int64_t mt = 0;
-                Utils::StatFile(exe_path, sz, mt);
-                info.engine = Utils::GuessEngineFromSize(sz);
-            }
+                info.xxh64 = Utils::HashFileXXH64(exe_path);
 
-            info.packer_label = Utils::DetectPackerFromPE(exe_path);
-            info.is_clean     = info.packer_label.empty();
+                // Parse the .kgt for player/stage/demo name lists so the UI
+                // can populate dropdowns pre-launch. Failure is non-fatal:
+                // we still surface the game; dropdowns fall back to indices.
+                if (!fm2k::ParseKgtSummary(std::filesystem::u8path(kgt_path), info.kgt)) {
+                    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                                 "KGT parse failed for '%s' — dropdowns will be empty",
+                                 kgt_path.c_str());
+                }
+
+                // Engine detection cascade (best signal first):
+                //   1. exact-hash registry match -> known build, friendly label
+                //   2. KGT2KGAME / KGT95GAME string sniff -> exact engine
+                //   3. file-size heuristic (1.1-1.7 MB FM2K, <600 KB FM95)
+                // Then PE-section sniff for actual packers.
+                if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
+                    info.engine      = known->engine;
+                    info.clean_label = known->label;
+                } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
+                    info.engine = *sniffed;
+                } else {
+                    uint64_t sz = 0; int64_t mt = 0;
+                    Utils::StatFile(exe_path, sz, mt);
+                    info.engine = Utils::GuessEngineFromSize(sz);
+                }
+
+                info.packer_label = Utils::DetectPackerFromPE(exe_path);
+                info.is_clean     = info.packer_label.empty();
+            }
 
             if (!info.packer_label.empty()) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Found PACKED exe: EXE='%s' packer='%s' engine=%s",
+                            "Found PACKED exe%s: EXE='%s' packer='%s' engine=%s",
+                            cache_hit ? " [cached]" : "",
                             exe_path.c_str(), info.packer_label.c_str(),
                             FM2K::EngineName(info.engine));
             } else {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Found %s game: EXE='%s' xxh64=%016llx%s",
-                            FM2K::EngineName(info.engine), exe_path.c_str(),
+                            "Found %s game%s: EXE='%s' xxh64=%016llx%s",
+                            FM2K::EngineName(info.engine),
+                            cache_hit ? " [cached]" : "",
+                            exe_path.c_str(),
                             (unsigned long long)info.xxh64,
                             info.clean_label.empty() ? "" : (" — " + info.clean_label).c_str());
             }
@@ -1928,38 +2146,55 @@ static void ScanDirForGames(const std::string& dir,
                     if (!exe_basename) exe_basename = SDL_strrchr(exe_list[i], '\\');
                     exe_basename = exe_basename ? exe_basename + 1 : exe_list[i];
                     std::string exe_path = dir + "/" + exe_basename;
-                    if (!SDL_GetPathInfo(exe_path.c_str(), nullptr)) continue;
+
+                    Utils::GameCacheEntry cached_entry;
+                    bool cache_hit = TryUseCachedEntry(cache, exe_path, std::string(), cached_entry);
+                    if (!cache_hit && !SDL_GetPathInfo(exe_path.c_str(), nullptr)) continue;
 
                     FM2K::FM2KGameInfo info{exe_path, "", 0, true};
-                    info.xxh64 = Utils::HashFileXXH64(exe_path);
 
-                    if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
-                        info.engine      = known->engine;
-                        info.clean_label = known->label;
-                    } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
-                        info.engine = *sniffed;
+                    if (cache_hit) {
+                        info.xxh64        = cached_entry.exe_xxh64;
+                        info.engine       = cached_entry.engine;
+                        info.clean_label  = cached_entry.clean_label;
+                        info.packer_label = cached_entry.packer_label;
+                        info.is_clean     = cached_entry.is_clean;
+                        // No kgt for the .player-only fallback — leave info.kgt default.
                     } else {
-                        uint64_t sz = 0; int64_t mt = 0;
-                        Utils::StatFile(exe_path, sz, mt);
-                        // .player-fallback path biases toward FM95 since that's
-                        // what triggered this branch, but defer to a clear FM2K
-                        // size signal if the exe sits in the FM2K cluster.
-                        info.engine = (sz > 600 * 1024) ? FM2K::Engine::FM2K
-                                                       : FM2K::Engine::FM95;
-                    }
+                        info.xxh64 = Utils::HashFileXXH64(exe_path);
 
-                    info.packer_label = Utils::DetectPackerFromPE(exe_path);
-                    info.is_clean     = info.packer_label.empty();
+                        if (const auto* known = Utils::FindKnownExe(info.xxh64)) {
+                            info.engine      = known->engine;
+                            info.clean_label = known->label;
+                        } else if (auto sniffed = Utils::SniffEngineFromStrings(exe_path)) {
+                            info.engine = *sniffed;
+                        } else {
+                            uint64_t sz = 0; int64_t mt = 0;
+                            Utils::StatFile(exe_path, sz, mt);
+                            // .player-fallback path biases toward FM95 since
+                            // that's what triggered this branch, but defer to
+                            // a clear FM2K size signal if the exe sits in the
+                            // FM2K cluster.
+                            info.engine = (sz > 600 * 1024) ? FM2K::Engine::FM2K
+                                                           : FM2K::Engine::FM95;
+                        }
+
+                        info.packer_label = Utils::DetectPackerFromPE(exe_path);
+                        info.is_clean     = info.packer_label.empty();
+                    }
 
                     if (!info.packer_label.empty()) {
                         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                    "Found PACKED game (no .kgt): EXE='%s' packer='%s' engine=%s",
+                                    "Found PACKED game (no .kgt)%s: EXE='%s' packer='%s' engine=%s",
+                                    cache_hit ? " [cached]" : "",
                                     exe_path.c_str(), info.packer_label.c_str(),
                                     FM2K::EngineName(info.engine));
                     } else {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "Found %s game (no .kgt, %d .player files): EXE='%s'",
-                                    FM2K::EngineName(info.engine), player_count, exe_path.c_str());
+                                    "Found %s game (no .kgt, %d .player files)%s: EXE='%s'",
+                                    FM2K::EngineName(info.engine), player_count,
+                                    cache_hit ? " [cached]" : "",
+                                    exe_path.c_str());
                     }
                     games.push_back(std::move(info));
                 }

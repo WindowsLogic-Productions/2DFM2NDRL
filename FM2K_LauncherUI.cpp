@@ -5108,17 +5108,29 @@ void LauncherUI::RenderHubPanel() {
 
                 ImGui::TableSetColumnIndex(2);
                 ImGui::PushID(a->id.c_str());
-                // Spectate is currently broken (sim-determinism leak under
-                // active investigation — host vs spectator diverge after
-                // ~bf=8000 with ALL inputs/RNG/scripts identical, only one
-                // pos field drifts; root-cause is a hook that touches
-                // sim state on host but not on spectator). Show the
-                // button greyed so users see the feature is intentional
-                // but disabled, not missing.
-                ImGui::BeginDisabled(true);
-                ImGui::SmallButton(T("btn_spectate"));
-                ImGui::EndDisabled();
-                ImGui::SetItemTooltip("%s", T("btn_spectate_disabled_tooltip"));
+                // Spectate via the hub — RequestSpectate asks the hub to
+                // grant us this match's host UDP addr; on grant we get a
+                // K::SpectateGranted event which dispatches into
+                // on_spectate_match (FM2K_RollbackClient.cpp) and ends up
+                // in LaunchRemoteSpectator with default mode="current"
+                // (CURRENT_MATCH snapshot-join path). The bf=8000+
+                // input-replay drift that gated this button before is
+                // sidestepped now: snapshot-join skips replay entirely
+                // and consumes only post-anchor INPUTs. Tooltip kept
+                // ambient — see docs/dev/spectator_smoke_test.md for the
+                // observable checklist.
+                if (ImGui::SmallButton(T("btn_spectate"))) {
+                    if (hs.client.IsConnected()) {
+                        // a->id is the user we're requesting to spectate;
+                        // hub maps it to their current match and replies
+                        // with the host's NAT-traversed UDP addr.
+                        hs.client.RequestSpectate(a->id);
+                        hs.status_line = "spectate request sent: " + a->nick;
+                    }
+                }
+                ImGui::SetItemTooltip("Watch this match (FULL_SESSION — "
+                                      "replays from session start; snapshot-join "
+                                      "still baking)");
                 ImGui::PopID();
             }
             ImGui::EndTable();
