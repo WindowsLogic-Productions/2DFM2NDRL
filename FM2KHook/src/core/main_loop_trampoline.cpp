@@ -26,6 +26,7 @@
 #include "../parity/parity_recorder.h"
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -956,6 +957,26 @@ static void RunSpectatorTick() {
     }
     if (qd == 0) {
         // Truly empty — even offline replay has nothing left to do.
+        //
+        // For offline replay (FM2K_REPLAY_FILE set): the entire file was
+        // loaded into pb_queue at startup; queue==0 + playing_back==false
+        // means the last MATCH_END drained and there are no further
+        // events. Without an exit here the replay viewer freezes on the
+        // last rendered frame indefinitely. ExitProcess from a hook is
+        // aggressive but the launcher spawned us specifically for replay
+        // playback — when playback ends, the process is done.
+        //
+        // Live spec falls through to RenderFrameWithSnapshot — peer might
+        // still send more events (next match) and we want to stay alive.
+        if (s_offline_replay_env_active &&
+            !SpectatorNode_IsPlayingBack()) {
+            static std::atomic<bool> s_exit_armed{false};
+            if (!s_exit_armed.exchange(true)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: offline replay drained — exiting process");
+                ExitProcess(0);
+            }
+        }
         RenderFrameWithSnapshot();
         return;
     }

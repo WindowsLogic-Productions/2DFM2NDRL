@@ -357,6 +357,10 @@ add_executable(FM2K_RollbackLauncher
     # ImGui-based input binder (shared with the hook overlay) — depends only
     # on SDL3 + ImGui, no project-specific includes.
     FM2KHook/src/ui/input_binder.cpp
+    # Shared PII scrubber — used by both the launcher's SDLCustomLogOutput
+    # and the hook DLL's LogOutputFunction so anything users share (log
+    # window copy, on-disk hook log) is pre-redacted.
+    FM2KHook/src/util/pii_scrub.cpp
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 

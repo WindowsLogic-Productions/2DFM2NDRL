@@ -127,6 +127,23 @@ static bool     g_remote_battle_entered   = false;
 static bool     g_battle_synced           = false;
 static uint32_t g_battle_entry_swap_frame = 0;     // Latest agreed swap frame.
 
+// "Are we expecting BATTLE_ENTERING right now?" gate. Set when a new CSS
+// GekkoSession comes up (we're entering the CSS phase that will swap to
+// battle); cleared once we've started the battle session. Without this,
+// stale BATTLE_ENTERING packets from a previous match — sent during that
+// match's CSS phase but delayed in flight or kernel-buffered, arriving
+// 100–200ms AFTER the previous match's Netplay_EndBattle reset us — get
+// blindly accepted and pre-poison g_battle_entry_swap_frame for the new
+// match. Symptom: every subsequent match's "BATTLE SYNC: both peers
+// signaled" line shows the SAME stale swap_frame, the BATTLE_ENTERING
+// echo loop never terminates (both peers latch g_local_battle_entered),
+// and eventually the battle GekkoNet sync stalls in one direction
+// → black screen on CSS->battle transition. See logs from 2026-05-09.
+static bool     g_battle_entry_armed      = false;
+
+// Mirror gate for BATTLE_END to prevent the same stale-packet-poisoning
+// pattern in the battle->CSS direction.
+//
 // Battle exit sync barrier (battle-session -> CSS-session swap, for rematch
 // or return-to-menu). Mirrors the entry barrier but reads g_netplay_frame
 // instead of g_css_frame and is driven by BATTLE_END instead of BATTLE_ENTERING.
@@ -134,6 +151,7 @@ static bool     g_local_battle_end_signaled  = false;
 static bool     g_remote_battle_end_signaled = false;
 static bool     g_battle_end_synced          = false;
 static uint32_t g_battle_end_swap_frame      = 0;
+static bool     g_battle_end_armed           = false;
 
 // Frames of slack added to the proposed swap_frame so both peers have time
 // to drain in-flight inputs and converge their proposals before reaching it.
@@ -344,6 +362,24 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 Netplay_OnHostBattleEntering(remote_proposal);
                 break;
             }
+            // Reject stale carryover from a previous match. g_battle_entry_armed
+            // is true ONLY between "new CSS session up" and "battle session
+            // started" — outside that window, an incoming BATTLE_ENTERING is
+            // either a delayed packet from the prior match (which would
+            // otherwise pre-poison g_battle_entry_swap_frame for the next
+            // match) or a duplicate from the current battle's echo storm
+            // (which has nothing to do but keep both peers latched in the
+            // ping-pong forever).
+            if (!g_battle_entry_armed) {
+                static uint32_t s_drop_count = 0;
+                if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: ignoring out-of-window BATTLE_ENTERING "
+                        "(swap=%u, drop#%u) — armed=false",
+                        remote_proposal, (unsigned)s_drop_count);
+                }
+                break;
+            }
             // Player-side handling: convergence on max(local, remote) swap.
             const uint32_t prev_agreed = g_battle_entry_swap_frame;
             if (remote_proposal > g_battle_entry_swap_frame) {
@@ -377,6 +413,20 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             const uint32_t remote_proposal = packet->data.sync.frame;
             if (g_session_kind == SessionKind::SPECTATE) {
                 Netplay_OnHostBattleEnd(remote_proposal);
+                break;
+            }
+            // Same stale-carryover gate as BATTLE_ENTERING. Armed when the
+            // battle GekkoSession comes up; cleared in Netplay_EndBattle.
+            // Outside that window the only thing a BATTLE_END packet can do
+            // is poison the next match's battle-end barrier.
+            if (!g_battle_end_armed) {
+                static uint32_t s_drop_count = 0;
+                if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: ignoring out-of-window BATTLE_END "
+                        "(swap=%u, drop#%u) — armed=false",
+                        remote_proposal, (unsigned)s_drop_count);
+                }
                 break;
             }
             const uint32_t prev_agreed = g_battle_end_swap_frame;
@@ -531,12 +581,14 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     g_remote_battle_entered   = false;
     g_battle_synced           = false;
     g_battle_entry_swap_frame = 0;
+    g_battle_entry_armed      = false;
 
     // Reset battle sync state (exit direction, for next return-to-CSS)
     g_local_battle_end_signaled  = false;
     g_remote_battle_end_signaled = false;
     g_battle_end_synced          = false;
     g_battle_end_swap_frame      = 0;
+    g_battle_end_armed           = false;
 
     // Reset handshake
     g_received_hello = false;
@@ -859,6 +911,11 @@ bool Netplay_ProcessCSS() {
         }
         g_css_synced = true;
         g_css_frame  = 0;
+        // Arm BATTLE_ENTERING acceptance for this match. Stale packets from
+        // the prior match arriving before this point are dropped; from
+        // here through the actual battle-session start they're accepted
+        // as legitimate signaling.
+        g_battle_entry_armed = true;
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "CSS SYNCED: Both ready, GekkoNet CSS session up, RNG reseeded");
@@ -1503,6 +1560,21 @@ bool Netplay_StartBattle() {
             p1_char, p1_name, p2_char, p2_name);
     }
 
+    // Snapshot the actual battle stage_id BEFORE the random-stage block
+    // touches ADDR_SELECTED_STAGE. By this point in Netplay_StartBattle
+    // vs_round_function has already loaded the stage file (the
+    // "<name>.stage" CreateFileA log line a few ms earlier), so the
+    // value at ADDR_SELECTED_STAGE right now is the one that's actually
+    // playing this match. The random-stage block below writes a fresh
+    // value for the *next* match, but that value is what MATCH_START
+    // used to record — leading to "battle on stage X, replay says Y"
+    // mismatches reported on 2026-05-09. Capture pre-roll, use that
+    // for both MATCH_START and SharedMem_PublishMatchStage.
+    const uint32_t mstage_id_pre_roll =
+        (FM2K::ADDR_SELECTED_STAGE != 0)
+            ? *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE
+            : 0u;
+
     // Random stage (#56 — Lilithport-style seeded xorshift). The
     // launcher hands us a host-generated seed via FM2K_STAGE_RANDOM_SEED
     // when both peers agree on random stage. We re-seed once per
@@ -1511,6 +1583,14 @@ bool Netplay_StartBattle() {
     // FM2K's stage memory. Both peers run the same xorshift sequence
     // from the same seed, so rematches keep rolling identically with
     // zero per-rematch wire traffic.
+    //
+    // KNOWN ISSUE: the write here lands AFTER vs_round_function has
+    // already loaded the stage file for the current match, so the roll
+    // does nothing for THIS battle. Only takes effect if the cached
+    // value happens to influence a subsequent stage read — which in
+    // current FM2K builds it doesn't. The random-stage feature is
+    // slated for replacement by an explicit lobby/game-settings stage
+    // selector, so this isn't being fixed in place.
     {
         constexpr uintptr_t kSelectedStageAddr = FM2K::ADDR_SELECTED_STAGE;
         static bool      g_xorshift_seeded = false;
@@ -1581,16 +1661,18 @@ bool Netplay_StartBattle() {
                 stage, g_stage_min, g_stage_max);
         }
 
-        // Stage_id capture for the hub match_result payload. Done AFTER
-        // the random-stage roll so we publish the post-roll value, not
-        // the stale CSS pre-roll one. FM95 has no documented selected-
-        // stage scalar yet (ADDR_SELECTED_STAGE == 0); publish unknown.
+        // Stage_id capture for the hub match_result payload. Uses the
+        // pre-roll snapshot taken at function entry — that's the stage
+        // file vs_round_function already loaded for THIS match. Reading
+        // ADDR_SELECTED_STAGE here would pick up whatever the random
+        // block just wrote (for the next match), producing a record
+        // that doesn't match what players actually saw on screen.
+        // FM95 has no documented selected-stage scalar yet
+        // (ADDR_SELECTED_STAGE == 0); publish unknown.
         if constexpr (FM2K::ADDR_SELECTED_STAGE != 0) {
-            const uint32_t stage_id =
-                *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE;
-            SharedMem_PublishMatchStage(stage_id);
+            SharedMem_PublishMatchStage(mstage_id_pre_roll);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: match stage_id=%u", stage_id);
+                "Netplay: match stage_id=%u", mstage_id_pre_roll);
         } else {
             SharedMem_PublishMatchStage(0xFFFFFFFFu);
         }
@@ -1785,23 +1867,36 @@ bool Netplay_StartBattle() {
     // any currently-subscribed viewers so they reset and follow this match.
     // C6: chars/stage read from the same addresses SharedMem_PublishMatchChars
     // / PublishMatchStage above use. Cast to uint8 — char/stage IDs are well
-    // under 256 (FM2K rosters cap at 50, stages at ~50). No FM2K-side palette/
-    // costume select, so colors stay 0; the slot exists in the wire schema
-    // for FM95-era games that may add it.
+    // under 256 (FM2K rosters cap at 50, stages at ~50).
+    //
+    // Color pick: read from each player's char-slot record at slot+0xE00B
+    // (ADDR_CHARSLOT0_COLOR_PICK + CHARSLOT_STRIDE * slot). 1v1 VS mode
+    // pins slot[0]=P1, slot[1]=P2 (set by AssignPlayerColor's call site
+    // in game_state_manager). v0.2.33 and earlier hardcoded 0 here based
+    // on a misread that FM2K had no palette select — but the bit-mask
+    // ladder in AssignPlayerColor maps attack buttons 1..5 to colors
+    // 1..5. With 0 in MATCH_START, css_autoconfirm's per-player target
+    // bit always fell back to bit 4 (color 0) on replay/spec, so every
+    // playback showed palette 0 regardless of what was originally picked.
     const uint8_t mp1_char = static_cast<uint8_t>(
         *(const uint32_t*)FM2K::ADDR_P1_SELECTED_CHAR);
     const uint8_t mp2_char = static_cast<uint8_t>(
         *(const uint32_t*)FM2K::ADDR_P2_SELECTED_CHAR);
-    const uint8_t mstage_id =
-        (FM2K::ADDR_SELECTED_STAGE != 0)
-            ? static_cast<uint8_t>(*(const uint32_t*)FM2K::ADDR_SELECTED_STAGE)
-            : 0;
+    uint8_t mp1_color = 0;
+    uint8_t mp2_color = 0;
+    if constexpr (FM2K::ADDR_CHARSLOT0_COLOR_PICK != 0) {
+        mp1_color = static_cast<uint8_t>(
+            *(const uint32_t*)FM2K::ADDR_CHARSLOT0_COLOR_PICK);
+        mp2_color = static_cast<uint8_t>(
+            *(const uint32_t*)(FM2K::ADDR_CHARSLOT0_COLOR_PICK + FM2K::CHARSLOT_STRIDE));
+    }
+    const uint8_t mstage_id = static_cast<uint8_t>(mstage_id_pre_roll);
     SpectatorNode_OnMatchStart(
         /*game_hash*/         0,
         /*initial_rng_seed*/  initial_seed,
         /*initial_state_hash*/initial_state_hash,
-        /*p1_char*/mp1_char, /*p1_color*/0,
-        /*p2_char*/mp2_char, /*p2_color*/0,
+        /*p1_char*/mp1_char, /*p1_color*/mp1_color,
+        /*p2_char*/mp2_char, /*p2_color*/mp2_color,
         /*stage_id*/mstage_id);
 
     // C3.5 — reset the intra-match round counter so the first ROUND_START
@@ -1831,6 +1926,14 @@ bool Netplay_StartBattle() {
     g_last_rollback_frame = 0;
     g_desync_count = 0;
     g_last_desync_log_tick = 0;
+
+    // Battle session is up. Disarm BATTLE_ENTERING (we're past the signaling
+    // window — any further arrivals are duplicates / late echoes and should
+    // be dropped, otherwise the rate-limited echo path keeps both peers in
+    // a forever-ping-pong that competes with GekkoNet's own sync handshake).
+    // Arm BATTLE_END for the eventual return-to-CSS swap.
+    g_battle_entry_armed = false;
+    g_battle_end_armed   = true;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created (runahead=4)");
     return true;
@@ -2053,17 +2156,24 @@ void Netplay_EndBattle() {
     g_local_css_ready = false;
     g_remote_css_ready = false;
 
-    // Reset battle sync state for next battle (entry direction)
+    // Reset battle sync state for next battle (entry direction). Both gates
+    // disarmed: the next CSS rendezvous re-arms BATTLE_ENTERING when the
+    // new CSS GekkoSession comes up, and Netplay_StartBattle re-arms
+    // BATTLE_END once the next battle session is created. Anything that
+    // arrives between now and those points is stale carryover and gets
+    // dropped at the handler.
     g_local_battle_entered    = false;
     g_remote_battle_entered   = false;
     g_battle_synced           = false;
     g_battle_entry_swap_frame = 0;
+    g_battle_entry_armed      = false;
 
     // Reset battle-end sync state — fresh for the rematch's next return.
     g_local_battle_end_signaled  = false;
     g_remote_battle_end_signaled = false;
     g_battle_end_synced          = false;
     g_battle_end_swap_frame      = 0;
+    g_battle_end_armed           = false;
 }
 
 // =============================================================================

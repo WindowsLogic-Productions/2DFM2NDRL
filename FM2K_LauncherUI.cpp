@@ -1604,10 +1604,17 @@ void LauncherUI::ScanReplays() {
     for (const auto& root : games_root_paths_) {
         if (root.empty()) continue;
         std::filesystem::path root_fs = std::filesystem::u8path(root);
-        if (!std::filesystem::is_directory(root_fs, ec)) continue;
+        if (!std::filesystem::is_directory(root_fs, ec)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "ReplayBrowser: skipping root '%s' — not a directory (ec=%s)",
+                root.c_str(), ec ? ec.message().c_str() : "ok");
+            continue;
+        }
         // Each game lives directly under root; replays/ is one level deeper.
         // Use recursive_directory_iterator with a depth cap so we don't walk
         // user-installed game subdirs unnecessarily.
+        size_t hits_before = replays_cache_.size();
+        size_t walked      = 0;
         for (auto it = std::filesystem::recursive_directory_iterator(
                  root_fs,
                  std::filesystem::directory_options::skip_permission_denied,
@@ -1615,9 +1622,15 @@ void LauncherUI::ScanReplays() {
              it != std::filesystem::recursive_directory_iterator{};
              it.increment(ec))
         {
-            if (ec) break;
+            if (ec) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "ReplayBrowser: walk error under '%s': %s",
+                    root.c_str(), ec.message().c_str());
+                break;
+            }
             if (it.depth() > 5) { it.disable_recursion_pending(); continue; }
             const auto& entry = *it;
+            ++walked;
             if (!entry.is_regular_file(ec)) continue;
             std::string ext = entry.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(),
@@ -1626,6 +1639,10 @@ void LauncherUI::ScanReplays() {
                 try_load_file(entry.path());
             }
         }
+        const size_t found = replays_cache_.size() - hits_before;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "ReplayBrowser: root '%s' walked %zu entries, accepted %zu replay file(s)",
+            root.c_str(), walked, found);
     }
 
     // Sort: newest finished first.
@@ -1647,13 +1664,32 @@ void LauncherUI::RenderReplayBrowser() {
     ImGui::SameLine();
     ImGui::TextDisabled("%zu file(s) — newest first",
                         replays_cache_.size());
+
+    // Show the configured games-root paths so the user can verify what's
+    // being scanned. Common gotcha: launcher in C:\games but games on D:\,
+    // and the games-root config still points at the legacy C:\ path —
+    // recursive walk silently scans nothing relevant. Surfacing the list
+    // means the user can spot it immediately instead of debugging blind.
+    if (games_root_paths_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
+            "No games-root paths configured — add one via Settings → Games "
+            "Folders.");
+    } else {
+        ImGui::TextDisabled("Scanned roots:");
+        for (const auto& root : games_root_paths_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("[%s]", root.c_str());
+        }
+    }
     ImGui::Separator();
 
     if (replays_cache_.empty()) {
         ImGui::TextWrapped("No .fm2krep / .fm2kset files found under any "
                            "configured games-root path. Play a netplay "
                            "match to create one (replays auto-save to "
-                           "<game>/replays/<timestamp>.fm2krep).");
+                           "<game>/replays/<timestamp>.fm2krep). If you "
+                           "have replays elsewhere, add the parent folder "
+                           "via Settings → Games Folders.");
         return;
     }
 

@@ -169,6 +169,12 @@ namespace FM2K {
     constexpr uintptr_t ADDR_LOAD_STAGE_FILE_ALT  = 0x4054b0;
     constexpr uintptr_t ADDR_CHAR_STAGE_PER_ROUND = 0x540337;
 
+    // FM2K-only fields stubbed at 0 on FM95 — the AssignPlayerColor /
+    // per-slot color-pick mechanism is FM2K-specific. FM95 has its own
+    // palette select that we don't currently surface to MATCH_START.
+    constexpr uintptr_t ADDR_CHARSLOT0_COLOR_PICK = 0;
+    constexpr size_t    CHARSLOT_STRIDE           = 0;
+
     // Engine tag — runtime check for code that needs to branch on engine.
     constexpr bool kIsFM95 = true;
     constexpr bool kIsFM2K = false;
@@ -301,6 +307,21 @@ namespace FM2K {
     // from the random-stage feature went to a dead address while
     // the game read the cursor's own pick from 0x43010c.
     constexpr uintptr_t ADDR_SELECTED_STAGE       = 0x43010c;
+
+    // Per-character-slot record table. Each slot is 0xE03F bytes;
+    // 8 slots span 0x4D1D80..0x54FF83. Field at slot+0xE00B is the
+    // resolved palette/color slot (0..5) — written by AssignPlayerColor
+    // @ 0x406F20 once a player presses an attack button on confirm. In
+    // 1v1 VS mode slot[0]=P1, slot[1]=P2; team mode uses 0..3 / 4..7.
+    //
+    // ADDR_CHARSLOT0_COLOR_PICK is `&slot[0].color` (0x4D1D80 + 0xE00B).
+    // For slot N's color: ADDR_CHARSLOT0_COLOR_PICK + CHARSLOT_STRIDE * N.
+    // IDA: g_charslot0_color_pick @ 0x4DFD8B (renamed from
+    // g_charslot0_demo_link_id 2026-05-09 — the field at +0xE00B is the
+    // color pick, the stale name was a misread of the same struct slot
+    // when used in demo-replay context).
+    constexpr uintptr_t ADDR_CHARSLOT0_COLOR_PICK = 0x4DFD8B;
+    constexpr size_t    CHARSLOT_STRIDE           = 0xE03F;
 
     // Engine tag — runtime check for code that needs to branch on engine.
     constexpr bool kIsFM95 = false;
