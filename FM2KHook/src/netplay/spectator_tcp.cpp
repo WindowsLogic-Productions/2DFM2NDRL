@@ -361,7 +361,15 @@ bool PerformTcpStun() {
                     host.c_str(), SDL_GetError());
         return false;
     }
-    if (NET_WaitUntilResolved(addr, 1000) != 1) {
+    // SDL_net's resolver runs on a background thread that has to spin up
+    // on first use — cold-start overhead pushed real-world DNS lookups
+    // past the 1000ms cap we shipped in v0.2.36, so the probe was
+    // timing out on the resolve step alone (DNS itself was healthy;
+    // confirmed by the working UDP-STUN path which uses raw getaddrinfo).
+    // 5s gives us plenty of margin even on a sluggish DNS path while
+    // still capping the worst case (TCP-STUN failure is non-fatal —
+    // we fall back to local listener port for the punch).
+    if (NET_WaitUntilResolved(addr, 5000) != 1) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "TCP-STUN: resolve '%s' timed out: %s",
                     host.c_str(), SDL_GetError());
