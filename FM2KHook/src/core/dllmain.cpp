@@ -135,7 +135,44 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
         if (len > 0 && formatted[len - 1] == '\n') {
             formatted[len - 1] = '\0';
         }
-        LOG_INFO(g_quill_logger, "{}", formatted);
+
+        // Diagnostic backtrace routing.
+        //
+        // SDL_LOG_CATEGORY_CUSTOM (and beyond) marks high-frequency
+        // diagnostic lines that we want CAPTURED but not always WRITTEN.
+        // Currently used by [SPEC-FP] / [HOST-FP] / [SPEC-TRACE] /
+        // [HOST-TRACE] / pb_queue=N (~3 lines/sec each). Quill's
+        // backtrace ring (init_backtrace below) buffers the last 4096
+        // such lines in memory; LOG_ERROR through any channel auto-
+        // flushes the ring to disk just before the error line, giving
+        // us "diag-armed forever, zero disk IO until something breaks."
+        //
+        // FM2K_SPECTATOR_DEBUG=1 routes diag straight to disk like a
+        // normal log line — keep the existing opt-in path for users
+        // who want continuous capture during a debug session.
+        //
+        // Routing for non-CUSTOM (regular APPLICATION) categories: WARN
+        // and below go to LOG_INFO (file); ERROR/CRITICAL go to LOG_ERROR
+        // (file + auto-flush backtrace).
+        if (category >= SDL_LOG_CATEGORY_CUSTOM) {
+            static int s_spec_diag_to_file = -1;
+            if (s_spec_diag_to_file < 0) {
+                const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
+                s_spec_diag_to_file =
+                    (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+            }
+            if (s_spec_diag_to_file == 1) {
+                LOG_INFO(g_quill_logger, "{}", formatted);
+            } else {
+                LOG_BACKTRACE(g_quill_logger, "{}", formatted);
+            }
+        } else if (priority >= SDL_LOG_PRIORITY_ERROR) {
+            // ERROR / CRITICAL — flushes the backtrace ring as a side
+            // effect of init_backtrace's flush_level being set to Error.
+            LOG_ERROR(g_quill_logger, "{}", formatted);
+        } else {
+            LOG_INFO(g_quill_logger, "{}", formatted);
+        }
     }
 }
 
@@ -181,6 +218,15 @@ static void InitFileLogging() {
     g_quill_logger = quill::Frontend::create_or_get_logger(
         "fm2k_hook", std::move(file_sink), fmt_opts);
 
+    if (g_quill_logger) {
+        // Backtrace ring — capacity = 4096 last diagnostic lines.
+        // ~13 minutes of sim coverage at the [SPEC-FP] / [HOST-FP]
+        // 30-frame cadence (3 lines/sec × 4 streams ≈ 12 lines/sec).
+        // flush_level = Error: any LOG_ERROR through this logger auto-
+        // dumps the entire ring to disk just before the error line,
+        // giving full crash-context for free without continuous IO.
+        g_quill_logger->init_backtrace(4096, quill::LogLevel::Error);
+    }
     if (g_quill_logger) {
         // Header lines go through the same async path. Three lines
         // matching the previous synchronous header so log readers /
