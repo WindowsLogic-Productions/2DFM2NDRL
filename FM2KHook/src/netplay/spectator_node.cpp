@@ -1942,8 +1942,8 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 }
                 if (s_offline_replay_cached == 1) {
                     CssAutoConfirm_OnReplayMatchStart(
-                        g_state.pb_p1_char,
-                        g_state.pb_p2_char,
+                        g_state.pb_p1_char, g_state.pb_p1_color,
+                        g_state.pb_p2_char, g_state.pb_p2_color,
                         g_state.pb_stage_id);
                 }
             }

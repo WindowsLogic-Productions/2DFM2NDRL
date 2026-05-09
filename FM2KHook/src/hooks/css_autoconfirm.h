@@ -28,11 +28,14 @@ bool CssAutoConfirm_Install();
 
 // Activate auto-confirm for the next CSS phase. Called from the spectator
 // node's MATCH_START apply path when an offline-replay session is loading
-// per-battle data. p1_char / p2_char index into the FM2K char grid; stage_id
-// is the recorded stage slot. Live-spectator paths do NOT call this — they
-// drive CSS via the full host input stream and don't need the override.
-void CssAutoConfirm_OnReplayMatchStart(uint8_t p1_char,
-                                       uint8_t p2_char,
+// per-battle data. p1_char / p2_char index into the FM2K char grid;
+// p1_color / p2_color are the recorded color slots (0..5) that map to the
+// attack-button bit our auto-confirm injects so AssignPlayerColor lands on
+// the same color the original player picked; stage_id is the recorded
+// stage slot. Live-spectator paths do NOT call this — they drive CSS via
+// the full host input stream and don't need the override.
+void CssAutoConfirm_OnReplayMatchStart(uint8_t p1_char, uint8_t p1_color,
+                                       uint8_t p2_char, uint8_t p2_color,
                                        uint8_t stage_id);
 
 // Reset on MATCH_END / battle-mode entry — re-engaged by the next

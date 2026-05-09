@@ -18,6 +18,7 @@ extern void NeuterFullscreenTogglesForCncDdraw();
 #include <windows.h>
 #include <mmsystem.h>
 #include <psapi.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -250,6 +251,176 @@ static void InitFileLogging() {
     SDL_SetLogOutputFunction(LogOutputFunction, nullptr);
 }
 
+// Crash dumper — last-chance handler that records faulting address +
+// exception code + a hex stack-backtrace to the same log file the rest
+// of the hook writes to. No DbgHelp dependency: we capture raw frame
+// addresses (RtlCaptureStackBackTrace) and dump the module name + RVA
+// for each so you can post-process against the IDA / .map / .pdb later.
+//
+// Why this exists: alt-tab during init or modal title-drag mid-boot
+// occasionally crashes the game right after the main pump resumes.
+// Without a stack we can only guess at root cause (D3D9 device-lost,
+// rollback catchup explosion, ImGui state mismatch — all plausible).
+// This handler turns the next incident into a concrete trace.
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    FILE* f = g_log_file_fallback;  // shared with normal logging
+    if (!f) {
+        // Last-resort fallback — open a dedicated crash file in case the
+        // main log handle is lost. Same logs/ dir.
+        char path[MAX_PATH];
+        char base[64];
+        std::snprintf(base, sizeof(base),
+                      "FM2K_P%d_Crash.log", g_player_index + 1);
+        if (Fm2k_BuildLogPath(path, sizeof(path), base)) {
+            f = fopen(path, "w");
+        }
+    }
+    if (!f) return EXCEPTION_CONTINUE_SEARCH;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    DWORD code = ep && ep->ExceptionRecord
+                 ? ep->ExceptionRecord->ExceptionCode : 0;
+    void* addr = ep && ep->ExceptionRecord
+                 ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+
+    fprintf(f,
+        "\n=== CRASH at %02d:%02d:%02d.%03d (P%d) ===\n"
+        "ExceptionCode    = 0x%08lX\n"
+        "ExceptionAddress = %p\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        g_player_index + 1,
+        (unsigned long)code, addr);
+
+    if (ep && ep->ContextRecord) {
+        const CONTEXT* c = ep->ContextRecord;
+        fprintf(f,
+            "EIP=0x%08lX EAX=0x%08lX EBX=0x%08lX ECX=0x%08lX EDX=0x%08lX\n"
+            "ESI=0x%08lX EDI=0x%08lX EBP=0x%08lX ESP=0x%08lX\n",
+            (unsigned long)c->Eip, (unsigned long)c->Eax,
+            (unsigned long)c->Ebx, (unsigned long)c->Ecx,
+            (unsigned long)c->Edx, (unsigned long)c->Esi,
+            (unsigned long)c->Edi, (unsigned long)c->Ebp,
+            (unsigned long)c->Esp);
+
+        // ExceptionInformation[0] = 0 read, 1 write, 8 DEP.
+        // ExceptionInformation[1] = the inaccessible address. Critical
+        // for AVs — tells us "tried to {read,write} <addr>".
+        if (code == EXCEPTION_ACCESS_VIOLATION &&
+            ep->ExceptionRecord->NumberParameters >= 2) {
+            ULONG_PTR rw   = ep->ExceptionRecord->ExceptionInformation[0];
+            ULONG_PTR vbad = ep->ExceptionRecord->ExceptionInformation[1];
+            fprintf(f, "AV: %s 0x%08lX\n",
+                    rw == 0 ? "read" : rw == 1 ? "write" : "exec",
+                    (unsigned long)vbad);
+        }
+    }
+
+    // Backtrace: RtlCaptureStackBackTrace gives us up to 62 frames on
+    // 32-bit Windows. Walk and resolve each to module+RVA via
+    // GetModuleHandleEx with FROM_ADDRESS (no DbgHelp needed).
+    void* frames[64] = {};
+    USHORT n = RtlCaptureStackBackTrace(0, 64, frames, nullptr);
+    fprintf(f, "Backtrace (%u frames):\n", (unsigned)n);
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE mod = nullptr;
+        char modname[MAX_PATH] = {0};
+        ULONG_PTR rva = 0;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCSTR)frames[i], &mod) && mod) {
+            char fullpath[MAX_PATH] = {0};
+            if (GetModuleFileNameA(mod, fullpath, sizeof(fullpath))) {
+                const char* p = strrchr(fullpath, '\\');
+                std::snprintf(modname, sizeof(modname),
+                              "%s", p ? p + 1 : fullpath);
+            }
+            rva = (ULONG_PTR)frames[i] - (ULONG_PTR)mod;
+        }
+        fprintf(f, "  [%02u] %p  %s+0x%08lX\n",
+                (unsigned)i, frames[i],
+                modname[0] ? modname : "?",
+                (unsigned long)rva);
+    }
+    fprintf(f, "=== END CRASH ===\n\n");
+    fflush(f);
+    return EXCEPTION_CONTINUE_SEARCH;  // let Windows' default handler
+                                       // pop the WER dialog as usual
+}
+
+// Vectored exception handler for known vanilla-game render bugs that we
+// can't (yet) prevent at the source.
+//
+// Currently catches: AV inside sprite_rendering_engine @ 0x40CC30 reading
+// from `[g_effect_character_data_base + 0x114] + frame_idx*16 - 0x10`.
+// Repro: alt-tab / drag title bar of one launcher instance during the CSS
+// demo phase; the OTHER instance occasionally trips this AV. Stack
+// register dump showed EDI=3 (case 3 = effect render path), EBX pointing
+// at g_effect_character_data_base, EDX = a near-page-aligned heap-ish
+// pointer that didn't extend 3 more bytes for the `mov ax, [edx+3]` read.
+// Likely a vanilla edge case where an effect's sprite-table pointer is
+// either uninitialized or off-by-one against the loaded sprite stream.
+//
+// Recovery strategy: jump EIP to a known full-epilogue position inside
+// the function (0x40D7A8: `pop edi; pop esi; pop ebp; pop ebx; add esp,
+// 0x6C; ret`). At the crash address the function has only executed its
+// prologue + a handful of loads — no extra stack pushes — so the epilogue
+// unwinds cleanly to the caller. Effect renders for that one frame are
+// skipped; game keeps running.
+//
+// Throttle: log first 3 recoveries, then 1-per-1000 thereafter, to avoid
+// blasting the log if the crash repeats every render frame.
+static LONG WINAPI VectoredRenderGuard(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    constexpr DWORD kSpriteEngineStart    = 0x0040CC30;
+    constexpr DWORD kSpriteEngineEnd      = 0x0040E3E8;  // start + 0x17B8
+    constexpr DWORD kSpriteEngineEpilogue = 0x0040D7A8;
+    constexpr DWORD kKnownCrashSite       = 0x0040CCAE;  // mov ax, [edx+3]
+
+    CONTEXT* c = ep->ContextRecord;
+    if (c->Eip < kSpriteEngineStart || c->Eip >= kSpriteEngineEnd) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Only recover at the known crash site for now — broad jump-to-epilogue
+    // from arbitrary EIPs inside the function risks unwinding past
+    // mid-call stack pushes (later in the function). Tightens the
+    // recovery to "the exact frame-decode AV we've observed" and lets
+    // any new crash pattern surface as a real fault we can dump.
+    if (c->Eip != kKnownCrashSite) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static std::atomic<uint32_t> s_count{0};
+    const uint32_t n = s_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 3 || (n % 1000) == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "VectoredRenderGuard: recovered AV at 0x%08lX in sprite_rendering_engine "
+            "(occurrence #%u, EDX=0x%08lX) — skipping render via epilogue jump",
+            (unsigned long)c->Eip, (unsigned)n, (unsigned long)c->Edx);
+    }
+    c->Eip = kSpriteEngineEpilogue;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void InstallCrashHandler() {
+    // Vectored handlers run BEFORE SEH-style filters and BEFORE the
+    // unhandled-exception filter, so they get first crack at recovering
+    // known-bad code paths. SetUnhandledExceptionFilter remains as the
+    // last-resort dumper for everything we don't recover.
+    AddVectoredExceptionHandler(/*FirstHandler=*/1, VectoredRenderGuard);
+    SetUnhandledExceptionFilter(CrashHandler);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "CrashHandler: installed (vectored render-guard + last-resort dumper)");
+}
+
 static void ShutdownFileLogging() {
     if (g_quill_logger) {
         LOG_INFO(g_quill_logger, "{}", "=== Session ended ===");
@@ -438,6 +609,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 }
             }
             InitFileLogging();
+            InstallCrashHandler();
             SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
 

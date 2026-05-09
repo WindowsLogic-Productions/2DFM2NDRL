@@ -32,14 +32,36 @@ constexpr uintptr_t ADDR_STAGE_HEIGHT       = 0x004452BA;  // u16
 constexpr uintptr_t ADDR_SELECTED_STAGE     = 0x0043010C;
 constexpr uintptr_t ADDR_GAME_MODE          = 0x00470054;
 
-// One of the bits inside the 0x3F0 attack mask. The CSS state-1 code reads
-// `g_input_changes[player] & 0x3F0` to detect a confirm; any bit in that
-// mask works. Picking 0x10 (bit 4 = first attack button) gives a
-// deterministic AssignPlayerColor result so every replay confirms with the
-// same palette index. We OVERWRITE rather than OR so that pb_queue's leaked
-// battle-input bits don't cause AssignPlayerColor to pick a different
-// (and host-mismatched) color via GetButtonIndexFromMask's bit-scan.
-constexpr uint32_t INJECTED_CONFIRM_BIT = 0x10;
+// AssignPlayerColor @ 0x406F20 reads `input_changes & 0x3E0` (bits 5..9) to
+// pick color slot 1..5; if none of those bits set, the function falls
+// through to color 0. The caller in game_state_manager triggers the call
+// only when `input_changes & 0x3F0` (bits 4..9) is non-zero — so bit 4
+// (0x10) on its own confirms with color 0.
+//
+// Earlier versions of this file used a fixed `INJECTED_CONFIRM_BIT = 0x10`
+// for both players, which always landed on color 0 regardless of what the
+// recorded match used. That made offline replays look like every fight
+// confirmed with palette 0 even when the original players picked colors
+// 1..5 — visible as wrong palette in the replay's CSS portrait + battle
+// sprites.
+//
+// Replacement: per-player target bit derived from the MATCH_START header's
+// p1_color / p2_color, mapped through ColorBitForSlot:
+//
+//   color 0 → 0x10  (bit 4 — confirm-only, falls through to default 0)
+//   color 1 → 0x20  (bit 5)
+//   color 2 → 0x40  (bit 6)
+//   color 3 → 0x80  (bit 7)
+//   color 4 → 0x100 (bit 8)
+//   color 5 → 0x200 (bit 9)
+//
+// We still OVERWRITE the 0x3F0 bits rather than OR — pb_queue's leaked
+// battle-input bits could otherwise set a different attack button and shift
+// AssignPlayerColor's bit ladder onto the wrong color.
+inline uint32_t ColorBitForSlot(uint8_t color) {
+    if (color == 0u || color > 5u) return 0x10u;
+    return 0x10u << color;  // 0x20, 0x40, 0x80, 0x100, 0x200
+}
 
 typedef char (__cdecl *GameStateManagerFn)();
 GameStateManagerFn g_orig = nullptr;
@@ -49,6 +71,8 @@ GameStateManagerFn g_orig = nullptr;
 std::atomic<bool>    g_active{false};
 std::atomic<uint8_t> g_target_p1_char{0};
 std::atomic<uint8_t> g_target_p2_char{0};
+std::atomic<uint8_t> g_target_p1_color{0};
+std::atomic<uint8_t> g_target_p2_color{0};
 std::atomic<uint8_t> g_target_stage_id{0};
 
 // Tick counter for diag — log first few frames of pinning then stay quiet so
@@ -112,12 +136,17 @@ char __cdecl Hook_GameStateManager() {
                 // pb_queue's natural attack-button bits are ALSO masked out
                 // during Phase A so they can't accidentally trigger an early
                 // confirm with the wrong selected value.
+                const uint8_t p1col = g_target_p1_color.load(std::memory_order_relaxed);
+                const uint8_t p2col = g_target_p2_color.load(std::memory_order_relaxed);
+                const uint32_t p1_bit = ColorBitForSlot(p1col);
+                const uint32_t p2_bit = ColorBitForSlot(p2col);
+
                 if (p1_act == 0u) {
                     if (selected[0] != static_cast<int>(p1c)) {
                         selected[0] = -1;
                         in_changes[0] &= ~0x3F0u;
                     } else {
-                        in_changes[0] = (in_changes[0] & ~0x3F0u) | INJECTED_CONFIRM_BIT;
+                        in_changes[0] = (in_changes[0] & ~0x3F0u) | p1_bit;
                     }
                 }
                 if (p2_act == 0u) {
@@ -125,18 +154,18 @@ char __cdecl Hook_GameStateManager() {
                         selected[1] = -1;
                         in_changes[1] &= ~0x3F0u;
                     } else {
-                        in_changes[1] = (in_changes[1] & ~0x3F0u) | INJECTED_CONFIRM_BIT;
+                        in_changes[1] = (in_changes[1] & ~0x3F0u) | p2_bit;
                     }
                 }
 
                 const uint32_t tick = g_pin_tick.fetch_add(1, std::memory_order_relaxed);
                 if (tick < 8u || (tick % 30u) == 0u) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "CssAutoConfirm: tick=%u p1=%u@(%d,%d)[sel=%d] "
-                        "p2=%u@(%d,%d)[sel=%d] act=%u/%u stage=%u sw=%u",
+                        "CssAutoConfirm: tick=%u p1=%u/c%u@(%d,%d)[sel=%d,bit=0x%X] "
+                        "p2=%u/c%u@(%d,%d)[sel=%d,bit=0x%X] act=%u/%u stage=%u sw=%u",
                         tick,
-                        p1c, p1_cur[0], p1_cur[1], selected[0],
-                        p2c, p2_cur[0], p2_cur[1], selected[1],
+                        p1c, p1col, p1_cur[0], p1_cur[1], selected[0], p1_bit,
+                        p2c, p2col, p2_cur[0], p2_cur[1], selected[1], p2_bit,
                         p1_act, p2_act, stg, sw);
                 }
             }
@@ -174,17 +203,19 @@ bool CssAutoConfirm_Install() {
     return true;
 }
 
-void CssAutoConfirm_OnReplayMatchStart(uint8_t p1_char,
-                                       uint8_t p2_char,
+void CssAutoConfirm_OnReplayMatchStart(uint8_t p1_char, uint8_t p1_color,
+                                       uint8_t p2_char, uint8_t p2_color,
                                        uint8_t stage_id) {
     g_target_p1_char.store(p1_char, std::memory_order_relaxed);
     g_target_p2_char.store(p2_char, std::memory_order_relaxed);
+    g_target_p1_color.store(p1_color, std::memory_order_relaxed);
+    g_target_p2_color.store(p2_color, std::memory_order_relaxed);
     g_target_stage_id.store(stage_id, std::memory_order_relaxed);
     g_pin_tick.store(0, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "CssAutoConfirm: armed for replay — p1_char=%u p2_char=%u stage=%u",
-        p1_char, p2_char, stage_id);
+        "CssAutoConfirm: armed for replay — p1=%u/c%u p2=%u/c%u stage=%u",
+        p1_char, p1_color, p2_char, p2_color, stage_id);
 }
 
 void CssAutoConfirm_Disengage() {
@@ -199,7 +230,7 @@ void CssAutoConfirm_Disengage() {
 #include "css_autoconfirm.h"
 
 bool CssAutoConfirm_Install()                              { return true; }
-void CssAutoConfirm_OnReplayMatchStart(uint8_t, uint8_t, uint8_t) {}
+void CssAutoConfirm_OnReplayMatchStart(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
 void CssAutoConfirm_Disengage()                            {}
 
 #endif
