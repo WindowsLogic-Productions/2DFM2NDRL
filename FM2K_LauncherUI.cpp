@@ -4696,6 +4696,24 @@ void LauncherUI::RenderHubPanel() {
                 hs.status_line = "spectate denied: " + ev.error;
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
                 break;
+            case K::SpectatorIncoming: {
+                // We're the host of an in-progress match; hub forwarded a
+                // spectator's external UDP addr. Fire a NAT-punch packet
+                // toward them so their first JOIN_REQ doesn't get dropped
+                // by our NAT. Forward to launcher → game-instance shared
+                // mem → hook's TickHostMaintenance picks it up + StartPunch.
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hub: spectator_incoming nick=%s addr=%s:%d — punching",
+                    ev.spectator_incoming.spec_nick.c_str(),
+                    ev.spectator_incoming.spec_udp_ip.c_str(),
+                    ev.spectator_incoming.spec_udp_port);
+                if (on_spectator_punch_target) {
+                    on_spectator_punch_target(
+                        ev.spectator_incoming.spec_udp_ip,
+                        ev.spectator_incoming.spec_udp_port);
+                }
+                break;
+            }
             case K::RecordReceived: {
                 // Only the unfiltered global-record reply (no opponent_id /
                 // game_id filter) carries the per-opponent breakdown that

@@ -175,6 +175,17 @@ void SharedMem_PublishRoundResult(uint8_t  winner_idx,
     g_shared_mem->match_rounds_count = i + 1;
 }
 
+void SharedMem_PublishSpectatorPunchTarget(uint32_t ip_be, uint16_t port) {
+    if (!g_shared_mem) return;
+    g_shared_mem->spectator_punch_ip_be = ip_be;
+    g_shared_mem->spectator_punch_port  = port;
+    // Bump seq AFTER writing the addr fields so a hook poll racing the
+    // launcher's write reads either the old (seq=N) or new (seq=N+1)
+    // addr cleanly, never half-written. x86 stores are sequentially
+    // consistent so no fence needed here.
+    g_shared_mem->spectator_punch_seq  += 1;
+}
+
 void SharedMem_PublishHudScores(uint16_t p1, uint16_t p2) {
     if (!g_shared_mem) return;
     g_shared_mem->hud_score_p1 = p1;

@@ -2917,6 +2917,51 @@ void SpectatorNode_TickHealth() {
 void SpectatorNode_TickHostMaintenance() {
     const uint64_t now = (uint64_t)GetTickCount64();
 
+    // ---- Spectator-incoming NAT punch poll --------------------------------
+    // The launcher's hub-event handler (on_spectator_punch_target) writes
+    // an external UDP addr into shared mem when the hub forwards a
+    // spectator_incoming WS event. Poll spectator_punch_seq for changes;
+    // each bump is a new spectator that needs us to fire an outbound
+    // packet to open our NAT mapping for them. Without this their first
+    // SPEC_JOIN_REQ gets dropped at our NAT and they sit on
+    // "Connecting..." through every reconnect cycle.
+    //
+    // We send a small burst of SPEC_HEARTBEAT packets — harmless on the
+    // spectator side (they're not subscribed yet, packets get logged +
+    // dropped) but enough to traverse our NAT and create the inbound
+    // hole. The spectator's existing 2-second reconnect will then
+    // succeed on its next attempt.
+    {
+        FM2KSharedMemData* shm = GetSharedMemory();
+        static uint32_t s_last_punch_seq = 0;
+        if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC &&
+            shm->spectator_punch_seq != s_last_punch_seq) {
+            s_last_punch_seq = shm->spectator_punch_seq;
+            const uint32_t ip_be = shm->spectator_punch_ip_be;
+            const uint16_t port  = shm->spectator_punch_port;
+            if (ip_be != 0 && port != 0) {
+                char ip_str[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &ip_be, ip_str, sizeof(ip_str));
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: hub-coordinated NAT punch toward "
+                    "spectator %s:%u (seq=%u)",
+                    ip_str, (unsigned)port, (unsigned)s_last_punch_seq);
+
+                sockaddr_in target{};
+                target.sin_family      = AF_INET;
+                target.sin_addr.s_addr = ip_be;
+                target.sin_port        = htons(port);
+                CtrlPacket hb{};
+                hb.header.type = CtrlMsg::SPEC_HEARTBEAT;
+                // 5-pack burst to ride out single-packet UDP loss; total
+                // ~250 B at typical Ctrl size, negligible cost.
+                for (int i = 0; i < 5; ++i) {
+                    ControlChannel_SendTo(hb, target);
+                }
+            }
+        }
+    }
+
     // ---- Upstream-side: bind newly-arrived TCP clients to subscribers ----
     // Spectator's async TCP dial completes some frames after JOIN_ACK; the
     // accept queue carries a fresh socket waiting to be paired by IP. On

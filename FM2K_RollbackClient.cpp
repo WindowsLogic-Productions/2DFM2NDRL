@@ -25,6 +25,8 @@
 #include <iostream>
 #include <thread>
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <fstream>
@@ -1234,6 +1236,66 @@ bool FM2KLauncher::Initialize() {
     ui_->on_session_stop = [this]() {
         StopSession();
     };
+    ui_->on_spectator_punch_target = [this](const std::string& spec_udp_ip,
+                                            int                spec_udp_port) {
+        // Hub forwarded a spectator's external UDP addr (we're the host
+        // of an active match). Write it into our running game instance's
+        // shared mem so the hook's TickHostMaintenance polls the seq
+        // bump and fires StartPunch toward it. Without this the
+        // spectator's first JOIN_REQ gets dropped at our NAT and they
+        // sit on "Connecting..." through every reconnect cycle.
+        DWORD target_pid = 0;
+        if (game_instance_ && game_instance_->IsRunning()) {
+            target_pid = game_instance_->GetProcessId();
+        } else if (client1_instance_ && client1_instance_->IsRunning()) {
+            // Dev-mode dual-clients fallback — local-test spectator path.
+            target_pid = client1_instance_->GetProcessId();
+        }
+        if (target_pid == 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: spectator_incoming with no running game instance "
+                "to deliver punch target to (addr=%s:%d) — dropping",
+                spec_udp_ip.c_str(), spec_udp_port);
+            return;
+        }
+        // Resolve dotted IPv4 -> network-byte-order u32 for StartPunch.
+        IN_ADDR addr_bin{};
+        if (inet_pton(AF_INET, spec_udp_ip.c_str(), &addr_bin) != 1 ||
+            spec_udp_port <= 0 || spec_udp_port > 0xFFFF) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: spectator_incoming bad addr %s:%d — dropping",
+                spec_udp_ip.c_str(), spec_udp_port);
+            return;
+        }
+        const std::string mapping_name =
+            "FM2K_SharedMem_" + std::to_string((unsigned)target_pid);
+        HANDLE h = OpenFileMappingA(FILE_MAP_WRITE, FALSE,
+                                    mapping_name.c_str());
+        if (!h) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: spectator_incoming: OpenFileMapping('%s') failed: %lu",
+                mapping_name.c_str(), GetLastError());
+            return;
+        }
+        FM2KSharedMemData* shm = static_cast<FM2KSharedMemData*>(
+            MapViewOfFile(h, FILE_MAP_WRITE, 0, 0,
+                          sizeof(FM2KSharedMemData)));
+        if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC) {
+            shm->spectator_punch_ip_be = addr_bin.S_un.S_addr;
+            shm->spectator_punch_port  = (uint16_t)spec_udp_port;
+            // Bump seq AFTER the addr writes — hook's poll reads addr
+            // only when seq advances, so a torn write is harmless.
+            shm->spectator_punch_seq  += 1;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: queued spectator-punch target %s:%d to game pid %lu (seq=%u)",
+                spec_udp_ip.c_str(), spec_udp_port,
+                (unsigned long)target_pid,
+                (unsigned)shm->spectator_punch_seq);
+        }
+        if (shm) UnmapViewOfFile(shm);
+        CloseHandle(h);
+    };
+
     ui_->on_spectate_match = [this](const std::string& host_ip, int host_port) {
         // Need an installed game to point the spectator at; reuse whatever
         // the launcher currently has selected.

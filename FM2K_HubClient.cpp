@@ -1017,6 +1017,16 @@ void HubClient::OnMessage(const std::string& msg) {
         return;
     }
 
+    if (type == "spectator_incoming") {
+        ev.kind = HubEvent::Kind::SpectatorIncoming;
+        ev.spectator_incoming.spec_user_id  = GetStr(msg, "spec_user_id");
+        ev.spectator_incoming.spec_nick     = GetStr(msg, "spec_nick");
+        ev.spectator_incoming.spec_udp_ip   = GetStr(msg, "spec_udp_ip");
+        ev.spectator_incoming.spec_udp_port = GetInt(msg, "spec_udp_port", 0);
+        EmitEvent(std::move(ev));
+        return;
+    }
+
     if (type == "peer_disconnected") {
         ev.kind = HubEvent::Kind::PeerDisconnected;
         EmitEvent(std::move(ev));
