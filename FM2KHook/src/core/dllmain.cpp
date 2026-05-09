@@ -207,58 +207,25 @@ static void InitFileLogging() {
         snprintf(filename, sizeof(filename), "%s", base_name);
     }
 
-    // Try quill async logging first. If any of the init steps fail
-    // (Backend::start hangs/throws, FileSink can't open the path,
-    // create_or_get_logger throws under 32-bit MinGW), fall through to
-    // the synchronous FILE* fallback. v0.2.32 had silent quill failures
-    // on some 32-bit DLL injection paths leaving users with no log at
-    // all; this hardened init guarantees we always have SOMEWHERE to
-    // write.
+    // v0.2.33: quill init removed from the hook DLL.
+    //
+    // Why: InitFileLogging runs from DLL_PROCESS_ATTACH, which Windows
+    // serializes under the loader lock. quill::Backend::start spawns a
+    // std::thread for its writer; CreateThread blocks until DllMain
+    // returns, deadlocking the loader. Symptom in v0.2.32: AllocConsole
+    // (a few lines above) succeeds → "FM2K P*N* Console" window appears →
+    // hook hangs in Backend::start → game's WinMain never resumes → no
+    // game window, no log file. try/catch can't help: it's a hang, not a
+    // throw.
+    //
+    // The launcher (which inits quill from main(), not DllMain) is fine.
+    // The hook just uses synchronous fopen below — same as v0.2.31 and
+    // earlier. Quill stays vendored; if we want it back in the hook a
+    // future commit can defer init to a worker spawned AFTER DllMain
+    // returns (e.g. on first frame-hook callback).
     bool quill_ok = false;
-    try {
-        quill::BackendOptions backend_opts;
-        quill::Backend::start(backend_opts);
+    g_quill_logger = nullptr;
 
-        quill::FileSinkConfig sink_cfg;
-        sink_cfg.set_open_mode('w');
-        auto file_sink = quill::Frontend::create_or_get_sink<quill::FileSink>(
-            std::string(filename), sink_cfg);
-
-        quill::PatternFormatterOptions fmt_opts(
-            /*format_pattern=*/"%(message)",
-            /*timestamp_pattern=*/"%H:%M:%S.%Qns",
-            /*timestamp_timezone=*/quill::Timezone::LocalTime,
-            /*add_metadata_to_multi_line_logs=*/false);
-
-        g_quill_logger = quill::Frontend::create_or_get_logger(
-            "fm2k_hook", std::move(file_sink), fmt_opts);
-
-        if (g_quill_logger) {
-            g_quill_logger->init_backtrace(4096, quill::LogLevel::Error);
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            char header[256];
-            snprintf(header, sizeof(header),
-                     "=== FM2K Hook Debug Log - Player %d ===",
-                     g_player_index + 1);
-            LOG_INFO(g_quill_logger, "{}", header);
-            snprintf(header, sizeof(header),
-                     "Session started: %04d-%02d-%02d %02d:%02d:%02d",
-                     st.wYear, st.wMonth, st.wDay,
-                     st.wHour, st.wMinute, st.wSecond);
-            LOG_INFO(g_quill_logger, "{}", header);
-            LOG_INFO(g_quill_logger,
-                     "{}",
-                     "==========================================");
-            quill_ok = true;
-        }
-    } catch (...) {
-        g_quill_logger = nullptr;
-    }
-
-    // Quill failed — open the fallback FILE* directly. Synchronous
-    // fprintf+fflush per line, slower under heavy log volume, but
-    // guarantees a log file lands on disk so users can debug.
     if (!quill_ok) {
         g_log_file_fallback = fopen(filename, "w");
         if (g_log_file_fallback) {
@@ -271,8 +238,6 @@ static void InitFileLogging() {
                     "Session started: %04d-%02d-%02d %02d:%02d:%02d\n",
                     st.wYear, st.wMonth, st.wDay,
                     st.wHour, st.wMinute, st.wSecond);
-            fprintf(g_log_file_fallback,
-                    "(quill init failed — falling back to synchronous fprintf)\n");
             fprintf(g_log_file_fallback,
                     "==========================================\n");
             fflush(g_log_file_fallback);
@@ -448,15 +413,30 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             // Init console + file logging FIRST so every later step
             // (locale spoof, FM2K patches, hook init) is captured in
             // <game_dir>/logs/FM2K_P*_Debug.log.
-            FreeConsole();
-            AllocConsole();
-            FILE* fDummy;
-            freopen_s(&fDummy, "CONOUT$", "w", stdout);
-            freopen_s(&fDummy, "CONOUT$", "w", stderr);
-            freopen_s(&fDummy, "CONIN$", "r", stdin);
-            char title[64];
-            std::snprintf(title, sizeof(title), "FM2K P%d Console", g_player_index + 1);
-            SetConsoleTitleA(title);
+            //
+            // Console window is gated on FM2K_DEV_MODE=1 or
+            // FM2K_SPECTATOR_DEBUG=1 — release-mode users don't want a
+            // stray "FM2K P*N* Console" window next to their game. Log
+            // file is always written either way.
+            {
+                const char* dev = std::getenv("FM2K_DEV_MODE");
+                const char* spec_dbg = std::getenv("FM2K_SPECTATOR_DEBUG");
+                bool want_console =
+                    (dev && dev[0] == '1' && dev[1] == '\0') ||
+                    (spec_dbg && spec_dbg[0] == '1' && spec_dbg[1] == '\0');
+                if (want_console) {
+                    FreeConsole();
+                    AllocConsole();
+                    FILE* fDummy;
+                    freopen_s(&fDummy, "CONOUT$", "w", stdout);
+                    freopen_s(&fDummy, "CONOUT$", "w", stderr);
+                    freopen_s(&fDummy, "CONIN$", "r", stdin);
+                    char title[64];
+                    std::snprintf(title, sizeof(title),
+                                  "FM2K P%d Console", g_player_index + 1);
+                    SetConsoleTitleA(title);
+                }
+            }
             InitFileLogging();
             SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
