@@ -346,8 +346,26 @@ void HubClient::EmitEvent(HubEvent ev) {
 
 // ----- public outbound helpers — all just queue a JSON string -----
 
-void HubClient::SendUdpAddr(const std::string& ip, int port) {
+void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
+    // tcp_port < 0 → omit; spec hook listens on the same number as UDP by
+    // convention (launcher passes the same value for both bind ports). Hub
+    // stores it as `user.local_tcp_port` and forwards it in
+    // spectator_incoming so the host can do TCP simultaneous-open punch.
     std::string m = "{\"type\":\"udp_addr\",\"ip\":\"" + EscapeJsonString(ip)
+                  + "\",\"port\":" + std::to_string(port);
+    if (tcp_port > 0) {
+        m += ",\"tcp_port\":" + std::to_string(tcp_port);
+    }
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
+void HubClient::SendTcpAddr(const std::string& ip, int port) {
+    // External TCP addr learned via TCP-STUN against the hub. Hub stores
+    // it on user.external_tcp_addr and forwards in spectator_incoming
+    // (preferred over local_tcp_port — accurate even on non-port-
+    // preserving NATs).
+    std::string m = "{\"type\":\"tcp_addr\",\"ip\":\"" + EscapeJsonString(ip)
                   + "\",\"port\":" + std::to_string(port) + "}";
     EnqueueOut(std::move(m));
 }
@@ -1023,6 +1041,7 @@ void HubClient::OnMessage(const std::string& msg) {
         ev.spectator_incoming.spec_nick     = GetStr(msg, "spec_nick");
         ev.spectator_incoming.spec_udp_ip   = GetStr(msg, "spec_udp_ip");
         ev.spectator_incoming.spec_udp_port = GetInt(msg, "spec_udp_port", 0);
+        ev.spectator_incoming.spec_tcp_port = GetInt(msg, "spec_tcp_port", 0);
         EmitEvent(std::move(ev));
         return;
     }

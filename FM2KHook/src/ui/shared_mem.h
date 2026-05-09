@@ -21,7 +21,7 @@ constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
 // breakdowns + session grouping.
 // v9 (2026-05-06): in-game HUD state block (scores, spectator count,
 // system-message slot).
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 11;
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 12;
 
 // Maximum bytes for a UTF-8-encoded character name in the shared mem
 // outcome payload. FM2K stores .player filenames as 256-byte CP932
@@ -218,9 +218,28 @@ struct FM2KSharedMemData {
     // straight to StartPunch without re-conversion. seq=0 sentinel for
     // "no punch target queued yet"; first publish sets seq=1.
     uint32_t spectator_punch_ip_be;
-    uint16_t spectator_punch_port;
-    uint16_t _pad_punch;
+    uint16_t spectator_punch_port;       // spectator's external UDP port
+    uint16_t spectator_punch_tcp_port;   // spectator's external TCP port (v12)
+                                         // — drives the host-side raw-winsock
+                                         // TCP "punch" that opens host's NAT
+                                         // for inbound TCP from spec:tcp_port.
+                                         // 0 sentinel = TCP punch disabled
+                                         // (older hub or non-TCP-capable spec).
     uint32_t spectator_punch_seq;
+
+    // Hook → launcher: external TCP addr discovered by SpectatorTCP's
+    // PerformTcpStun (outbound connect to hub TCP-STUN endpoint, source-
+    // bound to the listener port so the NAT mapping reveals the
+    // external-mapped TCP port). Launcher polls tcp_stun_seq for changes
+    // and forwards (ip_be, port) to the hub via the WS `tcp_addr`
+    // message; hub stores it on user.external_tcp_addr and forwards in
+    // spectator_incoming so cross-NAT spectators on non-port-preserving
+    // NATs still get the right punch target. seq=0 sentinel for "TCP-STUN
+    // hasn't run yet" (e.g. FM2K_HUB_TCP_STUN_ADDR unset).
+    uint32_t tcp_stun_ext_ip_be;
+    uint16_t tcp_stun_ext_port;
+    uint16_t _pad_tcp_stun;
+    uint32_t tcp_stun_seq;
 };
 
 // Bumped to 1024 to fit the v9 HUD block. Still under 4 KB which is
@@ -285,12 +304,22 @@ void SharedMem_PublishRoundResult(uint8_t  winner_idx,
 
 // Spectator NAT-punch coordination — called from the launcher's
 // SpectatorIncoming hub event handler. Writes the spectator's external
-// UDP addr into shared mem and bumps spectator_punch_seq so the hook's
-// TickHostMaintenance polling loop notices and fires StartPunch toward
-// it. ip_be is network-byte-order (already in the form StartPunch
-// expects). port is host-byte-order. Subsequent calls overwrite —
-// the hook handles each fresh seq value.
-void SharedMem_PublishSpectatorPunchTarget(uint32_t ip_be, uint16_t port);
+// UDP+TCP addr into shared mem and bumps spectator_punch_seq so the
+// hook's TickHostMaintenance polling loop notices and fires both the
+// UDP heartbeat burst (opens NAT for SPEC_JOIN_REQ replies) and the
+// TCP simultaneous-open punch (opens NAT for inbound TCP from
+// spec:tcp_port to our listener port). ip_be is network-byte-order;
+// udp_port and tcp_port are both host-byte-order. tcp_port=0 sentinel
+// for "spec is on an older client without TCP-punch support" — host
+// only does UDP heartbeat in that case.
+void SharedMem_PublishSpectatorPunchTarget(uint32_t ip_be, uint16_t udp_port,
+                                           uint16_t tcp_port);
+
+// Hook → launcher: SpectatorTCP::PerformTcpStun result. Launcher polls
+// tcp_stun_seq for bumps and forwards to the hub via `tcp_addr` WS msg.
+// Idempotent — safe to call repeatedly with the same value (won't bump
+// seq if values unchanged).
+void SharedMem_PublishExternalTcp(uint32_t ip_be, uint16_t port);
 
 // Launcher-side write hook for the v6 stats feed. The launcher process
 // opens the same FM2K_SharedMem_<pid> mapping read-write and stuffs

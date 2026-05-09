@@ -6,6 +6,7 @@
 
 #include "spectator_tcp.h"
 #include "spectator_node.h"
+#include "../ui/shared_mem.h"
 
 #include <SDL3_net/SDL_net.h>
 #include <SDL3/SDL_log.h>
@@ -15,8 +16,10 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 // Forward declaration — defined in spectator_node.cpp. The `from` field is
@@ -62,6 +65,16 @@ std::vector<SubConn>              g_subs;
 NET_StreamSocket*                 g_upstream_sock     = nullptr;
 std::vector<uint8_t>              g_upstream_read_buf;
 uint64_t                          g_last_upstream_recv_ms = 0;
+
+// External TCP addr learned from a hub TCP-STUN round-trip. Initialized
+// false; set to true after PerformTcpStun completes successfully. The
+// launcher polls this via SharedMem and forwards to the hub in a
+// `tcp_addr` WS message; the hub then carries it in the
+// spectator_incoming forward to the host so the host's TCP punch hits
+// the right external port even on non-port-preserving NATs.
+bool      g_external_tcp_known   = false;
+uint32_t  g_external_tcp_ip_be   = 0;
+uint16_t  g_external_tcp_port    = 0;
 
 // Throttled-log helper: rate-limit a tagged log site to once per second.
 struct LogThrottle { uint64_t last_ms; };
@@ -312,6 +325,119 @@ void DisconnectSubscriber(const sockaddr_in& sub_addr) {
 // SPECTATOR-SIDE
 // ===========================================================================
 
+bool PerformTcpStun() {
+    if (g_external_tcp_known) return true;  // already done
+    if (g_listen_port == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: skipped (listener not bound yet)");
+        return false;
+    }
+    const char* hub_addr_str = std::getenv("FM2K_HUB_TCP_STUN_ADDR");
+    if (!hub_addr_str || !*hub_addr_str) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: FM2K_HUB_TCP_STUN_ADDR unset — skipping");
+        return false;
+    }
+    std::string hub_str = hub_addr_str;
+    auto colon = hub_str.rfind(':');
+    if (colon == std::string::npos) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: bad addr '%s' (need ip:port)", hub_addr_str);
+        return false;
+    }
+    std::string host = hub_str.substr(0, colon);
+    int hub_port = std::atoi(hub_str.c_str() + colon + 1);
+    if (hub_port <= 0 || hub_port > 0xFFFF) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: bad port in '%s'", hub_addr_str);
+        return false;
+    }
+    if (!EnsureNetInit()) return false;
+
+    NET_Address* addr = NET_ResolveHostname(host.c_str());
+    if (!addr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: resolve '%s' failed: %s",
+                    host.c_str(), SDL_GetError());
+        return false;
+    }
+    if (NET_WaitUntilResolved(addr, 1000) != 1) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: resolve '%s' timed out: %s",
+                    host.c_str(), SDL_GetError());
+        NET_UnrefAddress(addr);
+        return false;
+    }
+    NET_StreamSocket* s = NET_CreateClientBound(
+        addr, (Uint16)hub_port, /*local_port=*/g_listen_port);
+    NET_UnrefAddress(addr);
+    if (!s) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: NET_CreateClientBound -> %s:%d (local=%u) "
+                    "failed: %s",
+                    host.c_str(), hub_port, (unsigned)g_listen_port,
+                    SDL_GetError());
+        return false;
+    }
+    // Block up to 500ms for the connect to complete.
+    const int conn_rc = NET_WaitUntilConnected(s, 500);
+    if (conn_rc != 1) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: connect to %s:%d timed out (rc=%d): %s",
+                    host.c_str(), hub_port, conn_rc, SDL_GetError());
+        NET_DestroyStreamSocket(s);
+        return false;
+    }
+    // Hub sends 8 bytes: 0xCD 0x02 [ip_be:4] [port_be:2]. Block up to
+    // 500ms for them to arrive.
+    if (NET_WaitUntilInputAvailable(reinterpret_cast<void**>(&s),
+                                    1, 500) <= 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: no reply from %s:%d in 500ms",
+                    host.c_str(), hub_port);
+        NET_DestroyStreamSocket(s);
+        return false;
+    }
+    uint8_t ack[8] = {};
+    int total = 0;
+    while (total < 8) {
+        const int n = NET_ReadFromStreamSocket(s, ack + total,
+                                               sizeof(ack) - total);
+        if (n < 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "TCP-STUN: read error: %s", SDL_GetError());
+            NET_DestroyStreamSocket(s);
+            return false;
+        }
+        if (n == 0) break;
+        total += n;
+    }
+    NET_DestroyStreamSocket(s);
+    if (total < 8 || ack[0] != 0xCD || ack[1] != 0x02) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: malformed reply (got %d bytes, magic %02X %02X)",
+                    total, ack[0], ack[1]);
+        return false;
+    }
+    g_external_tcp_ip_be = *reinterpret_cast<uint32_t*>(&ack[2]);
+    g_external_tcp_port  = ntohs(*reinterpret_cast<uint16_t*>(&ack[6]));
+    g_external_tcp_known = true;
+    char ip_str[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &g_external_tcp_ip_be, ip_str, sizeof(ip_str));
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "TCP-STUN: external = %s:%u (local listener was %u)",
+                ip_str, (unsigned)g_external_tcp_port,
+                (unsigned)g_listen_port);
+    // Publish to launcher via SharedMem; launcher's poll loop sees the
+    // seq bump and forwards the value to hub via WS `tcp_addr` message.
+    SharedMem_PublishExternalTcp(g_external_tcp_ip_be, g_external_tcp_port);
+    return true;
+}
+
+bool     HasExternalTcpAddr() { return g_external_tcp_known; }
+uint32_t GetExternalTcpIpBe() { return g_external_tcp_ip_be; }
+uint16_t GetExternalTcpPort() { return g_external_tcp_port; }
+
 bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port) {
     if (g_upstream_sock) return false;
     if (!host_ip || !*host_ip) return false;
@@ -334,18 +460,27 @@ bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port) {
         NET_UnrefAddress(addr);
         return false;
     }
-    g_upstream_sock = NET_CreateClient(addr, host_tcp_port);
+    // Source the outbound connect from our own listener port (when one is
+    // bound) so the host's TCP simultaneous-open punch — which targets our
+    // spec_tcp_port via the hub-coordinated spectator_incoming flow — sees
+    // a matching 4-tuple at its NAT and lets the reply SYN-ACK back through.
+    // local_port=0 falls back to NET_CreateClient's kernel-ephemeral.
+    const Uint16 local_bind = g_listen_port;
+    g_upstream_sock = NET_CreateClientBound(addr, host_tcp_port, local_bind);
     NET_UnrefAddress(addr);
     if (!g_upstream_sock) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "SpectatorTCP: NET_CreateClient(%s:%u) failed: %s",
-                     host_ip, host_tcp_port, SDL_GetError());
+                     "SpectatorTCP: NET_CreateClientBound(%s:%u local:%u) "
+                     "failed: %s",
+                     host_ip, host_tcp_port, (unsigned)local_bind,
+                     SDL_GetError());
         return false;
     }
     g_upstream_read_buf.clear();
     g_last_upstream_recv_ms = GetTickCount64();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorTCP: dialing %s:%u (async)", host_ip, host_tcp_port);
+                "SpectatorTCP: dialing %s:%u from local port %u (async)",
+                host_ip, host_tcp_port, (unsigned)local_bind);
     return true;
 }
 

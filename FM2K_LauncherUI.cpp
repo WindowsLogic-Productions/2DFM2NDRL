@@ -3076,6 +3076,16 @@ void LauncherUI::SetGamesRootPaths(const std::vector<std::string>& paths) {
     games_root_paths_ = paths;
 }
 
+void LauncherUI::SendHubTcpAddr(uint32_t ip_be, uint16_t port) {
+    if (!hub_state_) return;
+    char ip_str[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &ip_be, ip_str, sizeof(ip_str));
+    hub_state_->client.SendTcpAddr(std::string(ip_str), (int)port);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: forwarded TCP-STUN result %s:%u to hub", ip_str,
+                (unsigned)port);
+}
+
 void LauncherUI::SetFramesAhead(float frames_ahead) {
     frames_ahead_ = frames_ahead;
 }
@@ -4114,7 +4124,12 @@ void LauncherUI::RenderHubPanel() {
                 // their already-configured network_config_.local_port.
                 // For LAN/internet, replace "127.0.0.1" with the hub-
                 // observed reflexive IP (Phase 2 — STUN responder).
-                hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port);
+                // Spec hook binds its TCP listener to the same port as UDP
+                // (convention enforced in spectator_tcp.cpp's Start). Send
+                // both so the hub can forward spec_tcp_port in the
+                // spectator_incoming event for the host's TCP punch.
+                hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port,
+                                      network_config_.local_port);
                 // Pre-match STUN. The in-game hook does its own STUN at
                 // launch but match_start fires immediately on accept and
                 // the hook's STUN doesn't arrive at the hub for several
@@ -4551,6 +4566,23 @@ void LauncherUI::RenderHubPanel() {
                     ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",   hub_udp.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_USER_ID",    hs.my_id.c_str());
                     ::SetEnvironmentVariableA("FM2K_HUB_MATCH_TOKEN", ev.match.token.c_str());
+                    // TCP-STUN endpoint — same hub host, port+2 (UDP-STUN
+                    // is +0, UDP-relay is +1). Hook's PerformTcpStun reads
+                    // this; absent → hook skips TCP-STUN and the spec
+                    // falls back to local listener port (works on port-
+                    // preserving NATs only).
+                    if (!hub_udp.empty()) {
+                        const auto colon = hub_udp.rfind(':');
+                        std::string tcp_stun;
+                        if (colon != std::string::npos) {
+                            // hub_udp port is :7711 by convention; +2 = 7713
+                            tcp_stun = hub_udp.substr(0, colon) + ":7713";
+                        }
+                        if (!tcp_stun.empty()) {
+                            ::SetEnvironmentVariableA(
+                                "FM2K_HUB_TCP_STUN_ADDR", tcp_stun.c_str());
+                        }
+                    }
 
                     // Per-player local SOCD mode. The hook reads
                     // FM2K_SOCD_MODE on first GetSOCDMode() call;
@@ -4734,19 +4766,24 @@ void LauncherUI::RenderHubPanel() {
                 break;
             case K::SpectatorIncoming: {
                 // We're the host of an in-progress match; hub forwarded a
-                // spectator's external UDP addr. Fire a NAT-punch packet
-                // toward them so their first JOIN_REQ doesn't get dropped
-                // by our NAT. Forward to launcher → game-instance shared
-                // mem → hook's TickHostMaintenance picks it up + StartPunch.
+                // spectator's external UDP+TCP addr. Forward to game-instance
+                // shared mem → hook's TickHostMaintenance fires both:
+                //   * UDP heartbeat burst (existing — opens NAT for the
+                //     spectator's first SPEC_JOIN_REQ replies)
+                //   * TCP simultaneous-open punch (new in v0.2.35 — opens
+                //     NAT for inbound TCP from spec:tcp_port to our
+                //     listener port, the path the INPUT_BATCH stream uses)
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Hub: spectator_incoming nick=%s addr=%s:%d — punching",
+                    "Hub: spectator_incoming nick=%s addr=%s udp:%d tcp:%d — punching",
                     ev.spectator_incoming.spec_nick.c_str(),
                     ev.spectator_incoming.spec_udp_ip.c_str(),
-                    ev.spectator_incoming.spec_udp_port);
+                    ev.spectator_incoming.spec_udp_port,
+                    ev.spectator_incoming.spec_tcp_port);
                 if (on_spectator_punch_target) {
                     on_spectator_punch_target(
                         ev.spectator_incoming.spec_udp_ip,
-                        ev.spectator_incoming.spec_udp_port);
+                        ev.spectator_incoming.spec_udp_port,
+                        ev.spectator_incoming.spec_tcp_port);
                 }
                 break;
             }
