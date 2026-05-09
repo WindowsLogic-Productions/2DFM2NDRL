@@ -836,16 +836,13 @@ static bool SpectatorSimOneFrame() {
     if (original_update_game)         original_update_game();
     ParityRecorder::Capture();
 
-    // [SPEC-TRACE] is per-frame for the first 100 battle frames — very
-    // spammy. Gate on FM2K_SPECTATOR_DEBUG so release builds stay quiet.
-    static int s_spec_debug_env = -1;
-    if (s_spec_debug_env < 0) {
-        const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
-        s_spec_debug_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
-    }
-    if (s_spec_debug_env == 1 &&
-        s_spec_trace_in_battle && s_spec_trace_bf < 100) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+    // [SPEC-TRACE] per-frame for first 100 battle frames. Routed through
+    // SDL_LOG_CATEGORY_CUSTOM so LogOutputFunction sends it to quill's
+    // backtrace ring instead of disk — captured forever-cheap, only
+    // flushed to disk on a subsequent LOG_ERROR. FM2K_SPECTATOR_DEBUG=1
+    // routes CUSTOM to disk like a normal log line for verbose sessions.
+    if (s_spec_trace_in_battle && s_spec_trace_bf < 100) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
             "[SPEC-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
             "p1=0x%03X p2=0x%03X",
             s_spec_trace_bf, rng_pre_pgi_spec,
@@ -871,11 +868,13 @@ static bool SpectatorSimOneFrame() {
                 s_battle_frame_at_entry = s_pop_count;
             }
             const uint32_t bf = s_pop_count - s_battle_frame_at_entry;
-            // [SPEC-FP] every 30 frames was ~3 lines/sec for the entire
-            // battle — release builds stay quiet, debug builds opt in via
-            // FM2K_SPECTATOR_DEBUG=1. Reuses the env-var cache from the
-            // SPEC-TRACE block above.
-            if (s_spec_debug_env == 1 && (bf % 30) == 0) {
+            // [SPEC-FP] every 30 battle frames (~3 lines/sec). Routed
+            // through SDL_LOG_CATEGORY_CUSTOM so LogOutputFunction puts
+            // it in quill's backtrace ring rather than always-on disk.
+            // Last 4096 such lines stay in memory; auto-flushed to file
+            // when any LOG_ERROR fires (great for desync post-mortems).
+            // FM2K_SPECTATOR_DEBUG=1 routes CUSTOM to disk for live tail.
+            if ((bf % 30) == 0) {
                 const uint32_t rng     = *(uint32_t*)0x41FB1C;
                 const uint32_t buf_idx = *(uint32_t*)0x447EE0;
                 const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
@@ -889,7 +888,7 @@ static bool SpectatorSimOneFrame() {
                 const int32_t p2_y = *(int32_t*)(POOL + 1 * SLOT + 0x0C);
                 const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
                 const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
                     "[SPEC-FP] bf=%u (pop=%u) rng=0x%08X buf=%u "
                     "p1_hp=%u p2_hp=%u timer=%u "
                     "p1_pos=(%d,%d) p2_pos=(%d,%d) "

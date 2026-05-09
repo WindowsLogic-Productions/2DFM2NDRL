@@ -2502,18 +2502,11 @@ bool Netplay_ProcessBattleInputPhase() {
                     // visible desync. "bf-1" subtraction aligns this with
                     // spec's bf=K labelling (spec starts at 0, host's
                     // post-increment makes its first log bf=1).
-                    // [HOST-TRACE] is per-frame for the first 5000 battle
-                    // frames — extremely spammy. Gate on FM2K_SPECTATOR_DEBUG
-                    // so release builds stay quiet. Cached at function-static
-                    // scope for cheap repeat checks.
-                    static int s_host_debug_env = -1;
-                    if (s_host_debug_env < 0) {
-                        const char* v = std::getenv("FM2K_SPECTATOR_DEBUG");
-                        s_host_debug_env =
-                            (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
-                    }
-                    if (s_host_debug_env == 1 &&
-                        g_netplay_frame > 0 && g_netplay_frame <= 5000) {
+                    // [HOST-TRACE] per-frame for first 5000 battle frames.
+                    // Routed via SDL_LOG_CATEGORY_CUSTOM into quill's
+                    // backtrace ring (in-memory; flushed to disk on any
+                    // LOG_ERROR). FM2K_SPECTATOR_DEBUG=1 routes to disk.
+                    if (g_netplay_frame > 0 && g_netplay_frame <= 5000) {
                         constexpr uintptr_t POOL = 0x4701E0;
                         constexpr size_t    SLOT = 382;
                         const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
@@ -2522,7 +2515,7 @@ bool Netplay_ProcessBattleInputPhase() {
                         const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
                         const uint32_t p1_hp = *(uint32_t*)0x4DFC85;
                         const uint32_t p2_hp = *(uint32_t*)0x4EDCC4;
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
                             "[HOST-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
                             "p1=0x%03X p2=0x%03X p1_x=%d p2_x=%d "
                             "p1_s=%d p2_s=%d hp=%u/%u",
@@ -2552,10 +2545,9 @@ bool Netplay_ProcessBattleInputPhase() {
                     // bf counter is its own pop count post-battle-entry,
                     // host's bf is g_netplay_frame. Match by bf to find
                     // first divergent frame.
-                    // [HOST-FP] every 30 frames — gated on the same debug
-                    // env var as [HOST-TRACE] above (s_host_debug_env).
-                    if (s_host_debug_env == 1 &&
-                        (g_netplay_frame % 30) == 0) {
+                    // [HOST-FP] every 30 frames — same diagnostic-ring
+                    // routing as [HOST-TRACE] above (CUSTOM category).
+                    if ((g_netplay_frame % 30) == 0) {
                         const uint32_t rng     = *(uint32_t*)0x41FB1C;
                         const uint32_t buf_idx = *(uint32_t*)0x447EE0;
                         const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
@@ -2573,7 +2565,7 @@ bool Netplay_ProcessBattleInputPhase() {
                         const int32_t p2_y = *(int32_t*)(POOL + 1 * SLOT + 0x0C);
                         const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
                         const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
                             "[HOST-FP] bf=%u rng=0x%08X buf=%u "
                             "p1_hp=%u p2_hp=%u timer=%u "
                             "p1_pos=(%d,%d) p2_pos=(%d,%d) "
