@@ -4119,6 +4119,12 @@ void LauncherUI::RenderHubPanel() {
                 hs.my_id = ev.user_id;
                 hs.rooms = ev.rooms;
                 hs.status_line = "connected";
+                // Process-wide FM2K_HUB_USER_ID — companion to FM2K_HUB_UDP_ADDR
+                // set at hub-connect time. Together they unlock the hook's
+                // SendStunProbe call, so any spawned game (player or spec)
+                // gets STUN'd and hub's user.udp_addr reflects this hook's
+                // actual external UDP mapping.
+                ::SetEnvironmentVariableA("FM2K_HUB_USER_ID", hs.my_id.c_str());
                 // Tell the hub our planned UDP listen so it can relay
                 // it to a peer in match_start. Both launchers register
                 // their already-configured network_config_.local_port.
@@ -5079,6 +5085,17 @@ void LauncherUI::RenderHubPanel() {
             // — which fails on non-port-preserving NATs.
             ::SetEnvironmentVariableA("FM2K_HUB_TCP_STUN_ADDR",
                                       (hub_host + ":7713").c_str());
+            // FM2K_HUB_UDP_ADDR — set at connect time (hub_host known here).
+            // FM2K_HUB_USER_ID is set on Connected (hello_ack) where my_id
+            // first lands; both are required by the hook's STUN probe
+            // (nat_traversal.cpp::SendStunProbe). Used to be set only
+            // inside the match_start handler — meaning a spec instance
+            // launched before joining any match wouldn't STUN, so hub's
+            // user.udp_addr stayed at whatever earlier game STUN landed
+            // (or empty), and spectator_incoming forwarded the wrong UDP
+            // port to the host. The punch went nowhere.
+            ::SetEnvironmentVariableA("FM2K_HUB_UDP_ADDR",
+                                      (hub_host + ":7711").c_str());
             // Pull the cached Discord hub_token. Hub will reject the
             // hello with `auth_required` if missing/expired and the
             // launcher will surface the error in status_line.

@@ -749,6 +749,28 @@ bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
             mode = SpecJoinMode::FULL_SESSION;
         }
     }
+    // Hub-driven NAT registration. Same as Netplay_Init's player path:
+    // fire a STUN probe so the hub learns OUR external UDP mapping
+    // (from the spec hook's UDP socket — same one ControlChannel uses
+    // for SPEC_JOIN_REQ + SPEC_HEARTBEAT). Without this, hub's
+    // user.udp_addr is whatever an earlier game STUN landed (or
+    // empty), spectator_incoming forwards the wrong port to the
+    // host, and the host's UDP NAT-punch heartbeat goes nowhere —
+    // spec then sits on "Connecting..." through the entire reconnect
+    // backoff.
+    {
+        const char* hub_udp     = std::getenv("FM2K_HUB_UDP_ADDR");
+        const char* hub_user_id = std::getenv("FM2K_HUB_USER_ID");
+        if (hub_udp && hub_user_id) {
+            ::fm2k::nat::SendStunProbe();
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay (spectator): FM2K_HUB_UDP_ADDR or FM2K_HUB_USER_ID "
+                "unset — STUN probe skipped, host's punch may target wrong "
+                "port (cross-NAT spec will likely fail)");
+        }
+    }
+
     SpectatorNode_RequestJoin(*upstream, mode);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Netplay (spectator): SPEC_JOIN_REQ sent to host (mode=%s)",
