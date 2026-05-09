@@ -1237,13 +1237,21 @@ bool FM2KLauncher::Initialize() {
         StopSession();
     };
     ui_->on_spectator_punch_target = [this](const std::string& spec_udp_ip,
-                                            int                spec_udp_port) {
-        // Hub forwarded a spectator's external UDP addr (we're the host
-        // of an active match). Write it into our running game instance's
+                                            int                spec_udp_port,
+                                            int                spec_tcp_port) {
+        // Hub forwarded a spectator's external UDP+TCP addr (we're the
+        // host of an active match). Write into our running game instance's
         // shared mem so the hook's TickHostMaintenance polls the seq
-        // bump and fires StartPunch toward it. Without this the
-        // spectator's first JOIN_REQ gets dropped at our NAT and they
-        // sit on "Connecting..." through every reconnect cycle.
+        // bump and fires:
+        //   * UDP heartbeat burst toward spec_udp_addr (existing — opens
+        //     NAT for the spectator's first SPEC_JOIN_REQ replies),
+        //   * TCP simultaneous-open punch toward spec_tcp_addr (new in
+        //     v0.2.35 — opens NAT for inbound TCP from spec:tcp_port to
+        //     our listener port, the data path the INPUT_BATCH stream
+        //     actually rides).
+        // spec_tcp_port = 0 sentinel for older spec clients that don't
+        // know their own TCP listener port — host falls back to UDP-only
+        // (no TCP punch).
         DWORD target_pid = 0;
         if (game_instance_ && game_instance_->IsRunning()) {
             target_pid = game_instance_->GetProcessId();
@@ -1254,8 +1262,8 @@ bool FM2KLauncher::Initialize() {
         if (target_pid == 0) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                 "Hub: spectator_incoming with no running game instance "
-                "to deliver punch target to (addr=%s:%d) — dropping",
-                spec_udp_ip.c_str(), spec_udp_port);
+                "to deliver punch target to (addr=%s:%d/%d) — dropping",
+                spec_udp_ip.c_str(), spec_udp_port, spec_tcp_port);
             return;
         }
         // Resolve dotted IPv4 -> network-byte-order u32 for StartPunch.
@@ -1267,6 +1275,9 @@ bool FM2KLauncher::Initialize() {
                 spec_udp_ip.c_str(), spec_udp_port);
             return;
         }
+        const uint16_t tcp_port_u16 =
+            (spec_tcp_port > 0 && spec_tcp_port <= 0xFFFF)
+                ? (uint16_t)spec_tcp_port : 0u;
         const std::string mapping_name =
             "FM2K_SharedMem_" + std::to_string((unsigned)target_pid);
         HANDLE h = OpenFileMappingA(FILE_MAP_WRITE, FALSE,
@@ -1281,14 +1292,16 @@ bool FM2KLauncher::Initialize() {
             MapViewOfFile(h, FILE_MAP_WRITE, 0, 0,
                           sizeof(FM2KSharedMemData)));
         if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC) {
-            shm->spectator_punch_ip_be = addr_bin.S_un.S_addr;
-            shm->spectator_punch_port  = (uint16_t)spec_udp_port;
+            shm->spectator_punch_ip_be    = addr_bin.S_un.S_addr;
+            shm->spectator_punch_port     = (uint16_t)spec_udp_port;
+            shm->spectator_punch_tcp_port = tcp_port_u16;
             // Bump seq AFTER the addr writes — hook's poll reads addr
             // only when seq advances, so a torn write is harmless.
             shm->spectator_punch_seq  += 1;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Hub: queued spectator-punch target %s:%d to game pid %lu (seq=%u)",
-                spec_udp_ip.c_str(), spec_udp_port,
+                "Hub: queued spectator-punch target %s udp:%d tcp:%d "
+                "to game pid %lu (seq=%u)",
+                spec_udp_ip.c_str(), spec_udp_port, (int)tcp_port_u16,
                 (unsigned long)target_pid,
                 (unsigned)shm->spectator_punch_seq);
         }
@@ -1754,6 +1767,49 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
     // Process DLL events from the game instance
     if (game_instance_ && game_instance_->IsRunning()) {
         game_instance_->ProcessDLLEvents();
+    }
+
+    // TCP-STUN poll: when the spec hook completes its outbound STUN
+    // probe (FM2KHook/src/netplay/spectator_tcp.cpp PerformTcpStun), it
+    // bumps tcp_stun_seq in SharedMem with the discovered external
+    // (ip, port). Forward to hub via WS so cross-NAT spectators can be
+    // told the right TCP punch target. Track per-pid last-seen seq so
+    // we only forward fresh values; resets when game_instance restarts.
+    {
+        DWORD target_pid = 0;
+        if (game_instance_ && game_instance_->IsRunning()) {
+            target_pid = game_instance_->GetProcessId();
+        } else if (client1_instance_ && client1_instance_->IsRunning()) {
+            target_pid = client1_instance_->GetProcessId();
+        }
+        static DWORD    s_last_pid = 0;
+        static uint32_t s_last_seq = 0;
+        if (target_pid != 0 && target_pid != s_last_pid) {
+            s_last_pid = target_pid;
+            s_last_seq = 0;
+        }
+        if (target_pid != 0) {
+            const std::string mapping_name =
+                "FM2K_SharedMem_" + std::to_string((unsigned)target_pid);
+            HANDLE h = OpenFileMappingA(FILE_MAP_READ, FALSE,
+                                        mapping_name.c_str());
+            if (h) {
+                FM2KSharedMemData* shm = static_cast<FM2KSharedMemData*>(
+                    MapViewOfFile(h, FILE_MAP_READ, 0, 0,
+                                  sizeof(FM2KSharedMemData)));
+                if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC &&
+                    shm->tcp_stun_seq != 0 &&
+                    shm->tcp_stun_seq != s_last_seq) {
+                    s_last_seq = shm->tcp_stun_seq;
+                    if (ui_) {
+                        ui_->SendHubTcpAddr(shm->tcp_stun_ext_ip_be,
+                                            shm->tcp_stun_ext_port);
+                    }
+                }
+                if (shm) UnmapViewOfFile(shm);
+                CloseHandle(h);
+            }
+        }
     }
     
     // Check for game termination

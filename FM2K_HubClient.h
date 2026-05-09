@@ -184,6 +184,7 @@ struct HubEvent {
         std::string spec_nick;
         std::string spec_udp_ip;    // post-STUN external IPv4 dotted
         int         spec_udp_port = 0;
+        int         spec_tcp_port = 0;  // 0 if older spec client
     } spectator_incoming;
 
     // RecordReceived payload. Filled when Kind::RecordReceived fires.
@@ -292,7 +293,14 @@ public:
 
     // Outbound. Safe to call any time after Connect; queued if not yet
     // connected, sent in order once the upgrade completes.
-    void SendUdpAddr(const std::string& ip, int port);
+    void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1);
+
+    // External TCP addr discovered by the spec hook via hub TCP-STUN
+    // (see FM2KHook/src/netplay/spectator_tcp.cpp PerformTcpStun). Sent
+    // separately from SendUdpAddr because TCP-STUN is async — the
+    // hook's outbound STUN connect happens after Init, the launcher
+    // polls SharedMem for the result, and forwards once it arrives.
+    void SendTcpAddr(const std::string& ip, int port);
     void ListRooms();
     void JoinRoom(const std::string& game_id, const std::string& display_name = "");
     void LeaveRoom();

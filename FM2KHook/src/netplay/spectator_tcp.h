@@ -120,6 +120,25 @@ void DisconnectSubscriber(const sockaddr_in& sub_addr);
 // implicitly). Returns false on resolve failure / already connected.
 bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port);
 
+// Run an outbound TCP-STUN probe against the hub's TCP-STUN endpoint
+// (FM2K_HUB_TCP_STUN_ADDR env). Source-binds the connect to the
+// listener's port (g_listen_port) so the kernel-NAT registers a
+// (listener_port -> hub:tcp_stun) outbound flow, the hub observes the
+// external mapping, and replies with the (ip, port) it saw. We block
+// up to ~500 ms for the round-trip — runs once at hook init, before
+// the spectator's first JOIN_REQ goes out, so the right external port
+// is known by the time the launcher's `tcp_addr` message reaches the
+// hub. Stashes results in g_external_tcp_{ip_be,port}; query via
+// HasExternalTcpAddr / GetExternalTcp{IpBe,Port}. Returns true on
+// successful round-trip, false on any failure (no env, no listener,
+// connect/recv timeout). Failures are logged but non-fatal; the spec
+// just reports its local listener port instead, which works on
+// port-preserving NATs.
+bool PerformTcpStun();
+bool     HasExternalTcpAddr();
+uint32_t GetExternalTcpIpBe();
+uint16_t GetExternalTcpPort();
+
 // Drain inbound bytes on the upstream socket. Each fully-buffered
 // SpecDataHeader+payload gets dispatched into
 // SpectatorNode_HandleSpecData. Maintains a partial-read buffer across

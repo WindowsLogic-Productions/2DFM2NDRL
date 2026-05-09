@@ -216,6 +216,17 @@ struct State {
 
 State g_state;
 
+// In-flight TCP punch sockets — see TickHostMaintenance comment for why
+// we defer close. Each entry holds a SOCKET handle and the wall-clock
+// deadline (ms) after which it's safe to closesocket(). The sweep at
+// the bottom of TickHostMaintenance (which runs every frame) processes
+// expired entries. Bounded by spectator-join rate, ~1/sec at most.
+struct PendingPunchSock {
+    SOCKET   handle;
+    uint64_t close_after_ms;
+};
+std::vector<PendingPunchSock> g_pending_punch_sockets;
+
 // Classic Fletcher-32 over a byte buffer. Used both by the C9 desync
 // fingerprint and the task-#18 snapshot-blob checksum. Self-contained so
 // the test-side mirror can verify by replicating the algorithm without
@@ -869,6 +880,16 @@ void SpectatorNode_Init() {
                 "tcp_port=%u)",
                 g_state.capacity, BROADCAST_BATCH_FRAMES,
                 (unsigned)SpectatorTCP::GetListenPort());
+
+    // TCP-STUN — discover external TCP addr by source-binding an outbound
+    // connect to (hub:tcp_stun) from our listener port. Only meaningful
+    // for spectators (where the cross-NAT punch path needs the *external*
+    // tcp_port for the host-side punch to fire at the right port). Hosts
+    // run this too for symmetry — costs ~50ms once and pre-populates
+    // the field if the host ever later acts as a spectator (daisy chain).
+    // Failure here is logged but non-fatal; punching falls back to local
+    // listener port which works on port-preserving NATs.
+    SpectatorTCP::PerformTcpStun();
 }
 
 void SpectatorNode_Shutdown() {
@@ -2958,6 +2979,84 @@ void SpectatorNode_TickHostMaintenance() {
                 for (int i = 0; i < 5; ++i) {
                     ControlChannel_SendTo(hb, target);
                 }
+
+                // TCP simultaneous-open punch (v0.2.35). UDP heartbeat
+                // above only opens our NAT for inbound UDP; the
+                // INPUT_BATCH stream rides TCP, which uses an entirely
+                // separate NAT mapping. Without a TCP-side punch, spec's
+                // TCP SYN to our listener gets dropped at our NAT and
+                // they sit on "Connecting..." through every reconnect.
+                //
+                // Strategy: create a temporary raw TCP socket, set
+                // SO_REUSEADDR so we can bind to the same port our
+                // listener already holds, bind to that port, mark
+                // non-blocking, and call connect() toward the spec's
+                // external TCP addr. The connect almost certainly fails
+                // (spec hasn't punched their side yet, or even if they
+                // have the simultaneous-open negotiation usually doesn't
+                // succeed in time) — that's fine. The point is the SYN
+                // we send out registers an outbound flow in our NAT's
+                // state table from listener_port -> spec_ext_ip:tcp_port.
+                // When spec's connect SYN arrives at listener_port from
+                // that exact remote endpoint, our NAT lets it through.
+                // Listener accept() picks it up normally.
+                //
+                // Skip when spec_tcp_port == 0 (older spec client without
+                // TCP-port reporting) — UDP-only path is what they had.
+                const uint16_t tcp_port = shm->spectator_punch_tcp_port;
+                const uint16_t our_listen = SpectatorTCP::GetListenPort();
+                if (tcp_port != 0 && our_listen != 0) {
+                    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    if (s != INVALID_SOCKET) {
+                        BOOL reuse = TRUE;
+                        ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+                                     (const char*)&reuse, sizeof(reuse));
+                        sockaddr_in local{};
+                        local.sin_family      = AF_INET;
+                        local.sin_addr.s_addr = INADDR_ANY;
+                        local.sin_port        = htons(our_listen);
+                        if (::bind(s, (sockaddr*)&local, sizeof(local)) == 0) {
+                            // Non-blocking so connect() returns
+                            // immediately with WSAEWOULDBLOCK. We let
+                            // the SYN actually leave the kernel before
+                            // closing — see g_pending_punch_sockets
+                            // below.
+                            u_long nb = 1;
+                            ::ioctlsocket(s, FIONBIO, &nb);
+                            sockaddr_in dst{};
+                            dst.sin_family      = AF_INET;
+                            dst.sin_addr.s_addr = ip_be;
+                            dst.sin_port        = htons(tcp_port);
+                            ::connect(s, (sockaddr*)&dst, sizeof(dst));
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "SpectatorNode: TCP punch %s:%u from local "
+                                "port %u (listener) — SYN out, deferred close",
+                                ip_str, (unsigned)tcp_port,
+                                (unsigned)our_listen);
+                            // Defer close. Closing immediately races the
+                            // kernel's SYN emission (non-blocking
+                            // connect just queues; close + linger=0
+                            // would abort the unsent SYN). Stash with
+                            // a 2-second cleanup deadline; the bottom
+                            // of TickHostMaintenance sweeps expired
+                            // entries on every tick. By then the SYN
+                            // is long-gone and our NAT mapping is
+                            // established for ~30 s.
+                            g_pending_punch_sockets.push_back(
+                                {s, now + 2000});
+                        } else {
+                            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "SpectatorNode: TCP punch bind to :%u failed "
+                                "(WSA=%d) — punch skipped",
+                                (unsigned)our_listen, WSAGetLastError());
+                            ::closesocket(s);
+                        }
+                    } else {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "SpectatorNode: TCP punch socket() failed "
+                            "(WSA=%d)", WSAGetLastError());
+                    }
+                }
             }
         }
     }
@@ -3035,6 +3134,25 @@ void SpectatorNode_TickHostMaintenance() {
             ControlChannel_SendTo(leave, it->addr);
             SpectatorTCP::DisconnectSubscriber(it->addr);
             it = g_state.subscribers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // ---- Sweep deferred TCP-punch sockets --------------------------------
+    // 2 s after each punch the SYN has long since left the kernel and our
+    // NAT mapping is established for the typical 30 s+ TCP-NAT TTL. Safe
+    // to close. Linger=0 so Windows sends an RST instead of waiting in
+    // FIN_WAIT (which we don't need — the spec's incoming SYN goes to
+    // our LISTENER, not this transient connect socket).
+    for (auto it = g_pending_punch_sockets.begin();
+         it != g_pending_punch_sockets.end(); ) {
+        if (now >= it->close_after_ms) {
+            struct linger lng = { 1, 0 };
+            ::setsockopt(it->handle, SOL_SOCKET, SO_LINGER,
+                         (const char*)&lng, sizeof(lng));
+            ::closesocket(it->handle);
+            it = g_pending_punch_sockets.erase(it);
         } else {
             ++it;
         }

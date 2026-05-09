@@ -719,7 +719,8 @@ public:
     // so we can fire an outbound NAT-punch packet to open the inbound
     // mapping before their first JOIN_REQ arrives at our NAT.
     std::function<void(const std::string& spec_udp_ip,
-                       int                spec_udp_port)> on_spectator_punch_target;
+                       int                spec_udp_port,
+                       int                spec_tcp_port)> on_spectator_punch_target;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     // C11 — replay browser dispatch. Called when the user clicks a row in
@@ -856,6 +857,11 @@ public:
     // Update scanning progress (0-1). Only meaningful while scanning flag is true.
     void SetScanning(bool scanning);
     void SetGamesRootPaths(const std::vector<std::string>& paths);
+
+    // Forward an external TCP addr (learned by the spec hook via TCP-STUN
+    // against the hub) to the hub via a `tcp_addr` WS message. Called
+    // from FM2KLauncher::Update on tcp_stun_seq SharedMem bumps.
+    void SendHubTcpAddr(uint32_t ip_be, uint16_t port);
 
 private:
     // Logging
