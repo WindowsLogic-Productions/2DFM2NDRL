@@ -242,7 +242,14 @@ bool FM2KGameInstance::Launch(const std::string& exe_path, FM2K::Engine engine) 
     std::wstring cnc_ddraw_dir;
     std::vector<wchar_t> env_block;
     LPVOID lp_environment = nullptr;
-    DWORD  creation_flags = CREATE_SUSPENDED;
+    // CREATE_NO_WINDOW prevents the spawned game from inheriting (or
+    // creating) a visible console window. The launcher hides its own
+    // console early in SDL_AppInit, but the OS would otherwise pop a
+    // fresh console window for the child since it's a console-subsystem
+    // EXE inheriting our console handle. FM2K games render via DDraw/
+    // D3D9; they don't need stdout, so suppressing the console entirely
+    // matches user expectation. Bug v0.2.32 → fixed v0.2.33.
+    DWORD  creation_flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
     if (ddraw_redirect_enabled) {
         cnc_ddraw_dir = FM2K::ddraw_redirect::ResolveCncDdrawDir();
         if (!cnc_ddraw_dir.empty()) {
