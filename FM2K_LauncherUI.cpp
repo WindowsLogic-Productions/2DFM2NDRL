@@ -5070,6 +5070,15 @@ void LauncherUI::RenderHubPanel() {
             // the same host.
             const std::string hub_host = (hub_host_[0] != '\0') ? hub_host_ : "hub.2dfm.org";
             ::SetEnvironmentVariableA("FM2K_HUB_HOST", hub_host.c_str());
+            // TCP-STUN endpoint — same hub host, port 7713 (UDP-STUN at
+            // 7711, UDP-relay at 7712). Set process-wide here so every
+            // spawned game (player AND spectator) inherits and can run
+            // its outbound TCP-STUN probe at hook init. Without this,
+            // the spec hook logs "FM2K_HUB_TCP_STUN_ADDR unset — skipping"
+            // and falls back to local listener port for cross-NAT punch
+            // — which fails on non-port-preserving NATs.
+            ::SetEnvironmentVariableA("FM2K_HUB_TCP_STUN_ADDR",
+                                      (hub_host + ":7713").c_str());
             // Pull the cached Discord hub_token. Hub will reject the
             // hello with `auth_required` if missing/expired and the
             // launcher will surface the error in status_line.
