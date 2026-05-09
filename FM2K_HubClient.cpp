@@ -23,6 +23,7 @@
 #define WINVER 0x0602
 
 #include "FM2K_HubClient.h"
+#include "version_local.h"  // fm2k::kAppVersion
 #include <winhttp.h>
 
 #include <SDL3/SDL_log.h>
@@ -718,6 +719,14 @@ void HubClient::IoThread(std::string host, uint16_t port,
     {
         std::string hello = "{\"type\":\"hello\",\"nick\":\""
                             + EscapeJsonString(nick) + "\"";
+        // client_version — sent so hub-side logs (connection, match,
+        // spectate_request) can print "v0.2.37" alongside the user
+        // and operators can spot version-mismatch bugs at a glance
+        // (e.g. cross-NAT spec failing because the host they're
+        // spec'ing is on a build that doesn't fire the TCP punch).
+        // Sourced from version_local.h's kAppVersion (auto-stamped
+        // by scripts/make_version.sh per release).
+        hello += ",\"client_version\":\"" + EscapeJsonString(fm2k::kAppVersion) + "\"";
         if (!hub_token_.empty()) {
             hello += ",\"hub_token\":\"" + EscapeJsonString(hub_token_) + "\"";
         }
