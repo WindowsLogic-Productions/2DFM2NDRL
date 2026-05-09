@@ -714,6 +714,12 @@ public:
     // spectate_grant. Launcher should boot a local FM2K spectator instance
     // pointing at that addr (LaunchRemoteSpectator).
     std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
+    // Hub fired a spectator_incoming event — we're the host of an active
+    // match and a spectator wants in. Their external UDP addr is passed
+    // so we can fire an outbound NAT-punch packet to open the inbound
+    // mapping before their first JOIN_REQ arrives at our NAT.
+    std::function<void(const std::string& spec_udp_ip,
+                       int                spec_udp_port)> on_spectator_punch_target;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     // C11 — replay browser dispatch. Called when the user clicks a row in

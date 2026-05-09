@@ -9,6 +9,11 @@
 // ============================================================================
 
 constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
+// v11 (2026-05-09): spectator NAT-punch coordination — adds
+// spectator_punch_{ip_be,port,seq}. Launcher writes when hub forwards a
+// spectator_incoming event; hook's TickHostMaintenance polls the seq
+// for changes and calls StartPunch on bumps. Fixes "stuck on Connecting"
+// for spectators outside the host's NAT.
 // v10 (2026-05-08): C10 hub-schema-v2 plumbing — adds match_session_id +
 // match_index_in_session + match_rounds_count + match_rounds[8]. The
 // launcher includes these in its `match_result` JSON to the hub so
@@ -16,7 +21,7 @@ constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
 // breakdowns + session grouping.
 // v9 (2026-05-06): in-game HUD state block (scores, spectator count,
 // system-message slot).
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 10;
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 11;
 
 // Maximum bytes for a UTF-8-encoded character name in the shared mem
 // outcome payload. FM2K stores .player filenames as 256-byte CP932
@@ -198,6 +203,24 @@ struct FM2KSharedMemData {
     uint8_t  match_rounds_count;       // valid entries in match_rounds[]
     uint8_t  _pad_match_c10[6];        // align match_rounds[] to 8-byte
     FM2KRoundResult match_rounds[8];   // 96 bytes, indexed [0..count-1]
+
+    // Spectator NAT-punch target (launcher → hook channel).
+    //
+    // When the hub forwards a spectator_incoming event to our launcher,
+    // it carries the spectator's external UDP addr. The launcher writes
+    // it here (via SharedMem_PublishSpectatorPunchTarget below) and the
+    // hook's TickHostMaintenance polls spectator_punch_seq for changes,
+    // calling StartPunch toward the addr to open our NAT for the
+    // spectator's first JOIN_REQ. Without this, spectators outside our
+    // NAT got stuck on "Connecting..." through every reconnect cycle.
+    //
+    // ip_be is network-byte-order (big-endian) so the hook can pass it
+    // straight to StartPunch without re-conversion. seq=0 sentinel for
+    // "no punch target queued yet"; first publish sets seq=1.
+    uint32_t spectator_punch_ip_be;
+    uint16_t spectator_punch_port;
+    uint16_t _pad_punch;
+    uint32_t spectator_punch_seq;
 };
 
 // Bumped to 1024 to fit the v9 HUD block. Still under 4 KB which is
@@ -259,6 +282,15 @@ void SharedMem_PublishRoundResult(uint8_t  winner_idx,
                                   uint16_t p1_hp_remaining,
                                   uint16_t p2_hp_remaining,
                                   uint32_t frames_elapsed);
+
+// Spectator NAT-punch coordination — called from the launcher's
+// SpectatorIncoming hub event handler. Writes the spectator's external
+// UDP addr into shared mem and bumps spectator_punch_seq so the hook's
+// TickHostMaintenance polling loop notices and fires StartPunch toward
+// it. ip_be is network-byte-order (already in the form StartPunch
+// expects). port is host-byte-order. Subsequent calls overwrite —
+// the hook handles each fresh seq value.
+void SharedMem_PublishSpectatorPunchTarget(uint32_t ip_be, uint16_t port);
 
 // Launcher-side write hook for the v6 stats feed. The launcher process
 // opens the same FM2K_SharedMem_<pid> mapping read-write and stuffs

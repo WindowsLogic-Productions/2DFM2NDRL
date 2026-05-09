@@ -102,6 +102,9 @@ struct HubEvent {
         PeerDisconnected,
         SpectateGranted,       // hub returned host addr for our spectate request
         SpectateDenied,        // hub rejected spectate (target not in_match etc)
+        SpectatorIncoming,     // we're the host; hub forwarded a spectator's UDP
+                               // addr so we can fire a NAT punch toward them
+                               // before their first JOIN_REQ arrives
         RecordReceived,        // hub answered our query_record (W/L/D)
         RecentMatchesReceived, // hub answered our recent_matches request
         CurrentMatchesReceived,// hub answered our current_matches request
@@ -169,6 +172,19 @@ struct HubEvent {
         std::string host_ip;
         int         host_port = 0;
     } spectate;
+
+    // SpectatorIncoming payload — we're the host; hub forwarded the
+    // spectator's external UDP addr so we can fire a NAT-punch packet
+    // to it before the spectator's first JOIN_REQ arrives. Without this
+    // step the spectator's UDP packet hits our NAT and gets dropped
+    // (no inbound state for the new source). Symptom users hit pre-fix:
+    // spectator sits on "Connecting..." through 14 reconnect cycles.
+    struct {
+        std::string spec_user_id;   // hub's id for the spectator
+        std::string spec_nick;
+        std::string spec_udp_ip;    // post-STUN external IPv4 dotted
+        int         spec_udp_port = 0;
+    } spectator_incoming;
 
     // RecordReceived payload. Filled when Kind::RecordReceived fires.
     // user_id is whose record this is (always the asker for now). If
