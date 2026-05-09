@@ -76,6 +76,14 @@ bool Fm2k_BuildLogPath(char* out, size_t out_size, const char* filename) {
 // prefix in the same shape the user/CI grep tools expect.
 static quill::Logger* g_quill_logger = nullptr;
 
+// Fallback FILE* for the case where quill init fails (rare — only seen on
+// some 32-bit injected DLL paths where the backend thread can't spawn).
+// LogOutputFunction prefers g_quill_logger when non-null; falls through
+// to this synchronous-but-reliable file write otherwise. Bug v0.2.32:
+// silent quill init failures left users with no log file at all on
+// game launch. Belt-and-suspenders fallback added v0.2.33.
+static FILE* g_log_file_fallback = nullptr;
+
 static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPriority priority, const char* message) {
     // Get timestamp
     SYSTEMTIME st;
@@ -173,6 +181,14 @@ static void SDLCALL LogOutputFunction(void* userdata, int category, SDL_LogPrior
         } else {
             LOG_INFO(g_quill_logger, "{}", formatted);
         }
+    } else if (g_log_file_fallback) {
+        // Quill init failed — write directly. Re-add the trailing newline
+        // since the LOG_BACKTRACE path strips it but fprintf needs it back.
+        size_t len = std::strlen(formatted);
+        bool had_newline = (len > 0 && formatted[len - 1] == '\n');
+        fputs(formatted, g_log_file_fallback);
+        if (!had_newline) fputc('\n', g_log_file_fallback);
+        fflush(g_log_file_fallback);
     }
 }
 
@@ -191,61 +207,76 @@ static void InitFileLogging() {
         snprintf(filename, sizeof(filename), "%s", base_name);
     }
 
-    // Start quill's backend writer thread (idempotent — std::call_once
-    // inside Backend::start handles double-init from FM2K + FM95 builds
-    // co-loaded into the same process).
-    quill::BackendOptions backend_opts;
-    quill::Backend::start(backend_opts);
+    // Try quill async logging first. If any of the init steps fail
+    // (Backend::start hangs/throws, FileSink can't open the path,
+    // create_or_get_logger throws under 32-bit MinGW), fall through to
+    // the synchronous FILE* fallback. v0.2.32 had silent quill failures
+    // on some 32-bit DLL injection paths leaving users with no log at
+    // all; this hardened init guarantees we always have SOMEWHERE to
+    // write.
+    bool quill_ok = false;
+    try {
+        quill::BackendOptions backend_opts;
+        quill::Backend::start(backend_opts);
 
-    // FileSink: open in "w" mode so each new game session truncates the
-    // prior log (matches the previous fopen(... "w") behavior).
-    quill::FileSinkConfig sink_cfg;
-    sink_cfg.set_open_mode('w');
-    auto file_sink = quill::Frontend::create_or_get_sink<quill::FileSink>(
-        std::string(filename), sink_cfg);
+        quill::FileSinkConfig sink_cfg;
+        sink_cfg.set_open_mode('w');
+        auto file_sink = quill::Frontend::create_or_get_sink<quill::FileSink>(
+            std::string(filename), sink_cfg);
 
-    // PatternFormatter that emits the message body verbatim — our
-    // LogOutputFunction has already built the full "[hh:mm:ss.mmm] [P1]
-    // [INFO] ..." prefix in the same shape the existing log-grep tooling
-    // (parity diff scripts, e2e harnesses) expects. Quill's default
-    // pattern would double-prefix.
-    quill::PatternFormatterOptions fmt_opts(
-        /*format_pattern=*/"%(message)",
-        /*timestamp_pattern=*/"%H:%M:%S.%Qns",
-        /*timestamp_timezone=*/quill::Timezone::LocalTime,
-        /*add_metadata_to_multi_line_logs=*/false);
+        quill::PatternFormatterOptions fmt_opts(
+            /*format_pattern=*/"%(message)",
+            /*timestamp_pattern=*/"%H:%M:%S.%Qns",
+            /*timestamp_timezone=*/quill::Timezone::LocalTime,
+            /*add_metadata_to_multi_line_logs=*/false);
 
-    g_quill_logger = quill::Frontend::create_or_get_logger(
-        "fm2k_hook", std::move(file_sink), fmt_opts);
+        g_quill_logger = quill::Frontend::create_or_get_logger(
+            "fm2k_hook", std::move(file_sink), fmt_opts);
 
-    if (g_quill_logger) {
-        // Backtrace ring — capacity = 4096 last diagnostic lines.
-        // ~13 minutes of sim coverage at the [SPEC-FP] / [HOST-FP]
-        // 30-frame cadence (3 lines/sec × 4 streams ≈ 12 lines/sec).
-        // flush_level = Error: any LOG_ERROR through this logger auto-
-        // dumps the entire ring to disk just before the error line,
-        // giving full crash-context for free without continuous IO.
-        g_quill_logger->init_backtrace(4096, quill::LogLevel::Error);
+        if (g_quill_logger) {
+            g_quill_logger->init_backtrace(4096, quill::LogLevel::Error);
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            char header[256];
+            snprintf(header, sizeof(header),
+                     "=== FM2K Hook Debug Log - Player %d ===",
+                     g_player_index + 1);
+            LOG_INFO(g_quill_logger, "{}", header);
+            snprintf(header, sizeof(header),
+                     "Session started: %04d-%02d-%02d %02d:%02d:%02d",
+                     st.wYear, st.wMonth, st.wDay,
+                     st.wHour, st.wMinute, st.wSecond);
+            LOG_INFO(g_quill_logger, "{}", header);
+            LOG_INFO(g_quill_logger,
+                     "{}",
+                     "==========================================");
+            quill_ok = true;
+        }
+    } catch (...) {
+        g_quill_logger = nullptr;
     }
-    if (g_quill_logger) {
-        // Header lines go through the same async path. Three lines
-        // matching the previous synchronous header so log readers /
-        // parity tools find the exact same byte sequence at file start.
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        char header[256];
-        snprintf(header, sizeof(header),
-                 "=== FM2K Hook Debug Log - Player %d ===",
-                 g_player_index + 1);
-        LOG_INFO(g_quill_logger, "{}", header);
-        snprintf(header, sizeof(header),
-                 "Session started: %04d-%02d-%02d %02d:%02d:%02d",
-                 st.wYear, st.wMonth, st.wDay,
-                 st.wHour, st.wMinute, st.wSecond);
-        LOG_INFO(g_quill_logger, "{}", header);
-        LOG_INFO(g_quill_logger,
-                 "{}",
-                 "==========================================");
+
+    // Quill failed — open the fallback FILE* directly. Synchronous
+    // fprintf+fflush per line, slower under heavy log volume, but
+    // guarantees a log file lands on disk so users can debug.
+    if (!quill_ok) {
+        g_log_file_fallback = fopen(filename, "w");
+        if (g_log_file_fallback) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            fprintf(g_log_file_fallback,
+                    "=== FM2K Hook Debug Log - Player %d ===\n",
+                    g_player_index + 1);
+            fprintf(g_log_file_fallback,
+                    "Session started: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    st.wYear, st.wMonth, st.wDay,
+                    st.wHour, st.wMinute, st.wSecond);
+            fprintf(g_log_file_fallback,
+                    "(quill init failed — falling back to synchronous fprintf)\n");
+            fprintf(g_log_file_fallback,
+                    "==========================================\n");
+            fflush(g_log_file_fallback);
+        }
     }
 
     // Wire SDL's logger to dispatch through our function so each
@@ -262,6 +293,11 @@ static void ShutdownFileLogging() {
         // normal process exit. Stopping early could swallow pending log
         // lines from late shutdown paths (gekko_destroy etc).
         g_quill_logger = nullptr;
+    }
+    if (g_log_file_fallback) {
+        fprintf(g_log_file_fallback, "=== Session ended ===\n");
+        fclose(g_log_file_fallback);
+        g_log_file_fallback = nullptr;
     }
 }
 
