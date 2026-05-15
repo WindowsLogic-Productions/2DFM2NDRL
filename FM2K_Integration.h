@@ -584,6 +584,7 @@ public:
     void SetScanning(bool scanning);
 
     SDL_Window* GetWindow() const { return window_; }
+    bool IsVsyncAvailable() const { return vsync_available_; }
 
 private:
     bool InitializeSDL();
@@ -612,6 +613,12 @@ private:
     NetworkConfig network_config_;
     LauncherState current_state_;
     bool running_;
+    // True when SDL_SetRenderVSync(renderer_, 1) reported success AND
+    // SDL_GetRenderVSync reads back enabled. When false (e.g. RDP /
+    // software fallback / driver refused), SDL_AppIterate falls back to
+    // a software 60 fps cap so the launcher doesn't spin uncapped and
+    // burn CPU/GPU at idle.
+    bool vsync_available_ = false;
     
     // Timing
     std::chrono::steady_clock::time_point last_frame_time_;
