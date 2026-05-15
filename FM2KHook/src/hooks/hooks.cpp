@@ -1361,13 +1361,50 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     // idempotent and resolves to %APPDATA%\FM2K_Rollback\fm2k_inputs.ini
     // (matching the launcher's save path) so launcher-bound keys / pads
     // drive offline play here, GekkoNet-online play through Input_CaptureLocal.
+    //
+    // Per-game profile routing: this branch (the FM2K offline / CSS /
+    // battle path) USED to call Init() without a prior SetGameProfile,
+    // so g_active_game stayed empty and Load() always picked the
+    // default fm2k_inputs.ini — silently ignoring the per-game
+    // fm2k_inputs_<exe_stem>.ini that the launcher's "Use override for
+    // X" checkbox writes. Symptom: users (URORFG, CC) reporting that
+    // per-game overrides never took effect offline. Online play worked
+    // because netplay.cpp goes through Input_CaptureLocal first, which
+    // DID call SetGameProfile.
+    //
+    // Fix: do the SetGameProfile + Load dance here on a 1-second
+    // periodic check, mirroring input.cpp's Input_CaptureLocal. Load()
+    // every tick so launcher-side edits (Save() in the binder UI)
+    // propagate into the running game without restart.
     {
         static int  s_last_check_tick = 0;
         static bool s_binder_active   = false;
+        static bool s_profile_routed  = false;
         const int now_tick = (int)GetTickCount();
         if ((now_tick - s_last_check_tick) > 1000 || s_last_check_tick == 0) {
             s_last_check_tick = now_tick;
+            if (!s_profile_routed) {
+                s_profile_routed = true;
+                char buf[MAX_PATH] = {};
+                if (GetModuleFileNameA(nullptr, buf, sizeof(buf)) > 0) {
+                    const char* slash = std::strrchr(buf, '\\');
+                    if (!slash) slash = std::strrchr(buf, '/');
+                    const char* base = slash ? slash + 1 : buf;
+                    std::string stem = base;
+                    auto dot = stem.find_last_of('.');
+                    if (dot != std::string::npos) stem.resize(dot);
+                    FM2KInputBinder::SetGameProfile(stem.c_str());
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hook_GetPlayerInput: routed binder to per-game profile '%s'",
+                        stem.c_str());
+                }
+            }
             FM2KInputBinder::Init();
+            // Re-Load so launcher-side Save() in the binder UI reaches
+            // the running game without restart. Init() only Load()s on
+            // first call (gated by g_initialized); we need the periodic
+            // re-read here to pick up edits.
+            FM2KInputBinder::Load();
             const auto& pb = FM2KInputBinder::Bindings(0);
             s_binder_active = false;
             for (const auto& b : pb.bits) {
