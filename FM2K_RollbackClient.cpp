@@ -1111,19 +1111,58 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     if (!launcher) {
         return SDL_APP_FAILURE;
     }
-    
+
     // Calculate delta time
     static auto last_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
     float delta_time = std::chrono::duration<float>(current_time - last_time).count();
     last_time = current_time;
-    
-    // Update launcher
+
+    // Idle/visibility throttle. Vsync is our framerate cap when the
+    // window is on a real swap chain — but when the window is MINIMIZED
+    // or HIDDEN, presents complete instantly (no real swap), and we'd
+    // otherwise spin at thousands of fps redrawing an offscreen surface.
+    // Same story when vsync fell back to software (RDP / headless / a
+    // refused driver path): without a cap we burn cores.
+    //
+    // Symptom in the wild: users on Xeon E3 1230 v3 + GTX 1060 and on a
+    // 3060 both reported ~17–22% CPU/GPU just sitting on the launcher.
+    // Capping the unfocused/uncapped path to ~60 fps fixes that
+    // without affecting the active-user experience.
+    SDL_Window* w = launcher->GetWindow();
+    const SDL_WindowFlags flags = w ? SDL_GetWindowFlags(w) : 0;
+    const bool minimized = (flags & SDL_WINDOW_MINIMIZED) != 0;
+    const bool hidden    = (flags & SDL_WINDOW_HIDDEN) != 0;
+    const bool unfocused = !(flags & SDL_WINDOW_INPUT_FOCUS);
+
+    if (minimized || hidden) {
+        // Nothing visible — skip render entirely and sleep ~100 ms.
+        // Events still pump via SDL_AppEvent so a restore wakes us up.
+        SDL_Delay(100);
+        return SDL_APP_CONTINUE;
+    }
+
     launcher->Update(delta_time);
-    
-    // Render
     launcher->Render();
-    
+
+    // Soft 60 fps cap when vsync isn't doing the limiting for us, or
+    // when the window is unfocused (most users alt-tab between matches
+    // and don't need 144Hz update rates on a static panel).
+    static Uint64 last_present_ns = 0;
+    const Uint64 now_ns = SDL_GetTicksNS();
+    const Uint64 frame_target_ns =
+        unfocused ? 33'333'333ULL  // ~30 fps when unfocused
+                  : 16'666'666ULL; // ~60 fps focused fallback
+    if (!launcher->IsVsyncAvailable() || unfocused) {
+        if (last_present_ns != 0) {
+            const Uint64 elapsed = now_ns - last_present_ns;
+            if (elapsed < frame_target_ns) {
+                SDL_DelayNS(frame_target_ns - elapsed);
+            }
+        }
+    }
+    last_present_ns = SDL_GetTicksNS();
+
     return SDL_APP_CONTINUE;
 }
 
@@ -1887,14 +1926,38 @@ bool FM2KLauncher::InitializeSDL() {
     }
     
     renderer_ = SDL_CreateRenderer(window_, nullptr);
-    SDL_SetRenderVSync(renderer_, 1);
-    
     if (!renderer_) {
         SDL_LogError(SDL_LOG_CATEGORY_RENDER, "SDL_CreateRenderer failed: %s", SDL_GetError());
         SDL_DestroyWindow(window_);
         SDL_Quit();
         return false;
     }
+    // Vsync is the framerate cap. If it silently fails (driver fallback,
+    // headless / RDP session, software renderer), the launcher would spin
+    // at hundreds of fps and burn CPU/GPU — exactly the symptom users
+    // reported on Xeon E3 / 3060 (~20% CPU + ~20% GPU at idle). Log the
+    // result, and stash a flag so SDL_AppIterate can soft-cap to ~60fps
+    // via SDL_DelayNS when vsync is unavailable.
+    if (!SDL_SetRenderVSync(renderer_, 1)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "SDL_SetRenderVSync(1) failed: %s — falling back to software cap",
+            SDL_GetError());
+        vsync_available_ = false;
+    } else {
+        int v = 0;
+        if (SDL_GetRenderVSync(renderer_, &v) && v == 1) {
+            vsync_available_ = true;
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                "SDL_GetRenderVSync reports vsync=%d — assuming off, software-capping",
+                v);
+            vsync_available_ = false;
+        }
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_RENDER,
+        "Renderer: '%s', vsync=%s",
+        SDL_GetRendererName(renderer_) ? SDL_GetRendererName(renderer_) : "?",
+        vsync_available_ ? "on" : "off (software cap)");
 
     // App icon. We try paths first (so a future assets/icon.bmp drop-in
     // overrides without a rebuild), then fall back to an embedded
