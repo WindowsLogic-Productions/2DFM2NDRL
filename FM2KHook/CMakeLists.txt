@@ -24,6 +24,8 @@ set(FM2KHOOK_SOURCES
     src/hooks/game_patches.cpp
     src/hooks/round_events.cpp
     src/hooks/css_autoconfirm.cpp
+    src/hooks/per_game_patches.cpp
+    src/hooks/combat_state.cpp
     src/hooks/wndproc_subclass.cpp
     # Netplay
     src/netplay/netplay.cpp
@@ -33,6 +35,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/spectator_tcp.cpp
     src/netplay/nat_traversal.cpp
     src/netplay/game_hash.cpp
+    src/netplay/upload_queue.cpp
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI
@@ -47,6 +50,15 @@ set(FM2KHOOK_SOURCES
     src/locale/locale_spoof.cpp
     # Shared PII scrubber for log lines (hook + launcher both use it).
     src/util/pii_scrub.cpp
+    # STORED-method ZIP writer for desync/crash log bundling (ported
+    # from /mnt/c/dev/bbbr/revolve_input_sdl3). No deps.
+    src/util/zip_writer.cpp
+    # SafetyHook + Zydis (amalgamated vendored singles). Used by the KOF
+    # HP-init MidHook in per_game_patches.cpp. Skips the FetchContent /
+    # subdirectory dance — we just compile the single-file amalgamations
+    # directly into FM2KHook + FM95Hook.
+    ${CMAKE_SOURCE_DIR}/vendored/safetyhook/amalgamated-dist/safetyhook.cpp
+    ${CMAKE_SOURCE_DIR}/vendored/zydis-amalgamated/amalgamated-dist/Zydis.c
 )
 
 set(FM2KHOOK_INCLUDES
@@ -65,6 +77,13 @@ set(FM2KHOOK_INCLUDES
     ${CMAKE_SOURCE_DIR}/vendored/GekkoNet/GekkoLib/include
     ${CMAKE_SOURCE_DIR}/vendored/imgui
     ${CMAKE_SOURCE_DIR}/vendored/quill/include
+    # SafetyHook amalgamated (Zydis + SafetyHook bundled as single-file
+    # sources). The amalgamated SafetyHook header pulls in Zydis via
+    # __has_include("Zydis.h"), so adding the Zydis amalgamation dir to
+    # the include path is sufficient — no FetchContent / subdirectory
+    # dance + no cross-toolchain pain.
+    ${CMAKE_SOURCE_DIR}/vendored/safetyhook/amalgamated-dist
+    ${CMAKE_SOURCE_DIR}/vendored/zydis-amalgamated/amalgamated-dist
     # kgtengine parity-snapshot header (sibling repo at /mnt/c/dev/kgtengine).
     ${CMAKE_CURRENT_SOURCE_DIR}/../../kgtengine/include
 )
@@ -80,6 +99,7 @@ set(FM2KHOOK_LIBS
     d3d9
     xinput9_1_0
     psapi
+    advapi32  # CryptAcquireContext / CryptCreateHash for upload_queue SHA1
 )
 
 set(FM2KHOOK_DEFS
