@@ -236,6 +236,19 @@ bool           SaveState_LoadFromBytes(const uint8_t* bytes, size_t n);
 // No-op if no Save has run yet (e.g. CSS pre-battle).
 void SaveState_PatchPostRenderRng(uint32_t rng);
 
+// Read the POST-render RNG that the forward pass captured for a given
+// frame, if any. Returns true and fills *out_rng iff a forward render
+// has run for that exact frame number (the parallel buffer carries the
+// frame number alongside the rng so a wrap-around or a load to a frame
+// that was never rendered doesn't replay a stale value).
+//
+// Used by Netplay_ProcessBattleInputPhase to re-establish the right
+// starting RNG at the head of each replay AdvanceEvent — without this,
+// intermediate frames in a multi-frame rollback batch run their sim
+// from POST-sim-prev (replay) instead of POST-render-prev (forward),
+// and the render-side game_rand delta accumulates as divergence.
+bool SaveState_GetPostRenderRng(int frame, uint32_t* out_rng);
+
 // Per-region diagnostic checksums for desync investigation
 struct RegionChecksums {
     uint32_t rng;
