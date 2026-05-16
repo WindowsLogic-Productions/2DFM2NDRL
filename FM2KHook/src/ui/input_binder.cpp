@@ -83,6 +83,13 @@ void ApplyDefaultsP1(PlayerBindings& pb) {
     kb(Bit::E,     SDL_SCANCODE_S);
     kb(Bit::F,     SDL_SCANCODE_D);
     kb(Bit::START, SDL_SCANCODE_RETURN);
+    // Meta-buttons. Tab = OPTION (title submode cycle, doesn't conflict
+    // with START's confirm on title). F1/F2 reserved for hook features
+    // (training-mode behavior cycle migrates here from the GetAsyncKeyState
+    // fallback once the binder's Sample feeds FN2 into the cycle handler).
+    kb(Bit::OPTION, SDL_SCANCODE_TAB);
+    kb(Bit::FN1,    SDL_SCANCODE_F1);
+    kb(Bit::FN2,    SDL_SCANCODE_F2);
 }
 
 void ApplyDefaultsP2(PlayerBindings& pb) {
@@ -305,7 +312,9 @@ const char* GamepadNameAt(int idx) {
 // back to defaults. That's an acceptable one-time cost for matching the
 // 2DFM convention; the binder ships in v1 so very few configs exist.
 const char* kBitNames[(size_t)Bit::COUNT] = {
-    "LEFT", "RIGHT", "UP", "DOWN", "A", "B", "C", "D", "E", "F", "START"
+    "LEFT", "RIGHT", "UP", "DOWN",
+    "A", "B", "C", "D", "E", "F",
+    "START", "OPTION", "FN1", "FN2"
 };
 
 std::string BindingLabel(const Binding& b) {
@@ -684,6 +693,11 @@ void Shutdown() {
     g_initialized = false;
 }
 
+// Public wrapper for hot-plug refresh. See input_binder.h.
+void RefreshGamepads() {
+    RefreshGamepadList();
+}
+
 // Refresh the cached config path against the current per-game profile
 // state. Called whenever SetGameProfile / fork / delete changes which
 // file should be active.
@@ -823,7 +837,7 @@ uint16_t Sample(int player_slot) {
                           || SampleOne_SDL(pb.bits_alt[i], ks, nkeys);
         if (pressed) mask |= (uint16_t)(1u << i);
     }
-    return mask & 0x7FF;
+    return mask & kFullInputMask;
 }
 
 // SDL3 scancode → Windows VK lookup. Covers the keys fighting-game players
@@ -1033,7 +1047,7 @@ uint16_t Sample_Win32(int player_slot) {
             mask |= (uint16_t)(1u << i);
         }
     }
-    return mask & 0x7FF;
+    return mask & kFullInputMask;
 #endif
 }
 

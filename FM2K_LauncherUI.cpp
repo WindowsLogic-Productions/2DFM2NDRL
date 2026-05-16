@@ -117,6 +117,16 @@ struct LauncherUI::HubState {
     int my_wins   = -1;
     int my_losses = -1;
     int my_draws  = -1;
+    // Per-launcher-session counters (Patrick's bug — wanted "current
+    // session record" alongside the overall in the titlebar). These
+    // increment on every committed match_result (self_won / peer_won /
+    // draw) and reset only on launcher process restart. Never reset
+    // across hub disconnect / reconnect, since the user expects "this
+    // play session" to span their entire afternoon. Disconnect outcomes
+    // don't count (consistent with hub-side ledger).
+    int session_wins   = 0;
+    int session_losses = 0;
+    int session_draws  = 0;
     // Per-opponent record from MY perspective ("how I've done vs them").
     // Keyed by opponent hub user_id; populated from the `vs_breakdown`
     // attached to the record event when we issue an unfiltered
@@ -1465,9 +1475,15 @@ void LauncherUI::RenderGamesFoldersWindow() {
 void LauncherUI::RenderRecentMatchesBody() {
     auto& hs = *hub_state_;
 
+    // Unique-ID suffix — when the Recent Matches and Live Matches
+    // panels are both visible the bare T("btn_refresh") collides on
+    // ImGui's hashed-by-label widget IDs and clicking one fires the
+    // other's callback (FlippySpatula's bug). PushID isolates them.
+    ImGui::PushID("recent_matches_refresh");
     if (ImGui::Button(T("btn_refresh"))) {
         if (hs.client.IsConnected()) hs.client.RequestRecentMatches(50);
     }
+    ImGui::PopID();
     ImGui::SameLine();
     ImGui::TextDisabled("%u %s", (unsigned)hs.recent_matches.size(),
                         T("label_matches"));
@@ -1852,9 +1868,11 @@ void LauncherUI::RenderInProgressMatchesBody() {
 
     if (ImGui::CollapsingHeader(T("hub_live_matches_header"),
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("live_matches_refresh");
         if (ImGui::SmallButton(T("btn_refresh"))) {
             if (hs.client.IsConnected()) hs.client.RequestCurrentMatches();
         }
+        ImGui::PopID();
         ImGui::SameLine();
         ImGui::TextDisabled("%u %s", (unsigned)hs.current_matches.size(),
                             T("label_matches"));
@@ -3211,19 +3229,32 @@ void LauncherUI::RenderGameSelection() {
     // main panel just shows the current root count + a button to open
     // the editor, so the games list itself dominates the panel.
     {
+        // FlippySpatula's bug: when the column is narrow, the long
+        // path string previously consumed the whole row and pushed
+        // the Edit button off-screen with no way to recover. Render
+        // the button FIRST so it's always reachable; the path text
+        // wraps onto the next line(s) below if it doesn't fit.
         const size_t n = games_root_paths_.size();
+        if (ImGui::SmallButton(T("btn_edit_games_folders"))) {
+            show_games_folders_ = true;
+        }
+        ImGui::SameLine();
         if (n == 0) {
             ImGui::TextDisabled("%s", T("status_invalid_games_folder"));
         } else if (n == 1) {
-            ImGui::TextDisabled("%s: %s", T("panel_games_folder"),
-                                games_root_paths_[0].c_str());
+            // TextWrapped instead of TextDisabled so long absolute
+            // paths wrap into a second line instead of clipping at
+            // the column edge. Keeps the disabled-color styling via
+            // PushStyleColor since TextWrapped doesn't have a
+            // "Disabled" variant.
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("%s: %s", T("panel_games_folder"),
+                               games_root_paths_[0].c_str());
+            ImGui::PopStyleColor();
         } else {
             ImGui::TextDisabled("%s: %u", T("panel_games_folders"),
                                 static_cast<unsigned>(n));
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton(T("btn_edit_games_folders"))) {
-            show_games_folders_ = true;
         }
     }
 
@@ -4195,18 +4226,33 @@ void LauncherUI::AppendResultsCsvRow(const char* outcome_str,
 void LauncherUI::UpdateWindowTitleWithRecord() {
     if (!window_ || !hub_state_) return;
     auto& hs = *hub_state_;
-    char title[192];
+    char title[256];
+    // Session suffix — Patrick's bug. Empty until we've finished at
+    // least one match this launcher session so the title isn't
+    // cluttered with "0-0-0" for everyone who just opened the app.
+    char session_buf[48] = {};
+    if (hs.session_wins + hs.session_losses + hs.session_draws > 0) {
+        std::snprintf(session_buf, sizeof(session_buf),
+                      " \xe2\x80\xa2 session %d-%d-%d",
+                      hs.session_wins, hs.session_losses, hs.session_draws);
+    }
     if (hs.my_wins < 0) {
-        // No record yet — keep the bare title.
-        std::snprintf(title, sizeof(title), "FM2K Rollback Launcher");
+        // No overall record yet — bare title or session-only.
+        if (session_buf[0]) {
+            std::snprintf(title, sizeof(title),
+                          "FM2K Rollback Launcher%s", session_buf);
+        } else {
+            std::snprintf(title, sizeof(title), "FM2K Rollback Launcher");
+        }
     } else if (!hs.my_nick.empty()) {
         std::snprintf(title, sizeof(title),
-                      "FM2K Rollback Launcher \xe2\x80\x94 %s (%d-%d-%d)",
-                      hs.my_nick.c_str(), hs.my_wins, hs.my_losses, hs.my_draws);
+                      "FM2K Rollback Launcher \xe2\x80\x94 %s (%d-%d-%d)%s",
+                      hs.my_nick.c_str(), hs.my_wins, hs.my_losses, hs.my_draws,
+                      session_buf);
     } else {
         std::snprintf(title, sizeof(title),
-                      "FM2K Rollback Launcher \xe2\x80\x94 %d-%d-%d",
-                      hs.my_wins, hs.my_losses, hs.my_draws);
+                      "FM2K Rollback Launcher \xe2\x80\x94 %d-%d-%d%s",
+                      hs.my_wins, hs.my_losses, hs.my_draws, session_buf);
     }
     SDL_SetWindowTitle(window_, title);
 }
@@ -4701,6 +4747,18 @@ void LauncherUI::PollMatchOutcome() {
                     case FM2K_MATCH_OUTCOME_DISCONNECT: outcome_str = "disconnect"; break;
                     default: break;
                 }
+                // Session counter (Patrick's bug — wanted current-session
+                // record in the titlebar in addition to the overall). Only
+                // committed outcomes count; disconnect doesn't, matching
+                // the hub's ledger semantics.
+                bool session_changed = false;
+                switch (outcome_u8) {
+                    case FM2K_MATCH_OUTCOME_SELF_WON: ++hs.session_wins;   session_changed = true; break;
+                    case FM2K_MATCH_OUTCOME_PEER_WON: ++hs.session_losses; session_changed = true; break;
+                    case FM2K_MATCH_OUTCOME_DRAW:     ++hs.session_draws;  session_changed = true; break;
+                    default: break;
+                }
+                if (session_changed) UpdateWindowTitleWithRecord();
                 if (outcome_str) {
                     // Local CSV mirror first — runs even if the hub
                     // send queues silently because we're disconnected.
@@ -6108,12 +6166,26 @@ void LauncherUI::RenderHubPanel() {
 
                 ImGui::TableSetColumnIndex(3);
                 if (is_self) {
-                    // Self row: show overall global W/L/D in this column
-                    // instead of an "vs me" cell that doesn't make sense.
+                    // Self row: show overall W/L/D + a per-session
+                    // counter that resets on launcher restart (Patrick
+                    // asked for current-session record visibility).
+                    // The "vs me" cell wouldn't make sense for self.
                     if (hs.my_wins >= 0) {
                         ImGui::Text("%d-%d-%d", hs.my_wins, hs.my_losses, hs.my_draws);
                     } else {
                         ImGui::TextDisabled("—");
+                    }
+                    if (hs.session_wins + hs.session_losses + hs.session_draws > 0) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(+%d-%d-%d)",
+                                            hs.session_wins,
+                                            hs.session_losses,
+                                            hs.session_draws);
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Current launcher-session "
+                                              "wins-losses-draws (resets "
+                                              "on launcher restart)");
+                        }
                     }
                 } else {
                     auto it = hs.my_vs.find(uid);
