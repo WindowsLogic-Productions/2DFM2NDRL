@@ -2679,6 +2679,38 @@ bool Netplay_ProcessBattleInputPhase() {
                     pal_pre.rng_seed = *(uint32_t*)0x41FB1C;
                 }
 
+                // Phase F fix (#23): re-seed the engine RNG to forward-sim's
+                // POST-render value for the previous frame BEFORE running
+                // this frame's sim. Without this, a rollback batch's
+                // intermediate AdvanceEvents start from POST-sim-(N-1)
+                // (replay state) instead of POST-render-(N-1) (forward
+                // state) — render-side game_rand calls
+                // (ProcessShakeEffect mode 4, ProcessColorInterpolation
+                // mode 3, sprite effects) advance RNG on the forward pass
+                // but render is skipped on intermediate replay frames, so
+                // their delta accumulates as divergence (RNG_Seed forward
+                // != replay in the desync diagnostic, GameplayFingerprint
+                // DIFF in every v0.2.43 user report).
+                //
+                // On the forward path this is a no-op (engine RNG already
+                // equals the recorded post-render value from the previous
+                // wall-clock tick's render). On the rollback path it
+                // re-establishes that invariant before sim consumes RNG.
+                //
+                // Skipped on the FIRST sim frame (g_netplay_frame == 0 has
+                // no "previous frame" to look up).
+                //
+                // Skipped under runahead — running_ahead's existing
+                // RNG-snapshot/restore carve-out a few lines below handles
+                // its case and would conflict with this restore otherwise.
+                if (g_netplay_frame > 0 && !update->data.adv.running_ahead) {
+                    uint32_t prev_post_render_rng = 0;
+                    if (SaveState_GetPostRenderRng((int)g_netplay_frame - 1,
+                                                   &prev_post_render_rng)) {
+                        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = prev_post_render_rng;
+                    }
+                }
+
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
                 if (original_process_game_inputs) {

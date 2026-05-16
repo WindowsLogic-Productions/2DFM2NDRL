@@ -70,6 +70,27 @@ static SaveStateData g_state_buffer[MAX_ROLLBACK_FRAMES];
 static int g_last_saved_slot  = -1;
 static int g_last_saved_frame = -1;
 
+// Parallel "post-render RNG" buffer — separate from g_state_buffer because
+// SaveState_Save overwrites rng_seed on REPLAY saves, wiping the value
+// PatchPostRenderRng wrote during the original forward pass. During a
+// rollback batch, render fires only ONCE (after the last AdvanceEvent),
+// so intermediate frames in the batch never get their POST-render RNG
+// applied to the engine — replay sim_K+2 starts from POST-sim-K+1 instead
+// of POST-render-K+1, accumulating render's RNG delta as divergence.
+//
+// Phase F (#23): the v0.2.43 user-reported desyncs all show "RNG_Seed
+// forward != replay" or "GameplayFingerprint DIFF" caused exactly by
+// this. Fix is to keep a per-frame snapshot here that replay does NOT
+// touch, then apply it at the start of each replay AdvanceEvent so sim
+// starts from the same RNG the forward pass's sim started from.
+//
+// Frame number stored alongside so a wrap-around (rollback >MAX_ROLLBACK_
+// FRAMES, which we don't expect to actually happen — typical rewinds are
+// <10 — but be defensive) doesn't restore a stale value from a previous
+// session.
+static uint32_t g_post_render_rng[MAX_ROLLBACK_FRAMES] = {};
+static int32_t  g_post_render_rng_frame[MAX_ROLLBACK_FRAMES] = {};
+
 // Initial sync flag - forces deterministic state on first save (like BBBR's m_initialSyncDone)
 static bool g_initial_sync_done = false;
 
@@ -208,6 +229,13 @@ void SaveState_Init() {
         g_replay_saves[i].frame_number = -1;
         g_replay_saves[i].valid = false;
     }
+    // Reset the post-render-RNG parallel buffer — stale values from a
+    // previous session would cause the Phase F fix to apply the wrong
+    // RNG at the start of AdvanceEvents in the new session.
+    for (int i = 0; i < MAX_ROLLBACK_FRAMES; i++) {
+        g_post_render_rng[i]       = 0;
+        g_post_render_rng_frame[i] = -1;
+    }
     // Truncate the consolidated replay-diff log so each battle session starts
     // with a fresh file.
     if (FILE* f = fopen(ReplayDiffLogPath(), "w")) {
@@ -226,6 +254,20 @@ void SaveState_Init() {
 void SaveState_PatchPostRenderRng(uint32_t rng) {
     if (g_last_saved_slot < 0) return;  // no save has happened yet
     g_state_buffer[g_last_saved_slot].rng_seed = rng;
+    // Mirror into the replay-safe parallel buffer (see g_post_render_rng
+    // comment up top). Forward sim writes this; rollback replay reads it
+    // to re-establish the right starting RNG for each intermediate
+    // AdvanceEvent in a multi-frame rollback batch.
+    g_post_render_rng[g_last_saved_slot]       = rng;
+    g_post_render_rng_frame[g_last_saved_slot] = g_last_saved_frame;
+}
+
+bool SaveState_GetPostRenderRng(int frame, uint32_t* out_rng) {
+    if (frame < 0 || !out_rng) return false;
+    const int slot = frame % MAX_ROLLBACK_FRAMES;
+    if (g_post_render_rng_frame[slot] != frame) return false;
+    *out_rng = g_post_render_rng[slot];
+    return true;
 }
 
 #if defined(ENGINE_FM95)
@@ -957,7 +999,7 @@ bool SaveState_Save(int frame) {
     //   First 10 frames: verbose (combined + fingerprint + rng + buf_idx).
     //   After that: push into the in-memory rngtrace ring. Writing a console
     //   line every save at 100 fps tanks framerate and is user-visible.
-    //   The ring is flushed to FM2K_P<N>_rngtrace.bin when SaveState_FlushRngTrace
+    //   The ring is flushed to FM2K_P<N>_rngtrace.csv when SaveState_FlushRngTrace
     //   is called (on desync detection or session end). Non-rollback saves
     //   only — replay ticks are not part of the authoritative per-frame trace.
     static int save_log_count = 0;
