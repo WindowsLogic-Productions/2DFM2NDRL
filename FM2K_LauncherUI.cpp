@@ -4,6 +4,8 @@
 #include "FM2K_Locale.h"
 #include "FM2K_Updater.h"
 #include "version_local.h"
+#include "auto_upload_secret.h"
+#include "FM2K_UploadQueue.h"
 #include "FM2KHook/src/ui/input_binder.h"
 #include "FM2KHook/src/ui/shared_mem.h"
 #include "FM2KHook/src/util/pii_scrub.h"
@@ -147,6 +149,28 @@ struct LauncherUI::HubState {
     // on the next K::MatchStart so back-to-back matches don't share a
     // stale flag.
     bool        match_result_sent = false;
+
+    // Match results we couldn't send because the hub WS was disconnected
+    // at outcome time (long pause → keepalive timeout → WS drop is the
+    // classic trigger — multiple users reported wins not counting after
+    // long pauses). On K::Connected we drain this queue and ship every
+    // entry. Local CSV is written EITHER WAY (PollMatchOutcome writes
+    // it before checking WS state), so the per-user record stays
+    // accurate even if the hub is permanently down.
+    struct PendingMatchResult {
+        std::string token;
+        std::string outcome;
+        uint32_t    p1_char_id   = 0xFFFFFFFFu;
+        uint32_t    p2_char_id   = 0xFFFFFFFFu;
+        std::string p1_char_name;
+        std::string p2_char_name;
+        uint32_t    stage_id     = 0xFFFFFFFFu;
+        std::string stage_name;
+        uint64_t    session_id   = 0;
+        uint8_t     match_index  = 0;
+        std::vector<fm2k::HubClient::RoundJson> rounds;
+    };
+    std::vector<PendingMatchResult> pending_match_results;
     // De-dupe for peer-disconnected toasts. Three independent paths
     // can fire one for a single dropout: (a) the hook publishes a
     // DISCONNECT outcome via shared mem, (b) the hub sends a UserUpdate
@@ -183,6 +207,13 @@ struct LauncherUI::HubState {
 // Returns true if at least one authentic peer punch was observed.
 // Synchronous and bounded by `timeout_ms`; UI freezes briefly while it
 // runs (≤ ~50 ms on loopback, <1 s typical LAN/Internet).
+// File-scope mirror of the dev "auto-upload diagnostics" checkbox so
+// PollUploadQueue (a class method) can read it without piping a class
+// member through. Initialized from dev_flags.ini on first Render() and
+// kept in sync when the checkbox flips. See FM2K_UploadQueue.cpp for
+// the upload pipeline.
+static bool g_auto_upload_logs = false;
+
 static bool HubPreflightPunch(uint16_t local_port,
                               const std::string& peer_ip,
                               uint16_t peer_port,
@@ -808,6 +839,11 @@ void LauncherUI::Render() {
     // user has the Hub panel docked-visible. Idempotent — second call
     // for the same seq is a no-op.
     PollMatchOutcome();
+
+    // Drain at most one upload manifest per tick. Throttles network
+    // bandwidth/UI hitches and lets transient failures get retried on
+    // a later tick. Gated on dev checkbox + non-empty queue.
+    PollUploadQueue();
 
     // Render menu bar at application level first
     RenderMenuBar();
@@ -2026,6 +2062,248 @@ static void SaveDevFlag(const char* key, bool value) {
     }
 }
 
+static int LoadDevFlagInt(const char* key, int default_val) {
+    const std::string path = DevFlagsIniPath();
+    if (path.empty()) return default_val;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return default_val;
+    char line[128];
+    int result = default_val;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t')) s.pop_back();
+        const size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        if (s.substr(0, eq) != key) continue;
+        result = std::atoi(s.substr(eq + 1).c_str());
+    }
+    std::fclose(f);
+    return result;
+}
+
+static void SaveDevFlagInt(const char* key, int value) {
+    const std::string path = DevFlagsIniPath();
+    if (path.empty()) return;
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof(line), f)) {
+            std::string s = line;
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
+            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+            const size_t eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
+        }
+        std::fclose(f);
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%d", value);
+    bool found = false;
+    for (auto& p : kv) if (p.first == key) { p.second = buf; found = true; }
+    if (!found) kv.emplace_back(key, buf);
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
+        std::fclose(f);
+    }
+}
+
+// =============================================================================
+// PER-GAME PATCH PERSISTENCE
+// =============================================================================
+//
+// Each game has its own INI in %APPDATA%\FM2K_Rollback\game_patches\<game_id>.ini,
+// extending the dev_flags.ini pattern but per-game so different FM2K games
+// can opt into experimental hook-side patches independently. The launcher
+// edits these via the Host Config panel; the game's hook DLL receives the
+// settings as env vars (set by ApplyGamePatchEnvVars before each launch).
+//
+// Hand-editable; missing keys → hardcoded default (recommended-on for fixes).
+
+static std::string GamePatchesDir() {
+    const char* a = std::getenv("APPDATA");
+    if (!a || !*a) return "";
+    const std::string parent = std::string(a) + "\\FM2K_Rollback";
+    CreateDirectoryA(parent.c_str(), nullptr);
+    const std::string dir = parent + "\\game_patches";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir;
+}
+
+static std::string GamePatchesIniPath(const std::string& game_id) {
+    if (game_id.empty()) return "";
+    const std::string dir = GamePatchesDir();
+    if (dir.empty()) return "";
+    return dir + "\\" + game_id + ".ini";
+}
+
+static std::vector<std::pair<std::string, std::string>>
+ReadGamePatchesKv(const std::string& path) {
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (path.empty()) return kv;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return kv;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t')) s.pop_back();
+        if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+        const size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
+    }
+    std::fclose(f);
+    return kv;
+}
+
+static void WriteGamePatchesKv(const std::string& path,
+        const std::vector<std::pair<std::string, std::string>>& kv) {
+    if (path.empty()) return;
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fprintf(f, "# Per-game FM2K hook patches. Hand-editable.\n");
+        std::fprintf(f, "# Edited via the launcher's Host Config panel.\n");
+        for (const auto& p : kv) {
+            std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
+        }
+        std::fclose(f);
+    }
+}
+
+static bool LoadGamePatchBool(const std::string& game_id, const char* key,
+                              bool default_val) {
+    const auto kv = ReadGamePatchesKv(GamePatchesIniPath(game_id));
+    for (const auto& p : kv) {
+        if (p.first == key) {
+            return (p.second == "1" || p.second == "true" ||
+                    p.second == "yes" || p.second == "on");
+        }
+    }
+    return default_val;
+}
+
+static int LoadGamePatchInt(const std::string& game_id, const char* key,
+                            int default_val) {
+    const auto kv = ReadGamePatchesKv(GamePatchesIniPath(game_id));
+    for (const auto& p : kv) {
+        if (p.first == key) {
+            try { return std::stoi(p.second); }
+            catch (...) { return default_val; }
+        }
+    }
+    return default_val;
+}
+
+static void SaveGamePatchString(const std::string& game_id, const char* key,
+                                const std::string& value) {
+    const std::string path = GamePatchesIniPath(game_id);
+    auto kv = ReadGamePatchesKv(path);
+    bool found = false;
+    for (auto& p : kv) {
+        if (p.first == key) { p.second = value; found = true; break; }
+    }
+    if (!found) kv.emplace_back(key, value);
+    WriteGamePatchesKv(path, kv);
+}
+
+static void SaveGamePatchBool(const std::string& game_id, const char* key,
+                              bool value) {
+    SaveGamePatchString(game_id, key, value ? "1" : "0");
+}
+
+static void SaveGamePatchInt(const std::string& game_id, const char* key,
+                             int value) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d", value);
+    SaveGamePatchString(game_id, key, buf);
+}
+
+// Compute the canonical game_id from an exe path. Mirrors the
+// Python-side registry's exe-stem convention so launcher INIs and
+// registry.json line up 1:1.
+static std::string GameIdForExePath(const std::string& exe_path_utf8) {
+    if (exe_path_utf8.empty()) return "";
+    std::filesystem::path p(fm2k::utf8path::Utf8ToWide(exe_path_utf8));
+    return fm2k::utf8path::StemUtf8(p);
+}
+
+// Apply per-game patch env vars before launching the game. Called by
+// every launch path (offline / online / dual-client / hub challenge)
+// so the hook DLL sees consistent settings. Each new patch added to
+// the per-game INI gets a corresponding env var set here.
+static void ApplyGamePatchEnvVars(const std::string& game_id) {
+    // ---- IMPLEMENTED ----
+
+    // gs_pic_fix: OPT-OUT (fix is on by default in the hook).
+    const bool gs_pic_fix = LoadGamePatchBool(game_id, "gs_pic_fix", true);
+    ::SetEnvironmentVariableA("FM2K_KEEP_GAMESPEED_PIC",
+                              gs_pic_fix ? nullptr : "1");
+
+    // team_css_dupe_lock: OPT-IN — masks confirm bits when the cursor
+    // would land on an already-locked team slot.
+    const bool team_css_dupe_lock =
+        LoadGamePatchBool(game_id, "team_css_dupe_lock", false);
+    ::SetEnvironmentVariableA("FM2K_TEAM_CSS_DUPE_LOCK",
+                              team_css_dupe_lock ? "1" : nullptr);
+
+    // team_kof_retention: OPT-IN — winner's HP/meter carries into next
+    // round (loser gets fresh char). Team mode only.
+    const bool team_kof_retention =
+        LoadGamePatchBool(game_id, "team_kof_retention", false);
+    ::SetEnvironmentVariableA("FM2K_TEAM_KOF_RETENTION",
+                              team_kof_retention ? "1" : nullptr);
+
+    // team_size: int 2..4, default 0 (engine default). Hard ceiling is
+    // 4 per side — the engine's CSS indexes its 8-slot character data
+    // pool as 4*player_idx + round_count, so N>4 stomps the opposite
+    // player's slots. See per_game_patches.cpp for the full analysis.
+    const int team_size = LoadGamePatchInt(game_id, "team_size", 0);
+    if (team_size >= 2 && team_size <= 4) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%d", team_size);
+        ::SetEnvironmentVariableA("FM2K_TEAM_SIZE", buf);
+    } else {
+        ::SetEnvironmentVariableA("FM2K_TEAM_SIZE", nullptr);
+    }
+
+    // damage_multiplier_pct: int 1..1000, default 100 (no scaling).
+    const int dmg_mult = LoadGamePatchInt(game_id, "damage_multiplier_pct", 100);
+    if (dmg_mult != 100 && dmg_mult >= 1 && dmg_mult <= 1000) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%d", dmg_mult);
+        ::SetEnvironmentVariableA("FM2K_DAMAGE_MULT_PCT", buf);
+    } else {
+        ::SetEnvironmentVariableA("FM2K_DAMAGE_MULT_PCT", nullptr);
+    }
+
+    // ---- STUBS (toggles wired through to env vars; hook-side TODO) ----
+    // Each of these sets the env var so the hook can pick it up once the
+    // implementation lands. Until then the hook just logs a warning when
+    // it sees one of these set.
+
+    const bool vs_cpu_mode =
+        LoadGamePatchBool(game_id, "vs_cpu_mode", false);
+    ::SetEnvironmentVariableA("FM2K_VS_CPU_MODE",
+                              vs_cpu_mode ? "1" : nullptr);
+
+    const bool cpu_vs_cpu_mode =
+        LoadGamePatchBool(game_id, "cpu_vs_cpu_mode", false);
+    ::SetEnvironmentVariableA("FM2K_CPU_VS_CPU_MODE",
+                              cpu_vs_cpu_mode ? "1" : nullptr);
+
+    const bool training_mode =
+        LoadGamePatchBool(game_id, "training_mode", false);
+    ::SetEnvironmentVariableA("FM2K_TRAINING_MODE",
+                              training_mode ? "1" : nullptr);
+
+    const bool option_mode_selector =
+        LoadGamePatchBool(game_id, "option_mode_selector", false);
+    ::SetEnvironmentVariableA("FM2K_OPTION_MODE_SELECTOR",
+                              option_mode_selector ? "1" : nullptr);
+}
+
 void LauncherUI::LoadAudioMuteState() {
     const std::string path = AudioIniPath();
     if (path.empty()) return;
@@ -2742,6 +3020,181 @@ void LauncherUI::RenderHostConfigBody() {
             "lockstep, no extra wire traffic per rematch.");
     }
     (void)prev_enable;
+
+    // ---------- Per-game experimental patches ----------
+    // Hook-side patches that compensate for FM2K engine bugs or expose
+    // optional gameplay tweaks. Each setting is per-game (stored in
+    // %APPDATA%\FM2K_Rollback\game_patches\<game_id>.ini) so different
+    // FM2K games can opt in/out independently. Restart the game after
+    // toggling — env vars are read at hook init.
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                       "Per-game experimental patches");
+    ImGui::TextWrapped(
+        "Hook-side fixes for FM2K engine bugs. Stored per-game in "
+        "%%APPDATA%%\\FM2K_Rollback\\game_patches\\%s.ini. Restart "
+        "the game after toggling.",
+        GameIdForExePath(game.exe_path).c_str());
+    ImGui::Spacing();
+
+    // Per-game state cache: reload toggles when the selected game changes.
+    static int  s_patches_loaded_for         = -1;
+    static bool s_patch_gs_pic_fix           = true;
+    static bool s_patch_team_css_dupe        = false;
+    static bool s_patch_team_kof_retention   = false;
+    static int  s_patch_team_size            = 0;     // 0 = engine default (don't override)
+    static int  s_patch_damage_mult_pct      = 100;   // 100 = no scaling
+    static bool s_patch_vs_cpu_mode          = false;
+    static bool s_patch_cpu_vs_cpu_mode      = false;
+    static bool s_patch_training_mode        = false;
+    static bool s_patch_option_mode_selector = false;
+    if (s_patches_loaded_for != selected_game_index_) {
+        s_patches_loaded_for = selected_game_index_;
+        const std::string gid = GameIdForExePath(game.exe_path);
+        s_patch_gs_pic_fix           = LoadGamePatchBool(gid, "gs_pic_fix", true);
+        s_patch_team_css_dupe        = LoadGamePatchBool(gid, "team_css_dupe_lock", false);
+        s_patch_team_kof_retention   = LoadGamePatchBool(gid, "team_kof_retention", false);
+        s_patch_team_size            = LoadGamePatchInt (gid, "team_size", 0);
+        s_patch_damage_mult_pct      = LoadGamePatchInt (gid, "damage_multiplier_pct", 100);
+        s_patch_vs_cpu_mode          = LoadGamePatchBool(gid, "vs_cpu_mode", false);
+        s_patch_cpu_vs_cpu_mode      = LoadGamePatchBool(gid, "cpu_vs_cpu_mode", false);
+        s_patch_training_mode        = LoadGamePatchBool(gid, "training_mode", false);
+        s_patch_option_mode_selector = LoadGamePatchBool(gid, "option_mode_selector", false);
+    }
+
+    const std::string gid_for_save = GameIdForExePath(game.exe_path);
+
+    // ---- Implemented patches ----
+    ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "Bug fixes & engine tweaks");
+
+    if (ImGui::Checkbox("EXPERIMENTAL: speed patch for vanpri (gs != 10 fix)",
+                        &s_patch_gs_pic_fix)) {
+        SaveGamePatchBool(gid_for_save, "gs_pic_fix", s_patch_gs_pic_fix);
+    }
+    ImGui::SetItemTooltip(
+        "Locks the broken script-wait scaling to its working value (the "
+        "value at GameSpeed=10). Speed change still works (chars move "
+        "faster) but scripts no longer break.\n\n"
+        "Confirmed working on Vanpri.");
+
+    if (ImGui::Checkbox("Team CSS: prevent duplicate character per team",
+                        &s_patch_team_css_dupe)) {
+        SaveGamePatchBool(gid_for_save, "team_css_dupe_lock", s_patch_team_css_dupe);
+    }
+    ImGui::SetItemTooltip(
+        "Team-mode only. Masks each player's confirm bits if the cursor "
+        "would land on a character already locked into one of that "
+        "player's earlier team slots.");
+
+    if (ImGui::Checkbox("Team KOF retention: winner keeps HP & meter into next round",
+                        &s_patch_team_kof_retention)) {
+        SaveGamePatchBool(gid_for_save, "team_kof_retention",
+                          s_patch_team_kof_retention);
+    }
+    ImGui::SetItemTooltip(
+        "Team-mode only. When the round ends, the winner's remaining HP "
+        "and super meter carry into the next round (loser's incoming "
+        "character initializes at full HP / default meter). Vanilla "
+        "behavior resets both sides to full each round.");
+
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::InputInt("Team size override (0 = engine default)",
+                        &s_patch_team_size, 1, 1)) {
+        if (s_patch_team_size < 0) s_patch_team_size = 0;
+        if (s_patch_team_size > 4) s_patch_team_size = 4;
+        SaveGamePatchInt(gid_for_save, "team_size", s_patch_team_size);
+    }
+    ImGui::SetItemTooltip(
+        "Override g_team_round @ 0x430128. Range [2, 4]; 0 leaves the "
+        "engine's INI-loaded value alone. Hard ceiling is 4 per side — "
+        "the engine indexes its 8-slot character data pool as "
+        "4*player_idx + round_count, so values >4 stomp the opposite "
+        "player's slots.");
+
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::SliderInt("Damage multiplier %%",
+                         &s_patch_damage_mult_pct, 1, 500, "%d%%")) {
+        SaveGamePatchInt(gid_for_save, "damage_multiplier_pct",
+                         s_patch_damage_mult_pct);
+    }
+    ImGui::SetItemTooltip(
+        "Scales the damage argument to health_damage_manager by this "
+        "percentage. 100 = no change. 50 = halved damage. 200 = doubled. "
+        "Hook only installs when != 100, so default users pay no "
+        "trampoline cost.");
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "Modes");
+    ImGui::TextWrapped(
+        "Two ways to use these:\n"
+        "  - Enable ONE individual mode toggle below for a always-on "
+        "default on this game.\n"
+        "  - Enable OPTION-button selector to cycle Default → VS CPU → "
+        "Training → CPU vs CPU at runtime via the OPTION button on title.\n\n"
+        "If both are set, OPTION cycle wins (overrides individual flags "
+        "at title→CSS).");
+    ImGui::Spacing();
+
+    // No mutual exclusion in the UI — the hook resolves combinations in a
+    // documented fixed precedence (option_mode_selector cycle > cpu_vs_cpu
+    // > vs_cpu > training for battle behavior; CSS takeover fires if ANY
+    // mode is active). Some users want all three individual flags
+    // enableable simultaneously for diagnostics, and the OPTION cycle
+    // requires only its own toggle — over-restricting blocked legitimate
+    // configurations.
+
+    if (ImGui::Checkbox("VS CPU mode (P1 picks both, AI plays P2)",
+                        &s_patch_vs_cpu_mode)) {
+        SaveGamePatchBool(gid_for_save, "vs_cpu_mode", s_patch_vs_cpu_mode);
+    }
+    ImGui::SetItemTooltip(
+        "Always-on VS CPU for this game. P1's CSS cursor drives both "
+        "character slots; in battle P2's input is zeroed so the engine's "
+        "script-driven AI takes over. Skip this toggle if you're using "
+        "the OPTION cycle below.");
+
+    if (ImGui::Checkbox("CPU vs CPU (both AI)", &s_patch_cpu_vs_cpu_mode)) {
+        SaveGamePatchBool(gid_for_save, "cpu_vs_cpu_mode",
+                          s_patch_cpu_vs_cpu_mode);
+    }
+    ImGui::SetItemTooltip(
+        "Always-on CPU vs CPU. CSS uses P1 input for both cursors so you "
+        "can pick the matchup; in battle both inputs are zeroed. Skip if "
+        "using OPTION cycle.");
+
+    if (ImGui::Checkbox("Training mode (P2 behavior options)",
+                        &s_patch_training_mode)) {
+        SaveGamePatchBool(gid_for_save, "training_mode",
+                          s_patch_training_mode);
+    }
+    ImGui::SetItemTooltip(
+        "Always-on Training. P1 picks both characters via CSS pipe; in "
+        "battle P2 behavior cycles through Player / CPU / Imitate / Guard "
+        "/ Jump-up via the FN2 hotkey (default F2). Skip if using OPTION "
+        "cycle.");
+
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("OPTION-button mode selector + title overlay",
+                        &s_patch_option_mode_selector)) {
+        SaveGamePatchBool(gid_for_save, "option_mode_selector",
+                          s_patch_option_mode_selector);
+    }
+    ImGui::SetItemTooltip(
+        "Press the OPTION button (default Tab, rebindable via Input "
+        "Bindings) on the title screen to cycle through:\n"
+        "  Default → VS CPU → Training → CPU vs CPU → Default\n\n"
+        "Badge appears in the top-right of the game viewport showing "
+        "the queued submode (hidden in Default — no overlay clutter). "
+        "The chosen submode applies at title→CSS transition; P1's CSS "
+        "cursor drives both characters for the three non-default modes. "
+        "Returning to title clears the selection so you can pick again "
+        "next round.\n\n"
+        "You don't need to also enable the individual mode toggles "
+        "above — the cycle controls them at runtime. They DO override "
+        "Default when the cycle is at slot 0 (so if you want \"VS CPU "
+        "unless I explicitly cycle\", enable VS CPU + OPTION together).");
 }
 
 void LauncherUI::RenderHostConfigWindow() {
@@ -3146,6 +3599,45 @@ void LauncherUI::RenderSessionControls() {
             ::SetEnvironmentVariableA("FM2K_DEV_MODE", v ? "1" : nullptr);
             return v;
         }();
+        // FM2K_BOOT_TO_BATTLE dev shortcut: append /F to the game's
+        // cmdline (engine's built-in debug-boot path) and prime
+        // g_iniFile_nameOverride from the hook so its kgt loader works
+        // on shipped binaries. Skips splash/title/CSS entirely; uses
+        // the kgt's TestPlay-section preset chars for the matchup.
+        // VS 1v1 only — engine hardcodes g_game_mode_flag=1 in that
+        // branch. Off by default; persists across launcher restarts.
+        static bool s_dev_boot_to_battle = []() {
+            bool v = LoadDevFlag("boot_to_battle", false);
+            ::SetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE",
+                                      v ? "1" : nullptr);
+            return v;
+        }();
+        // Auto-upload crash + desync diagnostics to the hub. Default
+        // OFF until the user explicitly opts in — uploading game logs
+        // is sensitive even though they're already partially redacted.
+        // No env var: the launcher reads g_auto_upload_logs directly
+        // in PollUploadQueue and the hook side doesn't need to know.
+        // File-scope (not function-static) so PollUploadQueue can read.
+        static bool s_auto_upload_logs_loaded = []() {
+            g_auto_upload_logs = LoadDevFlag("auto_upload_logs", false);
+            return true;
+        }();
+        (void)s_auto_upload_logs_loaded;
+        bool& s_dev_auto_upload_logs = g_auto_upload_logs;
+        // Boot-to-battle char/stage/meter overrides. Written into the
+        // engine's g_config_value1/3 (chars), wParam (stage), and
+        // g_config_value2/4 (meter init) by the hook's MinHook detour on
+        // InitializeGameFromCommandLine. Persisted across launcher runs
+        // so quick-iteration testing keeps the last matchup.
+        static int s_btb_p1_char  = LoadDevFlagInt("btb_p1_char",  0);
+        static int s_btb_p2_char  = LoadDevFlagInt("btb_p2_char",  0);
+        static int s_btb_stage    = LoadDevFlagInt("btb_stage",    0);
+        static int s_btb_p1_meter = LoadDevFlagInt("btb_p1_meter", 0);
+        static int s_btb_p2_meter = LoadDevFlagInt("btb_p2_meter", 0);
+        // gs_pic_fix has been migrated to per-game settings (see
+        // LoadGamePatchBool / ApplyGamePatchEnvVars); host-config panel
+        // owns the toggle and writes to %APPDATA%\FM2K_Rollback\
+        // game_patches\<game_id>.ini.
 
         // ---------- USER-FACING SECTION ----------
         ImGui::Text("%s", T("label_play"));
@@ -3177,6 +3669,31 @@ void LauncherUI::RenderSessionControls() {
         if (ImGui::Button(T("btn_play_offline"), ImVec2(-1, 0))) {
             ::SetEnvironmentVariableA("FM2K_BOOT_TO_CSS_DIRECT",
                                       s_boot_strategy == 1 ? "1" : nullptr);
+            ::SetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE",
+                                      s_dev_boot_to_battle ? "1" : nullptr);
+            // Boot-to-battle char/stage/meter overrides. Only export
+            // when the checkbox is on; hook ignores unset env vars and
+            // keeps the kgt-default value.
+            {
+                auto put_int = [](const char* name, int v) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), "%d", v);
+                    ::SetEnvironmentVariableA(name, buf);
+                };
+                if (s_dev_boot_to_battle) {
+                    put_int("FM2K_BTB_P1_CHAR",  s_btb_p1_char);
+                    put_int("FM2K_BTB_P2_CHAR",  s_btb_p2_char);
+                    put_int("FM2K_BTB_STAGE",    s_btb_stage);
+                    put_int("FM2K_BTB_P1_METER", s_btb_p1_meter);
+                    put_int("FM2K_BTB_P2_METER", s_btb_p2_meter);
+                } else {
+                    ::SetEnvironmentVariableA("FM2K_BTB_P1_CHAR",  nullptr);
+                    ::SetEnvironmentVariableA("FM2K_BTB_P2_CHAR",  nullptr);
+                    ::SetEnvironmentVariableA("FM2K_BTB_STAGE",    nullptr);
+                    ::SetEnvironmentVariableA("FM2K_BTB_P1_METER", nullptr);
+                    ::SetEnvironmentVariableA("FM2K_BTB_P2_METER", nullptr);
+                }
+            }
             ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP",
                                       s_auto_title_skip ? nullptr : "0");
             ::SetEnvironmentVariableA("FM2K_BYPASS_TRAMPOLINE",
@@ -3191,6 +3708,14 @@ void LauncherUI::RenderSessionControls() {
                                       s_eb_diag ? "1" : nullptr);
             ::SetEnvironmentVariableA("FM95_TRAMPOLINE",
                                       s_fm95_trampoline ? "1" : nullptr);
+            // Per-game patches override global flags for the selected game.
+            // Each per-game INI key gets a matching env var; hook DLL reads
+            // them at DLL_PROCESS_ATTACH.
+            if (selected_game_index_ >= 0 &&
+                selected_game_index_ < (int)games_.size()) {
+                ApplyGamePatchEnvVars(GameIdForExePath(
+                    games_[selected_game_index_].exe_path));
+            }
             if (on_offline_session_start) {
                 on_offline_session_start();
             }
@@ -3220,6 +3745,76 @@ void LauncherUI::RenderSessionControls() {
                 "Default ON. Disable to walk title screen manually with your "
                 "own inputs.");
 
+            // Engine's built-in /F debug-boot path. Bypasses the
+            // boot_strategy radio above (which fights the title-screen
+            // state machine post-launch) by going through the slot-0
+            // boot dispatcher's debug_mode==3 branch directly. Hook
+            // primes g_iniFile_nameOverride @ 0x43012c at dispatcher
+            // entry so the kgt loader finds <exe_basename>.kgt.
+            if (ImGui::Checkbox("Boot straight to battle (/F, dev)",
+                                &s_dev_boot_to_battle)) {
+                ::SetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE",
+                                          s_dev_boot_to_battle ? "1" : nullptr);
+                SaveDevFlag("boot_to_battle", s_dev_boot_to_battle);
+            }
+            ImGui::SetItemTooltip(
+                "Append /F to the game's command line. The engine's WinMain "
+                "sets g_debug_mode=3 and its slot-0 boot dispatcher creates "
+                "a battle-init object instead of splash/title/CSS — no hook-"
+                "side input mashing involved.\n\n"
+                "VS 1v1 only (engine hardcodes the mode flag in the /F "
+                "branch). Use the char/stage inputs below to pick the "
+                "matchup; values map directly to the CSS grid index.\n\n"
+                "Needs <exe_basename>.kgt sitting next to the .exe (the "
+                "standard layout — works on WonderfulWorld, vanpri, etc.).");
+
+            // Char / stage / meter inputs — only meaningful when the
+            // checkbox above is on. Hook ignores the env vars if BTB is
+            // off, but we hide the controls to reduce visual noise.
+            if (s_dev_boot_to_battle) {
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputInt("P1 char##btb", &s_btb_p1_char)) {
+                    if (s_btb_p1_char < 0)  s_btb_p1_char = 0;
+                    if (s_btb_p1_char > 49) s_btb_p1_char = 49;
+                    SaveDevFlagInt("btb_p1_char", s_btb_p1_char);
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputInt("P2 char##btb", &s_btb_p2_char)) {
+                    if (s_btb_p2_char < 0)  s_btb_p2_char = 0;
+                    if (s_btb_p2_char > 49) s_btb_p2_char = 49;
+                    SaveDevFlagInt("btb_p2_char", s_btb_p2_char);
+                }
+                ImGui::SetItemTooltip(
+                    "CSS grid index (0-49). Char 0 is whichever character "
+                    "occupies the top-left cell of the kgt's character grid.");
+
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputInt("Stage##btb", &s_btb_stage)) {
+                    if (s_btb_stage < 0)  s_btb_stage = 0;
+                    if (s_btb_stage > 49) s_btb_stage = 49;
+                    SaveDevFlagInt("btb_stage", s_btb_stage);
+                }
+                ImGui::SetItemTooltip(
+                    "Stage index (0-49). Maps to wParam/g_fm2k_game_mode — "
+                    "vs_round_function reads it on battle init.");
+
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputInt("P1 meter##btb", &s_btb_p1_meter)) {
+                    SaveDevFlagInt("btb_p1_meter", s_btb_p1_meter);
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputInt("P2 meter##btb", &s_btb_p2_meter)) {
+                    SaveDevFlagInt("btb_p2_meter", s_btb_p2_meter);
+                }
+                ImGui::SetItemTooltip(
+                    "Super meter starting value. 0 = empty (vanilla); the "
+                    "engine treats non-zero as a pre-charged init.");
+                ImGui::Unindent();
+            }
+
             ImGui::Spacing();
 
             // FM2K_DEV_MODE master flag — gates experimental hook features
@@ -3239,6 +3834,33 @@ void LauncherUI::RenderSessionControls() {
                 "  - Spectator .player OS-cache pre-warmer (faster CSS replay "
                 "after the spectator's first session start).\n"
                 "Safe to leave off; required if you're testing spectator perf.");
+
+            // Auto-upload crash + desync diagnostic bundles to the hub
+            // so we can pull them down for debugging. OFF by default
+            // (user must explicitly opt in — game logs are sensitive
+            // even with PII-scrubbed IP addresses).
+            const bool secret_baked =
+                fm2k::kLogUploadSecret && fm2k::kLogUploadSecret[0] != '\0';
+            ImGui::BeginDisabled(!secret_baked);
+            if (ImGui::Checkbox("Auto-upload crash/desync diagnostics",
+                                &s_dev_auto_upload_logs)) {
+                SaveDevFlag("auto_upload_logs", s_dev_auto_upload_logs);
+            }
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip(
+                "On crash or desync, the hook drops a manifest in the "
+                "game's upload_queue/ directory. The launcher then POSTs "
+                "the bundle (debug.log tail + desync diff + RNG trace) to "
+                "%s.\n\n"
+                "%s",
+                fm2k::kLogUploadUrl,
+                secret_baked
+                    ? "Logs are tagged with session_id + match_id + "
+                      "client_version + game_id + hook-DLL SHA1, indexed "
+                      "for pull-down by the dev tool."
+                    : "Disabled: this build wasn't compiled with a "
+                      "FM2K_LOG_UPLOAD_SECRET — feature would have no "
+                      "endpoint to authenticate against.");
 
             ImGui::Spacing();
 
@@ -3304,6 +3926,11 @@ void LauncherUI::RenderSessionControls() {
 
                 ImGui::Unindent();
             }
+
+            // (Experimental patches moved to Host Config panel — they're
+            // per-game now, stored in %APPDATA%\FM2K_Rollback\game_patches\
+            // <game_id>.ini, edited via the Host Config tab when a game
+            // is selected.)
 
             // ---------- FM95 / CPW (collapsed by default) ----------
             // Engine-specific to FM95Hook.dll-injected games. Won't fire
@@ -3594,6 +4221,15 @@ void LauncherUI::LoadSocdState() {
     for (int i = 0; i < 2; ++i) {
         if (socd_mode_[i] < 0 || socd_mode_[i] > 5) socd_mode_[i] = 1;
     }
+    // Publish the local slot's setting to the Win32 environment so
+    // EVERY launch path (offline, dev dual-client P1, stress) inherits
+    // it via CreateProcess. Online K::MatchStart re-applies the
+    // role-resolved value on top. Pre-v0.2.45 only the online path
+    // set this, so offline launches always used the compiled-in
+    // default — bug Froglet reported.
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%d", socd_mode_[0]);
+    ::SetEnvironmentVariableA("FM2K_SOCD_MODE", buf);
 }
 
 void LauncherUI::SaveSocdState() {
@@ -3654,10 +4290,27 @@ void LauncherUI::RenderInputBindingsTab(int player_slot) {
         // Live-update the env so a freshly-spawned game picks up the
         // new mode; running games don't reload (hook caches on first
         // GetSOCDMode call) — they get the new value next launch.
-        char buf[8];
-        std::snprintf(buf, sizeof(buf), "%d", socd_mode_[player_slot]);
-        if (player_slot == 0) _putenv_s("FM2K_SOCD_MODE_P1", buf);
-        else                   _putenv_s("FM2K_SOCD_MODE_P2", buf);
+        //
+        // Bug Froglet reported: the previous code wrote
+        // FM2K_SOCD_MODE_P1 / _P2 via _putenv_s, but
+        //   (a) the hook reads FM2K_SOCD_MODE (no suffix), and
+        //   (b) _putenv_s writes CRT env which is a DIFFERENT table
+        //       from Win32 env, and CreateProcess only inherits Win32
+        //       env into child processes.
+        // So the setting silently never reached the spawned game and
+        // every launch ran at the compiled-in default (mode 1).
+        //
+        // For player_slot==0 (local game) we publish to FM2K_SOCD_MODE
+        // so the next offline / online launch inherits it. Online
+        // play's K::MatchStart handler still re-applies the
+        // role-resolved slot value on top, so host/guest each pick
+        // their own setting — slot 1's value only matters there (kept
+        // on disk via SaveSocdState).
+        if (player_slot == 0) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%d", socd_mode_[0]);
+            ::SetEnvironmentVariableA("FM2K_SOCD_MODE", buf);
+        }
     }
     ImGui::Separator();
 
@@ -3768,6 +4421,40 @@ void LauncherUI::NotifyHubMatchEnded() {
                 "Hub: signaled match_ended (game terminated)");
 }
 
+void LauncherUI::PollUploadQueue() {
+    // Read the static dev-checkbox state. Declared inside Render's local
+    // g_auto_upload_logs is a file-scope mirror of the dev checkbox
+    // state, kept in sync by Render() (lambda init + Checkbox handler
+    // in the developer section).
+    if (!g_auto_upload_logs) return;
+
+    // Need a game selected to know which game_dir to scan.
+    if (selected_game_index_ < 0 ||
+        selected_game_index_ >= (int)games_.size()) return;
+
+    // Bail when the build had no secret baked in — nowhere to upload.
+    if (!fm2k::kLogUploadSecret || fm2k::kLogUploadSecret[0] == '\0') return;
+
+    std::filesystem::path exe =
+        fm2k::utf8path::Utf8ToWide(games_[selected_game_index_].exe_path);
+    std::filesystem::path game_dir = exe.parent_path();
+
+    fm2k::upload_queue::ProcessorConfig cfg;
+    {
+        // Convert wide path to UTF-8 for the upload-queue API. fs::path
+        // already supports that natively via .u8string() but the return
+        // type changed in C++20; use string() and accept the system-
+        // codepage round-trip for the launcher (game dirs are ASCII in
+        // practice for FM2K installs).
+        cfg.game_dir = game_dir.string();
+    }
+    cfg.upload_url = fm2k::kLogUploadUrl;
+    cfg.secret     = fm2k::kLogUploadSecret;
+    cfg.enabled    = true;
+
+    fm2k::upload_queue::Process(cfg);
+}
+
 void LauncherUI::PollMatchOutcome() {
     if (!hub_state_) return;
     auto& hs = *hub_state_;
@@ -3794,18 +4481,21 @@ void LauncherUI::PollMatchOutcome() {
     // dedup. match_result_sent is now only used by the K::Peer-
     // Disconnected handler to skip a redundant send.
     if (hs.current_match_token.empty()) return;
-    if (!hs.client.IsConnected()) {
-        // One-shot diagnostic: log why we're bailing the FIRST time
-        // we'd otherwise have sent a match_result. Helps surface the
-        // case where the hub WS died mid-match — without this we just
-        // silently drop the result and the hub never commits.
+    // Pre-v0.2.45: a WS disconnect HERE silently dropped the outcome
+    // for the rest of the set (long pause → keepalive timeout → WS drop
+    // is the classic trigger; multiple users reported wins not counting
+    // after long pauses). We now FALL THROUGH on disconnect — CSV mirror
+    // still writes, hub send is queued onto hs.pending_match_results,
+    // and the K::Connected handler drains the queue on reconnect.
+    const bool ws_connected = hs.client.IsConnected();
+    if (!ws_connected) {
         static bool s_warned_disconnect = false;
         if (!s_warned_disconnect) {
             s_warned_disconnect = true;
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "PollMatchOutcome: hub WS disconnected — match_result will NOT be sent");
+                "PollMatchOutcome: hub WS disconnected — outcomes will be "
+                "queued and replayed on reconnect");
         }
-        return;
     }
     if (!on_get_client_status) return;
 
@@ -3937,6 +4627,32 @@ void LauncherUI::PollMatchOutcome() {
                     return;
                 }
 
+                // Desync: GekkoNet caught state checksum divergence
+                // between peers and the hook terminated the game on the
+                // first occurrence (prevents the cascading-corruption
+                // crash users were hitting at character_state_machine
+                // 0x4125FC after thousands of frames of bad sim state).
+                // No W/L/D record — sim diverged, outcome undefined.
+                if (outcome_u8 == FM2K_MATCH_OUTCOME_DESYNC) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: DESYNC — game terminated on first divergence "
+                        "(no record). Inspect FM2K_P*_desync_f*.log for "
+                        "the per-region diff.");
+                    hs.status_line = "desync detected — match not recorded";
+                    FireSystemNotification(
+                        "Desync detected",
+                        "Game state diverged between peers. Match was "
+                        "stopped before sim corruption caused a crash. "
+                        "Re-launch to start a fresh session.");
+                    if (on_session_stop) on_session_stop();
+                    hs.current_match_token.clear();
+                    hs.current_match_peer_id.clear();
+                    hs.current_match_peer_nick.clear();
+                    UnmapViewOfFile(data);
+                    CloseHandle(h);
+                    return;
+                }
+
                 // Hash mismatch: peers' game files diverge. Closes the
                 // local session and surfaces a clear toast pointing the
                 // user at the hook log so they can identify the
@@ -4018,31 +4734,57 @@ void LauncherUI::PollMatchOutcome() {
                         });
                     }
 
-                    hs.client.MatchResult(hs.current_match_token, outcome_str,
-                                          p1_char_id, p2_char_id,
-                                          p1_char_name, p2_char_name,
-                                          stage_id, stage_name,
-                                          session_id, match_index,
-                                          rounds_json);
+                    if (ws_connected) {
+                        hs.client.MatchResult(hs.current_match_token, outcome_str,
+                                              p1_char_id, p2_char_id,
+                                              p1_char_name, p2_char_name,
+                                              stage_id, stage_name,
+                                              session_id, match_index,
+                                              rounds_json);
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: match_result sent token=%.8s... outcome=%s "
+                            "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") "
+                            "session=0x%016llx match_idx=%u rounds=%u "
+                            "pid=%lu seq=%u",
+                            hs.current_match_token.c_str(), outcome_str,
+                            p1_char_id, p1_char_name.c_str(),
+                            p2_char_id, p2_char_name.c_str(),
+                            stage_id, stage_name.c_str(),
+                            (unsigned long long)session_id,
+                            (unsigned)match_index, (unsigned)rc,
+                            (unsigned long)pid, (unsigned)seq);
+                        // Refresh our cached W/L/D so the UI updates
+                        // immediately for the next room render. Also
+                        // refresh the recent-matches list so the just-
+                        // committed match shows up at the top.
+                        hs.client.QueryRecord();
+                        hs.client.RequestRecentMatches(50);
+                    } else {
+                        // WS dropped — queue everything for K::Connected
+                        // to drain. CSV mirror already written above so
+                        // the local record is intact even if the hub
+                        // stays down forever.
+                        HubState::PendingMatchResult q;
+                        q.token         = hs.current_match_token;
+                        q.outcome       = outcome_str;
+                        q.p1_char_id    = p1_char_id;
+                        q.p2_char_id    = p2_char_id;
+                        q.p1_char_name  = p1_char_name;
+                        q.p2_char_name  = p2_char_name;
+                        q.stage_id      = stage_id;
+                        q.stage_name    = stage_name;
+                        q.session_id    = session_id;
+                        q.match_index   = match_index;
+                        q.rounds        = rounds_json;
+                        hs.pending_match_results.push_back(std::move(q));
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: match_result QUEUED (WS disconnected) "
+                            "token=%.8s... outcome=%s — pending=%zu, "
+                            "will replay on reconnect",
+                            hs.current_match_token.c_str(), outcome_str,
+                            hs.pending_match_results.size());
+                    }
                     hs.match_result_sent = true;
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Hub: match_result sent token=%.8s... outcome=%s "
-                        "p1=%u(\"%s\") p2=%u(\"%s\") stage=%u(\"%s\") "
-                        "session=0x%016llx match_idx=%u rounds=%u "
-                        "pid=%lu seq=%u",
-                        hs.current_match_token.c_str(), outcome_str,
-                        p1_char_id, p1_char_name.c_str(),
-                        p2_char_id, p2_char_name.c_str(),
-                        stage_id, stage_name.c_str(),
-                        (unsigned long long)session_id,
-                        (unsigned)match_index, (unsigned)rc,
-                        (unsigned long)pid, (unsigned)seq);
-                    // Refresh our cached W/L/D so the UI updates
-                    // immediately for the next room render. Also
-                    // refresh the recent-matches list so the just-
-                    // committed match shows up at the top.
-                    hs.client.QueryRecord();
-                    hs.client.RequestRecentMatches(50);
 
                     // Peer-disconnect: tear down the surviving local
                     // game so the user isn't stuck staring at a frozen
@@ -4119,6 +4861,36 @@ void LauncherUI::RenderHubPanel() {
                 hs.my_id = ev.user_id;
                 hs.rooms = ev.rooms;
                 hs.status_line = "connected";
+                // Drain any match results queued while the WS was down.
+                // PollMatchOutcome falls through to push here when
+                // hs.client.IsConnected() is false (long pause →
+                // keepalive timeout → drop is the classic case; pre-
+                // v0.2.45 those outcomes were silently lost for the
+                // rest of the set). Local CSV was already written at
+                // outcome time, so this is purely hub catch-up.
+                if (!hs.pending_match_results.empty()) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Hub: replaying %zu queued match_result(s) on reconnect",
+                        hs.pending_match_results.size());
+                    for (const auto& q : hs.pending_match_results) {
+                        hs.client.MatchResult(
+                            q.token, q.outcome,
+                            q.p1_char_id, q.p2_char_id,
+                            q.p1_char_name, q.p2_char_name,
+                            q.stage_id, q.stage_name,
+                            q.session_id, q.match_index,
+                            q.rounds);
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "  replayed token=%.8s... outcome=%s",
+                            q.token.c_str(), q.outcome.c_str());
+                    }
+                    hs.pending_match_results.clear();
+                    // Refresh the record + recent-matches after the
+                    // catch-up so the UI shows the corrected totals
+                    // right away.
+                    hs.client.QueryRecord();
+                    hs.client.RequestRecentMatches(50);
+                }
                 // Process-wide FM2K_HUB_USER_ID — companion to FM2K_HUB_UDP_ADDR
                 // set at hub-connect time. Together they unlock the hook's
                 // SendStunProbe call, so any spawned game (player or spec)
