@@ -28,4 +28,14 @@ int __cdecl Hook_ProcessGameInputs();
 bool IsCSSMode(uint32_t mode);
 bool IsBattleMode(uint32_t mode);
 
+// SOCD (Simultaneous Opposite Cardinal Direction) cleaner — strips
+// nonsense input combinations like L+R or U+D per the currently-active
+// SOCD mode (env FM2K_SOCD_MODE, runtime override via Hook_SetSOCDMode).
+// Exposed so netplay.cpp can pre-apply on the host side BEFORE storing
+// into the spectator stream — eliminates SOCD-mode-mismatch between
+// host and a spectator/replay using a different mode as a source of
+// sim divergence. The spec re-applies on top (idempotent for the
+// resolved input).
+uint16_t Hook_ApplySOCD_Public(uint16_t input);
+
 #endif // HOOKS_H

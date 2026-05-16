@@ -3,12 +3,14 @@
 // - GekkoNet for battle mode rollback
 // - Uses game's internal timer for frame counting
 #include "netplay.h"
+#include "../hooks/hooks.h"   // Hook_ApplySOCD_Public for SOCD-pre-apply on spec capture
 #include "control_channel.h"
 #include "game_hash.h"
 #include "input.h"
 #include "savestate.h"
 #include "spectator_node.h"
 #include "nat_traversal.h"
+#include "upload_queue.h"
 #include "globals.h"
 #include "gekkonet.h"
 #include "../audio/sound_rollback.h"
@@ -98,6 +100,165 @@ static uint32_t g_last_rollback_frame = 0;
 static uint32_t g_desync_count = 0;
 static uint32_t g_last_desync_log_tick = 0;
 static int g_local_delay = 1;  // Computed from RTT at battle start
+
+// Common handler for both real (GekkoDesyncDetected) and synthetic
+// (FM2K_FORCE_DESYNC_AT_FRAME) desync events. Same diagnostic dump,
+// same upload manifest, same TerminateProcess — the synthetic path
+// exercises the full end-to-end pipeline (Dump → RNG flush → ZIP
+// bundle → manifest → launcher upload → server pairing) so we can
+// validate fixes without waiting for a real-world determinism leak.
+//
+// `synthetic` only affects log wording — the file-write + terminate
+// path is identical.
+static void HandleDesyncDetected(int frame, uint32_t local_chk,
+                                 uint32_t remote_chk, bool synthetic) {
+    g_desync_count++;
+    uint32_t now_tick = GetTickCount();
+
+    // Always log the first desync with full detail.
+    if (g_desync_count <= 5) {
+        auto& rc = SaveState_GetRegionChecksums();
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "%sDESYNC #%u f=%d: local=0x%08X remote=0x%08X",
+            synthetic ? "SYNTHETIC " : "",
+            g_desync_count, frame, local_chk, remote_chk);
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "  SAVED: rng=0x%08X game=0x%08X obj=0x%08X char=0x%08X inp=0x%08X",
+            rc.rng, rc.game_state, rc.object_pool, rc.char_dynamic,
+            rc.input_tracking);
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "  UNSAVED: eff1=0x%08X eff2=0x%08X shake=0x%08X",
+            rc.effect_sys1, rc.effect_sys2, rc.shake_effects);
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "  FINGERPRINT: gameplay=0x%08X (HP/pos/rng/timer only — "
+            "if this MATCHES across peers the desync is a memory-residue "
+            "false positive)",
+            rc.gameplay_fingerprint);
+    } else if (now_tick - g_last_desync_log_tick > 1000) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
+            g_desync_count, frame, local_chk, remote_chk);
+        g_last_desync_log_tick = now_tick;
+    }
+
+    // First desync only: dump diagnostics, enqueue upload, terminate.
+    if (g_desync_count != 1) return;
+
+    SaveState_DumpDesyncDiagnostic(frame, local_chk, remote_chk,
+                                   g_player_index);
+    SaveState_FlushRngTrace(g_player_index, "first desync");
+
+    // Escape hatch: FM2K_NO_DESYNC_KILL=1 keeps the game running for
+    // diagnostic sessions. Off by default.
+    const char* no_kill = std::getenv("FM2K_NO_DESYNC_KILL");
+    const bool kill_on_desync = !(no_kill && std::strcmp(no_kill, "1") == 0);
+
+    if (!kill_on_desync) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "DESYNC: FM2K_NO_DESYNC_KILL=1 — staying alive for diagnostic "
+            "observation. Game state will corrupt further; expect a crash "
+            "within a few thousand frames.");
+        return;
+    }
+
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+        "%sDESYNC: terminating game on first divergence (frame %d). "
+        "Dump written to FM2K_P%d_desync_f%d.log. Set FM2K_NO_DESYNC_KILL=1 "
+        "to keep running for diagnostic inspection.",
+        synthetic ? "SYNTHETIC " : "",
+        frame, g_player_index, frame);
+
+    // Drop an upload manifest for the launcher to pick up.
+    //
+    // Paths and game_id go through the UTF-8 helpers — GetCurrent-
+    // DirectoryA / GetModuleFileNameA return Shift-JIS bytes on
+    // Japanese-locale Windows with Japanese-named game folders, which
+    // produces non-UTF-8 JSON. Pre-v0.2.44 launchers crashed on those
+    // manifests; v0.2.44+ launchers quarantine them, but our own
+    // manifests should obviously be valid.
+    {
+        std::string cwd_utf8;
+        if (!fm2k::upload_queue::GetCurrentDirectoryUtf8(cwd_utf8)) {
+            cwd_utf8 = ".";
+        }
+        char debug_path[MAX_PATH * 2];
+        char desync_path[MAX_PATH * 2];
+        char rng_path[MAX_PATH * 2];
+        std::snprintf(debug_path, sizeof(debug_path),
+            "%s\\logs\\FM2K_P%d_Debug.log",
+            cwd_utf8.c_str(), g_player_index + 1);
+        std::snprintf(desync_path, sizeof(desync_path),
+            "%s\\FM2K_P%d_desync_f%d.log",
+            cwd_utf8.c_str(), g_player_index + 1, frame);
+        std::snprintf(rng_path, sizeof(rng_path),
+            "%s\\FM2K_P%d_rngtrace.csv",
+            cwd_utf8.c_str(), g_player_index + 1);
+
+        std::string exe_utf8;
+        fm2k::upload_queue::GetModuleFileNameUtf8(exe_utf8);
+        // Strip directory + .exe to get the game_id stem.
+        std::string game_id_str;
+        {
+            size_t slash = exe_utf8.find_last_of("\\/");
+            std::string base = (slash == std::string::npos)
+                ? exe_utf8 : exe_utf8.substr(slash + 1);
+            size_t dot = base.find_last_of('.');
+            game_id_str = (dot == std::string::npos)
+                ? base : base.substr(0, dot);
+        }
+
+        fm2k::upload_queue::Manifest mfst;
+        mfst.kind = synthetic ? "desync_synthetic" : "desync";
+        mfst.frame = frame;
+        mfst.session_id = SpectatorNode_GetSessionId();
+        mfst.player_index = g_player_index;
+        mfst.game_id = game_id_str.c_str();
+        mfst.file_paths.emplace_back(debug_path);
+        mfst.file_paths.emplace_back(desync_path);
+        mfst.file_paths.emplace_back(rng_path);
+        fm2k::upload_queue::Enqueue(mfst);
+    }
+
+    SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_DESYNC);
+    fflush(stdout);
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 1);
+}
+
+// Synthetic desync trigger — checks FM2K_FORCE_DESYNC_AT_FRAME env
+// var once at hook init. When the netplay frame counter reaches the
+// configured value, calls HandleDesyncDetected with synthetic flag
+// set. Both peers receive the same env var (the launcher inherits
+// it), both fire at the same frame, both end up with the same
+// match_token-derived match_id — perfect smoke test for the upload
+// + cross-peer pairing pipeline.
+//
+// Set to -1 (default) to disable.
+static int g_force_desync_at_frame = -1;
+static bool g_force_desync_inited = false;
+
+static void MaybeFireSyntheticDesync() {
+    if (!g_force_desync_inited) {
+        g_force_desync_inited = true;
+        const char* e = std::getenv("FM2K_FORCE_DESYNC_AT_FRAME");
+        if (e && *e) {
+            g_force_desync_at_frame = std::atoi(e);
+            if (g_force_desync_at_frame > 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SYNTHETIC-DESYNC armed: will fire at battle frame %d "
+                    "(env FM2K_FORCE_DESYNC_AT_FRAME)",
+                    g_force_desync_at_frame);
+            }
+        }
+    }
+    if (g_force_desync_at_frame > 0 &&
+        (int)g_netplay_frame >= g_force_desync_at_frame) {
+        const int target = g_force_desync_at_frame;
+        g_force_desync_at_frame = -1;  // one-shot
+        HandleDesyncDetected(target, 0xDEADBEEFu, 0xCAFEBABEu,
+                             /*synthetic=*/true);
+    }
+}
 
 // Connection-lifetime cache for the computed (auto) battle delay. Pinned
 // at the FIRST battle-session start after CONNECTED and reused for every
@@ -1720,6 +1881,20 @@ bool Netplay_StartBattle() {
     // of the match. Mean is robust to that and gives matched delays
     // between peers on stable links.
     //
+    // TODO(#24, Melancholy + toki bug reports): peers compute this
+    // INDEPENDENTLY. On stable links both see the same RTT and pick
+    // the same delay, but on jittery links one peer's mean drifts and
+    // they end up with different local_delays (Melancholy = 10,
+    // Spooder = 5). With prediction=0 lockstep, GekkoNet still
+    // converges but the game feel is asymmetric (one player's input
+    // lag is bigger than the other's). CCCaster's fix is to gossip
+    // the computed value over the control channel right before
+    // session start and pick max(local, peer). We don't have that
+    // exchange yet — needs a new CtrlMsg::DELAY_PROPOSAL round before
+    // gekko_set_local_delay below. Until then, document the asymmetry
+    // and recommend manual override (FM2K_LOCAL_DELAY) for matches
+    // where the auto-pick visibly diverges.
+    //
     // FM2K runs at 100 Hz, so 10 ms is one frame budget.
     //   local_delay = max(2, ceil(mean_one_way_ms / 10))
     // Floor of 2 keeps GekkoNet's prediction window happy on
@@ -2304,76 +2479,11 @@ bool Netplay_ProcessBattleInputPhase() {
             }
 
             case GekkoDesyncDetected: {
-                g_desync_count++;
-                uint32_t now_tick = GetTickCount();
-
-                // Always log the first desync with full detail
-                if (g_desync_count <= 5) {
-                    auto& rc = SaveState_GetRegionChecksums();
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                        "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
-                        g_desync_count,
-                        event->data.desynced.frame,
-                        event->data.desynced.local_checksum,
-                        event->data.desynced.remote_checksum);
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                        "  SAVED: rng=0x%08X game=0x%08X obj=0x%08X char=0x%08X inp=0x%08X",
-                        rc.rng, rc.game_state, rc.object_pool, rc.char_dynamic, rc.input_tracking);
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                        "  UNSAVED: eff1=0x%08X eff2=0x%08X shake=0x%08X",
-                        rc.effect_sys1, rc.effect_sys2, rc.shake_effects);
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                        "  FINGERPRINT: gameplay=0x%08X (HP/pos/rng/timer only — "
-                        "if this MATCHES across peers the desync is a memory-residue "
-                        "false positive)",
-                        rc.gameplay_fingerprint);
-                } else if (now_tick - g_last_desync_log_tick > 1000) {
-                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                        "DESYNC #%u f=%d: local=0x%08X remote=0x%08X",
-                        g_desync_count,
-                        event->data.desynced.frame,
-                        event->data.desynced.local_checksum,
-                        event->data.desynced.remote_checksum);
-                    g_last_desync_log_tick = now_tick;
-                }
-
-                // BBBR-style: Dump per-region CRC + hex to file on first desync
-                if (g_desync_count == 1) {
-                    SaveState_DumpDesyncDiagnostic(
-                        event->data.desynced.frame,
-                        event->data.desynced.local_checksum,
-                        event->data.desynced.remote_checksum,
-                        g_player_index);
-                    // Also flush the in-memory rngtrace ring so we can diff
-                    // the two peers' per-frame rng history offline.
-                    SaveState_FlushRngTrace(g_player_index, "first desync");
-
-                    // Stress mode is a determinism test - once we've caught a
-                    // desync we have full diagnostic evidence already. Kill the
-                    // game process immediately so the user can inspect the dump
-                    // without having to manually close the window, and so
-                    // subsequent divergences don't scribble over the diagnostic
-                    // region's frozen state (the object pool / player slots /
-                    // afterimage pool contents captured at the moment of the
-                    // first divergence are the valuable evidence; later frames'
-                    // values drift further from ground truth and obscure it).
-                    if (g_stress_mode) {
-                        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                            "STRESS: Desync detected on frame %d. "
-                            "Dump written to FM2K_stress_desync_f%d.log. "
-                            "Terminating game for clean inspection.",
-                            event->data.desynced.frame,
-                            event->data.desynced.frame);
-                        // Flush any pending log output before exit
-                        fflush(stdout);
-                        fflush(stderr);
-                        // Hard-exit the game process. We use TerminateProcess on
-                        // the current process so we don't get stuck in atexit
-                        // handlers running on the injected DLL's static objects
-                        // (which can race with the hook shutdown path).
-                        TerminateProcess(GetCurrentProcess(), 1);
-                    }
-                }
+                HandleDesyncDetected(
+                    event->data.desynced.frame,
+                    event->data.desynced.local_checksum,
+                    event->data.desynced.remote_checksum,
+                    /*synthetic=*/false);
                 break;
             }
 
@@ -2590,6 +2700,14 @@ bool Netplay_ProcessBattleInputPhase() {
                 g_netplay_frame++;
                 has_advance = true;
 
+                // Synthetic desync trigger — runs after the frame
+                // counter advances so we can match on a specific frame.
+                // One-shot per match; arms only when the env var is
+                // set. Skip on rollback re-sims (g_is_rolling_back is
+                // false here because we just unset it, but check anyway
+                // for safety against future refactors).
+                MaybeFireSyntheticDesync();
+
                 // Replay recording + spectator stream. Gate on TRUE
                 // confirmed advances only:
                 //
@@ -2669,7 +2787,33 @@ bool Netplay_ProcessBattleInputPhase() {
                     // frames (title screen, CSS) are captured by
                     // Hook_GetPlayerInput's capture_and_return, which is
                     // correct for those phases (no rollback there).
-                    SpectatorNode_OnFrameConfirmed(g_p1_input, g_p2_input);
+                    //
+                    // Phase F (#23, para's replay desync bug): the values
+                    // gekko delivers in g_p1_input / g_p2_input are RAW —
+                    // pre-SOCD, pre-facing-flip. The HOST engine then
+                    // applies Hook_ApplySOCD before feeding them into the
+                    // game. A spectator (live or .fm2krep replay) reads
+                    // these stored values and ALSO applies SOCD — but
+                    // using ITS OWN env-var-derived SOCD mode, which can
+                    // differ from the host's. Result: divergent input on
+                    // any frame where the user held L+R or U+D and the
+                    // spec's mode resolves it differently → cascading
+                    // script / position drift (parity_diff showed first
+                    // divergence at bf=1260 in p1_pos/p1_script for
+                    // vanpri, NOT in RNG).
+                    //
+                    // Fix: pre-apply the HOST's SOCD here. The stored
+                    // value carries the host's resolution. Spec's later
+                    // SOCD-application becomes idempotent (resolved
+                    // inputs don't trigger SOCD branches), so it doesn't
+                    // matter what mode the spec is in. Facing flip still
+                    // happens on the spec side, driven by deterministic
+                    // sim state — correct as long as sim hasn't diverged
+                    // upstream (it hasn't, since we now feed identical
+                    // post-SOCD inputs to both engines).
+                    const uint16_t p1_for_spec = Hook_ApplySOCD_Public(g_p1_input);
+                    const uint16_t p2_for_spec = Hook_ApplySOCD_Public(g_p2_input);
+                    SpectatorNode_OnFrameConfirmed(p1_for_spec, p2_for_spec);
 
                     // Per-frame state fingerprint for spectator-desync
                     // diagnosis — pairs with [SPEC-FP] log in
