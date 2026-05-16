@@ -10,23 +10,42 @@
 
 namespace FM2KInputBinder {
 
-// FM2K's 11-bit input layout (mask 0x7FF). Standard 2DFM convention is
-// 6 attack buttons (A..F) plus a Start button — same layout 2D Fighter
-// Maker 2002 ships in its KEYINPUT / JOYINPUT dialog.
+// FM2K's vanilla 11-bit input layout (engine mask 0x7FF) plus 3 additional
+// meta-bits (0x800-0x2000) used only by FM2KHook for its own features —
+// the engine itself doesn't see those bits (we mask them off before
+// passing input through).
+//
+// Bits 0-10  : standard 2DFM layout (d-pad + 6 attack buttons + Start)
+// Bits 11-13 : meta-buttons (OPTION/FN1/FN2) the hook reserves for itself
+//   * OPTION drives the title-screen submode cycle (VS 2P / VS CPU /
+//     CPU vs CPU / Training) when option_mode_selector is enabled
+//   * FN1 / FN2 are reserved for in-game features (e.g. training-mode
+//     P2 behavior cycle, future overlay toggles). Unbound by default.
 enum class Bit : uint8_t {
-    LEFT  = 0,   // 0x001
-    RIGHT = 1,   // 0x002
-    UP    = 2,   // 0x004
-    DOWN  = 3,   // 0x008
-    A     = 4,   // 0x010 (button1)
-    B     = 5,   // 0x020 (button2)
-    C     = 6,   // 0x040 (button3)
-    D     = 7,   // 0x080 (button4)
-    E     = 8,   // 0x100 (button5)
-    F     = 9,   // 0x200 (button6)
-    START = 10,  // 0x400 (button7 / start)
+    LEFT   = 0,   // 0x0001
+    RIGHT  = 1,   // 0x0002
+    UP     = 2,   // 0x0004
+    DOWN   = 3,   // 0x0008
+    A      = 4,   // 0x0010 (button1)
+    B      = 5,   // 0x0020 (button2)
+    C      = 6,   // 0x0040 (button3)
+    D      = 7,   // 0x0080 (button4)
+    E      = 8,   // 0x0100 (button5)
+    F      = 9,   // 0x0200 (button6)
+    START  = 10,  // 0x0400 (button7 / start) — engine-visible
+    OPTION = 11,  // 0x0800 (FM2KHook meta — submode cycle on title)
+    FN1    = 12,  // 0x1000 (FM2KHook meta — reserved)
+    FN2    = 13,  // 0x2000 (FM2KHook meta — reserved)
     COUNT
 };
+
+// Bitmask of engine-visible bits. Hook layer ANDs incoming input with
+// this before passing to the engine's get_player_input substitute so
+// meta-bits don't leak into game state.
+constexpr uint16_t kEngineInputMask = 0x07FFu;
+
+// Bitmask of all bits (engine + meta) the binder produces.
+constexpr uint16_t kFullInputMask = 0x3FFFu;
 
 // One slot per FM2K bit. A slot is either keyboard, gamepad button,
 // gamepad axis, or empty -- mutually exclusive for simplicity.
@@ -59,6 +78,14 @@ void Init();
 
 // Tear down opened gamepad handles. Optional.
 void Shutdown();
+
+// Re-enumerate connected gamepads. Picks up devices plugged in AFTER
+// Init() and closes handles for devices that have been removed. Cheap
+// (SDL_GetGamepads + a couple of SDL_PumpEvents); safe to call on a
+// 1 s cadence from the launcher's tick + the hook's periodic poll so
+// users don't have to restart the session after hot-plugging a pad
+// (Suicidal Muffin's bug report). No effect if nothing changed.
+void RefreshGamepads();
 
 // Render the binder window for one player slot (0 or 1). Returns true if
 // any binding was modified this frame (caller may auto-Save).

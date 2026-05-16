@@ -12,6 +12,7 @@
 #include "FM2K_GameIni.h"
 #include "FM2K_Utf8Path.h"
 #include "FM2KHook/src/ui/shared_mem.h"
+#include "FM2KHook/src/ui/input_binder.h"  // RefreshGamepads() on SDL hot-plug events
 #define XXH_INLINE_ALL
 #include "vendored/xxhash/xxhash.h"
 #include "LocalSession.h"
@@ -902,7 +903,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     bool direct_mode = false;
     bool spectate_mode = false;
     std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
-    std::string spectate_join_mode = "full";     // --spectate-mode {current,full}; default flipped 2026-05-08 (CURRENT_MATCH baking)
+    std::string spectate_join_mode = "current";  // --spectate-mode {current,full}; default flipped back to "current" 2026-05-13 (v0.2.42 Phases C/D/E)
     std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
 
     // Parse command line arguments
@@ -1171,16 +1172,31 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     if (!launcher) {
         return SDL_APP_FAILURE;
     }
-    
+
+    // Gamepad hot-plug: refresh the binder's pad list so the input
+    // bindings window (and the SOCD picker's "gamepad N" labels)
+    // update without requiring the user to close & reopen the
+    // launcher (Suicidal Muffin's bug report). The hook-side binder
+    // gets the same treatment via a 1 s periodic refresh in
+    // hooks.cpp + input.cpp, since events don't cross the process
+    // boundary into the injected DLL's SDL context.
+    if (event->type == SDL_EVENT_GAMEPAD_ADDED ||
+        event->type == SDL_EVENT_GAMEPAD_REMOVED) {
+        FM2KInputBinder::RefreshGamepads();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SDL_AppEvent: gamepad %s — binder refreshed",
+            event->type == SDL_EVENT_GAMEPAD_ADDED ? "ADDED" : "REMOVED");
+    }
+
     // Let launcher handle the event
     launcher->HandleEvent(event);
-    
+
     // Check for quit
     if (event->type == SDL_EVENT_QUIT) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SDL_EVENT_QUIT: Quitting application");
         return SDL_APP_SUCCESS;
     }
-    
+
     // Note: async discovery completion is handled inside FM2KLauncher::HandleEvent.
 
     return SDL_APP_CONTINUE;
@@ -2269,8 +2285,13 @@ static void ScanDirForGames(const std::string& dir,
                              (int)(SDL_strlen(kgt_name) - 4), kgt_name) < 0 || !exe_name) {
                 continue;
             }
-            std::string exe_path = dir + "/" + exe_name;
-            std::string kgt_path = dir + "/" + kgt_name;
+            // Use platform-preferred separator so the paths displayed in
+            // the games list match the slash style of the user-typed
+            // root folder. FlippySpatula reported the visible mismatch
+            // as confusing — Windows users see "C:\games" for their
+            // root then "C:\games/foo.exe" for the scraped child.
+            std::string exe_path = dir + "\\" + exe_name;
+            std::string kgt_path = dir + "\\" + kgt_name;
             SDL_free(exe_name);
 
             // Full cache hit: reuse the parsed summary, hash, engine, and
@@ -2359,7 +2380,7 @@ static void ScanDirForGames(const std::string& dir,
                     const char* exe_basename = SDL_strrchr(exe_list[i], '/');
                     if (!exe_basename) exe_basename = SDL_strrchr(exe_list[i], '\\');
                     exe_basename = exe_basename ? exe_basename + 1 : exe_list[i];
-                    std::string exe_path = dir + "/" + exe_basename;
+                    std::string exe_path = dir + "\\" + exe_basename;
 
                     Utils::GameCacheEntry cached_entry;
                     bool cache_hit = TryUseCachedEntry(cache, exe_path, std::string(), cached_entry);
@@ -2981,6 +3002,30 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
         const std::string normalized =
             (mode == "full" || mode == "FULL" || mode == "FULL_SESSION") ? "full" : "current";
         spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATE_MODE", normalized);
+
+        // NOTE: do NOT set FM2K_BOOT_TO_BATTLE=1 for spectators. The
+        // pkmncc 2026-05-13 test caught the interaction:
+        //   /F forces the engine to skip splash/title/CSS and create
+        //   a battle-init game object directly. DDraw surfaces, audio
+        //   handles, and the CSS state machine are all skipped.
+        //   If the host is in CSS when the spec joins, the snapshot
+        //   captured_game_mode is 2000 (CSS), and the apply-gate
+        //   `game_mode >= captured_game_mode` (3000 >= 2000) passes.
+        //   SaveState_LoadFromBytes then writes CSS-state bytes into
+        //   a battle-initialized engine: surfaces sized wrong, CSS
+        //   state machine memory uninitialized — spec renders battle
+        //   UI but consumes CSS inputs as battle inputs. Borked.
+        //
+        // Without /F, the spec walks title → CSS → battle naturally.
+        // CSS snapshot applies at game_mode=2000 (matching capture).
+        // Battle snapshot applies at game_mode=3000 (matching capture).
+        // Either way, the engine has done its mode-appropriate init
+        // before SaveState_LoadFromBytes overlays the host's state.
+        //
+        // Cost: spec sees ~300 ms of title screen before lockstep.
+        // Acceptable until we can plumb host's session_kind down to
+        // launcher-side LaunchRemoteSpectator (which would let us
+        // safely use /F when we know the host is already in battle).
     }
     spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
         "c:/games/2dfm/wanwan/parity_p3.pty");

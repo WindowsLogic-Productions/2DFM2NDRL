@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "round_events.h"     // C3.5 — vs_round_function detour install
 #include "css_autoconfirm.h"  // CSS lock-and-confirm for offline replay playback
+#include "per_game_patches.h" // damage multiplier MinHook + team-size override
 #include "globals.h"
 
 #include <cstdlib>
@@ -1361,21 +1362,6 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     // idempotent and resolves to %APPDATA%\FM2K_Rollback\fm2k_inputs.ini
     // (matching the launcher's save path) so launcher-bound keys / pads
     // drive offline play here, GekkoNet-online play through Input_CaptureLocal.
-    //
-    // Per-game profile routing: this branch (the FM2K offline / CSS /
-    // battle path) USED to call Init() without a prior SetGameProfile,
-    // so g_active_game stayed empty and Load() always picked the
-    // default fm2k_inputs.ini — silently ignoring the per-game
-    // fm2k_inputs_<exe_stem>.ini that the launcher's "Use override for
-    // X" checkbox writes. Symptom: users (URORFG, CC) reporting that
-    // per-game overrides never took effect offline. Online play worked
-    // because netplay.cpp goes through Input_CaptureLocal first, which
-    // DID call SetGameProfile.
-    //
-    // Fix: do the SetGameProfile + Load dance here on a 1-second
-    // periodic check, mirroring input.cpp's Input_CaptureLocal. Load()
-    // every tick so launcher-side edits (Save() in the binder UI)
-    // propagate into the running game without restart.
     {
         static int  s_last_check_tick = 0;
         static bool s_binder_active   = false;
@@ -1383,6 +1369,12 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
         const int now_tick = (int)GetTickCount();
         if ((now_tick - s_last_check_tick) > 1000 || s_last_check_tick == 0) {
             s_last_check_tick = now_tick;
+            // Per-game profile routing — v0.2.43 fix (Sheriel's bug
+            // report) restored here after an intervening edit removed
+            // it. Without this, Hook_GetPlayerInput's binder Init/Load
+            // resolves to the DEFAULT fm2k_inputs.ini and the launcher's
+            // "Use override for X" per-game profile is silently
+            // ignored offline. Mirrors input.cpp's Input_CaptureLocal.
             if (!s_profile_routed) {
                 s_profile_routed = true;
                 char buf[MAX_PATH] = {};
@@ -1400,11 +1392,15 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 }
             }
             FM2KInputBinder::Init();
-            // Re-Load so launcher-side Save() in the binder UI reaches
-            // the running game without restart. Init() only Load()s on
-            // first call (gated by g_initialized); we need the periodic
-            // re-read here to pick up edits.
+            // Re-Load every tick so launcher-side Save() reaches the
+            // running game without restart. Init() only Load()s once
+            // (gated by g_initialized); we need the periodic re-read.
             FM2KInputBinder::Load();
+            // Hot-plug refresh (#25, Suicidal Muffin's bug): pick up
+            // freshly-attached pads + drop removed handles on the same
+            // 1 s cadence as the binder reload, so users don't have to
+            // restart the session after plugging in a controller.
+            FM2KInputBinder::RefreshGamepads();
             const auto& pb = FM2KInputBinder::Bindings(0);
             s_binder_active = false;
             for (const auto& b : pb.bits) {
@@ -1420,8 +1416,54 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             // 0 = P1 character → P1 bindings, 1 = P2 character → P2 bindings.
             // Without this distinction both players get the SAME input from
             // P1's bindings — the bug we just fixed.
-            const int slot = (input_type & 1);
+            int slot = (input_type & 1);
             uint16_t bound = FM2KInputBinder::Sample_Win32(slot);
+            // OPTION title-screen submode cycle — fires on the binder path
+            // too, before masking off meta-bits so PerGamePatches sees the
+            // full 14-bit value (OPTION = 0x800).
+            if (player_id == 0) {
+                PerGamePatches_OnTitleInputTick(bound, game_mode);
+            }
+            // Solo-driver CSS takeover (vs_cpu / cpu_vs_cpu / training):
+            // when CSS is open AND we're being asked for P2's input AND
+            // any solo-driver mode is engaged, the pipe is GATED via
+            // PerGamePatches_GatedP2CssInput:
+            //   - P1 not confirmed → P2 = 0
+            //   - P1 confirmed but attack still held → P2 = 0
+            //   - P1 confirmed AND released attack → P2 = P1's input
+            // The override has to live INSIDE the binder branch because
+            // the binder path returns before PerGamePatches_TryOverrideInput
+            // is reached.
+            if (game_mode == 2000u && player_id == 1) {
+                const bool any_solo_driver =
+                    PerGamePatches_IsVsCpuModeActive() ||
+                    PerGamePatches_IsCpuVsCpuModeActive() ||
+                    PerGamePatches_IsTrainingModeActive();
+                if (any_solo_driver) {
+                    const uint16_t p1_bound =
+                        FM2KInputBinder::Sample_Win32(0)
+                            & FM2KInputBinder::kEngineInputMask;
+                    bound = PerGamePatches_GatedP2CssInput(p1_bound);
+                    slot = 0;
+                }
+            }
+
+            // Solo-driver BATTLE override. Same reason — binder path
+            // shortcircuits PerGamePatches_TryOverrideInput, so we have
+            // to invoke the battle helper here too. Zeros P2 for VS CPU /
+            // CPU vs CPU so the engine's script-driven AI takes over;
+            // applies training-mode P2 behavior for training. P1 is
+            // overridden too in CPU vs CPU.
+            if (game_mode >= 3000u && game_mode < 4000u) {
+                const uint16_t p1_bound_battle =
+                    FM2KInputBinder::Sample_Win32(0)
+                        & FM2KInputBinder::kEngineInputMask;
+                const int over = PerGamePatches_BattleInputOverride(
+                    player_id, p1_bound_battle);
+                if (over >= 0) {
+                    bound = (uint16_t)over;
+                }
+            }
             // Apply the same battle facing-fix the original_get_player_input
             // path applies (so offline matches behave the same way as the
             // game's own input flow).
@@ -1442,7 +1484,33 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 bound = (bound & ~0x003) | (left_bit << 1) | (right_bit >> 1);
             }
             bound = Hook_ApplySOCD(bound);
+            // Strip meta-bits (OPTION/FN1/FN2) before passing to engine so
+            // they don't leak into game state. Hook-side features that
+            // consume those bits did so above (or read via Sample directly).
+            bound &= FM2KInputBinder::kEngineInputMask;
             return capture_and_return((int)bound);
+        }
+    }
+
+    // OPTION-button title-screen submode cycle (no-binder fallback path).
+    // Engine's original_get_player_input only produces 11 bits so OPTION
+    // (bit 11) can't fire here — but we still call the tick so the
+    // rising-edge tracker stays consistent on game_mode transitions.
+    if (player_id == 0 && original_get_player_input) {
+        const uint16_t raw = (uint16_t)(original_get_player_input(0, 0) & 0x7FF);
+        PerGamePatches_OnTitleInputTick(raw, game_mode);
+    }
+
+    // Per-game mode overrides — VS CPU, CPU vs CPU, training. Returns -1
+    // when no toggle applies. Only fires on the offline path (netplay /
+    // spectator branches return earlier above), so we don't accidentally
+    // override authoritative input streams during a hub match. SOCD is
+    // applied uniformly on the override path too.
+    {
+        int o = PerGamePatches_TryOverrideInput(player_id, game_mode);
+        if (o >= 0) {
+            o = (int)Hook_ApplySOCD((uint16_t)o);
+            return capture_and_return(o);
         }
     }
 
@@ -2598,6 +2666,48 @@ bool InitializeHooks() {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
             "Hooks: CssAutoConfirm_Install failed — offline replay will fall "
             "back to natural CSS traversal (likely picks wrong chars)");
+    }
+
+    // Per-game damage multiplier — only installs the hook if
+    // FM2K_DAMAGE_MULT_PCT is set and != 100, so default users don't pay
+    // the trampoline cost on every damage event. FM95 build is a no-op.
+    if constexpr (FM2K::kIsFM2K) {
+        if (!PerGamePatches_InstallDamageMultiplierHook()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hooks: damage multiplier hook install failed — damage "
+                "scaling won't apply this session");
+        }
+        // Option-A KOF retention: code-cave patch on the engine's
+        // CSMK_PLAYER HP-init instruction so the engine never overwrites
+        // the winner's slot with max_hp. Only installs when
+        // FM2K_TEAM_KOF_RETENTION is enabled.
+        if (!PerGamePatches_InstallKofHpInitPatch()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hooks: KOF HP-init patch install failed — retention "
+                "will fall back to vanilla (HP resets between rounds)");
+        }
+        // /F boot-to-battle prime: MinHook on the slot-0 boot dispatcher
+        // (InitializeGameFromCommandLine @ 0x409a60). At entry, restamps
+        // the kgt name into g_iniFile_nameOverride — counters hit_judge_-
+        // set_function's earlier empty-default stomp. Only installs when
+        // FM2K_BOOT_TO_BATTLE=1 (launcher dev checkbox).
+        if (!PerGamePatches_InstallBootToBattleHook()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hooks: boot-to-battle hook install failed — /F path "
+                "will fail with 'GameSystem Open error[]'");
+        }
+        // Story-init AI hijack: MidHook char_state_machine's
+        // g_game_mode_flag dispatch read so battle-phase calls see
+        // flag=0 (1P arcade) — drives stage-script CPU AI init for
+        // P2 in our hijacked 1P→VS-CSS modes. Idempotent; only
+        // installs if option_mode_selector or one of the mode flags
+        // was on at startup (PerGamePatches_ApplyRuntime ran first
+        // in DllMain, so atomics are already populated).
+        if (!PerGamePatches_InstallStoryInitHijack()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hooks: story-init hijack install failed — VS CPU / "
+                "Training will leave P2 as a non-AI standing dummy");
+        }
     }
 
     // Hook timeGetTime (winmm.dll) — make the game's frame-skip pacing

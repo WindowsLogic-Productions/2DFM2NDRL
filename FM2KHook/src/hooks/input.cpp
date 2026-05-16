@@ -123,6 +123,15 @@ uint16_t Input_CaptureLocal() {
             // shot (gated on g_initialized) so it doesn't refresh
             // bindings on its own; Load() is the actual file-read.
             FM2KInputBinder::Load();
+            // Hot-plug refresh — Suicidal Muffin's bug report:
+            // unplugging a controller mid-match or plugging one in
+            // after the game started required a session restart. We
+            // walk SDL_GetGamepads / SDL_GetJoysticks on the same
+            // 1-second cadence as Load(), so newly-attached devices
+            // start receiving binder input within a second of being
+            // plugged in. Cost is one SDL_PumpEvents + a couple of
+            // SDL_GetGamepads — negligible compared to the input poll.
+            FM2KInputBinder::RefreshGamepads();
             // Detect "config file present and successfully loaded" by
             // checking whether any binding has a non-NONE source. Defaults
             // also have non-NONE bindings (P1 keyboard arrows + Z/X/C/V/A/S/D/Enter)
