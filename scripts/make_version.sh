@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # ---- The one line you bump per release ----
-FM2K_VERSION="0.2.46"
+FM2K_VERSION="0.2.47"
 
 # ---- Auto-derived ----
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

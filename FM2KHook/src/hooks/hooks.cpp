@@ -624,6 +624,17 @@ extern "C" int Hook_GetSOCDModePublic() {
     return Hook_GetSOCDMode();
 }
 
+// Public wrapper around Hook_ApplySOCD (declared in hooks.h). Used by
+// netplay.cpp to pre-apply SOCD on the host's confirmed inputs before
+// storing them into the spectator stream / .fm2krep file — eliminates
+// SOCD-mode-mismatch between host and spec (or original-vs-replay) as
+// a source of sim divergence. Defined later in this TU but forward-
+// declared here so the trivial wrapper compiles.
+static inline uint16_t Hook_ApplySOCD(uint16_t input);
+uint16_t Hook_ApplySOCD_Public(uint16_t input) {
+    return Hook_ApplySOCD(input);
+}
+
 static inline uint16_t Hook_ApplySOCD(uint16_t input) {
     constexpr uint16_t LEFT  = 0x001;
     constexpr uint16_t RIGHT = 0x002;
