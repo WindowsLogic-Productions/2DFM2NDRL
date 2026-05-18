@@ -1505,6 +1505,9 @@ static bool Netplay_StartCSSSession() {
 
     gekko_create(&g_session, GekkoGameSession);
     gekko_start(g_session, &config);
+    // Fresh session = no GekkoSpectator actors yet. Reset the dedup
+    // tracking so any post-boundary spec rejoins re-add cleanly.
+    SpectatorNode_ClearGekkoSpectatorTracking();
 
     auto adapter = CreateMultiplexAdapter();
     gekko_net_adapter_set(g_session, adapter);
@@ -1651,6 +1654,7 @@ bool Netplay_StartSpectateSession(NetplaySessionKind host_kind, const char* host
     gekko_create(&g_session, GekkoSpectateSession);
     gekko_start(g_session, &config);
     g_session_kind = SessionKind::SPECTATE;
+    SpectatorNode_ClearGekkoSpectatorTracking();
 
     auto adapter = CreateMultiplexAdapter();
     gekko_net_adapter_set(g_session, adapter);
@@ -2068,6 +2072,7 @@ bool Netplay_StartBattle() {
     gekko_create(&g_session, GekkoGameSession);
     gekko_start(g_session, &config);
     g_session_kind = SessionKind::BATTLE;
+    SpectatorNode_ClearGekkoSpectatorTracking();
 
     auto adapter = CreateMultiplexAdapter();
     gekko_net_adapter_set(g_session, adapter);
@@ -2298,6 +2303,7 @@ bool Netplay_StartStressBattle() {
     gekko_create(&g_session, GekkoStressSession);
     gekko_start(g_session, &config);
     g_session_kind = SessionKind::STRESS;
+    SpectatorNode_ClearGekkoSpectatorTracking();
 
     // Both actors local. No adapter set -> no network calls.
     //

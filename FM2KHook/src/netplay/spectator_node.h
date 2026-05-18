@@ -513,6 +513,14 @@ constexpr uint64_t SPECTATOR_SUBSCRIBER_EXPIRY_MS  = 30000;  // upstream-side
 // it already has subscribers).
 void SpectatorNode_SetCapacity(size_t max_direct);
 
+// Reset the per-session GekkoSpectator addr tracking set. Call once
+// after each fresh gekko_create + gekko_start so the new session starts
+// with an empty "already added" map. Without this, spec rejoins after a
+// session boundary would be no-op'd as "already added" against the
+// destroyed previous session's records. See spectator_node.cpp comment
+// next to g_gekko_spectator_addrs for the leak background.
+void SpectatorNode_ClearGekkoSpectatorTracking();
+
 // Handle an inbound SPEC_JOIN_REQ from a peer. Either:
 //   - accept (below capacity) → enqueue INITIAL_MATCH + SPEC_JOIN_ACK
 //   - redirect (at capacity, have subscribers) → send SPEC_JOIN_REDIRECT
