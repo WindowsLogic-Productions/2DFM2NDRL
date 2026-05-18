@@ -2242,6 +2242,27 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
                 fm2k::spec_relay::PopFront(s_relay_ring);
             }
         }
+
+        // Phase 4: surface the latest ring counters to the menu-bar
+        // status pill. Read raw from the ring -- we hold launcher-side
+        // (consumer) view of read_idx and producer-side view of
+        // write_idx; both rings expose counters at the same offset.
+        LauncherUI::SpecRelayStatus st{};
+        st.out_active = (s_relay_ring != nullptr);
+        if (st.out_active) {
+            st.out_enqueued = s_relay_ring->total_enqueued;
+            st.out_dropped  = s_relay_ring->total_dropped;
+            st.out_dequeued = s_relay_ring->total_dequeued;
+        }
+        // The inbound ring's static cache lives inside the
+        // on_spec_relay_bytes lambda above; expose via a parallel
+        // helper. For now we don't have a clean accessor, so just
+        // leave in_* zeroed -- drops on the inbound side would show
+        // up as "spec sees missing frames" symptoms first, and the
+        // hook log "ring full" warn is the primary signal. Future
+        // pass: refactor lambda statics into class members so the
+        // status pill can show inbound counters too.
+        if (ui_) ui_->SetSpecRelayStatus(st);
     }
 
     // Check for game termination
