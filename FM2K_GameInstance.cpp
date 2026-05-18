@@ -6,6 +6,7 @@
 // DLL injection approach - no direct hooks needed
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <locale>
 #include <codecvt>
@@ -185,6 +186,36 @@ bool FM2KGameInstance::Launch(const std::string& exe_path, FM2K::Engine engine) 
     std::filesystem::path exe_file_path(wide_exe_path);
     std::wstring wide_working_dir  = exe_file_path.parent_path().wstring();
     std::wstring wide_cmd_line     = L"\"" + wide_exe_path + L"\"";
+
+    // /F boot-to-battle. The engine's WinMain parses /F and sets
+    // g_debug_mode=3, which makes its slot-0 boot dispatcher skip
+    // splash/title/CSS and jump straight into a battle-init game
+    // object. The hook side populates g_iniFile_nameOverride so the
+    // dispatcher's kgt loader has a path.
+    //
+    // Check the per-instance environment_variables_ map FIRST (where
+    // LaunchRemoteSpectator and other per-spawn-config call sites
+    // store their FM2K_BOOT_TO_BATTLE=1), then fall back to the
+    // launcher's own process env (where the dev checkbox sets it
+    // directly via ::SetEnvironmentVariableA). The map gets applied
+    // to the process env at line ~235, but that's AFTER we build
+    // the cmdline here, so we must read the map for per-spawn vars.
+    {
+        bool boot_to_battle = false;
+        auto it = environment_variables_.find("FM2K_BOOT_TO_BATTLE");
+        if (it != environment_variables_.end()) {
+            boot_to_battle = (it->second == "1");
+        } else {
+            char buf[4] = {};
+            DWORD n = ::GetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE",
+                                                buf, sizeof(buf));
+            boot_to_battle = (n > 0 && n < sizeof(buf) &&
+                              std::strcmp(buf, "1") == 0);
+        }
+        if (boot_to_battle) {
+            wide_cmd_line += L" /F";
+        }
+    }
 
     STARTUPINFOW si = {};
     si.cb = sizeof(si);

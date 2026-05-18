@@ -954,6 +954,12 @@ void LauncherUI::Render() {
     RenderConnectionStatus();
 }
 
+// Forward decls for the dev_flags.ini helpers (full defns ~1000 lines
+// below). Needed by the Update Channel toggle in the Settings menu
+// (RenderMenuBar) so we don't have to move the helper bodies up.
+static int  LoadDevFlagInt(const char* key, int default_val);
+static void SaveDevFlagInt(const char* key, int value);
+
 void LauncherUI::RenderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu(T("menu_file"))) {
@@ -1065,6 +1071,44 @@ void LauncherUI::RenderMenuBar() {
             ImGui::EndMenu();
         }
 
+        // Release channel toggle — RIGHT in the menu bar, always visible.
+        // Persisted to dev_flags.ini under "update_channel" (0=stable,
+        // 1=dev); fm2k::updater::ReadUpdateChannel reads the same key.
+        // Switching auto-fires CheckForUpdates because that's the only
+        // reason anyone would flip it. Each MenuItem label includes the
+        // latest known version on that channel so the user can decide
+        // whether flipping is worth it without poking around — they see
+        // "Stable(0.2.53)  Dev(0.2.54)" or similar inline.
+        {
+            static int s_channel = LoadDevFlagInt("update_channel", 0);
+            const auto upd_snap = fm2k::updater::Get();
+            ImGui::TextDisabled("RELEASE:");
+
+            auto channel_label = [](const char* name, const std::string& ver, char* buf, size_t cap) {
+                if (ver.empty()) std::snprintf(buf, cap, "%s##bar_channel", name);
+                else             std::snprintf(buf, cap, "%s(%s)##bar_channel",
+                                                name, ver.c_str());
+            };
+            char lbl_stable[48], lbl_dev[48];
+            channel_label("Stable", upd_snap.latest_stable, lbl_stable, sizeof(lbl_stable));
+            channel_label("Dev",    upd_snap.latest_dev,    lbl_dev,    sizeof(lbl_dev));
+
+            if (ImGui::MenuItem(lbl_stable, nullptr, s_channel == 0)) {
+                if (s_channel != 0) {
+                    s_channel = 0;
+                    SaveDevFlagInt("update_channel", 0);
+                    fm2k::updater::CheckForUpdates();
+                }
+            }
+            if (ImGui::MenuItem(lbl_dev, nullptr, s_channel == 1)) {
+                if (s_channel != 1) {
+                    s_channel = 1;
+                    SaveDevFlagInt("update_channel", 1);
+                    fm2k::updater::CheckForUpdates();
+                }
+            }
+        }
+
         // Lazy-load auth state on first menu-bar render. File is only
         // touched when the auth window saves/clears, so the read is
         // cheap and we don't need to refresh per-frame.
@@ -1104,10 +1148,21 @@ void LauncherUI::RenderMenuBar() {
         ImVec4 update_col{};
         switch (upd.state) {
             case fm2k::updater::State::UpdateAvailable:
-                std::snprintf(update_pill, sizeof(update_pill),
-                              "  Update %s -> %s  ",
-                              fm2k::kAppVersion, upd.remote_version.c_str());
-                update_col      = ImVec4(0.40f, 0.65f, 0.95f, 1.0f);
+                // Downgrade case (local > remote): user just flipped to
+                // a channel where the latest is BELOW their installed
+                // build. Wording shifts from "Update" to "Switch" so
+                // they know they're going backwards intentionally.
+                if (fm2k::updater::IsRemoteOlderThanLocal()) {
+                    std::snprintf(update_pill, sizeof(update_pill),
+                                  "  Switch %s -> %s  ",
+                                  fm2k::kAppVersion, upd.remote_version.c_str());
+                    update_col      = ImVec4(0.95f, 0.70f, 0.40f, 1.0f);
+                } else {
+                    std::snprintf(update_pill, sizeof(update_pill),
+                                  "  Update %s -> %s  ",
+                                  fm2k::kAppVersion, upd.remote_version.c_str());
+                    update_col      = ImVec4(0.40f, 0.65f, 0.95f, 1.0f);
+                }
                 show_update_pill = true;
                 break;
             case fm2k::updater::State::Downloading: {
@@ -1281,6 +1336,8 @@ void LauncherUI::RenderHubServerBody() {
         "Use 127.0.0.1 (or localhost) when running your own hub.py on the same "
         "machine — NAT routers rarely hairpin so the public DNS won't loop back. "
         "Takes effect on next Connect.");
+    // Update Channel toggle was moved to the top-level Settings menu —
+    // 2 clicks instead of 4 to flip. See RenderMenuBar.
 }
 
 void LauncherUI::RenderHubServerWindow() {
@@ -1599,6 +1656,52 @@ void LauncherUI::RenderRecentMatchesWindow() {
     }
     RenderRecentMatchesBody();
     ImGui::End();
+}
+
+// "Spectate by IP" — hub-less spec entry. Renders inline in the dev
+// panel's Network tab. The hook's SPEC_JOIN_REQ → JOIN_ACK protocol
+// works without any hub coordination; this just exposes the existing
+// direct-spec CLI path through a UI. Cross-Patreon-tier scenarios:
+// patron watching a non-patron friend's match, or two non-patrons
+// spec'ing each other in dev mode. Both cases require the host to
+// share their public addr out-of-band (Discord etc) since there's no
+// hub matchmaking. Works for port-forwarded hosts + full-cone NATs;
+// doesn't work across symmetric NAT (that needs Patreon-tier hub
+// spec coordination).
+void LauncherUI::RenderDirectSpecInline() {
+    ImGui::TextWrapped(
+        "Spectate by IP \xE2\x80\x94 hub-free spec for cross-tier viewing. "
+        "Host must share their public addr out-of-band (e.g. Discord). "
+        "Spawns a spec instance of whichever game is currently selected.");
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputTextWithHint("Host addr (ip:port)##direct_spec_addr",
+                             "1.2.3.4:7000",
+                             direct_spec_addr_, sizeof(direct_spec_addr_));
+
+    const bool can_connect = std::strchr(direct_spec_addr_, ':') != nullptr;
+    ImGui::SameLine();
+    if (!can_connect) ImGui::BeginDisabled();
+    if (ImGui::Button("Spectate##direct_spec_go")) {
+        std::string addr_str(direct_spec_addr_);
+        const auto colon = addr_str.find_last_of(':');
+        if (colon != std::string::npos && colon + 1 < addr_str.size()) {
+            const std::string host_ip = addr_str.substr(0, colon);
+            const int host_port = std::atoi(addr_str.c_str() + colon + 1);
+            if (host_port > 0 && host_port <= 0xFFFF) {
+                // Default session_kind="battle" — same convention as
+                // CLI --spectate. User is presumably joining a live
+                // match; /F-boots straight to battle and applies host's
+                // snapshot. on_spectate_match (on the launcher side)
+                // validates a game is selected and warns if not.
+                if (on_spectate_match) {
+                    on_spectate_match(host_ip, host_port, "battle");
+                }
+            }
+        }
+    }
+    if (!can_connect) ImGui::EndDisabled();
 }
 
 // C11 — Replay browser. Walks configured games-root paths once
@@ -3570,6 +3673,16 @@ void LauncherUI::SendHubTcpAddr(uint32_t ip_be, uint16_t port) {
                 (unsigned)port);
 }
 
+void LauncherUI::SendHubSessionKind(uint8_t kind) {
+    if (!hub_state_) return;
+    const char* kind_str = (kind == 2) ? "battle"
+                         : (kind == 1) ? "css"
+                         :               "menu";
+    hub_state_->client.UpdateSessionKind(kind_str);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: forwarded session_kind=%s to hub", kind_str);
+}
+
 void LauncherUI::SetFramesAhead(float frames_ahead) {
     frames_ahead_ = frames_ahead;
 }
@@ -4088,6 +4201,14 @@ void LauncherUI::RenderSessionControls() {
                 }
             }
         }
+
+        // Hub-free Spectate-by-IP. Sits at the bottom of the dev section
+        // so it's grouped with the other "test the netcode directly"
+        // controls. Cross-Patreon-tier viewing — patron specs a non-
+        // patron friend, or two non-patrons in dev mode. Requires host
+        // to share their public addr OOB (Discord etc).
+        ImGui::Spacing();
+        RenderDirectSpecInline();
         }  // end if (developer_mode_)
 
         ImGui::Spacing();
@@ -5592,7 +5713,8 @@ void LauncherUI::RenderHubPanel() {
                                  std::to_string(ev.spectate.host_port);
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
                 if (on_spectate_match) {
-                    on_spectate_match(ev.spectate.host_ip, ev.spectate.host_port);
+                    on_spectate_match(ev.spectate.host_ip, ev.spectate.host_port,
+                                      ev.spectate.session_kind);
                 }
                 break;
             }
@@ -7106,13 +7228,13 @@ void LauncherUI::RenderMultiClientTools() {
         }
         if (!can_spectate2) ImGui::EndDisabled();
         ImGui::SetItemTooltip("%s", T("btn_launch_spectator_short_tip"));
-        
+
         if (!can_launch) {
             ImGui::EndDisabled();
         }
-        
+
         ImGui::Separator();
-        
+
         // Client status display
         ImGui::Text("%s", T("label_client_status"));
 

@@ -902,8 +902,15 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     NetworkConfig config;
     bool direct_mode = false;
     bool spectate_mode = false;
+    bool stress_mode_cli = false;        // --stress: auto-launches stress determinism test on first game in scan
+    std::string stress_game_filter;       // --stress <name>: filter discovered games by substring (case-insensitive)
+    std::string direct_game_filter;       // --host/--connect <name-or-path>: pick a specific game instead of "first discovered"
     std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
     std::string spectate_join_mode = "current";  // --spectate-mode {current,full}; default flipped back to "current" 2026-05-13 (v0.2.42 Phases C/D/E)
+    // CLI --spectate has no hub context — caller picks via
+    // --spectate-session-kind {menu,css,battle}. Default "battle"
+    // preserves prior behavior (always /F boot-to-battle).
+    std::string spectate_session_kind = "battle";
     std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
 
     // Parse command line arguments
@@ -912,11 +919,23 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         if (arg == "--host" || arg == "-h") {
             config.is_host = true;
             direct_mode = true;
+            // Optional next arg: game-name substring OR absolute path to
+            // game .exe (same convention as --stress). Picks the specific
+            // game instead of "first discovered" — the test harness needs
+            // this to target WonderfulWorld instead of whichever game
+            // ends up alphabetically first in the launcher registry.
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                direct_game_filter = argv[++i];
+            }
         } else if (arg == "--connect" || arg == "-c") {
             if (i + 1 < argc) {
                 config.remote_address = argv[++i];
                 config.is_host = false;
                 direct_mode = true;
+                // Optional second arg: game filter, same as --host.
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    direct_game_filter = argv[++i];
+                }
             } else {
                 std::cerr << "Error: --connect requires an address\n";
                 return SDL_APP_FAILURE;
@@ -935,6 +954,25 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 }
             } else {
                 std::cerr << "Error: --spectate-mode requires {current,full}\n";
+                return SDL_APP_FAILURE;
+            }
+        } else if (arg == "--spectate-session-kind") {
+            // --spectate-session-kind {menu,css,battle}
+            // Override the host's session_kind for CLI --spectate (no
+            // hub to read it from). "battle" sets FM2K_BOOT_TO_BATTLE
+            // for instant join; "menu"/"css" walks the title→CSS path.
+            if (i + 1 < argc) {
+                std::string k = argv[++i];
+                if (k == "menu" || k == "css" || k == "battle") {
+                    spectate_session_kind = k;
+                } else {
+                    std::cerr << "Error: --spectate-session-kind must be "
+                                 "{menu,css,battle}, got: " << k << "\n";
+                    return SDL_APP_FAILURE;
+                }
+            } else {
+                std::cerr << "Error: --spectate-session-kind requires "
+                             "{menu,css,battle}\n";
                 return SDL_APP_FAILURE;
             }
         } else if (arg == "--replay") {
@@ -983,6 +1021,24 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 // path" for parity with the legacy command line. Users who
                 // want multiple roots can configure them in the UI.
                 Utils::SaveGamesRootPaths({ argv[++i] });
+            }
+        } else if (arg == "--stress") {
+            // Auto-launches GekkoStressSession determinism test on the
+            // first discovered game (or the first match of a
+            // case-insensitive substring filter passed as the next arg)
+            // and exits the launcher when the test game terminates.
+            // Forces a rollback every check_distance=10 frames and
+            // fires GekkoDesyncDetected on any forward-vs-replay
+            // mismatch — exactly the test we need to validate
+            // Phase F (#23) fixes.
+            stress_mode_cli = true;
+            // Optional next arg: game-name substring (e.g. "wanwan"
+            // or "pkmncc"). The first arg that DOESN'T start with `--`
+            // is the filter; lets us pick a specific known-active game
+            // instead of "first alphabetical" (HHRTFG idles too much
+            // for the RNG-determinism check to fire).
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                stress_game_filter = argv[++i];
             }
         }
     }
@@ -1055,15 +1111,135 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         // replay-instance lifetime is managed normally.
     }
 
-    // If direct mode, skip UI and go straight to game launch + network
-    if (direct_mode || spectate_mode) {
-        if (g_launcher->GetDiscoveredGames().empty()) {
-            std::cerr << "No FM2K games found for direct mode\n";
+    // --stress mode: drive Phase F determinism test from the CLI so we
+    // don't need to UI-click. Launches the first discovered game with
+    // FM2K_STRESS_MODE=1; the hook creates a GekkoStressSession that
+    // forces a rollback every check_distance=10 frames and fires
+    // GekkoDesyncDetected on any forward-vs-replay mismatch. Watch
+    // <game_dir>/logs/FM2K_P1_Debug.log for DESYNC events.
+    if (stress_mode_cli) {
+        // Direct-path bypass: if --stress <filter> looks like a literal
+        // path to a .exe (contains a separator, ends in .exe, file
+        // exists), skip the launcher.cfg-rooted DiscoverGames scan
+        // entirely and just launch that EXE. Lets the replay-selftest
+        // harness target a specific game without waiting on a
+        // multi-thousand-file recursive scan of D:\Games\fm2k\.
+        std::vector<FM2K::FM2KGameInfo> games;
+        const bool is_direct_path = !stress_game_filter.empty()
+            && (stress_game_filter.find('/')  != std::string::npos ||
+                stress_game_filter.find('\\') != std::string::npos);
+        if (is_direct_path) {
+            FM2K::FM2KGameInfo info{};
+            info.exe_path = stress_game_filter;
+            // Other fields (engine, clean_label, etc) take their defaults
+            // — discovery normally populates them but for a direct-path
+            // launch the launcher only needs exe_path to drive
+            // StartStressSession.
+            games.push_back(info);
+            stress_game_filter.clear();  // suppress the substring matcher below
+        } else {
+            // Force a SYNCHRONOUS scan here so we have a games list to
+            // pick from. The launcher's async discovery thread will still
+            // run later but won't change the selection we made.
+            games = g_launcher->DiscoverGames();
+        }
+        if (games.empty()) {
+            std::cerr << "No FM2K games found for --stress (scanned launcher.cfg roots)\n";
             return SDL_APP_FAILURE;
         }
+        // Boot the game directly into battle so GekkoStressSession
+        // actually exercises rollback during the test run. Without
+        // these vars the game sits at title screen waiting for input
+        // and the determinism check never fires.
+        ::SetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE", "1");
+        ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP", "1");
+        ::SetEnvironmentVariableA("FM2K_PARITY_AUTOPLAY", "1");
+        // Phase F autonomous stress: keep mashing buttons during battle
+        // so RNG-consuming actions (hits, scripts, projectiles) fire
+        // and we exercise the active-gameplay code path that user-
+        // reported desyncs cluster on. Idle stress passed 21k+ frames
+        // clean. The --stress harness implies "actually try to break
+        // things," not "let the engine idle."
+        ::SetEnvironmentVariableA("FM2K_PARITY_AUTOPLAY_BATTLE", "1");
+        // Force per-save full per-region CRC so the desync diagnostic
+        // dump can attribute first-divergent region (vs the default
+        // 1/sec throttle that shows everything as 0x0).
+        ::SetEnvironmentVariableA("FM2K_FULL_CRCS", "1");
+        // Apply optional --stress <filter> game-name substring match
+        // (case-insensitive). Default = first discovered.
+        size_t pick = 0;
+        if (!stress_game_filter.empty()) {
+            auto lowercase = [](std::string s) {
+                for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+                return s;
+            };
+            std::string needle = lowercase(stress_game_filter);
+            bool found = false;
+            for (size_t i = 0; i < games.size(); ++i) {
+                if (lowercase(games[i].exe_path).find(needle) != std::string::npos) {
+                    pick = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::cerr << "--stress: no game matched filter '"
+                          << stress_game_filter << "'; falling back to first\n";
+            }
+        }
+        const auto& game_to_launch = games[pick];
+        g_launcher->SetSelectedGame(game_to_launch);
+        g_launcher->StartStressSession();
+        g_launcher->SetState(LauncherState::InGame);
+        std::cout << "Stress mode: GekkoStressSession started for "
+                  << game_to_launch.exe_path
+                  << " — watch logs/FM2K_P1_Debug.log\n";
+    }
 
-        // In direct mode, we assume the first discovered game is the target.
-        const auto& game_to_launch = g_launcher->GetDiscoveredGames()[0];
+    // If direct mode, skip UI and go straight to game launch + network
+    if (direct_mode || spectate_mode) {
+        // Direct-path bypass: if --host/--connect <filter> is a literal
+        // absolute path, build a one-element discovered-games list and
+        // launch that — skips the registry-scan entirely (matches --stress
+        // semantics for harness use). Otherwise treat as substring filter
+        // against the discovered games list.
+        const bool is_direct_path = !direct_game_filter.empty()
+            && (direct_game_filter.find('/')  != std::string::npos ||
+                direct_game_filter.find('\\') != std::string::npos);
+
+        FM2K::FM2KGameInfo selected{};
+        if (is_direct_path) {
+            selected.exe_path = direct_game_filter;
+        } else {
+            if (g_launcher->GetDiscoveredGames().empty()) {
+                std::cerr << "No FM2K games found for direct mode\n";
+                return SDL_APP_FAILURE;
+            }
+            if (!direct_game_filter.empty()) {
+                auto lowercase = [](std::string s) {
+                    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+                    return s;
+                };
+                std::string needle = lowercase(direct_game_filter);
+                const auto& games = g_launcher->GetDiscoveredGames();
+                bool matched = false;
+                for (size_t i = 0; i < games.size(); ++i) {
+                    if (lowercase(games[i].exe_path).find(needle) != std::string::npos) {
+                        selected = games[i];
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    std::cerr << "--host/--connect: no game matched filter '"
+                              << direct_game_filter << "'; falling back to first\n";
+                    selected = games[0];
+                }
+            } else {
+                selected = g_launcher->GetDiscoveredGames()[0];
+            }
+        }
+        const auto& game_to_launch = selected;
 
         // Manually set the selected game for the launcher
         g_launcher->SetSelectedGame(game_to_launch);
@@ -1080,9 +1256,14 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             const int host_port       = std::stoi(spectate_target_addr.substr(colon + 1));
             const int spectator_port  = (config.local_port > 0) ? config.local_port : 7702;
 
+            // CLI --spectate has no hub context, so session_kind isn't
+            // forwarded — assume "battle" (the typical e2e use case is
+            // joining an already-running match). To test the CSS-walk
+            // path from CLI, pass `--spectate-session-kind menu`.
             if (!g_launcher->LaunchRemoteSpectator(game_to_launch.exe_path,
                                                     spectator_port,
                                                     host_ip, host_port,
+                                                    spectate_session_kind,
                                                     spectate_join_mode)) {
                 std::cerr << "Spectate: launch failed\n";
                 return SDL_APP_FAILURE;
@@ -1364,7 +1545,8 @@ bool FM2KLauncher::Initialize() {
         CloseHandle(h);
     };
 
-    ui_->on_spectate_match = [this](const std::string& host_ip, int host_port) {
+    ui_->on_spectate_match = [this](const std::string& host_ip, int host_port,
+                                    const std::string& session_kind) {
         // Need an installed game to point the spectator at; reuse whatever
         // the launcher currently has selected.
         if (selected_game_.exe_path.empty()) {
@@ -1378,7 +1560,7 @@ bool FM2KLauncher::Initialize() {
         // false; user can stop it from the multi-client tools first.
         constexpr int SPEC_LOCAL_PORT = 7002;
         LaunchRemoteSpectator(selected_game_.exe_path, SPEC_LOCAL_PORT,
-                              host_ip, host_port);
+                              host_ip, host_port, session_kind);
     };
     ui_->on_exit = [this]() {
         running_ = false;
@@ -1839,9 +2021,11 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
         }
         static DWORD    s_last_pid = 0;
         static uint32_t s_last_seq = 0;
+        static uint32_t s_last_sk_seq = 0;
         if (target_pid != 0 && target_pid != s_last_pid) {
             s_last_pid = target_pid;
             s_last_seq = 0;
+            s_last_sk_seq = 0;
         }
         if (target_pid != 0) {
             const std::string mapping_name =
@@ -1859,6 +2043,17 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
                     if (ui_) {
                         ui_->SendHubTcpAddr(shm->tcp_stun_ext_ip_be,
                                             shm->tcp_stun_ext_port);
+                    }
+                }
+                // session_kind poll: forwards menu/CSS/battle phase
+                // transitions to the hub so spectators joining us know
+                // whether to /F-boot-to-battle or walk title→CSS.
+                if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC &&
+                    shm->session_kind_seq != 0 &&
+                    shm->session_kind_seq != s_last_sk_seq) {
+                    s_last_sk_seq = shm->session_kind_seq;
+                    if (ui_) {
+                        ui_->SendHubSessionKind(shm->session_kind);
                     }
                 }
                 if (shm) UnmapViewOfFile(shm);
@@ -2975,12 +3170,13 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
                                          int spectator_port,
                                          const std::string& host_ip,
                                          int host_port,
+                                         const std::string& session_kind,
                                          const std::string& mode)
 {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s)",
+                "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s, session_kind=%s)",
                 game_path.c_str(), spectator_port, host_ip.c_str(), host_port,
-                mode.c_str());
+                mode.c_str(), session_kind.c_str());
 
     if (spectator_instance_ && spectator_instance_->IsRunning()) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
@@ -3003,29 +3199,47 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
             (mode == "full" || mode == "FULL" || mode == "FULL_SESSION") ? "full" : "current";
         spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATE_MODE", normalized);
 
-        // NOTE: do NOT set FM2K_BOOT_TO_BATTLE=1 for spectators. The
-        // pkmncc 2026-05-13 test caught the interaction:
-        //   /F forces the engine to skip splash/title/CSS and create
-        //   a battle-init game object directly. DDraw surfaces, audio
-        //   handles, and the CSS state machine are all skipped.
-        //   If the host is in CSS when the spec joins, the snapshot
-        //   captured_game_mode is 2000 (CSS), and the apply-gate
-        //   `game_mode >= captured_game_mode` (3000 >= 2000) passes.
-        //   SaveState_LoadFromBytes then writes CSS-state bytes into
-        //   a battle-initialized engine: surfaces sized wrong, CSS
-        //   state machine memory uninitialized — spec renders battle
-        //   UI but consumes CSS inputs as battle inputs. Borked.
+        // /F boot-to-battle for spectators — conditional on host's
+        // current session_kind (forwarded by the hub in spectate_grant,
+        // sourced from the host hook's published game_mode transitions
+        // via SharedMem). Two cases:
         //
-        // Without /F, the spec walks title → CSS → battle naturally.
-        // CSS snapshot applies at game_mode=2000 (matching capture).
-        // Battle snapshot applies at game_mode=3000 (matching capture).
-        // Either way, the engine has done its mode-appropriate init
-        // before SaveState_LoadFromBytes overlays the host's state.
+        //  - host in "battle": set /F so the spec engine's slot-0
+        //    dispatcher fires `create_game_object(14, 127, 0, 0)`
+        //    straight into battle (skips CSS). SpectatorNode then
+        //    overlays the host's snapshot — chars, positions, RNG,
+        //    everything — and sim-forwards inputs to live. ~1s join
+        //    instead of ~5s title→CSS→battle walk.
         //
-        // Cost: spec sees ~300 ms of title screen before lockstep.
-        // Acceptable until we can plumb host's session_kind down to
-        // launcher-side LaunchRemoteSpectator (which would let us
-        // safely use /F when we know the host is already in battle).
+        //  - host in "menu" / "css": do NOT set /F. Spec walks the
+        //    normal title → CSS path; the CSS-snapshot mid-CSS-join
+        //    handshake (Phase E) syncs chars/cursor state. /F here
+        //    would land spec in battle with placeholder chars and
+        //    no battle-state snapshot to apply, crashing the engine
+        //    when the eventual mode 2000→3000 transition fails.
+        //
+        // Older hubs / pre-session_kind clients default to "menu"
+        // (no /F). This is the safe default — worst case the spec
+        // joins via title walk instead of boot-to-battle (slower
+        // join, never a crash).
+        const bool boot_to_battle = (session_kind == "battle");
+        if (boot_to_battle) {
+            spectator_instance_->SetEnvironmentVariable("FM2K_BOOT_TO_BATTLE", "1");
+            // Placeholder chars / stage for the /F slot-0 dispatcher's
+            // battle init. The snapshot apply overlays the real values
+            // from the host's saved blob, so the placeholders only
+            // affect the engine's INITIAL battle frame state (which
+            // SaveState_LoadFromBytes immediately overwrites).
+            spectator_instance_->SetEnvironmentVariable("FM2K_BTB_P1_CHAR", "0");
+            spectator_instance_->SetEnvironmentVariable("FM2K_BTB_P2_CHAR", "0");
+            spectator_instance_->SetEnvironmentVariable("FM2K_BTB_STAGE",   "0");
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spec: host in battle — set FM2K_BOOT_TO_BATTLE=1");
+        } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spec: host in %s — walking normal title→CSS path (no /F)",
+                session_kind.c_str());
+        }
     }
     spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
         "c:/games/2dfm/wanwan/parity_p3.pty");
