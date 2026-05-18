@@ -1578,28 +1578,32 @@ bool FM2KLauncher::Initialize() {
             // before spec game boots are normal at the very start; drop.
             return;
         }
-        static DWORD                       s_in_pid  = 0;
-        static fm2k::spec_relay::Ring*     s_in_ring = nullptr;
-        if (target_pid != s_in_pid) {
-            if (s_in_ring) {
-                fm2k::spec_relay::Close(s_in_ring);
-                s_in_ring = nullptr;
+        // Inbound ring cached as class member (spec_relay_in_ring_) so
+        // the status pill in the menu bar can read its counters. Was
+        // lambda-static; promotion required for menu-bar visibility.
+        auto* in_ring_ptr =
+            static_cast<fm2k::spec_relay::Ring*>(spec_relay_in_ring_);
+        if (target_pid != spec_relay_in_pid_) {
+            if (in_ring_ptr) {
+                fm2k::spec_relay::Close(in_ring_ptr);
+                in_ring_ptr = nullptr;
+                spec_relay_in_ring_ = nullptr;
             }
-            s_in_pid = target_pid;
+            spec_relay_in_pid_ = target_pid;
         }
         // Retry open until success. Hook's mapping creation races our
-        // first WS-binary delivery; the static cache would otherwise
-        // stick at nullptr if the first open happens before the hook
-        // is ready. Cheap on the miss path.
-        if (!s_in_ring) {
-            s_in_ring = fm2k::spec_relay::OpenInboundFor(target_pid);
-            if (s_in_ring) {
+        // first WS-binary delivery; the cache would otherwise stick at
+        // nullptr if the first open happens before the hook is ready.
+        if (!in_ring_ptr) {
+            in_ring_ptr = fm2k::spec_relay::OpenInboundFor(target_pid);
+            spec_relay_in_ring_ = in_ring_ptr;
+            if (in_ring_ptr) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpecRelay: opened inbound ring for spec game pid %lu",
                     (unsigned long)target_pid);
             }
         }
-        if (!s_in_ring) {
+        if (!in_ring_ptr) {
             // Mapping still not available (hook still booting, or hook
             // not in relay mode). Drop this WS frame; next one retries.
             return;
@@ -1609,7 +1613,7 @@ bool FM2KLauncher::Initialize() {
         // (kind isn't load-bearing on the inbound side; we set it for
         // consistency) and zero header metadata.
         fm2k::spec_relay::Enqueue(
-            s_in_ring,
+            in_ring_ptr,
             fm2k::spec_relay::TARGET_BROADCAST,
             /*spec_user_id=*/nullptr,
             /*spec_data_type=*/0,
@@ -2175,26 +2179,31 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
             target_pid = client1_instance_->GetProcessId();
         }
 
-        static DWORD                       s_relay_pid  = 0;
-        static fm2k::spec_relay::Ring*     s_relay_ring = nullptr;
+        // Outbound ring cached as class member (was lambda static)
+        // for the same reason as inbound -- menu-bar status pill needs
+        // live access.
+        auto* relay_ring_ptr =
+            static_cast<fm2k::spec_relay::Ring*>(spec_relay_out_ring_);
 
         // Game pid changed (or fresh process); drop the old mapping.
-        if (target_pid != s_relay_pid) {
-            if (s_relay_ring) {
-                fm2k::spec_relay::Close(s_relay_ring);
-                s_relay_ring = nullptr;
+        if (target_pid != spec_relay_out_pid_) {
+            if (relay_ring_ptr) {
+                fm2k::spec_relay::Close(relay_ring_ptr);
+                relay_ring_ptr = nullptr;
+                spec_relay_out_ring_ = nullptr;
             }
-            s_relay_pid = target_pid;
+            spec_relay_out_pid_ = target_pid;
         }
         // Retry open every tick when we have a pid but no ring. Hook
         // creates the mapping during SpectatorNode_Init which races our
-        // first tick after game spawn; without retry the static cache
-        // sticks at nullptr forever even though the hook came up
-        // milliseconds later. OpenFileMappingA returns fast on miss so
-        // tick-rate retry is cheap.
-        if (target_pid != 0 && !s_relay_ring) {
-            s_relay_ring = fm2k::spec_relay::OpenOutboundFor(target_pid);
-            if (s_relay_ring) {
+        // first tick after game spawn; without retry the cache sticks
+        // at nullptr even though the hook came up milliseconds later.
+        // OpenFileMappingA returns fast on miss so tick-rate retry is
+        // cheap.
+        if (target_pid != 0 && !relay_ring_ptr) {
+            relay_ring_ptr = fm2k::spec_relay::OpenOutboundFor(target_pid);
+            spec_relay_out_ring_ = relay_ring_ptr;
+            if (relay_ring_ptr) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpecRelay: opened outbound ring for game pid %lu",
                     (unsigned long)target_pid);
@@ -2205,11 +2214,11 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
         // monopolize the UI loop; 32 slots × 16 KB = ~512 KB / tick max,
         // and snapshot transfers are paced by GekkoNet's broadcast
         // cadence anyway so this rarely saturates.
-        if (s_relay_ring && ui_) {
+        if (relay_ring_ptr && ui_) {
             constexpr int kMaxPerTick = 32;
             for (int i = 0; i < kMaxPerTick; ++i) {
                 const fm2k::spec_relay::Slot* slot =
-                    fm2k::spec_relay::PeekFront(s_relay_ring);
+                    fm2k::spec_relay::PeekFront(relay_ring_ptr);
                 if (!slot) break;
 
                 // Pack Slot -> SpecDataBinary wire frame.
@@ -2258,29 +2267,29 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
                 }
 
                 ui_->SendHubSpecRelayFrame(std::move(frame));
-                fm2k::spec_relay::PopFront(s_relay_ring);
+                fm2k::spec_relay::PopFront(relay_ring_ptr);
             }
         }
 
         // Phase 4: surface the latest ring counters to the menu-bar
-        // status pill. Read raw from the ring -- we hold launcher-side
-        // (consumer) view of read_idx and producer-side view of
-        // write_idx; both rings expose counters at the same offset.
+        // status pill. Both outbound (host produces -> launcher drains)
+        // and inbound (launcher fills -> hook drains) read from class
+        // members (promoted from lambda statics so this read works).
         LauncherUI::SpecRelayStatus st{};
-        st.out_active = (s_relay_ring != nullptr);
+        st.out_active = (relay_ring_ptr != nullptr);
         if (st.out_active) {
-            st.out_enqueued = s_relay_ring->total_enqueued;
-            st.out_dropped  = s_relay_ring->total_dropped;
-            st.out_dequeued = s_relay_ring->total_dequeued;
+            st.out_enqueued = relay_ring_ptr->total_enqueued;
+            st.out_dropped  = relay_ring_ptr->total_dropped;
+            st.out_dequeued = relay_ring_ptr->total_dequeued;
         }
-        // The inbound ring's static cache lives inside the
-        // on_spec_relay_bytes lambda above; expose via a parallel
-        // helper. For now we don't have a clean accessor, so just
-        // leave in_* zeroed -- drops on the inbound side would show
-        // up as "spec sees missing frames" symptoms first, and the
-        // hook log "ring full" warn is the primary signal. Future
-        // pass: refactor lambda statics into class members so the
-        // status pill can show inbound counters too.
+        auto* in_ring_status =
+            static_cast<const fm2k::spec_relay::Ring*>(spec_relay_in_ring_);
+        st.in_active = (in_ring_status != nullptr);
+        if (st.in_active) {
+            st.in_enqueued = in_ring_status->total_enqueued;
+            st.in_dropped  = in_ring_status->total_dropped;
+            st.in_dequeued = in_ring_status->total_dequeued;
+        }
         if (ui_) ui_->SetSpecRelayStatus(st);
     }
 
@@ -2556,11 +2565,24 @@ bool FM2KLauncher::InitializeSDL() {
 void FM2KLauncher::Shutdown() {
     // Terminate any running test clients
     TerminateAllClients();
-    
-    
+
+
     // Stop network and game first
     // DLL handles GekkoNet directly - no launcher-side session needed
-    
+
+    // Close spec hub-relay shared-mem mappings (Phase 4). Close handles
+    // nullptr safely; hook side closes its end on DLL unload.
+    if (spec_relay_out_ring_) {
+        fm2k::spec_relay::Close(
+            static_cast<fm2k::spec_relay::Ring*>(spec_relay_out_ring_));
+        spec_relay_out_ring_ = nullptr;
+    }
+    if (spec_relay_in_ring_) {
+        fm2k::spec_relay::Close(
+            static_cast<fm2k::spec_relay::Ring*>(spec_relay_in_ring_));
+        spec_relay_in_ring_ = nullptr;
+    }
+
     if (game_instance_) {
         game_instance_->Terminate();
         game_instance_.reset();
