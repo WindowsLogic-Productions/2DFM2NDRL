@@ -609,6 +609,14 @@ private:
     // Validates that a relay node correctly forwards confirmed-input frames
     // it received from upstream to its own subscribers.
     std::unique_ptr<FM2KGameInstance> spectator2_instance_;
+    // Phase 4: spec hub-relay ring caches. Promoted from lambda-local
+    // statics so the menu-bar status pill can read live counters from
+    // BOTH directions. Lifetimes: opened lazily when a game with a
+    // relay-mode hook exists; closed on pid change.
+    void*    spec_relay_out_ring_ = nullptr;  // fm2k::spec_relay::Ring*
+    void*    spec_relay_in_ring_  = nullptr;
+    uint32_t spec_relay_out_pid_  = 0;
+    uint32_t spec_relay_in_pid_   = 0;
     FM2K::FM2KGameInfo selected_game_;
     NetworkConfig network_config_;
     LauncherState current_state_;
