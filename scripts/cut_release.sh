@@ -51,6 +51,29 @@ if ! command -v gh >/dev/null 2>&1; then
     echo "cut_release: gh CLI not installed (https://cli.github.com)" >&2
     exit 1
 fi
+
+# Refuse to release from a dirty working tree. We learned the hard
+# way (v0.2.49 -> v0.2.57): cutting from `git status`-dirty state
+# means the released zip and the git history disagree, and you can't
+# bisect or diff what shipped vs what's local. Force commit-first.
+#
+# Override with FM2K_RELEASE_ALLOW_DIRTY=1 for emergencies where the
+# release truly must go out before a commit can be made -- but the
+# message above ("we learned the hard way") is the default for a
+# reason. Don't use the override casually.
+if [ -z "${FM2K_RELEASE_ALLOW_DIRTY:-}" ]; then
+    DIRTY="$(cd "$REPO_ROOT" && git status --porcelain | grep -vE '^.. vendored/SDL_image$' || true)"
+    if [ -n "$DIRTY" ]; then
+        echo "cut_release: working tree is dirty -- refuse to release a phantom build." >&2
+        echo "" >&2
+        echo "  modified / untracked files (top 20):" >&2
+        echo "$DIRTY" | head -20 | sed 's/^/    /' >&2
+        echo "" >&2
+        echo "  commit (or stash, or gitignore) these first, then re-run." >&2
+        echo "  override (NOT recommended) with FM2K_RELEASE_ALLOW_DIRTY=1" >&2
+        exit 1
+    fi
+fi
 # Stable channel needs the fm2ktest checkout for the LatestVersion bump.
 # Dev channel skips the bump — only the GH pre-release tag matters; the
 # launcher's dev-channel updater finds it via the /releases API.
