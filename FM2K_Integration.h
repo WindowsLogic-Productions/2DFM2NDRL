@@ -737,7 +737,8 @@ public:
     // mapping before their first JOIN_REQ arrives at our NAT.
     std::function<void(const std::string& spec_udp_ip,
                        int                spec_udp_port,
-                       int                spec_tcp_port)> on_spectator_punch_target;
+                       int                spec_tcp_port,
+                       const std::string& spec_user_id)> on_spectator_punch_target;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     // C11 — replay browser dispatch. Called when the user clicks a row in

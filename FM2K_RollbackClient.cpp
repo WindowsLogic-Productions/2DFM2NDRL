@@ -1475,7 +1475,8 @@ bool FM2KLauncher::Initialize() {
     };
     ui_->on_spectator_punch_target = [this](const std::string& spec_udp_ip,
                                             int                spec_udp_port,
-                                            int                spec_tcp_port) {
+                                            int                spec_tcp_port,
+                                            const std::string& spec_user_id) {
         // Hub forwarded a spectator's external UDP+TCP addr (we're the
         // host of an active match). Write into our running game instance's
         // shared mem so the hook's TickHostMaintenance polls the seq
@@ -1532,13 +1533,27 @@ bool FM2KLauncher::Initialize() {
             shm->spectator_punch_ip_be    = addr_bin.S_un.S_addr;
             shm->spectator_punch_port     = (uint16_t)spec_udp_port;
             shm->spectator_punch_tcp_port = tcp_port_u16;
+            // Phase 2c: also write spec_user_id (relay-mode addressing).
+            // Truncate to fit (32-byte buffer, 31 chars + NUL). Empty
+            // when the hub doesn't include spec_user_id (older hub);
+            // hook treats absent user_id as "no relay routing" and
+            // falls back to addr-only TCP behavior.
+            std::memset(shm->spectator_punch_user_id, 0,
+                        sizeof(shm->spectator_punch_user_id));
+            const size_t uid_max = sizeof(shm->spectator_punch_user_id) - 1;
+            const size_t uid_n   = std::min<size_t>(spec_user_id.size(), uid_max);
+            if (uid_n > 0) {
+                std::memcpy(shm->spectator_punch_user_id,
+                            spec_user_id.data(), uid_n);
+            }
             // Bump seq AFTER the addr writes — hook's poll reads addr
             // only when seq advances, so a torn write is harmless.
             shm->spectator_punch_seq  += 1;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Hub: queued spectator-punch target %s udp:%d tcp:%d "
-                "to game pid %lu (seq=%u)",
+                "user_id=%s to game pid %lu (seq=%u)",
                 spec_udp_ip.c_str(), spec_udp_port, (int)tcp_port_u16,
+                spec_user_id.empty() ? "(none)" : spec_user_id.c_str(),
                 (unsigned long)target_pid,
                 (unsigned)shm->spectator_punch_seq);
         }

@@ -18,6 +18,7 @@
 #include <array>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -94,6 +95,14 @@ struct State {
     // pid) drains and forwards each Slot as a WS binary frame to the
     // hub. Layout + ordering documented in spec_relay_queue.h.
     fm2k::spec_relay::Ring*   spec_relay_out       = nullptr;
+    // Pending (ip:port) -> spec_user_id from spec_incoming events that
+    // arrived before the matching SPEC_JOIN_REQ. Populated by the punch-
+    // target poll in TickHostMaintenance; consumed (and erased) by
+    // HandleJoinReq's new-subscriber branch which assigns the user_id
+    // onto the Subscriber. Entries that never get a matching JOIN_REQ
+    // age out passively when the next punch for the same addr
+    // overwrites them.
+    std::unordered_map<std::string, std::string> pending_spec_user_ids;
 
     // ─── HOST SIDE: session event log ──────────────────────────────────
     // Every confirmed event the host produces (INPUT pairs in C2; PIN_RNG
@@ -319,6 +328,84 @@ bool AddrEqual(const sockaddr_in& a, const sockaddr_in& b) {
         && a.sin_addr.s_addr == b.sin_addr.s_addr;
 }
 
+// FormatAddr is defined below; forward-decl so the Phase 2c send
+// helpers can use it for their warning logs without reordering the
+// whole helper block.
+void FormatAddr(const sockaddr_in& a, char* out, size_t out_sz);
+
+// Spec data send helpers (Phase 2c). Branch on the active spec
+// transport: TCP (legacy P2P) or relay (hub-mediated WS binary).
+//
+// `buf` carries the full TCP-wire payload: SpecDataHeader (10 B) +
+// inner payload. In TCP mode it's blasted to the socket(s) as-is. In
+// relay mode it becomes the SPDB envelope's `payload` (the launcher
+// drain wraps it with magic + routing fields before WS send).
+//
+// Failure modes:
+//   - relay mode with no spec_relay_out (mapping creation failed):
+//     silently drop. Logged once at Init.
+//   - relay mode SendTo with no spec_user_id on the matching sub:
+//     drop with warn log. Means hub didn't forward user_id (older
+//     hub) or this sub came in via a pre-Phase-2c spec_incoming.
+//   - ring full: counted in Ring.total_dropped, no inline log.
+void OutboundBroadcast(const void* buf, size_t len) {
+    if (g_state.spec_transport_relay) {
+        if (!g_state.spec_relay_out) return;
+        fm2k::spec_relay::Enqueue(
+            g_state.spec_relay_out,
+            fm2k::spec_relay::TARGET_BROADCAST,
+            /*spec_user_id=*/nullptr,
+            /*spec_data_type=*/0,
+            /*frame_count=*/0,
+            /*spec_data_flags=*/0,
+            buf, static_cast<uint32_t>(len));
+        return;
+    }
+    SpectatorTCP::BroadcastToAll(buf, len);
+}
+
+void OutboundSendTo(const sockaddr_in& to, const void* buf, size_t len) {
+    if (g_state.spec_transport_relay) {
+        if (!g_state.spec_relay_out) return;
+        // Look up spec_user_id from the addr. Subscriber list is short
+        // (capacity-bounded; SPECTATOR_DEFAULT_CAPACITY = 4 today), so
+        // linear scan is fine.
+        const char* spec_uid = nullptr;
+        for (const auto& sub : g_state.subscribers) {
+            if (sub.addr.sin_family == to.sin_family &&
+                sub.addr.sin_port   == to.sin_port &&
+                sub.addr.sin_addr.s_addr == to.sin_addr.s_addr) {
+                if (!sub.spec_user_id.empty()) spec_uid = sub.spec_user_id.c_str();
+                break;
+            }
+        }
+        if (!spec_uid) {
+            // No user_id available; can't route through relay. Log
+            // rarely so a misconfigured pair doesn't spam.
+            static uint64_t s_warn_count = 0;
+            if ((s_warn_count++ % 64) == 0) {
+                char addr_buf[48] = {};
+                FormatAddr(to, addr_buf, sizeof(addr_buf));
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: relay SendTo %s -- no spec_user_id "
+                    "on Subscriber, dropping (warns:%llu)",
+                    addr_buf, (unsigned long long)s_warn_count);
+            }
+            return;
+        }
+        fm2k::spec_relay::Enqueue(
+            g_state.spec_relay_out,
+            fm2k::spec_relay::TARGET_DIRECT,
+            spec_uid,
+            /*spec_data_type=*/0,
+            /*frame_count=*/0,
+            /*spec_data_flags=*/0,
+            buf, static_cast<uint32_t>(len));
+        return;
+    }
+    SpectatorTCP::SendTo(to, buf, len);
+}
+
 void FormatAddr(const sockaddr_in& a, char* out, size_t out_sz) {
     char ip[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -441,7 +528,7 @@ void FlushBatch() {
     std::memcpy(buf.data(), &hdr, sizeof(hdr));
     std::memcpy(buf.data() + sizeof(hdr), payload.data(), payload.size());
 
-    SpectatorTCP::BroadcastToAll(buf.data(), buf.size());
+    OutboundBroadcast(buf.data(), buf.size());
 }
 
 // Legacy SendInitialMatchTo / INITIAL_MATCH packet path removed in C12.
@@ -593,7 +680,7 @@ void SendSessionEventsTo(const sockaddr_in& to,
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), payload.data(), payload.size());
 
-        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+        OutboundSendTo(to, buf.data(), buf.size());
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode:   chunk sent: start_frame=%u count=%u "
@@ -709,7 +796,7 @@ void SendSnapshotTo(const sockaddr_in& to) {
         hdr.flags       = (uint16_t)sizeof(meta);  // 16 — payload byte count
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), &meta, sizeof(meta));
-        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+        OutboundSendTo(to, buf.data(), buf.size());
     }
 
     // ---- SNAPSHOT_CHUNK xN -------------------------------------------
@@ -728,7 +815,7 @@ void SendSnapshotTo(const sockaddr_in& to) {
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr),
                     cache.blob.data() + emitted, chunk_n);
-        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+        OutboundSendTo(to, buf.data(), buf.size());
 
         emitted += chunk_n;
     }
@@ -744,7 +831,7 @@ void SendSnapshotTo(const sockaddr_in& to) {
         hdr.flags       = (uint16_t)sizeof(uint32_t);  // 4
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), &cache.checksum, sizeof(uint32_t));
-        SpectatorTCP::SendTo(to, buf.data(), buf.size());
+        OutboundSendTo(to, buf.data(), buf.size());
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2449,6 +2536,22 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
         sub.ack_frame    = 0;
         sub.tcp_bound    = false;
         sub.join_mode    = mode;
+        // Phase 2c: pop the cached spec_user_id (if any) for this addr.
+        // Punch-target poll wrote it earlier when the hub's
+        // spec_incoming forwarded the sub's user_id. Used by relay-mode
+        // SendTo to address binary frames; ignored in TCP mode.
+        {
+            char ip_str[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, (void*)&from.sin_addr, ip_str, sizeof(ip_str));
+            char addr_key[64];
+            std::snprintf(addr_key, sizeof(addr_key), "%s:%u",
+                          ip_str, ntohs(from.sin_port));
+            auto it = g_state.pending_spec_user_ids.find(addr_key);
+            if (it != g_state.pending_spec_user_ids.end()) {
+                sub.spec_user_id = it->second;
+                g_state.pending_spec_user_ids.erase(it);
+            }
+        }
         g_state.subscribers.push_back(sub);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: Accepted subscriber %s (%zu/%zu, mode=%s) — "
@@ -3340,10 +3443,28 @@ void SpectatorNode_TickHostMaintenance() {
             if (ip_be != 0 && port != 0) {
                 char ip_str[INET_ADDRSTRLEN] = {};
                 inet_ntop(AF_INET, &ip_be, ip_str, sizeof(ip_str));
+                // Phase 2c: stash the spec_user_id from this punch event so
+                // HandleJoinReq's new-subscriber branch can assign it onto
+                // the Subscriber when the matching JOIN_REQ from this
+                // (ip:port) arrives. Empty string when hub didn't include
+                // user_id (older hub); harmless -- relay-mode SendTo will
+                // just skip subs with no user_id.
+                char user_id_buf[33] = {};  // shm has 32; +1 for safety NUL
+                std::memcpy(user_id_buf, shm->spectator_punch_user_id,
+                            sizeof(shm->spectator_punch_user_id));
+                user_id_buf[32] = '\0';
+                if (user_id_buf[0]) {
+                    char addr_key[64];
+                    std::snprintf(addr_key, sizeof(addr_key), "%s:%u",
+                                  ip_str, (unsigned)port);
+                    g_state.pending_spec_user_ids[addr_key] = user_id_buf;
+                }
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: hub-coordinated NAT punch toward "
-                    "spectator %s:%u (seq=%u)",
-                    ip_str, (unsigned)port, (unsigned)s_last_punch_seq);
+                    "spectator %s:%u user_id=%s (seq=%u)",
+                    ip_str, (unsigned)port,
+                    user_id_buf[0] ? user_id_buf : "(none)",
+                    (unsigned)s_last_punch_seq);
 
                 sockaddr_in target{};
                 target.sin_family      = AF_INET;

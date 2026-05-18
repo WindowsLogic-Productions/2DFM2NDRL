@@ -5750,7 +5750,8 @@ void LauncherUI::RenderHubPanel() {
                     on_spectator_punch_target(
                         ev.spectator_incoming.spec_udp_ip,
                         ev.spectator_incoming.spec_udp_port,
-                        ev.spectator_incoming.spec_tcp_port);
+                        ev.spectator_incoming.spec_tcp_port,
+                        ev.spectator_incoming.spec_user_id);
                 }
                 break;
             }
