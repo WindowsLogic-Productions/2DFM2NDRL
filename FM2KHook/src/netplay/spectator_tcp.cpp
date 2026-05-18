@@ -352,75 +352,116 @@ bool PerformTcpStun() {
                     "TCP-STUN: bad port in '%s'", hub_addr_str);
         return false;
     }
-    if (!EnsureNetInit()) return false;
+    // Bypass SDL_net entirely. v0.2.51 tried sync getaddrinfo + handing a
+    // literal IP to SDL_net, but on some peers SDL_net's resolver still
+    // hung even for inet_pton-compatible input. Raw winsock is simpler,
+    // deterministic, and uses the same WSAStartup the netplay code path
+    // already initialized. Whole probe completes in <100ms in normal
+    // conditions; total cap is 1s connect + 500ms recv = 1.5s worst case.
+    struct in_addr hub_addr{};
+    if (inet_pton(AF_INET, host.c_str(), &hub_addr) != 1) {
+        // Hostname — resolve via sync getaddrinfo (UDP-STUN uses the
+        // same path successfully; SDL_net is what was hanging, not DNS).
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int gai = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+        if (gai != 0 || !res) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "TCP-STUN: getaddrinfo('%s') failed (rc=%d)",
+                        host.c_str(), gai);
+            return false;
+        }
+        hub_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+    }
+    char resolved_ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &hub_addr, resolved_ip, sizeof(resolved_ip));
 
-    NET_Address* addr = NET_ResolveHostname(host.c_str());
-    if (!addr) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "TCP-STUN: resolve '%s' failed: %s",
-                    host.c_str(), SDL_GetError());
+                    "TCP-STUN: socket() failed: %d", WSAGetLastError());
         return false;
     }
-    // SDL_net's resolver runs on a background thread that has to spin up
-    // on first use — cold-start overhead pushed real-world DNS lookups
-    // past the 1000ms cap we shipped in v0.2.36, so the probe was
-    // timing out on the resolve step alone (DNS itself was healthy;
-    // confirmed by the working UDP-STUN path which uses raw getaddrinfo).
-    // 5s gives us plenty of margin even on a sluggish DNS path while
-    // still capping the worst case (TCP-STUN failure is non-fatal —
-    // we fall back to local listener port for the punch).
-    if (NET_WaitUntilResolved(addr, 5000) != 1) {
+
+    // Set SO_REUSEADDR so we can bind to the same port the spec listener
+    // already has open. This is what creates the NAT mapping we want
+    // to probe — host punches to whatever external port maps from
+    // g_listen_port, so we MUST connect from g_listen_port.
+    BOOL reuse = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+               (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in local{};
+    local.sin_family      = AF_INET;
+    local.sin_port        = htons(g_listen_port);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, (sockaddr*)&local, sizeof(local)) != 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "TCP-STUN: resolve '%s' timed out: %s",
-                    host.c_str(), SDL_GetError());
-        NET_UnrefAddress(addr);
+                    "TCP-STUN: bind(local=%u) failed: %d",
+                    (unsigned)g_listen_port, WSAGetLastError());
+        closesocket(sock);
         return false;
     }
-    NET_StreamSocket* s = NET_CreateClientBound(
-        addr, (Uint16)hub_port, /*local_port=*/g_listen_port);
-    NET_UnrefAddress(addr);
-    if (!s) {
+
+    // Non-blocking connect so we can cap with select().
+    u_long nb = 1;
+    ioctlsocket(sock, FIONBIO, &nb);
+
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_port   = htons((uint16_t)hub_port);
+    remote.sin_addr   = hub_addr;
+    const int crc = connect(sock, (sockaddr*)&remote, sizeof(remote));
+    if (crc != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "TCP-STUN: NET_CreateClientBound -> %s:%d (local=%u) "
-                    "failed: %s",
-                    host.c_str(), hub_port, (unsigned)g_listen_port,
-                    SDL_GetError());
+                    "TCP-STUN: connect %s:%d failed: %d",
+                    resolved_ip, hub_port, WSAGetLastError());
+        closesocket(sock);
         return false;
     }
-    // Block up to 500ms for the connect to complete.
-    const int conn_rc = NET_WaitUntilConnected(s, 500);
-    if (conn_rc != 1) {
+
+    fd_set wfds; FD_ZERO(&wfds); FD_SET(sock, &wfds);
+    timeval tv{1, 0};   // 1s connect timeout
+    if (select(0, nullptr, &wfds, nullptr, &tv) <= 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "TCP-STUN: connect to %s:%d timed out (rc=%d): %s",
-                    host.c_str(), hub_port, conn_rc, SDL_GetError());
-        NET_DestroyStreamSocket(s);
+                    "TCP-STUN: connect %s:%d timed out (1s)",
+                    resolved_ip, hub_port);
+        closesocket(sock);
         return false;
     }
-    // Hub sends 8 bytes: 0xCD 0x02 [ip_be:4] [port_be:2]. Block up to
-    // 500ms for them to arrive.
-    if (NET_WaitUntilInputAvailable(reinterpret_cast<void**>(&s),
-                                    1, 500) <= 0) {
+    // Check SO_ERROR to confirm connect actually succeeded (writable
+    // can also mean immediate refusal in some stacks).
+    int so_err = 0; int so_len = sizeof(so_err);
+    getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&so_err, &so_len);
+    if (so_err != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "TCP-STUN: connect %s:%d refused: SO_ERROR=%d",
+                    resolved_ip, hub_port, so_err);
+        closesocket(sock);
+        return false;
+    }
+
+    // Hub sends 8 bytes: 0xCD 0x02 [ip_be:4] [port_be:2]. Block via
+    // select with 500ms cap.
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
+    timeval rtv{0, 500 * 1000};
+    if (select(0, &rfds, nullptr, nullptr, &rtv) <= 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "TCP-STUN: no reply from %s:%d in 500ms",
-                    host.c_str(), hub_port);
-        NET_DestroyStreamSocket(s);
+                    resolved_ip, hub_port);
+        closesocket(sock);
         return false;
     }
     uint8_t ack[8] = {};
     int total = 0;
     while (total < 8) {
-        const int n = NET_ReadFromStreamSocket(s, ack + total,
-                                               sizeof(ack) - total);
-        if (n < 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "TCP-STUN: read error: %s", SDL_GetError());
-            NET_DestroyStreamSocket(s);
-            return false;
-        }
-        if (n == 0) break;
+        const int n = recv(sock, (char*)ack + total, 8 - total, 0);
+        if (n <= 0) break;
         total += n;
     }
-    NET_DestroyStreamSocket(s);
+    closesocket(sock);
     if (total < 8 || ack[0] != 0xCD || ack[1] != 0x02) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "TCP-STUN: malformed reply (got %d bytes, magic %02X %02X)",

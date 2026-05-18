@@ -840,8 +840,29 @@ static NET_Status ResolveAddress(NET_Address *addr)
     struct addrinfo *ainfo = NULL;
     int rc;
 
+    // LOCAL PATCH (FM2K Rollback fork — wanwan): hints forced to AF_INET
+    // + AI_NUMERICHOST on literal-IPv4 input. Upstream's hints=NULL
+    // means AF_UNSPEC (queries both A and AAAA records); on Windows
+    // boxes with IPv6 enabled but no IPv6 connectivity (common consumer
+    // ISP setup) the AAAA query stalls the worker thread for seconds.
+    // Peers of FM2K spectator-mode joiners hit this and TCP-STUN
+    // timed out → wrong external port reported → cross-NAT spec failed
+    // silently. We're IPv4-only across the project so AF_INET is safe.
+    // AI_NUMERICHOST when input parses as IPv4 means getaddrinfo
+    // short-circuits without touching DNS at all — literal-IP resolves
+    // become essentially instant instead of taking a resolver-thread
+    // round-trip.
+    struct addrinfo hints;
+    SDL_zero(hints);
+    hints.ai_family = AF_INET;
+    {
+        struct in_addr probe;
+        if (inet_pton(AF_INET, addr->hostname, &probe) == 1) {
+            hints.ai_flags |= AI_NUMERICHOST;
+        }
+    }
     //SDL_Log("getaddrinfo '%s'", addr->hostname);
-    rc = getaddrinfo(addr->hostname, NULL, NULL, &ainfo);
+    rc = getaddrinfo(addr->hostname, NULL, &hints, &ainfo);
     //SDL_Log("rc=%d", rc);
     if (rc != 0) {
         addr->errstr = CreateGetAddrInfoErrorString(rc);

@@ -267,3 +267,20 @@ GekkoNetworkStats Netplay_GetNetworkStats();
 
 // Precise frame pacing - call after render (matches GekkoNet examples' handle_frame_time)
 void Netplay_HandleFrameTime();
+
+// =============================================================================
+// RUNAHEAD MID-MATCH TOGGLE + HEARTBEAT
+// =============================================================================
+
+// F8 hotkey toggles runahead between 0 and the user-configured "on" value.
+// WndProc subclass calls Netplay_RequestRunaheadToggle from the message-pump
+// thread; the actual gekko_set_runahead happens on the trampoline thread via
+// Netplay_PollRunaheadToggle, called at the top of every battle tick.
+void Netplay_RequestRunaheadToggle();
+void Netplay_PollRunaheadToggle();
+
+// [BEAT] heartbeat. Emits at most one INFO line per ~10s of battle
+// wall-clock with role/ping/jitter/FA/delay/ra/pred/rollback stats.
+// Safe to call every tick — internally rate-limited. No-op outside an
+// active battle session.
+void Netplay_TickHeartbeat();

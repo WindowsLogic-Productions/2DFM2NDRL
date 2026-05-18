@@ -41,3 +41,11 @@ void CssAutoConfirm_OnReplayMatchStart(uint8_t p1_char, uint8_t p1_color,
 // Reset on MATCH_END / battle-mode entry — re-engaged by the next
 // CssAutoConfirm_OnReplayMatchStart for back-to-back replay matches.
 void CssAutoConfirm_Disengage();
+
+// Enable/disable team-mode duplicate-slot lock. When enabled and team
+// mode (g_game_mode_flag == 2) is active, the hook masks each player's
+// confirm bits if their cursor would re-pick a character already locked
+// into one of their earlier team slots. Independent of the replay
+// auto-confirm path. Read from the FM2K_TEAM_CSS_DUPE_LOCK env var at
+// hook init; toggled per-game via the launcher's host config panel.
+void CssAutoConfirm_SetTeamDupeLock(bool enabled);

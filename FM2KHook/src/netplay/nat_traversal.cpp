@@ -481,4 +481,17 @@ bool UnwrapFromRelay(const uint8_t* data, size_t len,
     return true;
 }
 
+bool GetMatchTokenHex(char* out, size_t out_size) {
+    if (!out || out_size < 33) return false;
+    out[0] = '\0';
+    if (!g_match_token_set) return false;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < MATCH_TOKEN_LEN; ++i) {
+        out[i * 2 + 0] = hex[(g_match_token[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[g_match_token[i]        & 0xF];
+    }
+    out[MATCH_TOKEN_LEN * 2] = '\0';
+    return true;
+}
+
 }  // namespace fm2k::nat

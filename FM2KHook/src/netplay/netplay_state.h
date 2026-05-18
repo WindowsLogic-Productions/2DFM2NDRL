@@ -197,9 +197,21 @@ struct CtrlPacket {
         // host's TCP listener port — spectator MUST dial it to receive
         // the INPUT_BATCH / INITIAL_MATCH / MATCH_END stream. UDP carries
         // only handshake + heartbeat; TCP carries the bulk stream.
+        //
+        // host_p1_char / host_p2_char / host_stage carry the host's
+        // current battle char + stage indices when host_session_kind ==
+        // BATTLE (2). Spec hook seeds FM2K_BTB_* env vars from these so
+        // when the slot-0 /F dispatcher fires create_game_object(14,...)
+        // the engine loads the RIGHT character files (not mirror char 0)
+        // and the snapshot apply lands on a valid initial battle state.
+        // 0xFF means "unknown / not in battle" → leave BTB env unset.
         struct {
             uint8_t  host_session_kind;
             uint16_t host_tcp_port;
+            uint8_t  host_p1_char;   // FM2K char grid index (0..49), 0xFF=unset
+            uint8_t  host_p2_char;
+            uint8_t  host_stage;
+            uint8_t  reserved;
         } spec_join_ack;
 
         // SPEC_JOIN_REQ — viewer's mode preference.
@@ -217,15 +229,19 @@ struct CtrlPacket {
         } spec_join_req;
 
         // HOST_CONFIG — host's authoritative match settings, mirrored to
-        // client + spectators so everyone runs with identical rules. All
-        // fields are advisory: 0xFF / 0 means "leave at default; don't write."
+        // client + spectators so everyone runs with identical rules.
         // Address-mapped fields are written via direct memcpy to the
         // documented FM2K addresses inside the receiver.
+        //
+        // SENTINEL: 0xFFFFFFFF means "unset, don't apply" for ALL the
+        // uint32 fields (0xFF for socd_mode). Note that 0 is a VALID
+        // value for round_time_sec (= infinite timer) and round_count
+        // (engine reads as 0/special), so we can't use 0 to mean unset.
         struct {
-            uint32_t selected_stage;    // → FM2K::ADDR_SELECTED_STAGE (0x43010c on FM2K). 0xFFFFFFFF = unset
-            uint32_t round_count;       // best-of-N (1/3/5). 0 = unset
-            uint32_t round_time_sec;    // per-round time limit. 0 = unset
-            uint32_t game_speed_pct;    // 100 = normal. 0 = unset
+            uint32_t selected_stage;    // → FM2K::ADDR_SELECTED_STAGE (0x43010c on FM2K).
+            uint32_t round_count;       // → lParam @ 0x430124 (g_default_round, 1v1)
+            uint32_t round_time_sec;    // → lParam @ 0x430114 (loaded from TestPlay.time, default 60)
+            uint32_t game_speed_pct;    // → uValue @ 0x430104 (loaded from TestPlay.GameSpeed, default 10)
             uint8_t  socd_mode;         // 0..5 per Hook_GetSOCDMode. 0xFF = unset
             uint8_t  reserved[3];
         } host_config;

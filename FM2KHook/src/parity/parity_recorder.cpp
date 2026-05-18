@@ -49,6 +49,7 @@
 #include "../core/globals.h"  // Fm2k_BuildLogPath
 
 #include <kgt/kgt_parity_snapshot.h>
+#include <SDL3/SDL_log.h>
 #include <windows.h>
 
 #include <cstdio>
@@ -261,6 +262,40 @@ bool Open(const char* path) {
 void Capture() {
     if (!g_active_recorder || !g_active_recorder->fp) return;
 
+    // Diagnostic: log every capture with rng + frame_counter + buf_idx so
+    // we can pair host's captures with replay's captures across the
+    // entire run. Gated on FM2K_PARITY_CAPTURE_TRACE=1 — off by default.
+    {
+        static int s_trace_cached = -1;
+        if (s_trace_cached < 0) {
+            const char* v = std::getenv("FM2K_PARITY_CAPTURE_TRACE");
+            s_trace_cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (s_trace_cached == 1) {
+            const uint32_t rng = Read32(ADDR_RNG);
+            const uint32_t rfc = Read32(ADDR_FRAME_COUNTER);
+            const uint32_t buf_idx = Read32(ADDR_INPUT_BUF_INDEX);
+            // Hash char_dynamic[0] (p1's 57407-byte slot). Comparing this
+            // per-frame between host and replay pinpoints which character
+            // field differs, when parity's 92-byte player snap matches but
+            // engine state actually diverges. Fletcher32-style sum for
+            // cheap hashing (~57KB scan; called per Capture which fires
+            // once per battle frame).
+            constexpr uintptr_t CHAR_SLOT_0_BASE = 0x4D1D90;
+            constexpr size_t    CHAR_SLOT_SIZE   = 57407;
+            uint32_t s1 = 0xFFFF, s2 = 0xFFFF;
+            const uint8_t* p = (const uint8_t*)CHAR_SLOT_0_BASE;
+            for (size_t i = 0; i < CHAR_SLOT_SIZE; i++) {
+                s1 = (s1 + p[i]) % 65535;
+                s2 = (s2 + s1)   % 65535;
+            }
+            const uint32_t char0_crc = (s2 << 16) | s1;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[PARITY-CAPTURE] seq=%u rfc=%u buf=%u rng=0x%08X char0=0x%08X",
+                g_active_recorder->frames_written, rfc, buf_idx, rng, char0_crc);
+        }
+    }
+
     /* Patch initial_seed into the header on the first frame where FM2K
      * is in battle phase (g_game_mode == 3000). srand(time(NULL)) runs
      * during the title-to-CSS transition, well before battle. Capturing
@@ -300,8 +335,17 @@ void Capture() {
     snap.frame    = Read32(ADDR_FRAME_COUNTER);
     snap.rng      = Read32(ADDR_RNG);
 
-    /* Pull this frame's raw input from the ring at the current index. */
-    const uint32_t idx = Read32(ADDR_INPUT_BUF_INDEX) & 0x3FFu;  /* 1024 ring */
+    /* Raw input read at the current buf_idx slot. Known display artifact:
+     * record-vs-replay parity-snapshot input_p? fields diverge starting
+     * frame ~11 of stress mode (right after the first rollback boundary)
+     * even though every other field — rng, position, script, sysvars —
+     * still matches. The engines ARE deterministic; the parity recorder
+     * reads input_history[buf_idx] at a slightly different buf_idx on
+     * each side because the netplay AdvEvent callsite (record) sees a
+     * different post-update buf_idx than the SpectatorSimOneFrame
+     * callsite (replay) — likely due to rollback re-sim ordering.
+     * Diagnostic-only; doesn't affect actual replay determinism. */
+    const uint32_t idx = Read32(ADDR_INPUT_BUF_INDEX) & 0x3FFu;
     snap.input_p1 = Read32(ADDR_P1_INPUT_HISTORY + idx * 4u);
     snap.input_p2 = Read32(ADDR_P2_INPUT_HISTORY + idx * 4u);
 

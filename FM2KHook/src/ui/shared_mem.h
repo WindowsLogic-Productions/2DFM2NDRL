@@ -71,6 +71,14 @@ enum FM2KMatchOutcome : uint8_t {
     // distinct toast pointing the user at the hook log's manifest
     // dump so they can find the offending file.
     FM2K_MATCH_OUTCOME_HASH_MISMATCH = 6,
+    // GekkoNet caught a state checksum divergence between peers. We
+    // terminate the game on the first occurrence to (a) prevent users
+    // from playing on through corrupted sim state (which previously
+    // led to character_state_machine AVs at 0x4125FC after thousands
+    // of frames of cascading garbage) and (b) give us a clean,
+    // diagnostic-frozen state to inspect. No W/L/D recorded — the
+    // match's outcome is undefined once sim diverges.
+    FM2K_MATCH_OUTCOME_DESYNC      = 7,
 };
 
 struct FM2KSharedMemData {
@@ -240,6 +248,27 @@ struct FM2KSharedMemData {
     uint16_t tcp_stun_ext_port;
     uint16_t _pad_tcp_stun;
     uint32_t tcp_stun_seq;
+
+    // Hook → launcher: session phase (menu/CSS/battle).
+    //
+    // Drives the spectator-join /F boot decision: when another player
+    // requests to spectate us, the hub forwards our session_kind so
+    // their launcher knows whether to set FM2K_BOOT_TO_BATTLE=1 (we're
+    // in battle → spec /F-boots straight to battle and applies snapshot)
+    // or NOT (we're in CSS → spec walks title→CSS→battle naturally so
+    // its engine has CSS surfaces/state ready when the CSS snapshot
+    // applies at mode==2000).
+    //
+    // Updated by Hook_CheckGameModeTransition at every game_mode change:
+    //   0 = menu / title / unknown
+    //   1 = CSS (game_mode 2000)
+    //   2 = battle (game_mode 3000)
+    //
+    // Launcher polls session_kind_seq for changes and forwards via WS
+    // to the hub. Hub stores per-user and includes in spectate_grant.
+    uint8_t  session_kind;       // 0=menu, 1=css, 2=battle
+    uint8_t  _pad_session_kind[3];
+    uint32_t session_kind_seq;
 };
 
 // Bumped to 1024 to fit the v9 HUD block. Still under 4 KB which is
@@ -320,6 +349,12 @@ void SharedMem_PublishSpectatorPunchTarget(uint32_t ip_be, uint16_t udp_port,
 // Idempotent — safe to call repeatedly with the same value (won't bump
 // seq if values unchanged).
 void SharedMem_PublishExternalTcp(uint32_t ip_be, uint16_t port);
+
+// Publish the current session phase so the launcher can forward to hub.
+// Called from Hook_CheckGameModeTransition at every game_mode change.
+// Idempotent (no seq bump if kind unchanged).
+//   kind: 0=menu/unknown, 1=CSS (game_mode 2000), 2=battle (game_mode 3000)
+void SharedMem_PublishSessionKind(uint8_t kind);
 
 // Launcher-side write hook for the v6 stats feed. The launcher process
 // opens the same FM2K_SharedMem_<pid> mapping read-write and stuffs

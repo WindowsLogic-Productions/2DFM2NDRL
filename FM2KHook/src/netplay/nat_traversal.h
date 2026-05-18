@@ -50,6 +50,15 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
 // peer address when the packet authenticates via match_token.
 void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from);
 
+// Hex-encode the 16-byte match_token (32 chars) into `out` if it has
+// been latched (StartPunch was called). Returns true on success, false
+// if the token isn't set yet — in which case `out` is left as an empty
+// string. `out_size` must be >= 33 (32 hex chars + NUL).
+//
+// Same token on both peers post-NAT-punch; usable as a cross-peer
+// match identifier for tying together both sides' desync uploads.
+bool GetMatchTokenHex(char* out, size_t out_size);
+
 // =============================================================================
 // Relay fallback
 // =============================================================================

@@ -103,11 +103,19 @@ constexpr size_t   SPECTATOR_SNAPSHOT_CHUNK_BYTES = 16384;  // ~16KB / chunk
 
 #pragma pack(push, 1)
 struct SnapshotMetadata {
-    uint16_t version;       // SPECTATOR_SNAPSHOT_VERSION (= 1)
+    uint16_t version;             // SPECTATOR_SNAPSHOT_VERSION (= 1)
     uint16_t reserved0;
-    uint32_t total_bytes;   // SaveState blob size, summed across CHUNKs
-    uint32_t match_index;   // 0-based index of the match this snapshot covers
-    uint32_t reserved1;
+    uint32_t total_bytes;         // SaveState blob size, summed across CHUNKs
+    uint32_t match_index;         // 0-based index of the match this snapshot covers
+    // captured_game_mode: the g_game_mode value when the host captured
+    // this snapshot. Phase E (mid-CSS spectator join, v0.2.42+) writes
+    // 2000 for CSS-phase snapshots and 3000 for battle-phase snapshots.
+    //
+    // Backward-compat: pre-Phase-E hosts left this field as `reserved1`
+    // (always 0). The spec-side apply gate treats 0 as "battle-only
+    // capture", matching the v0.2.41 behavior (apply when spec reaches
+    // game_mode >= 3000). Hence the wire size + version stay the same.
+    uint32_t captured_game_mode;
 };
 static_assert(sizeof(SnapshotMetadata) == 16, "SnapshotMetadata must be 16 bytes");
 #pragma pack(pop)
@@ -387,6 +395,12 @@ SpectatorSnapshotInfo SpectatorNode_GetSnapshotInfo();
 // snapshot's INPUT-frame, and live broadcasts can resume.
 void SpectatorNode_ApplyPendingSnapshot();
 
+// Apply any queued PIN_RNG seed at battle-entry. Host emits PIN_RNG at
+// MATCH_START (= battle entry); replay defers application until its own
+// engine flips to game_mode 3000 so rng parity at battle frame 0 matches
+// host's recording. No-op if no PIN_RNG is queued.
+void SpectatorNode_ApplyPendingPinRng();
+
 // =============================================================================
 // SESSION REPLAY FILE WRITERS (C7)
 // =============================================================================
@@ -555,9 +569,16 @@ void SpectatorNode_SetRootAddr(const sockaddr_in& root);
 
 // Handle inbound SPEC_JOIN_ACK — upstream accepted us. host_session_kind
 // from the ACK payload (1=CSS, 2=BATTLE, 0=unknown/between-matches) is
-// used to create a matching GekkoSpectateSession.
+// used to create a matching GekkoSpectateSession. host_p1_char /
+// host_p2_char / host_stage carry the host's current battle chars when
+// host_session_kind == BATTLE (0xFF = unknown / not in battle); spec
+// seeds FM2K_BTB_* env vars from these so /F-boot loads the right
+// character files instead of the placeholder char 0.
 void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
-                                 uint16_t host_tcp_port);
+                                 uint16_t host_tcp_port,
+                                 uint8_t host_p1_char = 0xFF,
+                                 uint8_t host_p2_char = 0xFF,
+                                 uint8_t host_stage   = 0xFF);
 
 // Handle inbound SPEC_JOIN_REDIRECT — retry against redirect target.
 void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,

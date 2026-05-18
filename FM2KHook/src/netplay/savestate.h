@@ -131,6 +131,21 @@ struct SaveStateData {
         uint32_t gameplay_fingerprint;
         uint32_t combined;
 
+        // Raw scalar inputs to the fingerprint hash. Always captured (not gated
+        // by the 1/sec full-CRC throttle) so when a user desync shows
+        // "GameplayFingerprint DIFF" we can pinpoint WHICH scalar diverged
+        // forward-vs-replay without needing FM2K_FULL_CRCS enabled.
+        struct FingerprintInputs {
+            uint32_t rng;
+            uint32_t p1_hp;
+            uint32_t p2_hp;
+            uint32_t round_timer;
+            uint32_t game_timer;
+            uint32_t buf_idx;
+            uint16_t p1_input;
+            uint16_t p2_input;
+        } fp_in;
+
         // Per-object-slot CRCs. Engine-aware sizing: FM2K has 1024 × 382
         // (~391KB pool) and FM95 has 256 × 164 (~40KB pool). Diffing
         // forward-vs-replay localizes a desync to the exact slot index.
@@ -175,6 +190,11 @@ namespace WaveCAddrs {
 // SAVESTATE API
 // ============================================================================
 void SaveState_Init();
+// Reset buf_idx / render_frame_counter / input edge state to deterministic
+// values BEFORE the first AdvEvent. Pairs with the post-Init() teardown of
+// g_initial_sync_done by SaveState_Init(). Idempotent within a battle.
+// Must be called from Netplay_Start*Battle paths AFTER SaveState_Init().
+void SaveState_DoInitialSync();
 bool SaveState_Save(int frame);
 bool SaveState_Load(int frame);
 uint32_t SaveState_GetLastChecksum(int frame);
@@ -268,6 +288,11 @@ struct RegionChecksums {
     // players would see identical gameplay, only the internal memory layout
     // diverges due to per-process residue.
     uint32_t gameplay_fingerprint;
+
+    // Raw scalar inputs going into the fingerprint hash. Captured every save
+    // (not gated by the full-CRC throttle) so a desync dump can show exactly
+    // which scalar diverged forward-vs-replay.
+    SaveStateData::SavedRegionCRCs::FingerprintInputs fp_inputs;
 };
 
 const RegionChecksums& SaveState_GetRegionChecksums();

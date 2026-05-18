@@ -455,6 +455,11 @@ void HubClient::MatchEnded() {
     EnqueueOut("{\"type\":\"match_ended\"}");
 }
 
+void HubClient::UpdateSessionKind(const std::string& kind) {
+    EnqueueOut("{\"type\":\"session_kind\",\"value\":\"" +
+               EscapeJsonString(kind) + "\"}");
+}
+
 void HubClient::MatchResult(const std::string& match_id,
                             const std::string& outcome) {
     EnqueueOut("{\"type\":\"match_result\",\"match_id\":\"" +
@@ -1032,6 +1037,13 @@ void HubClient::OnMessage(const std::string& msg) {
         ev.spectate.opponent_nick = GetStr(msg, "opponent_nick");
         ev.spectate.host_ip       = GetStr(msg, "host_ip");
         ev.spectate.host_port     = GetInt(msg, "host_port", 0);
+        {
+            std::string sk = GetStr(msg, "session_kind");
+            if (sk == "menu" || sk == "css" || sk == "battle") {
+                ev.spectate.session_kind = std::move(sk);
+            }
+            // else: hub didn't supply — keep default "menu" from struct init
+        }
         EmitEvent(std::move(ev));
         return;
     }

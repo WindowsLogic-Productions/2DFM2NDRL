@@ -635,6 +635,56 @@ uint16_t Hook_ApplySOCD_Public(uint16_t input) {
     return Hook_ApplySOCD(input);
 }
 
+// Public autoplay-input computer. Mirrors the body of the
+// FM2K_PARITY_AUTOPLAY_BATTLE block inside Hook_GetPlayerInput so the
+// stress-mode `gekko_add_local_input` call site can feed gekko the
+// same per-player input the engine's Hook_GetPlayerInput would
+// dispatch. Keep these two implementations identical — they are the
+// shape of an autoplay determinism contract.
+uint16_t Hook_ComputeAutoplayBattleInput(int player_id) {
+    static int s_cache = -1;
+    if (s_cache < 0) {
+        const char* v = std::getenv("FM2K_PARITY_AUTOPLAY_BATTLE");
+        s_cache = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (s_cache != 1) return 0;
+    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    if (game_mode < 3000u || game_mode >= 4000u) return 0;
+
+    uint32_t seed = *(uint32_t*)0x447EE0;
+    seed ^= (uint32_t)player_id * 0x9E3779B9u;
+    seed = (seed ^ (seed >> 16)) * 0x7feb352du;
+    seed = (seed ^ (seed >> 15)) * 0x846ca68bu;
+    seed = seed ^ (seed >> 16);
+    const uint32_t phase = (seed >> 28) & 0x7u;
+    const uint32_t dirbits = (seed >> 8) & 0xFu;
+    const uint32_t btnbits = (seed >> 4) & 0xFu;
+    uint16_t out = 0;
+    switch (phase) {
+        case 0:
+        case 1:
+            out = 0; break;
+        case 2:
+            out = (uint16_t)(dirbits & 0xFu); break;
+        case 3:
+            out = (uint16_t)((1u << (4 + (btnbits & 3u)))); break;
+        case 4:
+            out = (uint16_t)((dirbits & 0xFu) | (1u << (4 + (btnbits & 3u)))); break;
+        case 5:
+            out = (uint16_t)((1u << (4 + (btnbits & 3u))) |
+                             (1u << (4 + ((btnbits >> 2) & 3u))));
+            break;
+        case 6:
+            out = (uint16_t)(1u << (dirbits & 3u)); break;
+        case 7:
+            out = (uint16_t)(0x4u | (1u << (4 + (btnbits & 3u))));
+            break;
+    }
+    if ((out & 0x3u) == 0x3u) out &= ~0x3u;
+    if ((out & 0xCu) == 0xCu) out &= ~0xCu;
+    return out;
+}
+
 static inline uint16_t Hook_ApplySOCD(uint16_t input) {
     constexpr uint16_t LEFT  = 0x001;
     constexpr uint16_t RIGHT = 0x002;
@@ -820,6 +870,19 @@ static void CheckGameModeTransition() {
     if (current_mode != g_last_game_mode) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "Hooks: game_mode changed: %u -> %u", g_last_game_mode, current_mode);
+
+        // Publish session_kind to SharedMem so the launcher can forward
+        // it to the hub. Used by the spectator-join /F decision: when
+        // someone requests to spectate us, the hub returns our current
+        // session_kind in spectate_grant so their launcher knows
+        // whether to set FM2K_BOOT_TO_BATTLE=1 (we're in battle) or
+        // not (we're in CSS — spec needs natural CSS init for the
+        // CSS-state snapshot to apply cleanly at mode==2000).
+        uint8_t kind = 0;  // menu / unknown
+        if (current_mode == 2000u) kind = 1;            // CSS
+        else if (current_mode >= 3000u && current_mode < 4000u)
+            kind = 2;                                    // battle
+        SharedMem_PublishSessionKind(kind);
 
         // Auto-capture banner pipeline. Drives one screenshot at each
         // mode-boundary the launcher's capture-runner cares about,
@@ -1250,6 +1313,97 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 if ((frame % 30u) == 0u) out = Z;
             }
             // mode >= 3000: idle (out stays 0)
+            //
+            // FM2K_PARITY_AUTOPLAY_BATTLE=1 keeps injecting inputs during
+            // battle. Pattern: every 12 frames pulse button A + a random-
+            // looking direction so character_state_machine fires attack
+            // edges and projectile spawns. Used by autonomous Phase F
+            // stress runs to exercise RNG-consuming actions that idle
+            // stress doesn't cover (~hours of idle stress passes clean,
+            // but user-reported desyncs cluster on active gameplay).
+            else if (game_mode >= 3000u && game_mode < 4000u) {
+                static int s_battle_play_cached = -1;
+                if (s_battle_play_cached < 0) {
+                    const char* v = std::getenv("FM2K_PARITY_AUTOPLAY_BATTLE");
+                    s_battle_play_cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+                }
+                // Stress + autoplay coexistence: when a battle netplay
+                // session is active, SKIP this autoplay path entirely and
+                // let the netplay branch downstream pick up g_p?_input
+                // (which netplay.cpp populated with the same autoplay
+                // values via gekko). Without this skip, the engine and the
+                // .fm2krep see different input streams: engine sims with
+                // autoplay-computed values, .fm2krep records the
+                // gekko-delivered values. The replay re-runs with the
+                // .fm2krep values and produces different state.
+                if (s_battle_play_cached == 1 && Netplay_IsActive()) {
+                    // out stays 0 here; the netplay-active gate at the
+                    // bottom of this block will skip the autoplay return
+                    // so the netplay branch can supply g_p?_input.
+                } else if (s_battle_play_cached == 1) {
+                    // Pseudo-random battle inputs DETERMINISTIC under
+                    // rollback. Derived from g_input_buffer_index (the
+                    // engine's authoritative per-tick counter at
+                    // 0x447EE0, part of saved InputTracking region) +
+                    // player_id, hashed through a splitmix32-like
+                    // function. Same frame → same input, every time,
+                    // forward and replay both. Different per-frame
+                    // entropy than a fixed pattern, so the test
+                    // exercises hit-stop, super-cancel, projectile
+                    // spawn, throw whiff, etc. — the RNG-consuming
+                    // code paths a fixed cycle wouldn't reach.
+                    //
+                    // ABSOLUTELY do not pull from a static counter
+                    // (s_call_count etc.) — that counter advances
+                    // EVERY Hook_GetPlayerInput call including replay
+                    // re-invocations, so forward sim_N and replay
+                    // sim_N would see different "random" outputs and
+                    // the test would diverge from itself. Last
+                    // iteration of this code did exactly that and
+                    // produced a frame-4 false-positive desync.
+                    uint32_t seed = *(uint32_t*)0x447EE0;
+                    seed ^= (uint32_t)player_id * 0x9E3779B9u;
+                    // splitmix32
+                    seed = (seed ^ (seed >> 16)) * 0x7feb352du;
+                    seed = (seed ^ (seed >> 15)) * 0x846ca68bu;
+                    seed = seed ^ (seed >> 16);
+                    // Holdable buttons: A (0x10), B (0x20), C (0x40),
+                    // D (0x80). Hold for ~10-15 frames so commands
+                    // register, then release. Directions: L (0x01),
+                    // R (0x02), U (0x04), D (0x08).
+                    //
+                    // Phase split into 3 bits: which input "mode" the
+                    // PRNG picks this frame.
+                    const uint32_t phase = (seed >> 28) & 0x7u;
+                    const uint32_t dirbits = (seed >> 8) & 0xFu;
+                    const uint32_t btnbits = (seed >> 4) & 0xFu;
+                    switch (phase) {
+                        case 0:  // idle (give engine time to settle)
+                        case 1:
+                            out = 0; break;
+                        case 2:  // pure directional (movement)
+                            out = (uint16_t)(dirbits & 0xFu); break;
+                        case 3:  // single button tap
+                            out = (uint16_t)((1u << (4 + (btnbits & 3u)))); break;
+                        case 4:  // direction + button (special move setup)
+                            out = (uint16_t)((dirbits & 0xFu) | (1u << (4 + (btnbits & 3u)))); break;
+                        case 5:  // multi-button (super / parry attempt)
+                            out = (uint16_t)((1u << (4 + (btnbits & 3u))) | (1u << (4 + ((btnbits >> 2) & 3u))));
+                            break;
+                        case 6:  // long-hold of one direction (walk)
+                            out = (uint16_t)(1u << (dirbits & 3u)); break;
+                        case 7:  // jump-cancel-style (UP + button)
+                            out = (uint16_t)(0x4u | (1u << (4 + (btnbits & 3u))));
+                            break;
+                    }
+                    // SOCD-cleaner expects no L+R or U+D simultaneously;
+                    // strip the conflicts at the source so the engine
+                    // doesn't have to reject them (same effect as
+                    // Hook_ApplySOCD mode 1, applied earlier).
+                    if ((out & 0x3u) == 0x3u) out &= ~0x3u;
+                    if ((out & 0xCu) == 0xCu) out &= ~0xCu;
+                }
+            }
 
             /* Diagnostic: log on first hit + every game_mode change AND
              * every 120 frames once we hit battle (game_mode >= 3000) so
@@ -1291,7 +1445,17 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 s_last_logged_mode = game_mode;
                 if (periodic) s_last_periodic = frame;
             }
-            return capture_and_return((int)out);
+            // Stress + autoplay + active battle netplay: don't short-circuit
+            // here. Fall through to the netplay branch below so the engine
+            // consumes g_p?_input (the gekko-delivered value, which is the
+            // SAME autoplay value via the netplay.cpp gekko_add_local_input
+            // path). End result: engine input == spec-stream input == .fm2krep
+            // input — replay reproduces record deterministically.
+            if (game_mode >= 3000u && game_mode < 4000u && Netplay_IsActive()) {
+                // Skip return; let the netplay branch handle it.
+            } else {
+                return capture_and_return((int)out);
+            }
         }
     }
 
@@ -2389,6 +2553,16 @@ static void RngTrace_ResolveOnce() {
 }
 }
 
+// Public API: flush the rng-trace FILE buffer. Called from netplay.cpp's
+// auto-terminate path before TerminateProcess, so the trace records that
+// are still in stdio's user-space buffer reach disk. Safe no-op when the
+// trace isn't enabled.
+void Hook_FlushRngTrace() {
+    if (g_rng_trace_fp) {
+        std::fflush(g_rng_trace_fp);
+    }
+}
+
 // Hook: GameRand
 // Records the call to the trace file (if enabled) then forwards.
 uint32_t __cdecl Hook_GameRand() {
@@ -2396,19 +2570,37 @@ uint32_t __cdecl Hook_GameRand() {
     if (!g_rng_trace_enabled) {
         return original_game_rand ? original_game_rand() : 0;
     }
+    // Read direct caller (0x004139A8 wrapper). For the caller-OF-caller
+    // (which would identify the actual game function), walk the frame
+    // pointer chain manually with a guard. __builtin_return_address(1)
+    // AVs inside MinHook's trampoline because the trampoline doesn't
+    // preserve EBP. Instead we read EBP, dereference for the caller's
+    // saved EBP, then read [EBP+4] for the caller-of-caller's return
+    // address. Wrapped with IsBadReadPtr to avoid AV on broken chains.
     const uint32_t ret_addr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    uint32_t ret_addr_2 = 0;
+    {
+        uintptr_t cur_bp = (uintptr_t)__builtin_frame_address(0);
+        // Walk one frame up: *(bp) = caller's saved bp; *(bp+4) = caller's return addr
+        // Then walk one more: *(caller_bp) = caller-of-caller's saved bp; *(caller_bp+4) = its return
+        // We want caller-of-caller's return addr.
+        if (cur_bp && !IsBadReadPtr((void*)cur_bp, 8)) {
+            uintptr_t caller_bp = *(uintptr_t*)cur_bp;
+            if (caller_bp && !IsBadReadPtr((void*)caller_bp, 8)) {
+                ret_addr_2 = *(uint32_t*)(caller_bp + 4);
+            }
+        }
+    }
     const uint32_t pre  = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
     const uint32_t r    = original_game_rand ? original_game_rand() : 0;
     const uint32_t post = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
     if (g_rng_trace_fp &&
         (g_rng_trace_max_calls == 0 || g_rng_call_index < g_rng_trace_max_calls))
     {
-        uint32_t rec[4] = {
-            (uint32_t)g_rng_call_index, ret_addr, pre, post
+        uint32_t rec[6] = {
+            (uint32_t)g_rng_call_index, ret_addr, ret_addr_2, pre, post, 0,
         };
         std::fwrite(rec, 1, sizeof(rec), g_rng_trace_fp);
-        // Flush every 10k calls (~100 frames at ~100 calls/frame) so a
-        // process kill loses at most ~1 sec of trace.
         if ((g_rng_call_index & 0x1FFFu) == 0) std::fflush(g_rng_trace_fp);
     }
     ++g_rng_call_index;
@@ -2678,6 +2870,27 @@ bool InitializeHooks() {
             "Hooks: CssAutoConfirm_Install failed — offline replay will fall "
             "back to natural CSS traversal (likely picks wrong chars)");
     }
+    // Test-harness CSS auto-confirm: arm the same auto-confirm path used
+    // by .fm2krep replay, but driven by env var so a 2-instance loopback
+    // netplay test can advance through CSS without keyboard input. Both
+    // peers must see the SAME values for gekko CSS sync to land on the
+    // same chars/stage. Format: FM2K_TEST_AUTO_CSS=p1char,p1color,p2char,p2color,stage
+    // (decimal bytes). Default chars/colors/stage = 0 (= first option).
+    // Test-harness FM2K_TEST_AUTO_CSS now ONLY enables the gekko input
+    // pulse in Netplay_ProcessCSSInputPhase — no direct CssAutoConfirm
+    // memory pinning. CssAutoConfirm was designed for single-instance
+    // offline replay; in 2-peer netplay it produced asymmetric CSS-state
+    // transitions (P1 reached battle, P2 didn't) because gekko's
+    // confirmed-input stream and CssAutoConfirm's direct-memory writes
+    // race differently per peer. With pulse-only, both peers' engines
+    // see the same gekko-delivered confirm rising edges and transition
+    // CSS→battle through normal engine code, in lockstep.
+    {
+        const char* env = std::getenv("FM2K_TEST_AUTO_CSS");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Hooks: FM2K_TEST_AUTO_CSS env='%s' (pulse-only mode)",
+            env ? env : "(null)");
+    }
 
     // Per-game damage multiplier — only installs the hook if
     // FM2K_DAMAGE_MULT_PCT is set and != 100, so default users don't pay
@@ -2839,6 +3052,13 @@ bool InitializeHooks() {
                      "Hooks: MH_ApplyQueued failed: %d", (int)apply);
         return false;
     }
+
+    // CSM dispatch-loop diagnostic. Off by default; FM2K_CSM_DIAG=1 installs
+    // a SafetyHook MidHook at 0x412564 that dumps obj state per call. Used
+    // by the replay-self-test bisect to find the char_dynamic field that
+    // differs between host and replay at the script-divergence frame.
+    extern void Hook_InstallCsmDiag();
+    Hook_InstallCsmDiag();
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: All hooks installed successfully");
     return true;

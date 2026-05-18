@@ -14,6 +14,7 @@
 #include "MinHook.h"
 
 #include "../core/globals.h"  // FM2K::ADDR_GAME_MODE, ADDR_*
+#include "per_game_patches.h" // PerGamePatches_GetTeamSizeOverride
 
 namespace {
 
@@ -31,6 +32,14 @@ constexpr uintptr_t ADDR_STAGE_WIDTH        = 0x004452B8;  // u16
 constexpr uintptr_t ADDR_STAGE_HEIGHT       = 0x004452BA;  // u16
 constexpr uintptr_t ADDR_SELECTED_STAGE     = 0x0043010C;
 constexpr uintptr_t ADDR_GAME_MODE          = 0x00470054;
+
+// Team-mode dupe-lock supplementary addresses (verified via IDA disasm
+// of game_state_manager @ 0x40752F and vs_round_function @ 0x408A07).
+constexpr uintptr_t ADDR_GAME_MODE_FLAG     = 0x00470058;  // 0=story, 1=VS, 2=team
+constexpr uintptr_t ADDR_P1_TEAM_HISTORY    = 0x0047006C;  // g_player_move_history (u32×4: P1 team chars)
+constexpr uintptr_t ADDR_P2_TEAM_HISTORY    = 0x0047007C;  // g_p2_round_history_chars (u32×4: P2 team chars)
+constexpr uintptr_t ADDR_P1_TEAM_SLOT_COUNT = 0x004700EC;  // g_p1_round_count — # P1 chars locked so far
+constexpr uintptr_t ADDR_P2_TEAM_SLOT_COUNT = 0x004700F0;  // g_p1_round_state — # P2 chars locked so far (P2 counter, despite the name)
 
 // AssignPlayerColor @ 0x406F20 reads `input_changes & 0x3E0` (bits 5..9) to
 // pick color slot 1..5; if none of those bits set, the function falls
@@ -79,7 +88,79 @@ std::atomic<uint8_t> g_target_stage_id{0};
 // CSS doesn't blast the log file with 100+ "pinning chars" lines.
 std::atomic<uint32_t> g_pin_tick{0};
 
+// Team-mode dupe-lock toggle. Set from FM2K_TEAM_CSS_DUPE_LOCK env var at
+// hook init; flipped per-game via the launcher's host config panel.
+std::atomic<bool> g_team_dupe_lock{false};
+
+// Apply team-mode dupe-lock: in team mode CSS, mask each player's confirm
+// bits if their cursor would land on a character already locked into one
+// of their earlier team slots. Engine writes the cursor's selected char
+// to g_player_move_history[round_count*4] (P1) / g_p2_round_history_chars
+// [round_state*4] (P2) at confirm time without dedup; this masks the
+// confirm bits BEFORE the engine sees them so the slot doesn't advance.
+void ApplyTeamDupeLock() {
+    if (!g_team_dupe_lock.load(std::memory_order_relaxed)) return;
+    if (*(const uint32_t*)ADDR_GAME_MODE_FLAG != 2u) return;       // team mode only
+    if (*(const uint32_t*)ADDR_GAME_MODE      != 2000u) return;    // CSS phase only
+
+    const int*       selected   = (const int*)ADDR_SELECTED_CHAR;
+    uint32_t*        in_changes = (uint32_t*)ADDR_INPUT_CHANGES;
+    const uint32_t*  p1_hist    = (const uint32_t*)ADDR_P1_TEAM_HISTORY;
+    const uint32_t*  p2_hist    = (const uint32_t*)ADDR_P2_TEAM_HISTORY;
+    const uint32_t   p1_locked  = *(const uint32_t*)ADDR_P1_TEAM_SLOT_COUNT;
+    const uint32_t   p2_locked  = *(const uint32_t*)ADDR_P2_TEAM_SLOT_COUNT;
+
+    // Cap iteration at 4 (storage size of each history array).
+    const uint32_t p1_n = p1_locked > 4u ? 4u : p1_locked;
+    const uint32_t p2_n = p2_locked > 4u ? 4u : p2_locked;
+
+    for (uint32_t i = 0; i < p1_n; ++i) {
+        if (p1_hist[i] == (uint32_t)selected[0]) {
+            in_changes[0] &= ~0x3F0u;  // suppress confirm
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < p2_n; ++i) {
+        if (p2_hist[i] == (uint32_t)selected[1]) {
+            in_changes[1] &= ~0x3F0u;
+            break;
+        }
+    }
+}
+
+// Address of g_team_round_setting (live runtime team count, 0x470064).
+// game_state_manager copies g_team_round → here at CSS init; we re-write
+// every frame after the original to ensure our override sticks.
+constexpr uintptr_t ADDR_G_TEAM_ROUND_SETTING = 0x00470064;
+
 char __cdecl Hook_GameStateManager() {
+    // OPTION-cycle title→CSS apply runs FIRST. Must fire BEFORE the
+    // original game_state_manager STATE 0 body so CSS init sees the
+    // final g_game_mode_flag (e.g. 1P→2P hijack writes flag=1 before
+    // STATE 0 reads it to dispatch 1-cursor vs 2-cursor CSS init).
+    PerGamePatches_OnGameStateManagerEntry();
+
+    // Team-mode dupe-lock runs independently of the replay auto-confirm
+    // path — they're orthogonal features that both happen to live in the
+    // same hook because MinHook only allows one detour per function.
+    ApplyTeamDupeLock();
+
+    // Team size override — apply BEFORE original so the natural copy
+    // from g_team_round at game_state_manager STATE 0 (init CSS) sees
+    // our value via g_team_round (we also re-write g_team_round_setting
+    // post-call below for paths that don't re-read from g_team_round).
+    {
+        const int override = PerGamePatches_GetTeamSizeOverride();
+        if (override >= 2 && override <= 8) {
+            // Write to g_team_round (the INI source the engine copies from).
+            DWORD old_protect;
+            if (VirtualProtect((void*)0x00430128, 4, PAGE_READWRITE, &old_protect)) {
+                *(uint32_t*)0x00430128 = (uint32_t)override;
+                VirtualProtect((void*)0x00430128, 4, old_protect, &old_protect);
+            }
+        }
+    }
+
     if (g_active.load(std::memory_order_relaxed)) {
         const uint32_t game_mode = *(uint32_t*)ADDR_GAME_MODE;
         if (game_mode == 2000u) {
@@ -175,7 +256,21 @@ char __cdecl Hook_GameStateManager() {
         }
     }
 
-    return g_orig ? g_orig() : 0;
+    char ret = g_orig ? g_orig() : 0;
+
+    // Team size override — second pass, AFTER the engine ran. The engine
+    // copies g_team_round → g_team_round_setting at CSS init (state 0);
+    // we re-stamp g_team_round_setting directly so any subsequent game
+    // logic reading it during this frame sees our override even on
+    // frames that don't run state 0 (most frames).
+    {
+        const int override = PerGamePatches_GetTeamSizeOverride();
+        if (override >= 2 && override <= 8) {
+            *(uint32_t*)ADDR_G_TEAM_ROUND_SETTING = (uint32_t)override;
+        }
+    }
+
+    return ret;
 }
 
 }  // namespace
@@ -225,6 +320,13 @@ void CssAutoConfirm_Disengage() {
     }
 }
 
+void CssAutoConfirm_SetTeamDupeLock(bool enabled) {
+    g_team_dupe_lock.store(enabled, std::memory_order_relaxed);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "CssAutoConfirm: team-mode dupe-lock %s",
+        enabled ? "ENABLED" : "disabled");
+}
+
 #else  // ENGINE_FM95 — separate state machine, separate hand-off
 
 #include "css_autoconfirm.h"
@@ -232,5 +334,6 @@ void CssAutoConfirm_Disengage() {
 bool CssAutoConfirm_Install()                              { return true; }
 void CssAutoConfirm_OnReplayMatchStart(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
 void CssAutoConfirm_Disengage()                            {}
+void CssAutoConfirm_SetTeamDupeLock(bool)                  {}
 
 #endif

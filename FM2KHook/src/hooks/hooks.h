@@ -38,4 +38,25 @@ bool IsBattleMode(uint32_t mode);
 // resolved input).
 uint16_t Hook_ApplySOCD_Public(uint16_t input);
 
+// Compute the deterministic-pseudo-random battle-autoplay input value
+// for player_id (0=P1, 1=P2). Seeded from g_input_buffer_index (saved
+// in InputTracking on every rollback save) so forward sim_N and replay
+// sim_N produce identical values. Returns 0 when:
+//   - FM2K_PARITY_AUTOPLAY_BATTLE env var isn't set
+//   - we're not in battle phase (game_mode != 3000..3999)
+// Exposed so the stress-mode `gekko_add_local_input` site feeds the
+// same per-player input that the engine's Hook_GetPlayerInput would
+// otherwise dispatch to. Without this, gekko's input pipeline sees
+// keyboard (typically 0 unless focused) → .fm2krep records 0/0 → the
+// replay re-runs with 0/0 even though the original sim consumed
+// autoplay values. The replay-vs-record divergence at frame 0 was
+// this exact mismatch.
+uint16_t Hook_ComputeAutoplayBattleInput(int player_id);
+
+// Flush the buffered FM2K_RNG_TRACE=1 log to disk. Called by the
+// harness auto-terminate path before TerminateProcess to avoid losing
+// trace bytes that are still in stdio's user-space buffer. Safe no-op
+// when the trace isn't enabled.
+void Hook_FlushRngTrace();
+
 #endif // HOOKS_H

@@ -1,5 +1,6 @@
 #include "wndproc_subclass.h"
 #include "../netplay/control_channel.h"
+#include "../netplay/netplay.h"   // Netplay_RequestRunaheadToggle (F8 hotkey)
 #include "../core/globals.h"   // FM2K::kIsFM2K / kIsFM95, g_spectator_*
 #include <SDL3/SDL_log.h>
 #include <windows.h>
@@ -63,6 +64,15 @@ static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
         // 1x. Title-bar shows "[FF]" while active. Swallowed before
         // game-input layer so it doesn't accidentally drive any FM2K
         // CSS/title menu (none of our games bind F12, but we're polite).
+        //
+        // F8: runahead on/off toggle (live, mid-match). Queues a
+        // request; the actual gekko_set_runahead call happens on the
+        // trampoline thread at the top of the next battle tick via
+        // Netplay_PollRunaheadToggle so we never touch GekkoNet state
+        // from this WindowProc thread. user_pref is set by the
+        // FM2K_RUNAHEAD env var (default 6); F8 flips between 0 and
+        // that value. Swallow so the game's input layer never sees
+        // the keystroke.
         case WM_KEYDOWN:
             if (wparam == VK_F12 && g_spectator_mode) {
                 g_spectator_ff_user = !g_spectator_ff_user;
@@ -72,9 +82,14 @@ static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg,
                             g_spectator_ff_user ? "ON" : "OFF");
                 return 0;
             }
+            if (wparam == VK_F8) {
+                Netplay_RequestRunaheadToggle();
+                return 0;
+            }
             break;
         case WM_KEYUP:
             if (wparam == VK_F12 && g_spectator_mode) return 0;
+            if (wparam == VK_F8) return 0;
             break;
         case WM_SYSCHAR:
             // Suppresses the "ding" Alt+letter would otherwise emit.
