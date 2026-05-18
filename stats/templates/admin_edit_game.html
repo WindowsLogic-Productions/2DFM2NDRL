@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Admin · Edit {{ rec.name or rec.game_id }} · 2DFM HUB{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>Edit · {{ rec.name or rec.game_id }}</h1>
+  <p class="lede">
+    Editing as <strong>{{ editor.nick or "?" }}</strong> ·
+    cabinet ID <code>{{ rec.game_id }}</code> ·
+    <a href="/g/{{ rec.game_id }}">view public page</a> ·
+    <a href="/admin/g/{{ rec.game_id }}/merge">merge</a> ·
+    <a href="/admin/">back to list</a>
+    {% if rec.aliased_ids %}
+    <br><small class="muted">aliased game_ids: {{ rec.aliased_ids|join(', ') }}</small>
+    {% endif %}
+    {% if rec.imported_from %}
+    <br><small class="muted">imported_from: {{ rec.imported_from }}</small>
+    {% endif %}
+  </p>
+</section>
+
+{% if saved %}
+<p class="empty" style="color: var(--green);">// saved</p>
+{% endif %}
+
+<form method="post" action="/admin/g/{{ rec.game_id }}/save"
+      style="display:flex; flex-direction: column; gap: 1.5rem;">
+
+  {# ── Identity / display ──────────────────────────────────────── #}
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">DISPLAY</legend>
+    <div class="cols-2" style="gap: 1rem;">
+      <label style="display:block;">
+        <span class="lbl">Name</span>
+        <input type="text" name="name" value="{{ rec.name or '' }}" style="width:100%;">
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Year</span>
+        <input type="text" name="year" value="{{ rec.year or '' }}" style="width:100%;">
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Developer</span>
+        <input type="text" name="developer" value="{{ rec.developer or '' }}" style="width:100%;">
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Publisher</span>
+        <input type="text" name="publisher" value="{{ rec.publisher or '' }}" style="width:100%;">
+      </label>
+    </div>
+    <label style="display:block; margin-top: 0.75rem;">
+      <span class="lbl">Alt names <small class="muted">(comma- or newline-separated)</small></span>
+      <textarea name="alt_names" rows="2" style="width:100%;">{{ rec.alt_names|join(', ') if rec.alt_names else '' }}</textarea>
+    </label>
+    <label style="display:block; margin-top: 0.75rem;">
+      <span class="lbl">Description</span>
+      <textarea name="description" rows="3" style="width:100%;">{{ rec.description or '' }}</textarea>
+    </label>
+  </fieldset>
+
+  {# ── Canonical URLs ──────────────────────────────────────────── #}
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">CANONICAL URLS</legend>
+    <label style="display:block;">
+      <span class="lbl">Homepage</span>
+      <input type="url" name="homepage" value="{{ rec.homepage or '' }}" style="width:100%;">
+    </label>
+    <label style="display:block; margin-top: 0.5rem;">
+      <span class="lbl">Wayback homepage <small class="muted">(manual override of auto-resolved value)</small></span>
+      <input type="url" name="wayback_homepage" value="{{ rec.wayback_homepage or '' }}" style="width:100%;">
+    </label>
+    <label style="display:block; margin-top: 0.5rem;">
+      <span class="lbl">Purchase URL <small class="muted">(for paid games — DLsite, DMM, etc.)</small></span>
+      <input type="url" name="purchase_url" value="{{ rec.purchase_url or '' }}" style="width:100%;">
+    </label>
+  </fieldset>
+
+  {# ── Resources ──────────────────────────────────────────────── #}
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">RESOURCES</legend>
+    <p class="empty" style="margin: 0 0 0.75rem;">
+      Open-ended list of links: wikis, mirrors, discords, GameFAQs, store pages, downloads.
+      Empty rows are dropped on save. Last 3 rows are blanks for new entries.
+    </p>
+    <table class="grid" style="width:100%;">
+      <thead>
+        <tr>
+          <th style="width: 100px;">Kind</th>
+          <th>URL</th>
+          <th>Label / Name</th>
+          <th>Desc</th>
+          <th>Wayback URL</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in resources_padded %}
+        <tr>
+          <td>
+            <select name="resource_{{ loop.index0 }}_kind">
+              {% for k in ALLOWED_KINDS %}
+              <option value="{{ k }}"{% if r.kind == k %} selected{% elif not r.kind and k == 'other' %} selected{% endif %}>{{ k }}</option>
+              {% endfor %}
+            </select>
+          </td>
+          <td><input type="url" name="resource_{{ loop.index0 }}_url" value="{{ r.url or '' }}" style="width:100%;"></td>
+          <td><input type="text" name="resource_{{ loop.index0 }}_label" value="{{ r.label or r.name or '' }}" style="width:100%;"></td>
+          <td><input type="text" name="resource_{{ loop.index0 }}_desc" value="{{ r.desc or '' }}" style="width:100%;"></td>
+          <td><input type="url" name="resource_{{ loop.index0 }}_archive_url" value="{{ r.archive_url or r.wayback or '' }}" style="width:100%;"></td>
+        </tr>
+        {# Preserve provenance — pass source through hidden field so an  #}
+        {# atwiki-crawler row stays attributed even after edit; manual   #}
+        {# rows default to "manual" in the normalizer.                   #}
+        <input type="hidden" name="resource_{{ loop.index0 }}_source" value="{{ r.source or 'manual' }}">
+        {% endfor %}
+      </tbody>
+    </table>
+  </fieldset>
+
+  <div style="display:flex; gap: 0.75rem; align-items: center;">
+    <button type="submit"
+            style="padding: 0.6rem 1.5rem; background: var(--green);
+                   border: 0; color: #000; cursor: pointer; font-weight: bold;">SAVE</button>
+    <a href="/admin/g/{{ rec.game_id }}" style="opacity: 0.6;">cancel / reload</a>
+    <span style="margin-left: auto; opacity: 0.5; font-size: 0.85rem;">
+      Audit log: <code>stats/editlog.jsonl</code>
+    </span>
+  </div>
+
+</form>
+
+{# Delete is its own form so accidental enter-to-submit on the edit form #}
+{# can't trigger it. Requires retyping the game_id as a confirmation     #}
+{# token.                                                                #}
+<section style="margin-top: 3rem; padding: 1rem;
+                border: 1px solid var(--red); opacity: 0.85;">
+  <h2 style="color: var(--red); margin: 0 0 0.5rem;">Danger zone</h2>
+  <p class="empty" style="margin: 0 0 0.75rem;">
+    Deletes this row from <code>games/registry.json</code>. Match history
+    in <code>matches.json</code> is not touched — orphaned matches will
+    aggregate without a display name. To preserve match history, use
+    <a href="/admin/g/{{ rec.game_id }}/merge" style="color: var(--blue);">merge</a> instead.
+  </p>
+  <form method="post" action="/admin/g/{{ rec.game_id }}/delete"
+        style="display:flex; gap: 0.5rem; align-items: center;">
+    <input type="text" name="confirm" placeholder="retype game_id to confirm" required
+           style="padding: 0.5rem; flex:1; max-width: 300px;
+                  background: rgba(0,0,0,0.4);
+                  border: 1px solid var(--red); color: inherit;">
+    <button type="submit"
+            style="padding: 0.5rem 1.25rem; background: var(--red);
+                   border: 0; color: #000; cursor: pointer; font-weight: bold;">DELETE</button>
+    <span style="opacity: 0.6;">expecting <code>{{ rec.game_id }}</code></span>
+  </form>
+</section>
+
+{% endblock %}

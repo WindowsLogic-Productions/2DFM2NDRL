@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Admin · New Game · 2DFM HUB{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>New Game</h1>
+  <p class="lede">
+    Add a registry row for a game we don't have catalogued yet.
+    Editing as <strong>{{ editor.nick or "?" }}</strong> ·
+    <a href="/admin/">back to list</a>
+  </p>
+</section>
+
+{% if err %}
+<p class="empty" style="color: var(--red);">// {{ err|replace('+',' ') }}</p>
+{% endif %}
+
+<form method="post" action="/admin/new"
+      style="display:flex; flex-direction: column; gap: 1rem; max-width: 760px;">
+
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">REQUIRED</legend>
+    <label style="display:block;">
+      <span class="lbl">Display name</span>
+      <input type="text" name="name" value="{{ prefill_name }}" required style="width:100%;">
+    </label>
+    <label style="display:block; margin-top: 0.75rem;">
+      <span class="lbl">game_id <small class="muted">(primary key — lower-case, digits, hyphens; e.g. <code>chaos-striker</code>)</small></span>
+      <input type="text" name="game_id" required pattern="[a-z0-9][a-z0-9-]{1,79}"
+             style="width:100%; font-family: monospace;">
+    </label>
+  </fieldset>
+
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">METADATA</legend>
+    <div class="cols-2" style="gap: 1rem;">
+      <label style="display:block;">
+        <span class="lbl">Engine</span>
+        <select name="engine" style="width:100%;">
+          <option value="FM2K" selected>FM2K</option>
+          <option value="FM95">FM95</option>
+        </select>
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Year</span>
+        <input type="text" name="year" style="width:100%;">
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Developer</span>
+        <input type="text" name="developer" style="width:100%;">
+      </label>
+      <label style="display:block;">
+        <span class="lbl">Publisher</span>
+        <input type="text" name="publisher" style="width:100%;">
+      </label>
+    </div>
+    <label style="display:block; margin-top: 0.75rem;">
+      <span class="lbl">Alt names <small class="muted">(comma- or newline-separated)</small></span>
+      <textarea name="alt_names" rows="2" style="width:100%;"></textarea>
+    </label>
+    <label style="display:block; margin-top: 0.75rem;">
+      <span class="lbl">Description</span>
+      <textarea name="description" rows="3" style="width:100%;"></textarea>
+    </label>
+  </fieldset>
+
+  <fieldset style="border: 1px solid var(--line-bright); padding: 1rem;">
+    <legend style="padding: 0 0.5rem; opacity: 0.7;">LINKS (OPTIONAL)</legend>
+    <label style="display:block;">
+      <span class="lbl">Homepage</span>
+      <input type="url" name="homepage" style="width:100%;">
+    </label>
+    <label style="display:block; margin-top: 0.5rem;">
+      <span class="lbl">Purchase URL <small class="muted">(for paid games — DLsite, DMM, Booth, etc.)</small></span>
+      <input type="url" name="purchase_url" style="width:100%;">
+    </label>
+    <label style="display:block; margin-top: 0.5rem;">
+      <span class="lbl">atwiki ID <small class="muted">(numeric, e.g. <code>86</code>; the page URL is built automatically)</small></span>
+      <input type="text" name="atwiki_id" pattern="[0-9]+" style="width:100%; max-width: 200px; font-family: monospace;">
+    </label>
+  </fieldset>
+
+  <p class="empty" style="margin: 0;">
+    Tip: after creating, you'll land on the per-game editor where you can add resources, wayback URLs, and version hashes.
+  </p>
+
+  <div style="display:flex; gap: 0.75rem; align-items: center;">
+    <button type="submit"
+            style="padding: 0.6rem 1.5rem; background: var(--green);
+                   border: 0; color: #000; cursor: pointer; font-weight: bold;">CREATE</button>
+    <a href="/admin/" style="opacity: 0.6;">cancel</a>
+  </div>
+</form>
+
+{% endblock %}

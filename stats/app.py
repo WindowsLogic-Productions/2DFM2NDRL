@@ -90,11 +90,15 @@ async def security_headers(request: Request, call_next):
     response. Inline scripts are disallowed by default-src + script-src,
     so any future XSS attempt fails to execute."""
     response = await call_next(request)
+    # Public pages still ban inline scripts (script-src 'self' allows
+    # only same-origin .js files — no inline tags, no eval). The admin
+    # editor at /admin/* needs JS for live editing; we ship that as a
+    # static file (/static/admin.js), which 'self' permits.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "img-src 'self' data:; "
         "style-src 'self' 'unsafe-inline'; "
-        "script-src 'none'; "
+        "script-src 'self'; "
         "frame-ancestors 'none'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -191,7 +195,12 @@ _registry_cache: dict[str, Any] = {"mtime": -1.0, "by_id": {}}
 def load_registry() -> dict[str, dict[str, Any]]:
     """Return {game_id: record} for the current registry. Empty dict
     when the file is absent or corrupt — callers fall back to raw
-    game_id rendering in that case."""
+    game_id rendering in that case.
+
+    Both the primary game_id AND any aliased_ids[] resolve to the same
+    record. This lets old game_id values (preserved during a rename)
+    keep finding their renamed game so match history doesn't orphan.
+    """
     try:
         st = REGISTRY_PATH.stat()
     except OSError:
@@ -211,9 +220,25 @@ def load_registry() -> dict[str, dict[str, Any]]:
         if not gid:
             continue
         by_id[gid] = r
+        # Aliased ids (left over from rename or merge) point at the
+        # same record. Collisions across two records would have been
+        # rejected by the rename/merge endpoints; if one slips through
+        # anyway, the latest entry wins.
+        for alias in (r.get("aliased_ids") or []):
+            if alias and alias != gid:
+                by_id[alias] = r
     _registry_cache["mtime"] = st.st_mtime
     _registry_cache["by_id"] = by_id
     return by_id
+
+
+def primary_game_id(any_id: str) -> str:
+    """Resolve an id (which may be the primary or an alias) to the
+    record's current primary game_id. Returns the input untouched if
+    no registry entry exists (e.g. matches recorded for a game that
+    never made it into the registry)."""
+    rec = load_registry().get(any_id)
+    return rec.get("game_id", any_id) if rec else any_id
 
 
 def game_friendly_name(game_id: str) -> str:
@@ -402,31 +427,109 @@ def aggregate_user(user_id: str) -> dict[str, Any]:
 
 
 def aggregate_game(game_id: str) -> dict[str, Any]:
-    matches = [m for m in load_matches() if m["game_id"] == game_id]
+    # Pull matches recorded under either the current game_id or any
+    # of the record's previous aliases. matches.json keys by game_id
+    # and we never rewrite it, so aliased history would otherwise
+    # orphan after a rename.
+    rec = load_registry().get(game_id) or {}
+    aliases = set(rec.get("aliased_ids") or [])
+    aliases.add(rec.get("game_id") or game_id)
+    matches = [m for m in load_matches() if m["game_id"] in aliases]
     if not matches:
+        meta = game_meta(game_id)
+        archive = {
+            "atwiki_id":        meta.get("atwiki_id"),
+            "atwiki_url":       meta.get("atwiki_url"),
+            "homepage":         meta.get("homepage"),
+            "wayback_homepage": meta.get("wayback_homepage"),
+            "archive_status":   meta.get("archive_status"),
+            "resources":        meta.get("resources") or [],
+            "versions":         meta.get("versions") or [],
+        }
         return {"game_id": game_id, "total": 0, "top_players": [],
-                "top_chars": [], "recent": []}
+                "top_chars": [], "recent": [], "archive": archive}
 
     by_player: Counter = Counter()
-    by_char:   Counter = Counter()
     by_player_nick: dict[str, str] = {}
+    # Per-character record keyed by char label. Tracks pick count plus
+    # W/L/D so the template can render winrate alongside picks. Draws
+    # are split between both characters (count toward neither W nor L,
+    # only the picks total). The winner_id field is empty string on
+    # draws — that's the sentinel we key off.
+    char_stats: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"picks": 0, "wins": 0, "losses": 0, "draws": 0})
     for m in matches:
         by_player[m["p1_id"]] += 1
         by_player[m["p2_id"]] += 1
         by_player_nick[m["p1_id"]] = m["p1_nick"]
         by_player_nick[m["p2_id"]] = m["p2_nick"]
-        by_char[char_label(m["p1_char_name"], m["p1_char_id"])] += 1
-        by_char[char_label(m["p2_char_name"], m["p2_char_id"])] += 1
+
+        c1 = char_label(m["p1_char_name"], m["p1_char_id"])
+        c2 = char_label(m["p2_char_name"], m["p2_char_id"])
+        char_stats[c1]["picks"] += 1
+        char_stats[c2]["picks"] += 1
+        wid = m["winner_id"]
+        if not wid:
+            char_stats[c1]["draws"] += 1
+            char_stats[c2]["draws"] += 1
+        elif wid == m["p1_id"]:
+            char_stats[c1]["wins"] += 1
+            char_stats[c2]["losses"] += 1
+        elif wid == m["p2_id"]:
+            char_stats[c2]["wins"] += 1
+            char_stats[c1]["losses"] += 1
 
     top_players = [
         {"user_id": uid, "nick": by_player_nick[uid], "matches": n}
         for uid, n in by_player.most_common(20)
     ]
-    top_chars = [{"char": c, "matches": n} for c, n in by_char.most_common(20)]
+
+    # Build the full character roster (no cap). Winrate excludes draws
+    # from the denominator since "what's the win-rate of this char?"
+    # most naturally reads as wins / decisive games. Sort by pick
+    # count desc; ties broken by winrate desc so the same-pick chars
+    # surface the strongest first.
+    #
+    # The "?" label is the fallback for player slots where both
+    # char_name and char_id resolved to null — see char_label(). It's
+    # not a real character; surface only as a data-quality footnote
+    # via top_chars_skipped, kept out of the visible leaderboard.
+    top_chars: list[dict[str, Any]] = []
+    top_chars_skipped: dict[str, int] = {}
+    for c, s in char_stats.items():
+        if c == "?":
+            top_chars_skipped["unknown_picks"] = s["picks"]
+            continue
+        decisive = s["wins"] + s["losses"]
+        winrate = (s["wins"] / decisive) if decisive else 0.0
+        top_chars.append({
+            "char":    c,
+            "matches": s["picks"],
+            "wins":    s["wins"],
+            "losses":  s["losses"],
+            "draws":   s["draws"],
+            "winrate": winrate,
+        })
+    top_chars.sort(key=lambda r: (-r["matches"], -r["winrate"]))
+
     recent = sorted(matches, key=lambda m: -m["finished_at"])[:20]
+    # Archive panel — pulled from the registry (populated by
+    # tools/atwiki_merge_to_registry.py). Templates render only when
+    # at least one archive field is present, so games not in atwiki
+    # gracefully fall through to the original layout.
+    meta = game_meta(game_id)
+    archive = {
+        "atwiki_id":         meta.get("atwiki_id"),
+        "atwiki_url":        meta.get("atwiki_url"),
+        "homepage":          meta.get("homepage"),
+        "wayback_homepage":  meta.get("wayback_homepage"),
+        "archive_status":    meta.get("archive_status"),
+        "resources":         meta.get("resources") or [],
+        "versions":          meta.get("versions") or [],
+    }
     return {"game_id": game_id, "total": len(matches),
             "top_players": top_players, "top_chars": top_chars,
-            "recent": recent}
+            "recent": recent, "archive": archive}
 
 
 def aggregate_character(game_id: str, char_key: str) -> dict[str, Any]:
@@ -589,11 +692,22 @@ def user_page(request: Request, user_id: str):
 
 @app.get("/g/{game_id}", response_class=HTMLResponse)
 def game_page(request: Request, game_id: str):
+    # If someone hits an old aliased URL, 301 to the renamed one so
+    # bookmarks / external links keep working but settle on canonical.
+    primary = primary_game_id(game_id)
+    if primary != game_id:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=f"/g/{primary}", status_code=301)
     if not game_id or len(game_id) > 64:
         raise HTTPException(status_code=404)
     data = aggregate_game(game_id)
-    if data["total"] == 0:
-        raise HTTPException(status_code=404, detail="No matches for this game.")
+    # 404 only when we have neither match history nor any registry/
+    # archive data to render. The page is also useful as a static
+    # info card for games we've cataloged but never played on the hub.
+    if data["total"] == 0 and not (data.get("archive") or {}).get("atwiki_id"):
+        meta = game_meta(game_id)
+        if not meta or not meta.get("name"):
+            raise HTTPException(status_code=404, detail="Unknown game.")
     return templates.TemplateResponse("game.html",
         {"request": request, "g": data, "char_label": char_label,
          "format_iso": format_iso})
@@ -705,3 +819,12 @@ async def not_found(request: Request, exc: HTTPException):
         {"request": request, "detail": getattr(exc, "detail", None)},
         status_code=404,
     )
+
+
+# ─── Admin editor (mounted under /admin) ─────────────────────────────────
+# Trusted-user write surface. Auth is bearer-token via cookie or
+# Authorization header — see stats/admin.py for the model.
+import admin as _admin       # noqa: E402  (imported after handlers above)
+_admin.set_registry_path(REGISTRY_PATH)
+_admin.attach_templates(templates)
+app.include_router(_admin.router)

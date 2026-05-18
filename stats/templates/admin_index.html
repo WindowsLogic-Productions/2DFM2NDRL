@@ -1,0 +1,426 @@
+{% extends "base.html" %}
+{% block title %}Admin · Games · 2DFM HUB{% endblock %}
+{% block body_class %}page-admin{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>Admin · Games</h1>
+  <p class="lede">
+    Editing as <strong>{{ editor.nick or "?" }}</strong> ·
+    {{ rows|length }} game{{ 's' if rows|length != 1 else '' }} listed
+    <form method="post" action="/admin/logout" style="display:inline; margin-left: 1rem;">
+      <button type="submit" style="background: none; border: 0; color: var(--red);
+                                    cursor: pointer; font-size: 0.85rem;">[ logout ]</button>
+    </form>
+  </p>
+</section>
+
+<section style="margin-bottom: 1rem;">
+  {# Single GET form so all filters submit together. The selects     #}
+  {# auto-submit on change (no JS needed: form has onsubmit, the     #}
+  {# selects use form attribute to submit). Hidden inputs preserve   #}
+  {# sort/status across submissions.                                  #}
+  <form method="get" action="/admin/" id="filter-form" style="display:flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;">
+    <input type="text" name="q" value="{{ q }}" placeholder="search name / id / dev / publisher / alt"
+           style="flex:1; min-width: 200px; padding: 0.5rem; background: rgba(0,0,0,0.4);
+                  border: 1px solid var(--line-bright); color: inherit;">
+    <select name="dev" class="auto-submit"
+            style="padding: 0.5rem; background: rgba(0,0,0,0.4);
+                   border: 1px solid var(--line-bright); color: inherit;
+                   min-width: 180px; max-width: 280px;">
+      <option value="">— any developer ({{ dev_options|length }}) —</option>
+      {% for d in dev_options %}
+      <option value="{{ d.name }}"{% if dev == d.name %} selected{% endif %}>{{ d.name }} ({{ d.count }})</option>
+      {% endfor %}
+    </select>
+    <select name="engine" class="auto-submit"
+            style="padding: 0.5rem; background: rgba(0,0,0,0.4);
+                   border: 1px solid var(--line-bright); color: inherit;">
+      <option value="">— any engine —</option>
+      {% for e in engine_options %}
+      <option value="{{ e.name }}"{% if engine == e.name %} selected{% endif %}>{{ e.name }} ({{ e.count }})</option>
+      {% endfor %}
+    </select>
+    {% if sort %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
+    {% if dir %}<input type="hidden" name="dir" value="{{ dir }}">{% endif %}
+    {% if active_statuses %}<input type="hidden" name="status" value="{{ active_statuses|join(',') }}">{% endif %}
+    <button type="submit" style="padding: 0.5rem 1rem; background: var(--blue);
+                                  border: 0; color: #000; cursor: pointer;">SEARCH</button>
+    {% if q or dev or engine %}<a href="/admin/?{% if active_statuses %}status={{ active_statuses|join(',') }}{% endif %}" style="padding: 0.5rem 1rem; align-self: center;">clear</a>{% endif %}
+    <button type="button" id="toggle-new"
+            style="padding: 0.5rem 1rem; background: var(--green);
+                   border: 0; color: #000; cursor: pointer; font-weight: bold;">+ NEW GAME</button>
+  </form>
+
+  <div class="filter-chips">
+    <span style="opacity: 0.6; font-size: 0.78rem; align-self: center;">FILTER:</span>
+    {% for st in filter_statuses %}
+      {% set is_active = st in active_statuses %}
+      {% set new_list = [] %}
+      {% for s in active_statuses if s != st %}{% set _ = new_list.append(s) %}{% endfor %}
+      {% if not is_active %}{% set _ = new_list.append(st) %}{% endif %}
+      {% set new_csv = new_list | sort | join(',') %}
+      {% set qs = [] %}
+      {% if q %}{% set _ = qs.append('q=' + q) %}{% endif %}
+      {% if sort %}{% set _ = qs.append('sort=' + sort) %}{% endif %}
+      {% if dir %}{% set _ = qs.append('dir=' + dir) %}{% endif %}
+      {% if dev %}{% set _ = qs.append('dev=' + dev) %}{% endif %}
+      {% if engine %}{% set _ = qs.append('engine=' + engine) %}{% endif %}
+      {% if new_csv %}{% set _ = qs.append('status=' + new_csv) %}{% endif %}
+      <a class="filter-chip archive-{{ st|lower }} {% if is_active %}active{% else %}dim{% endif %}"
+         href="/admin/?{{ qs|join('&amp;') }}">{{ st|replace('_', ' ') }}</a>
+    {% endfor %}
+    {% if active_statuses %}
+      {% set qs = [] %}
+      {% if q %}{% set _ = qs.append('q=' + q) %}{% endif %}
+      {% if sort %}{% set _ = qs.append('sort=' + sort) %}{% endif %}
+      {% if dir %}{% set _ = qs.append('dir=' + dir) %}{% endif %}
+      {% if dev %}{% set _ = qs.append('dev=' + dev) %}{% endif %}
+      {% if engine %}{% set _ = qs.append('engine=' + engine) %}{% endif %}
+      <a class="filter-chip" href="/admin/?{{ qs|join('&amp;') }}"
+         style="opacity: 0.7; border-color: var(--red); color: var(--red);">× clear filter</a>
+    {% endif %}
+  </div>
+</section>
+
+{# New-game card — hidden by default, toggled by the "+ NEW GAME" #}
+{# button. Submit posts to /admin/api/g and reloads on success.   #}
+<div class="new-game-card">
+  <h2 style="margin: 0 0 0.5rem;">New Game</h2>
+  <form class="new-game-form">
+    <div class="ed-grid" style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem 1rem; margin-bottom: 1rem;">
+      <label class="span2">Display name
+        <input type="text" name="name" required></label>
+      <label class="span2">game_id <small style="opacity:0.5;">[a-z0-9-]</small>
+        <input type="text" name="game_id" pattern="[a-z0-9][a-z0-9-]{1,79}" required></label>
+      <label>Engine
+        <select name="engine">
+          <option value="FM2K" selected>FM2K</option>
+          <option value="FM95">FM95</option>
+        </select></label>
+      <label>Year <input type="text" name="year"></label>
+      <label>Developer <input type="text" name="developer"></label>
+      <label>Publisher <input type="text" name="publisher"></label>
+      <label class="span2">Homepage <input type="url" name="homepage"></label>
+      <label class="span2">Purchase URL <input type="url" name="purchase_url"></label>
+      <label class="span4">Alt names <small style="opacity:0.5;">(comma-sep)</small>
+        <input type="text" name="alt_names"></label>
+      <label class="span4">Description <textarea name="description"></textarea></label>
+    </div>
+    <button type="submit" style="padding: 0.5rem 1.5rem; background: var(--green);
+                                  border: 0; color: #000; cursor: pointer;
+                                  font-weight: bold;">CREATE</button>
+  </form>
+</div>
+
+<section>
+  <div class="sec-head">
+    <h2>Registry</h2>
+    <span class="count">// CLICK A COLUMN TO SORT · {{ rows|length }} SHOWN · CLICK "EDIT" FOR INLINE PANEL</span>
+  </div>
+
+  {% macro hdr(col, label, num=False) %}
+    {% set new_dir = 'desc' if (sort == col and dir == 'asc') else 'asc' %}
+    {% set arrow = ('↑' if dir == 'asc' else '↓') if sort == col else '' %}
+    {% set qs = [] %}
+    {% set _ = qs.append('sort=' + col) %}
+    {% set _ = qs.append('dir=' + new_dir) %}
+    {% if q %}{% set _ = qs.append('q=' + q) %}{% endif %}
+    {% if dev %}{% set _ = qs.append('dev=' + dev) %}{% endif %}
+    {% if engine %}{% set _ = qs.append('engine=' + engine) %}{% endif %}
+    {% if active_statuses %}{% set _ = qs.append('status=' + (active_statuses|sort|join(','))) %}{% endif %}
+    <th{% if num %} class="num"{% endif %}>
+      <a href="/admin/?{{ qs|join('&amp;') }}"
+         style="color: inherit; text-decoration: none;{% if sort == col %} color: var(--blue);{% endif %}">{{ label }}{% if arrow %} <span style="opacity:0.6;">{{ arrow }}</span>{% endif %}</a>
+    </th>
+  {% endmacro %}
+
+  {% if rows %}
+  <div class="registry-wrap">
+  <table class="grid">
+    <thead>
+      <tr>
+        {{ hdr('game_id', 'game_id') }}
+        {{ hdr('name', 'Name') }}
+        {{ hdr('engine', 'Engine') }}
+        {{ hdr('year', 'Year') }}
+        {{ hdr('developer', 'Developer') }}
+        <th>Resources</th>
+        {{ hdr('n_versions', 'Versions', num=True) }}
+        {{ hdr('atwiki_id', 'atwiki') }}
+        {{ hdr('archive_status', 'Status') }}
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr data-game-id="{{ r.game_id }}">
+        <td><code style="opacity:0.6;">{{ r.game_id }}</code></td>
+        <td>{{ r.name }}</td>
+        <td>{{ r.engine }}</td>
+        <td>{{ r.year }}</td>
+        <td>
+          {% if r.developer %}
+            {# Click a developer name to filter the list to just that
+               dev's games. Preserves search/sort/status filters.    #}
+            {% set qs = ['dev=' + r.developer] %}
+            {% if q %}{% set _ = qs.append('q=' + q) %}{% endif %}
+            {% if sort %}{% set _ = qs.append('sort=' + sort) %}{% endif %}
+            {% if dir %}{% set _ = qs.append('dir=' + dir) %}{% endif %}
+            {% if engine %}{% set _ = qs.append('engine=' + engine) %}{% endif %}
+            {% if active_statuses %}{% set _ = qs.append('status=' + (active_statuses|sort|join(','))) %}{% endif %}
+            <a href="/admin/?{{ qs|join('&amp;') }}"
+               style="color: var(--blue); text-decoration: none;"
+               title="Filter to games by {{ r.developer }}">{{ r.developer }}</a>
+          {% endif %}
+        </td>
+        <td>
+          {% if r.purchase_url %}
+            <span class="res-row">
+              <a href="{{ r.purchase_url }}" target="_blank" rel="noopener"
+                 class="badge src" style="background: var(--pink); color: #000;"
+                 title="Purchase / store URL">$ buy</a>
+            </span>
+          {% endif %}
+          {% for x in r.resources %}
+            {% if x.url %}
+              {% set _label = (x.label or x.kind or 'link')[:32] %}
+              <span class="res-row">
+                <a href="{{ x.url }}" target="_blank" rel="noopener"
+                   class="badge src"
+                   title="{{ x.kind }}{% if x.desc %} — {{ x.desc }}{% endif %} · {{ x.url }}">
+                  <span style="opacity:0.6;">{{ x.kind }}</span> {{ _label }}{% if x.desc %} ✱{% endif %}
+                </a>
+                {% if x.archive_url %}
+                  {% set _is_synth = (x.preferred in ('wayback_calendar', 'wayback_closest')) %}
+                  <a href="{{ x.archive_url }}" target="_blank" rel="noopener"
+                     class="badge"
+                     style="background: {% if _is_synth %}rgba(120,120,160,0.4){% else %}rgba(80,160,80,0.4){% endif %}; margin-left: 0.15rem;"
+                     title="{% if _is_synth %}Wayback closest available — pick a snapshot manually{% else %}Resolved Wayback snapshot{% endif %}">
+                    {% if _is_synth %}wayback?{% else %}wayback ✓{% endif %}
+                  </a>
+                {% endif %}
+              </span>
+            {% endif %}
+          {% endfor %}
+          {% if not r.purchase_url and not r.resources %}
+            <span class="muted" style="opacity:0.4;">—</span>
+          {% endif %}
+          <span class="muted" style="opacity:0.4; font-size: 0.8em;">({{ r.n_resources }})</span>
+        </td>
+        <td class="num">{{ r.n_versions }}</td>
+        <td>{% if r.atwiki_id %}<code>{{ r.atwiki_id }}</code>{% endif %}</td>
+        <td>
+          {% if r.archive_status %}<span class="archive-status archive-{{ r.archive_status|lower }}">{{ r.archive_status|replace('_',' ') }}</span>{% endif %}
+          {% if r.held_by %}<br><small class="held-count" title="Held by: {{ r.held_by|join(', ') }}">👥 {{ r.held_by|length }} editor{{ 's' if r.held_by|length != 1 else '' }}</small>{% endif %}
+        </td>
+        <td><button type="button" class="edit-toggle" data-target="ep-{{ r.game_id }}">edit</button></td>
+      </tr>
+      {# Editor panel — hidden by default, toggled by the edit button.   #}
+      {# Each .editor-panel binds to its game_id and contains all the    #}
+      {# editable fields + resource sub-list + danger/merge zone. JS in  #}
+      {# /static/admin.js wires up auto-save on blur and remove buttons. #}
+      <tr class="editor-panel-row">
+        <td colspan="10">
+          <div class="editor-panel" id="ep-{{ r.game_id }}" data-game-id="{{ r.game_id }}">
+            <div class="save-status" data-state="idle">
+              <span class="save-status-text">All changes saved automatically — type, then click outside the field to save.</span>
+            </div>
+            <div class="ed-grid">
+              {# DISPLAY #}
+              <label class="span2">Display name
+                <input type="text" data-field="name" value="{{ r.name or '' }}"></label>
+              <label class="span2">Alt names <small style="opacity:0.5;">(comma-sep)</small>
+                <input type="text" data-field="alt_names" value="{{ r.alt_names|join(', ') if r.alt_names else '' }}"></label>
+              <label>Engine
+                <select data-field="engine">
+                  <option value="FM2K"{% if r.engine == 'FM2K' %} selected{% endif %}>FM2K</option>
+                  <option value="FM95"{% if r.engine == 'FM95' %} selected{% endif %}>FM95</option>
+                </select></label>
+              <label>Year <input type="text" data-field="year" value="{{ r.year or '' }}"></label>
+              <label>Developer <input type="text" data-field="developer" value="{{ r.developer or '' }}"></label>
+              <label>Publisher <input type="text" data-field="publisher" value="{{ r.publisher or '' }}"></label>
+              <label class="span4">Description
+                <textarea data-field="description">{{ r.description or '' }}</textarea></label>
+
+              {# CANONICAL URLS #}
+              <label class="span2">Homepage
+                <input type="url" data-field="homepage" value="{{ r.homepage or '' }}"></label>
+              <label class="span2">Wayback homepage
+                <input type="url" data-field="wayback_homepage" value="{{ r.wayback_homepage or '' }}"></label>
+              <label class="span2">Purchase URL <small style="opacity:0.5;">(paid storefronts)</small>
+                <input type="url" data-field="purchase_url" value="{{ r.purchase_url or '' }}"></label>
+              <label class="span2">Download URL <small style="opacity:0.5;">(direct, free)</small>
+                <input type="url" data-field="download_url" value="{{ r.download_url or '' }}"></label>
+              <label class="span2">Banner URL
+                <input type="url" data-field="banner_url" value="{{ r.banner_url or '' }}"></label>
+              <label class="span2">Thumb URL
+                <input type="url" data-field="thumb_url" value="{{ r.thumb_url or '' }}"></label>
+
+              {# ATWIKI + STATUS #}
+              <label>atwiki ID
+                <input type="text" data-field="atwiki_id" value="{{ r.atwiki_id or '' }}"></label>
+              <label>atwiki URL
+                <input type="url" data-field="atwiki_url" value="{{ r.atwiki_url or '' }}"></label>
+              <label>atwiki match
+                <input type="text" data-field="atwiki_match_method" value="{{ r.atwiki_match_method or '' }}"></label>
+              <label>Archive status
+                <select data-field="archive_status">
+                  <option value=""{% if not r.archive_status %} selected{% endif %}>(none)</option>
+                  {% for st in ALLOWED_STATUSES %}
+                  <option value="{{ st }}"{% if r.archive_status == st %} selected{% endif %}>{{ st|replace('_', ' ') }}</option>
+                  {% endfor %}
+                </select></label>
+              <label class="span2">I have it locally
+                {% set you_hold = editor_nick in (r.held_by or []) %}
+                <div class="held-controls">
+                  <button type="button" class="btn-held-toggle{% if you_hold %} active{% endif %}"
+                          data-game-id="{{ r.game_id }}" data-you-hold="{{ '1' if you_hold else '0' }}">
+                    {% if you_hold %}✓ You hold a copy{% else %}+ I have this{% endif %}
+                  </button>
+                  <span class="held-list">
+                    {% if r.held_by %}
+                    Also held by:
+                    {% for n in r.held_by if n != editor_nick %}<span class="held-nick">{{ n }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+                    {% else %}<span class="muted">no one yet</span>{% endif %}
+                  </span>
+                </div>
+              </label>
+
+              {# IDENTITY (lists) #}
+              <label class="span2">kgt_filename
+                <input type="text" data-field="kgt_filename" value="{{ r.kgt_filename or '' }}"></label>
+              <label class="span2">exe_stems <small style="opacity:0.5;">(comma-sep)</small>
+                <input type="text" data-field="exe_stems" value="{{ r.exe_stems|join(', ') if r.exe_stems else '' }}"></label>
+              <label class="span2">Sources <small style="opacity:0.5;">(comma-sep — atwiki, manual, MyAbandonware…)</small>
+                <input type="text" data-field="sources" value="{{ r.sources|join(', ') if r.sources else '' }}"></label>
+              <label class="span2">Characters <small style="opacity:0.5;">(comma-sep)</small>
+                <input type="text" data-field="characters" value="{{ r.characters|join(', ') if r.characters else '' }}"></label>
+              <label class="span2">Stages <small style="opacity:0.5;">(comma-sep)</small>
+                <input type="text" data-field="stages" value="{{ r.stages|join(', ') if r.stages else '' }}"></label>
+              <label class="span2">aliased game_ids <small style="opacity:0.5;">(from merges)</small>
+                <input type="text" data-field="aliased_ids" value="{{ r.aliased_ids|join(', ') if r.aliased_ids else '' }}"></label>
+
+              {# PROVENANCE #}
+              <label class="span2">Imported from
+                <input type="text" data-field="imported_from" value="{{ r.imported_from or '' }}"></label>
+              <label class="span2">Created by
+                <input type="text" data-field="created_by" value="{{ r.created_by or '' }}"></label>
+            </div>
+
+            <h3 style="margin: 0.5rem 0; font-size: 0.95rem;">Versions ({{ r.versions|length }})</h3>
+            <p class="empty" style="margin: 0 0 0.4rem; font-size: 0.85rem;">
+              Manual entries (just a label like <code>v0.1</code>) work without bytes — useful to track what builds exist out there. Hash-tracked entries (with xxh64) come from the auto-crossref pipeline. Each version has its own "I have this" toggle so editors can flag which specific build they hold.
+            </p>
+            <div class="ver-list">
+              {% for v in r.versions %}
+              {% set you_hold_ver = editor_nick in (v.held_by or []) %}
+              <div class="ver-edit-row" data-vidx="{{ loop.index0 }}">
+                <input type="text" data-vfield="label" value="{{ v.label or '' }}" placeholder="v0.1 / final / etc.">
+                <input type="text" data-vfield="xxh64" value="{{ v.xxh64 or '' }}" placeholder="xxh64 (optional)" {% if v.xxh64 and v.source != 'manual' %}readonly{% endif %}>
+                <input type="text" data-vfield="size_bytes" value="{{ v.size_bytes or '' }}" placeholder="size">
+                <select data-vfield="source">
+                  {% for s in ['manual', 'local', 'archive', 'local+archive', 'unknown'] %}
+                  <option value="{{ s }}"{% if v.source == s %} selected{% endif %}>{{ s }}</option>
+                  {% endfor %}
+                </select>
+                <button type="button" class="btn-ver-held{% if you_hold_ver %} active{% endif %}" data-vidx="{{ loop.index0 }}">
+                  {% if you_hold_ver %}✓ you{% else %}+ I have{% endif %}
+                </button>
+                <span class="ver-held-list">
+                  {% for n in v.held_by or [] if n != editor_nick %}<span class="held-nick">{{ n }}</span>{% if not loop.last %} {% endif %}{% endfor %}
+                </span>
+                <button type="button" class="btn-del btn-del-version" title="remove this version">×</button>
+              </div>
+              {% if v.match_known or v.from_archive or v.exe_path %}
+              <div class="ver-meta">
+                {% if v.match_known %}<span class="badge known">{{ v.match_known }}</span>{% endif %}
+                {% if v.from_archive %}<small class="muted">from {{ v.from_archive }}</small>{% endif %}
+                {% if v.exe_path %}<small class="muted">{{ v.exe_path.split('/')[-1] }}</small>{% endif %}
+              </div>
+              {% endif %}
+              {% endfor %}
+            </div>
+
+            <form class="ver-add-form">
+              <input type="text" name="label" placeholder="label (e.g. v0.1)" required>
+              <input type="text" name="xxh64" placeholder="xxh64 (optional)">
+              <input type="text" name="size_bytes" placeholder="size (optional)">
+              <select name="source">
+                {% for s in ['manual', 'local', 'archive', 'unknown'] %}
+                <option value="{{ s }}"{% if s == 'manual' %} selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit">+ ADD VERSION</button>
+            </form>
+
+            <h3 style="margin: 0.8rem 0 0.5rem; font-size: 0.95rem;">Resources ({{ r.resources|length }})</h3>
+            <div class="res-list">
+              {% for x in r.resources %}
+              <div class="res-edit-row" data-ridx="{{ loop.index0 }}">
+                <select data-rfield="kind">
+                  {% for k in ALLOWED_KINDS %}
+                  <option value="{{ k }}"{% if x.kind == k %} selected{% endif %}>{{ k }}</option>
+                  {% endfor %}
+                </select>
+                <input type="url" data-rfield="url" value="{{ x.url or '' }}">
+                <input type="text" data-rfield="label" value="{{ x.label or '' }}" placeholder="label">
+                <input type="text" data-rfield="desc" value="{{ x.desc or '' }}" placeholder="desc">
+                {% if x.url %}<a href="{{ x.url }}" target="_blank" rel="noopener" class="badge">↗ live</a>{% endif %}
+                {% if x.archive_url %}
+                  {% set _is_synth = (x.preferred in ('wayback_calendar', 'wayback_closest')) %}
+                  <a href="{{ x.archive_url }}" target="_blank" rel="noopener" class="badge"
+                     style="background: {% if _is_synth %}rgba(120,120,160,0.4){% else %}rgba(80,160,80,0.4){% endif %};">
+                    {% if _is_synth %}wayback?{% else %}wayback ✓{% endif %}</a>
+                {% endif %}
+                <button type="button" class="btn-del" title="remove">×</button>
+              </div>
+              {% endfor %}
+            </div>
+
+            <form class="res-add-form">
+              <select name="kind">
+                {% for k in ALLOWED_KINDS %}
+                <option value="{{ k }}"{% if k == 'mizuumi' %} selected{% endif %}>{{ k }}</option>
+                {% endfor %}
+              </select>
+              <input type="url" name="url" placeholder="https://..." required>
+              <input type="text" name="label" placeholder="label (optional)">
+              <button type="submit">+ ADD</button>
+            </form>
+
+            <div class="ed-actions">
+              <button type="button" class="btn-save-all" style="background: var(--green) !important; color: #000 !important; font-weight: bold;">💾 Save all</button>
+              <button type="button" class="btn-rename" data-game-id="{{ r.game_id }}">✎ Rename game_id…</button>
+              <button type="button" class="btn-merge">⇆ Merge…</button>
+              <div class="merge-area">
+                <input type="text" class="merge-target-input" placeholder="search target by name or game_id…">
+                <div class="merge-results"></div>
+              </div>
+              <button type="button" class="btn-delete-game" style="margin-left: auto;">🗑 Delete row</button>
+            </div>
+
+            {% if r.aliased_ids %}
+            <p style="margin: 0.5rem 0 0; opacity: 0.6; font-size: 0.85rem;">
+              Aliased game_ids (preserve match history): {{ r.aliased_ids|join(', ') }}
+            </p>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No games match your filter.</p>
+  {% endif %}
+</section>
+
+{# Pass the kind list to JS via a data attribute on a hidden div.   #}
+{# CSP (script-src 'self') blocks inline <script> blocks, so all   #}
+{# JS lives in /static/admin.js and reads ALLOWED_KINDS from here. #}
+<div id="admin-data" data-kinds="{{ ALLOWED_KINDS|tojson }}" data-editor="{{ editor_nick }}" style="display:none;"></div>
+<script src="{{ url_for('static', path='admin.js') }}"></script>
+
+{% endblock %}

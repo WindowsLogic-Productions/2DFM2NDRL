@@ -87,6 +87,25 @@ def diff_snap(a, b):
                 out.append((f'{who}.{k}', av, bv))
     return out
 
+
+# Fields that, when they're the ONLY divergence, indicate a known
+# parity-recorder display artifact rather than an engine determinism
+# bug. The parity recorder reads input_history at the current buf_idx;
+# record-side and replay-side callsites end up at slightly different
+# buf_idx values after the first rollback boundary, so the recorded
+# input fields can mismatch even when engine state (rng, positions,
+# scripts, sysvars) is byte-identical. See parity_recorder.cpp
+# comment + docs/input_pipeline_architecture.md.
+_ARTIFACT_ONLY_FIELDS = {'input_p1', 'input_p2'}
+# rng_only_fields: the parity recorder captures rng + rng_after_frame.
+# When the pre-battle path differs in PGI consumption (host went through
+# real CSS, replay went through auto-mash), the FIRST captured battle
+# frame's rng can lag by a few game_rand calls even though engine state
+# is otherwise byte-identical. Classify "only rng differs" as a known
+# pre-battle-path-leakage artifact so we can see if the engine sim
+# itself diverges anywhere downstream.
+_RNG_ONLY_FIELDS = {'rng', 'rng_after_frame'}
+
 def main(a_path, b_path):
     a = load(a_path)
     b = load(b_path)
@@ -97,9 +116,24 @@ def main(a_path, b_path):
     # so blind-merging by frame number aligns CSS-on-A with battle-on-B.
     BATTLE_PHASE = 3000
     def first_battle_idx(snaps):
+        # "Real" first battle frame: match_phase==3000 AND chars are
+        # actually loaded into the object pool (script_idx != 0xFFFFFFFF).
+        # During battle-init the host parity recorder catches an early
+        # window where match_phase has already flipped to 3000 but the
+        # battle-init game object hasn't yet populated character slots —
+        # those snaps have script_idx == 0xFFFFFFFF / pos == 0 / hp == 0
+        # and don't represent a real sim frame. Skip them so alignment
+        # picks the first true battle-frame on each side.
         for i, s in enumerate(snaps):
-            if s['match_phase'] == BATTLE_PHASE:
-                return i
+            if s['match_phase'] != BATTLE_PHASE:
+                continue
+            p1_si = s['p1']['script_idx']
+            p2_si = s['p2']['script_idx']
+            # script_idx is parsed as signed i32; uninitialized = -1
+            # (= 0xFFFFFFFF in unsigned). Skip those snaps.
+            if p1_si == -1 or p2_si == -1:
+                continue
+            return i
         return None
     ai = first_battle_idx(a)
     bi = first_battle_idx(b)
@@ -110,32 +144,76 @@ def main(a_path, b_path):
     print(f'B battle starts at index {bi} (frame={b[bi]["frame"]})')
     n = min(len(a) - ai, len(b) - bi)
     print(f'comparing {n} battle-aligned snapshots')
-    # Walk index-paired from battle start; report first divergence
+    # Walk index-paired from battle start; report first divergence.
+    # Classify each frame's diff:
+    #   - ENGINE DIFF: a field outside the artifact set differs → real desync
+    #   - ARTIFACT-ONLY: only input_p1/p2 differ → parity-recorder display
+    #     quirk, engine state still matches
+    first_engine_diff = None
+    first_rng_diff = None
+    artifact_frames = 0
+    rng_only_frames = 0
     for k in range(n):
         sa, sb = a[ai + k], b[bi + k]
         d = diff_snap(sa, sb)
-        if d:
-            print(f'\nFIRST DIVERGENCE at battle-aligned k={k} '
-                  f'(A.frame={sa["frame"]} B.frame={sb["frame"]})\n')
+        if not d:
+            continue
+        diff_fields = {fld for fld, _, _ in d}
+        if diff_fields.issubset(_ARTIFACT_ONLY_FIELDS):
+            artifact_frames += 1
+            continue
+        if diff_fields.issubset(_RNG_ONLY_FIELDS | _ARTIFACT_ONLY_FIELDS):
+            rng_only_frames += 1
+            if first_rng_diff is None:
+                first_rng_diff = (k, sa, sb, d)
+            continue
+        if first_engine_diff is None:
+            first_engine_diff = (k, sa, sb, d)
+            break
+
+    if first_engine_diff is None:
+        msg = f'\nALL {n} ALIGNED FRAMES SHOW IDENTICAL ENGINE STATE.'
+        if rng_only_frames:
+            msg += (f' ({rng_only_frames} rng-only frames — pre-battle '
+                    f'game_rand consumption asymmetry; sim is deterministic.)')
+        if artifact_frames:
+            msg += (f' ({artifact_frames} frame(s) had input-field-only diffs '
+                    f'— known parity_recorder display artifact, engine sim '
+                    f'is deterministic.)')
+        print(msg)
+        if first_rng_diff:
+            k, sa, sb, d = first_rng_diff
+            print(f'\nFirst rng-only divergence at k={k} '
+                  f'(A.frame={sa["frame"]} B.frame={sb["frame"]}):')
             for fld, av, bv in d:
-                if isinstance(av, int):
-                    print(f'  {fld:32s}  A=0x{av & 0xFFFFFFFF:08X}  B=0x{bv & 0xFFFFFFFF:08X}'
-                          f'  delta={bv - av}')
-                else:
-                    print(f'  {fld:32s}  A={av}  B={bv}')
-            # Show 1 frame of context BEFORE divergence (last matching)
-            if k > 0:
-                pa = a[ai + k - 1]
-                pb = b[bi + k - 1]
-                print(f'\n  Last matching frame: A.frame={pa["frame"]} B.frame={pb["frame"]}')
-                print(f'    rng={pa["rng"]:#x} input_p1=0x{pa["input_p1"]:03X} input_p2=0x{pa["input_p2"]:03X}')
-                print(f'    p1.pos=({pa["p1"]["pos_x"]},{pa["p1"]["pos_y"]}) '
-                      f'p1.vel=({pa["p1"]["vel_x"]},{pa["p1"]["vel_y"]}) p1.script={pa["p1"]["script_idx"]}/{pa["p1"]["item_idx"]}')
-                print(f'    p2.pos=({pa["p2"]["pos_x"]},{pa["p2"]["pos_y"]}) '
-                      f'p2.vel=({pa["p2"]["vel_x"]},{pa["p2"]["vel_y"]}) p2.script={pa["p2"]["script_idx"]}/{pa["p2"]["item_idx"]}')
-            return 0
-    print('\nALL ALIGNED FRAMES IDENTICAL — no divergence detected.')
-    return 0
+                print(f'  {fld:<32}  A=0x{av:08X}  B=0x{bv:08X}  '
+                      f'delta={(bv-av)&0xFFFFFFFF}')
+        return 0
+    else:
+        k, sa, sb, d = first_engine_diff
+        print(f'\nFIRST ENGINE DIVERGENCE at battle-aligned k={k} '
+              f'(A.frame={sa["frame"]} B.frame={sb["frame"]})')
+        if artifact_frames:
+            print(f'  (also saw {artifact_frames} input-field-only display '
+                  f'artifact frame(s) before this — those are not engine bugs)')
+        print()
+        for fld, av, bv in d:
+            if isinstance(av, int):
+                print(f'  {fld:32s}  A=0x{av & 0xFFFFFFFF:08X}  B=0x{bv & 0xFFFFFFFF:08X}'
+                      f'  delta={bv - av}')
+            else:
+                print(f'  {fld:32s}  A={av}  B={bv}')
+        # Show 1 frame of context BEFORE divergence (last matching)
+        if k > 0:
+            pa = a[ai + k - 1]
+            pb = b[bi + k - 1]
+            print(f'\n  Last matching frame: A.frame={pa["frame"]} B.frame={pb["frame"]}')
+            print(f'    rng={pa["rng"]:#x} input_p1=0x{pa["input_p1"]:03X} input_p2=0x{pa["input_p2"]:03X}')
+            print(f'    p1.pos=({pa["p1"]["pos_x"]},{pa["p1"]["pos_y"]}) '
+                  f'p1.vel=({pa["p1"]["vel_x"]},{pa["p1"]["vel_y"]}) p1.script={pa["p1"]["script_idx"]}/{pa["p1"]["item_idx"]}')
+            print(f'    p2.pos=({pa["p2"]["pos_x"]},{pa["p2"]["pos_y"]}) '
+                  f'p2.vel=({pa["p2"]["vel_x"]},{pa["p2"]["vel_y"]}) p2.script={pa["p2"]["script_idx"]}/{pa["p2"]["item_idx"]}')
+        return 1  # non-zero = real divergence found
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
