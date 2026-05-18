@@ -105,6 +105,11 @@ struct HubEvent {
         SpectatorIncoming,     // we're the host; hub forwarded a spectator's UDP
                                // addr so we can fire a NAT punch toward them
                                // before their first JOIN_REQ arrives
+        SpecRelayBinary,       // Phase 3: hub forwarded a spec data frame to
+                               // us (we're the spec). Bytes are SpecDataHeader-
+                               // prefixed wire payload; launcher writes them
+                               // into the inbound shared-mem ring for the
+                               // game hook to drain.
         RecordReceived,        // hub answered our query_record (W/L/D)
         RecentMatchesReceived, // hub answered our recent_matches request
         CurrentMatchesReceived,// hub answered our current_matches request
@@ -181,6 +186,12 @@ struct HubEvent {
         // hub field is absent — shouldn't happen in practice.
         std::string session_kind = "menu";
     } spectate;
+
+    // SpecRelayBinary payload (Phase 3). Hub forwarded a SpecDataHeader-
+    // prefixed wire frame to us; launcher writes into the inbound shared-
+    // mem ring for the spec hook to dispatch. Bytes are exactly what
+    // SpectatorNode_HandleSpecData expects.
+    std::vector<uint8_t> spec_relay_bytes;
 
     // SpectatorIncoming payload — we're the host; hub forwarded the
     // spectator's external UDP addr so we can fire a NAT-punch packet

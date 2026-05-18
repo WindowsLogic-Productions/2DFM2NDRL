@@ -1561,6 +1561,57 @@ bool FM2KLauncher::Initialize() {
         CloseHandle(h);
     };
 
+    // Phase 3: spec hub-relay inbound. Hub forwarded SpecDataHeader-
+    // prefixed wire bytes for our spec game; write into its inbound
+    // shared-mem ring. Lazy-open the ring keyed by game pid (similar
+    // pattern to the outbound drain in Update). The hook's TickHealth
+    // drains the ring and dispatches each Slot through HandleSpecData.
+    ui_->on_spec_relay_bytes = [this](const std::vector<uint8_t>& bytes) {
+        DWORD target_pid = 0;
+        if (game_instance_ && game_instance_->IsRunning()) {
+            target_pid = game_instance_->GetProcessId();
+        } else if (client1_instance_ && client1_instance_->IsRunning()) {
+            target_pid = client1_instance_->GetProcessId();
+        }
+        if (target_pid == 0) {
+            // Game not running -- nothing to deliver to. Frames arriving
+            // before spec game boots are normal at the very start; drop.
+            return;
+        }
+        static DWORD                       s_in_pid  = 0;
+        static fm2k::spec_relay::Ring*     s_in_ring = nullptr;
+        if (target_pid != s_in_pid) {
+            if (s_in_ring) {
+                fm2k::spec_relay::Close(s_in_ring);
+                s_in_ring = nullptr;
+            }
+            s_in_pid = target_pid;
+            s_in_ring = fm2k::spec_relay::OpenInboundFor(target_pid);
+            if (s_in_ring) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpecRelay: opened inbound ring for spec game pid %lu",
+                    (unsigned long)target_pid);
+            }
+        }
+        if (!s_in_ring) {
+            // Hook may not have created it yet (still booting) or it's
+            // not in relay mode. Drop -- next frame might succeed.
+            return;
+        }
+        // The bytes are exactly the payload the hook hands to
+        // SpectatorNode_HandleSpecData. Enqueue with TARGET_BROADCAST
+        // (kind isn't load-bearing on the inbound side; we set it for
+        // consistency) and zero header metadata.
+        fm2k::spec_relay::Enqueue(
+            s_in_ring,
+            fm2k::spec_relay::TARGET_BROADCAST,
+            /*spec_user_id=*/nullptr,
+            /*spec_data_type=*/0,
+            /*frame_count=*/0,
+            /*spec_data_flags=*/0,
+            bytes.data(), static_cast<uint32_t>(bytes.size()));
+    };
+
     ui_->on_spectate_match = [this](const std::string& host_ip, int host_port,
                                     const std::string& session_kind) {
         // Need an installed game to point the spectator at; reuse whatever

@@ -95,6 +95,13 @@ struct State {
     // pid) drains and forwards each Slot as a WS binary frame to the
     // hub. Layout + ordering documented in spec_relay_queue.h.
     fm2k::spec_relay::Ring*   spec_relay_out       = nullptr;
+    // Inbound spec-relay ring (Phase 3). Launcher writes WS binary
+    // frames forwarded from hub here; hook drains in TickHealth and
+    // dispatches each Slot's payload through the existing
+    // SpectatorNode_HandleSpecData path (same handler the TCP-arrived
+    // bytes feed). Only meaningful when this process is acting as a
+    // spec; harmless empty ring otherwise.
+    fm2k::spec_relay::Ring*   spec_relay_in        = nullptr;
     // Pending (ip:port) -> spec_user_id from spec_incoming events that
     // arrived before the matching SPEC_JOIN_REQ. Populated by the punch-
     // target poll in TickHostMaintenance; consumed (and erased) by
@@ -1045,26 +1052,28 @@ void SpectatorNode_Init() {
         g_state.spec_transport_relay = true;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: FM2K_SPEC_TRANSPORT=relay -- skipping TCP "
-            "listener + TCP-STUN, creating shared-mem outbound queue "
-            "for launcher to forward to hub");
-        // Create the outbound shared-mem ring (hook is the producer).
-        // Launcher opens the same mapping by pid and drains every tick.
-        // If creation fails, we log + continue in a degraded "negotiate
-        // but no data" state -- not worth aborting init over.
+            "listener + TCP-STUN, creating shared-mem queues for "
+            "launcher <-> hub forwarding");
+        // Create BOTH outbound (hook->launcher) and inbound
+        // (launcher->hook) rings unconditionally. Either could be used
+        // depending on whether this process ends up acting as host or
+        // spec for a given match. ~2 MB of shared mem total per process
+        // -- cheap, and avoids late-bound role-detection logic.
         g_state.spec_relay_out = fm2k::spec_relay::CreateOutboundHere();
-        if (!g_state.spec_relay_out) {
+        g_state.spec_relay_in  = fm2k::spec_relay::CreateInboundHere();
+        if (!g_state.spec_relay_out || !g_state.spec_relay_in) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: spec_relay outbound mapping failed; "
-                "spec data plane unavailable for this session");
+                "SpectatorNode: spec_relay mapping(s) failed (out=%s in=%s); "
+                "spec data plane degraded",
+                g_state.spec_relay_out ? "ok" : "fail",
+                g_state.spec_relay_in  ? "ok" : "fail");
         }
-        // Capacity still applies (hub fan-out is bounded too). Match
-        // the TCP path's default so behavior is identical from the
-        // host-control-flow perspective.
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: Init (capacity=%zu, batch=%zu frames, "
-            "transport=relay, outbound_queue=%s)",
+            "transport=relay, out=%s, in=%s)",
             g_state.capacity, BROADCAST_BATCH_FRAMES,
-            g_state.spec_relay_out ? "ok" : "failed");
+            g_state.spec_relay_out ? "ok" : "failed",
+            g_state.spec_relay_in  ? "ok" : "failed");
         return;
     }
 
@@ -1182,13 +1191,16 @@ void SpectatorNode_Shutdown() {
     g_state.subscribed_upstream = false;
     g_state.playing_back = false;
     SpectatorTCP::Shutdown();
-    // Tear down the relay outbound ring if we created one. Idempotent
-    // (Close handles nullptr). The kernel mapping object lives until
-    // both processes (us + launcher) drop their handles, so an in-
-    // flight launcher drain won't get torn out from under us mid-pop.
+    // Tear down both relay rings if we created them. Close handles
+    // nullptr. Kernel mapping refcount keeps the object alive while
+    // launcher still has it mapped; we just drop our side.
     if (g_state.spec_relay_out) {
         fm2k::spec_relay::Close(g_state.spec_relay_out);
         g_state.spec_relay_out = nullptr;
+    }
+    if (g_state.spec_relay_in) {
+        fm2k::spec_relay::Close(g_state.spec_relay_in);
+        g_state.spec_relay_in = nullptr;
     }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SpectatorNode: Shutdown");
 }
@@ -2742,16 +2754,21 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     g_state.playing_back = true;
 
     // Dial the host's TCP port. Bulk INPUT_BATCH / INITIAL_MATCH /
-    // MATCH_END flow over TCP exclusively; if the host didn't advertise
-    // a port, this peer has nothing to listen to and the subscription
-    // is unusable. Bail.
-    if (host_tcp_port == 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "SpectatorNode: JOIN_ACK from host has no TCP port — refusing");
-        g_state.subscribed_upstream = false;
-        return;
-    }
-    {
+    // MATCH_END flow over TCP exclusively in legacy mode. In relay
+    // mode (Phase 3), spec data arrives via hub WS -> launcher -> our
+    // inbound ring, so there's no P2P TCP to dial.
+    if (g_state.spec_transport_relay) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: JOIN_ACK accepted in relay mode -- skipping "
+            "ConnectUpstream (spec data arrives via hub via launcher via "
+            "inbound shared-mem ring)");
+    } else {
+        if (host_tcp_port == 0) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: JOIN_ACK from host has no TCP port — refusing");
+            g_state.subscribed_upstream = false;
+            return;
+        }
         char host_ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, (void*)&from.sin_addr, host_ip, sizeof(host_ip));
         if (!SpectatorTCP::ConnectUpstream(host_ip, host_tcp_port)) {
@@ -3341,6 +3358,34 @@ void SpectatorNode_SetRootAddr(const sockaddr_in& root) {
 // Cheap to call every iter; the work is gated on the time deltas.
 void SpectatorNode_TickHealth() {
     const uint64_t now = (uint64_t)GetTickCount64();
+
+    // ---- Spec hub-relay inbound drain (Phase 3) -------------------------
+    // When the launcher has WS binary frames forwarded from the hub, it
+    // writes them into the inbound shared-mem ring. Each Slot's payload
+    // is a SpecDataHeader-prefixed wire frame -- byte-identical to what
+    // SpectatorTCP::PollUpstream would have produced from the TCP path
+    // it's replacing. Feed straight into HandleSpecData.
+    //
+    // Bound work-per-tick so a snapshot burst doesn't monopolize the
+    // hook tick. ~32 slots = up to 512 KB per tick which covers most
+    // snapshots in 2 ticks. Drain continues next tick if there's more.
+    if (g_state.spec_relay_in) {
+        constexpr int kMaxPerTick = 32;
+        for (int i = 0; i < kMaxPerTick; ++i) {
+            const fm2k::spec_relay::Slot* slot =
+                fm2k::spec_relay::PeekFront(g_state.spec_relay_in);
+            if (!slot) break;
+            // payload bytes are exactly what SpectatorTCP's framer
+            // would deliver to HandleSpecData via the TCP path. The
+            // sockaddr_in second arg is a debug breadcrumb; zero
+            // works (TCP path also passes zero).
+            sockaddr_in zero_from{};
+            zero_from.sin_family = AF_INET;
+            SpectatorNode_HandleSpecData(
+                slot->payload, slot->payload_len, zero_from);
+            fm2k::spec_relay::PopFront(g_state.spec_relay_in);
+        }
+    }
 
     // ---- Subscriber-side: heartbeat + silence failover ------------------
     if (g_state.subscribed_upstream) {
