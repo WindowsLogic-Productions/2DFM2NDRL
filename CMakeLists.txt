@@ -383,6 +383,11 @@ add_executable(FM2K_RollbackLauncher
     # and the hook DLL's LogOutputFunction so anything users share (log
     # window copy, on-disk hook log) is pre-redacted.
     FM2KHook/src/util/pii_scrub.cpp
+    # Spec hub-relay shared-memory queue (Phase 2c). Launcher consumes
+    # the outbound side (hook -> launcher direction); same .cpp is
+    # also compiled into FM2KHook for the producer side. Different
+    # binaries, isolated function symbols, no link-time clash.
+    FM2KHook/src/netplay/spec_relay_queue.cpp
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 

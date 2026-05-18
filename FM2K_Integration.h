@@ -886,6 +886,13 @@ public:
     // includes in spectate_grant so spec launchers can decide /F.
     void SendHubSessionKind(uint8_t kind);
 
+    // Forward a packed SpecDataBinary frame to the hub (Phase 2c of v0.3
+    // spec rebuild). Called from FM2KLauncher::Update's drain of the
+    // hook's outbound spec-relay shared-mem ring. The bytes match
+    // hub.py:handle_spec_relay_frame's expected SPDB wire shape; hub
+    // fans out to subscribed specs.
+    void SendHubSpecRelayFrame(std::vector<uint8_t> frame);
+
 private:
     // Logging
     void AddLog(const char* message);

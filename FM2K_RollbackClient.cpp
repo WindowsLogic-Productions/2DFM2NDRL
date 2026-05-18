@@ -13,6 +13,7 @@
 #include "FM2K_Utf8Path.h"
 #include "FM2KHook/src/ui/shared_mem.h"
 #include "FM2KHook/src/ui/input_binder.h"  // RefreshGamepads() on SDL hot-plug events
+#include "FM2KHook/src/netplay/spec_relay_queue.h"  // hub-relay outbound drain (Phase 2c)
 #define XXH_INLINE_ALL
 #include "vendored/xxhash/xxhash.h"
 #include "LocalSession.h"
@@ -2061,7 +2062,111 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
             }
         }
     }
-    
+
+    // Spec hub-relay drain (Phase 2c). When the hook is running in
+    // FM2K_SPEC_TRANSPORT=relay mode it creates the outbound shared-mem
+    // ring "FM2K_SpecRelayOut_<pid>" and produces one Slot per spec
+    // frame it wants to ship. We open the ring lazily, drain pop-able
+    // slots each tick, pack each Slot into the SpecDataBinary wire
+    // shape (matches hub.py:handle_spec_relay_frame), and ship via
+    // HubClient::SendSpecRelayFrame (-> WS binary frame).
+    //
+    // Hook in TCP mode never creates the mapping; OpenOutboundFor
+    // returns nullptr and the drain is a no-op. No env probing or
+    // mode detection needed on the launcher side -- existence of the
+    // mapping IS the signal.
+    {
+        DWORD target_pid = 0;
+        if (game_instance_ && game_instance_->IsRunning()) {
+            target_pid = game_instance_->GetProcessId();
+        } else if (client1_instance_ && client1_instance_->IsRunning()) {
+            target_pid = client1_instance_->GetProcessId();
+        }
+
+        static DWORD                       s_relay_pid  = 0;
+        static fm2k::spec_relay::Ring*     s_relay_ring = nullptr;
+
+        // Game pid changed (or fresh process); drop the old mapping and
+        // try to open the new one. Open is best-effort -- the hook may
+        // not be in relay mode, in which case there's no mapping yet.
+        if (target_pid != s_relay_pid) {
+            if (s_relay_ring) {
+                fm2k::spec_relay::Close(s_relay_ring);
+                s_relay_ring = nullptr;
+            }
+            s_relay_pid = target_pid;
+            if (target_pid != 0) {
+                s_relay_ring = fm2k::spec_relay::OpenOutboundFor(target_pid);
+                if (s_relay_ring) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpecRelay: opened outbound ring for game pid %lu",
+                        (unsigned long)target_pid);
+                }
+            }
+        }
+
+        // Drain. Bound work-per-tick so a snapshot transfer doesn't
+        // monopolize the UI loop; 32 slots × 16 KB = ~512 KB / tick max,
+        // and snapshot transfers are paced by GekkoNet's broadcast
+        // cadence anyway so this rarely saturates.
+        if (s_relay_ring && ui_) {
+            constexpr int kMaxPerTick = 32;
+            for (int i = 0; i < kMaxPerTick; ++i) {
+                const fm2k::spec_relay::Slot* slot =
+                    fm2k::spec_relay::PeekFront(s_relay_ring);
+                if (!slot) break;
+
+                // Pack Slot -> SpecDataBinary wire frame.
+                //   u32 magic = 0x53504442 ("SPDB")
+                //   u32 frame_count
+                //   u16 type
+                //   u16 flags
+                //   u32 payload_len
+                //   u8  target_kind
+                //   u8  spec_user_id_len
+                //   char spec_user_id[]
+                //   u8  payload[]
+                std::vector<uint8_t> frame;
+                const uint32_t magic = 0x53504442u;
+                const uint8_t spec_id_len =
+                    slot->target_kind == fm2k::spec_relay::TARGET_DIRECT
+                        ? (uint8_t)std::strlen(slot->spec_user_id)
+                        : 0;
+                frame.reserve(16 + 2 + spec_id_len + slot->payload_len);
+                auto append_u32 = [&](uint32_t v) {
+                    frame.push_back((uint8_t)(v));
+                    frame.push_back((uint8_t)(v >> 8));
+                    frame.push_back((uint8_t)(v >> 16));
+                    frame.push_back((uint8_t)(v >> 24));
+                };
+                auto append_u16 = [&](uint16_t v) {
+                    frame.push_back((uint8_t)(v));
+                    frame.push_back((uint8_t)(v >> 8));
+                };
+                append_u32(magic);
+                append_u32(slot->frame_count);
+                append_u16((uint16_t)slot->spec_data_type);
+                append_u16((uint16_t)slot->spec_data_flags);
+                append_u32(slot->payload_len);
+                frame.push_back((uint8_t)slot->target_kind);
+                frame.push_back(spec_id_len);
+                if (spec_id_len) {
+                    frame.insert(frame.end(),
+                                 slot->spec_user_id,
+                                 slot->spec_user_id + spec_id_len);
+                }
+                if (slot->payload_len) {
+                    frame.insert(frame.end(),
+                                 slot->payload,
+                                 slot->payload + slot->payload_len);
+                }
+
+                ui_->SendHubSpecRelayFrame(std::move(frame));
+                fm2k::spec_relay::PopFront(s_relay_ring);
+            }
+        }
+    }
+
     // Check for game termination
     if (game_instance_ && !game_instance_->IsRunning()) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Game process has terminated.");

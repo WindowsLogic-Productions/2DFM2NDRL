@@ -333,9 +333,23 @@ void HubClient::Poll(const std::function<void(const HubEvent&)>& on_event) {
 }
 
 void HubClient::EnqueueOut(std::string msg) {
+    OutMsg out{};
+    out.is_binary = false;
+    out.data.assign(msg.begin(), msg.end());
     {
         std::lock_guard<std::mutex> lk(out_mtx_);
-        outbox_.push_back(std::move(msg));
+        outbox_.push_back(std::move(out));
+    }
+    out_cv_.notify_one();
+}
+
+void HubClient::SendSpecRelayFrame(std::vector<uint8_t> frame) {
+    OutMsg out{};
+    out.is_binary = true;
+    out.data      = std::move(frame);
+    {
+        std::lock_guard<std::mutex> lk(out_mtx_);
+        outbox_.push_back(std::move(out));
     }
     out_cv_.notify_one();
 }
@@ -773,9 +787,12 @@ void HubClient::IoThread(std::string host, uint16_t port,
     }
 
     // Sender side-thread — drains outbox, sleeps on cv when empty.
+    // Each OutMsg carries is_binary; we pick the matching WS buffer
+    // type. Same thread for both JSON and binary so MSDN's per-handle
+    // serialization guidance holds.
     std::thread sender([this]() {
         while (running_.load()) {
-            std::string msg;
+            OutMsg msg;
             {
                 std::unique_lock<std::mutex> lk(out_mtx_);
                 out_cv_.wait(lk, [&]() { return !outbox_.empty() || !running_.load(); });
@@ -783,12 +800,15 @@ void HubClient::IoThread(std::string host, uint16_t port,
                 msg = std::move(outbox_.front());
                 outbox_.pop_front();
             }
-            DWORD r = WinHttpWebSocketSend(ws_,
-                WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                msg.data(), (DWORD)msg.size());
+            const WINHTTP_WEB_SOCKET_BUFFER_TYPE bt = msg.is_binary
+                ? WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
+                : WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
+            DWORD r = WinHttpWebSocketSend(ws_, bt,
+                msg.data.data(), (DWORD)msg.data.size());
             if (r != ERROR_SUCCESS) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "HubClient: WS send failed (err=%lu)", (unsigned long)r);
+                            "HubClient: WS send failed (err=%lu, kind=%s)",
+                            (unsigned long)r, msg.is_binary ? "binary" : "json");
                 running_.store(false);
                 break;
             }

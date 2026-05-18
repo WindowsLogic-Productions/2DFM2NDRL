@@ -37,6 +37,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/nat_traversal.cpp
     src/netplay/game_hash.cpp
     src/netplay/upload_queue.cpp
+    src/netplay/spec_relay_queue.cpp
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI

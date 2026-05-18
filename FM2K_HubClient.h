@@ -334,6 +334,18 @@ public:
     //   kind ∈ {"menu", "css", "battle"}
     void UpdateSessionKind(const std::string& kind);
 
+    // Send a spec hub-relay binary frame (Phase 2c). `frame` is the
+    // SpecDataBinary wire format documented in
+    // docs/dev/spec_hub_relay_design.md and parsed by hub.py's
+    // handle_spec_relay_frame -- header + routing block + payload.
+    // Caller (the spec relay drain loop in FM2K_RollbackClient) builds
+    // the bytes from a fm2k::spec_relay::Slot before passing here.
+    //
+    // Queued on the same outbox as JSON control messages so cross-
+    // message ordering is preserved per MSDN's "serialize sends per
+    // handle" guidance.
+    void SendSpecRelayFrame(std::vector<uint8_t> frame);
+
     // Report end-of-match outcome to the hub for stats tracking. `match_id`
     // is the token from the `match_start` event we received (== relay
     // session_id). `outcome` is one of: "self_won" | "peer_won" | "draw"
@@ -451,9 +463,19 @@ private:
     std::string hub_token_;
     bool        use_tls_ = false;  // wss:// when true
 
+    // Outbox holds both UTF-8 JSON control messages AND binary frames
+    // (spec hub-relay, Phase 2c). The sender thread inspects is_binary
+    // to pick WINHTTP_WEB_SOCKET_{UTF8,BINARY}_MESSAGE_BUFFER_TYPE.
+    // Same queue + same thread keeps the cross-message ordering well-
+    // defined (per MSDN, serializing WS sends per handle is recommended
+    // to avoid intermixing on the wire).
+    struct OutMsg {
+        std::vector<uint8_t> data;
+        bool                 is_binary;
+    };
     std::mutex out_mtx_;
     std::condition_variable out_cv_;
-    std::deque<std::string> outbox_;
+    std::deque<OutMsg> outbox_;
 
     std::mutex in_mtx_;
     std::deque<HubEvent> inbox_;
