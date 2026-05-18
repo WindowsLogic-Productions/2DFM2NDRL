@@ -747,6 +747,24 @@ void HubClient::IoThread(std::string host, uint16_t port,
             dev_suffix && dev_suffix[0]) {
             hello += ",\"dev_suffix\":\"" + EscapeJsonString(dev_suffix) + "\"";
         }
+        // FM2K_SPEC_TRANSPORT (Phase 2 of v0.3 spec rebuild). Opt-in
+        // flag advertising the host's preferred spec data plane:
+        //   "tcp"   (default; omitted) -- legacy P2P TCP spec stream,
+        //                                 with NAT punch and TCP-STUN
+        //                                 we've been fighting all year.
+        //   "relay" -- route spec data through hub WS binary frames.
+        //              Works on every NAT class. Hook plumbing for the
+        //              actual binary-frame send arrives in a follow-up
+        //              commit; this just exposes the negotiation so we
+        //              can ship the wire field before the data plane.
+        // Hub stores on User.spec_transport, forwards in spectate_grant
+        // so spec knows whether to dial host directly or subscribe via
+        // hub. See docs/dev/spec_hub_relay_design.md.
+        if (const char* transport = std::getenv("FM2K_SPEC_TRANSPORT");
+            transport && (std::strcmp(transport, "relay") == 0 ||
+                          std::strcmp(transport, "tcp") == 0)) {
+            hello += ",\"spec_transport\":\"" + std::string(transport) + "\"";
+        }
         hello += "}";
         DWORD r = WinHttpWebSocketSend(ws_,
             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
