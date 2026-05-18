@@ -237,6 +237,553 @@ main {
   z-index: 2;
 }
 body.page-games main { max-width: 1500px; }
+/* Admin pages need to fit a wide table without horizontal scroll on
+ * common desktop widths (1440 / 1920). 1900px caps the center column
+ * at large monitors while still using full viewport at smaller ones.
+ * Combined with the .badge.src max-width below and the sticky Edit
+ * column, the table is fully visible at 1440px+ without scrolling. */
+body.page-admin main {
+  max-width: 1900px;
+  width: 100%;
+}
+body.page-admin .grid td .res-row {
+  display: flex;
+  align-items: center;
+  margin: 0.15rem 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+body.page-admin .grid td .res-row .badge {
+  display: inline-block;
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The primary URL badge truncates to keep the table from blowing
+ * wider than `main`. Full URL is on hover via the `title` attribute
+ * and the badge itself is the link, so truncation never hides
+ * functionality. The cell width cap below applies to the resources
+ * column as a whole. */
+body.page-admin .grid td .res-row .badge.src {
+  max-width: 320px;
+}
+body.page-admin .grid th:nth-child(5),
+body.page-admin .grid td:nth-child(5) {
+  max-width: 380px;
+}
+
+/* Sticky last column — keep the Edit button reachable even when the
+ * table overflows registry-wrap horizontally. Background fills so
+ * scrolled content underneath doesn't bleed through. */
+body.page-admin .registry-wrap { position: relative; }
+body.page-admin .grid th:last-child,
+body.page-admin .grid td:last-child {
+  position: sticky;
+  right: 0;
+  background: var(--bg);
+  border-left: 1px solid var(--line);
+  z-index: 1;
+}
+body.page-admin .grid tbody tr:hover td:last-child {
+  background: rgba(80, 130, 200, 0.08);
+}
+
+/* Archive-status pills — color-coded so editors can scan a 442-row
+ * list and immediately see which games need attention. None of these
+ * imply permanence; "needs hunt" means a human should look, not that
+ * the bytes are lost. */
+.archive-status {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 2px;
+  font-size: 0.78rem;
+  font-weight: bold;
+  letter-spacing: 0.04em;
+  border: 1px solid;
+}
+.archive-have_local         { background: rgba(70, 200, 90, 0.18); color: #6fe88e; border-color: rgba(70, 200, 90, 0.4); }
+.archive-have_archive_bytes { background: rgba(60, 160, 220, 0.18); color: #6fc8ee; border-color: rgba(60, 160, 220, 0.4); }
+.archive-known_recoverable  { background: rgba(220, 200, 60, 0.18); color: #f0d870; border-color: rgba(220, 200, 60, 0.4); }
+.archive-needs_hunt         { background: rgba(230, 130, 60, 0.18); color: #f0a060; border-color: rgba(230, 130, 60, 0.45); }
+.archive-no_outbound        { background: rgba(140, 140, 160, 0.18); color: #b0b0c0; border-color: rgba(140, 140, 160, 0.4); }
+
+/* Filter chips at the top of /admin/. Active = solid border, opacity 1;
+ * inactive = dim. Reusing the archive-status colors so the chip palette
+ * matches the in-table pills. */
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0 1rem;
+}
+.filter-chip {
+  padding: 0.25rem 0.6rem;
+  border-radius: 2px;
+  font-size: 0.78rem;
+  font-weight: bold;
+  letter-spacing: 0.04em;
+  border: 1px solid;
+  text-decoration: none;
+  cursor: pointer;
+  user-select: none;
+}
+.filter-chip.dim { opacity: 0.4; }
+.filter-chip.active { opacity: 1; box-shadow: 0 0 0 1px currentColor inset; }
+
+/* Inline editor panel — expands below each row when "edit" is
+ * clicked. Holds all editable fields + the resources list. Live
+ * auto-save via /admin/api/* (admin.js). */
+body.page-admin .editor-panel {
+  display: none;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--line-bright);
+  padding: 1rem;
+  margin: 0;
+}
+body.page-admin .editor-panel.expanded { display: block; }
+body.page-admin .editor-panel-row > td {
+  padding: 0 !important;
+  border-top: 0 !important;
+}
+
+body.page-admin .editor-panel .ed-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem 1rem;
+  margin-bottom: 1rem;
+}
+body.page-admin .editor-panel .ed-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  opacity: 0.8;
+}
+body.page-admin .editor-panel .ed-grid label.span2 { grid-column: span 2; }
+body.page-admin .editor-panel .ed-grid label.span4 { grid-column: span 4; }
+body.page-admin .editor-panel input[type=text],
+body.page-admin .editor-panel input[type=url],
+body.page-admin .editor-panel select,
+body.page-admin .editor-panel textarea {
+  margin-top: 0.2rem;
+  padding: 0.35rem 0.5rem;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--line-bright);
+  color: inherit;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+body.page-admin .editor-panel textarea { min-height: 3em; resize: vertical; }
+
+/* Resource sub-list (one editable line per resource) */
+body.page-admin .editor-panel .res-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0.5rem 0;
+}
+body.page-admin .editor-panel .res-edit-row {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+body.page-admin .editor-panel .res-edit-row select { width: 110px; }
+body.page-admin .editor-panel .res-edit-row input[type=url] { flex: 2; min-width: 0; }
+body.page-admin .editor-panel .res-edit-row input[type=text] { flex: 1; min-width: 0; }
+body.page-admin .editor-panel .res-edit-row .badge { font-size: 0.7rem; }
+body.page-admin .editor-panel .btn-del {
+  padding: 0.25rem 0.5rem;
+  background: rgba(220, 60, 60, 0.3);
+  border: 1px solid rgba(220, 60, 60, 0.5);
+  color: #f86060;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 0.85rem;
+}
+
+/* Version sub-list — same shape as resources but with extra fields
+ * (label, xxh64, size, source) plus a per-version "I hold this" button. */
+body.page-admin .editor-panel .ver-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0.5rem 0;
+}
+body.page-admin .editor-panel .ver-edit-row {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+body.page-admin .editor-panel .ver-edit-row input[data-vfield="label"]      { flex: 1; min-width: 80px; }
+body.page-admin .editor-panel .ver-edit-row input[data-vfield="xxh64"]      { flex: 2; min-width: 140px; font-family: monospace; }
+body.page-admin .editor-panel .ver-edit-row input[data-vfield="size_bytes"] { flex: 1; min-width: 70px; max-width: 110px; }
+body.page-admin .editor-panel .ver-edit-row select[data-vfield="source"]    { flex: 1; min-width: 100px; max-width: 130px; }
+body.page-admin .editor-panel .ver-edit-row[data-vidx] input[readonly] {
+  opacity: 0.65;
+  font-style: italic;
+}
+body.page-admin .editor-panel .btn-ver-held {
+  padding: 0.25rem 0.55rem;
+  background: rgba(80, 130, 200, 0.15);
+  border: 1px solid var(--blue);
+  color: var(--blue);
+  cursor: pointer;
+  white-space: nowrap;
+  font-weight: bold;
+  font-size: 0.78rem;
+}
+body.page-admin .editor-panel .btn-ver-held.active {
+  background: rgba(70, 200, 90, 0.18);
+  border-color: var(--green);
+  color: #6fe88e;
+}
+body.page-admin .editor-panel .ver-held-list {
+  font-size: 0.75rem;
+  opacity: 0.85;
+  white-space: nowrap;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+body.page-admin .editor-panel .ver-meta {
+  margin: -0.1rem 0 0.3rem 0.3rem;
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+body.page-admin .editor-panel .badge.known {
+  background: rgba(70, 200, 90, 0.18);
+  color: #6fe88e;
+  border: 1px solid rgba(70, 200, 90, 0.3);
+}
+
+body.page-admin .editor-panel .ver-add-form {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--line);
+}
+body.page-admin .editor-panel .ver-add-form input[name="label"]      { flex: 1; min-width: 90px; }
+body.page-admin .editor-panel .ver-add-form input[name="xxh64"]      { flex: 2; min-width: 140px; font-family: monospace; }
+body.page-admin .editor-panel .ver-add-form input[name="size_bytes"] { flex: 1; min-width: 70px; max-width: 110px; }
+body.page-admin .editor-panel .ver-add-form select                   { flex: 1; min-width: 100px; max-width: 130px; }
+body.page-admin .editor-panel .ver-add-form button {
+  padding: 0.3rem 0.8rem;
+  background: var(--green);
+  border: 0;
+  color: #000;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+/* Add-resource bottom row */
+body.page-admin .editor-panel .res-add-form {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--line);
+}
+body.page-admin .editor-panel .res-add-form select { width: 110px; }
+body.page-admin .editor-panel .res-add-form input[type=url] { flex: 2; min-width: 0; }
+body.page-admin .editor-panel .res-add-form input[type=text] { flex: 1; min-width: 0; }
+body.page-admin .editor-panel .res-add-form button {
+  padding: 0.3rem 0.8rem;
+  background: var(--green);
+  border: 0;
+  color: #000;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+/* Danger / merge zone */
+body.page-admin .editor-panel .ed-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--line);
+}
+body.page-admin .editor-panel .ed-actions button {
+  padding: 0.4rem 1rem;
+  background: rgba(80, 80, 100, 0.3);
+  border: 1px solid var(--line-bright);
+  color: inherit;
+  cursor: pointer;
+}
+body.page-admin .editor-panel .btn-delete-game {
+  background: rgba(220, 60, 60, 0.2) !important;
+  border-color: var(--red) !important;
+  color: #f86060 !important;
+}
+body.page-admin .editor-panel .merge-area {
+  display: none;
+  flex: 1;
+  margin-left: 0.5rem;
+}
+body.page-admin .editor-panel .merge-area.expanded { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+body.page-admin .editor-panel .merge-target-input {
+  flex: 1;
+  min-width: 200px;
+}
+body.page-admin .editor-panel .merge-results {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+body.page-admin .editor-panel .merge-candidate {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.85rem;
+}
+body.page-admin .editor-panel .merge-candidate code {
+  flex: 1;
+}
+body.page-admin .editor-panel .merge-candidate button {
+  padding: 0.2rem 0.5rem;
+  background: rgba(80, 130, 200, 0.3);
+  border: 1px solid var(--blue);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+/* Toast notifications (bottom-right) */
+.admin-toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  padding: 0.7rem 1.2rem;
+  background: rgba(220, 60, 60, 0.95);
+  color: #fff;
+  border: 1px solid rgba(255, 80, 80, 0.7);
+  font-family: inherit;
+  font-size: 0.9rem;
+  z-index: 9999;
+  transition: opacity 0.6s;
+  max-width: 360px;
+}
+.admin-toast-ok { background: rgba(70, 200, 90, 0.95); color: #000; }
+.admin-toast-info { background: rgba(80, 130, 200, 0.95); color: #fff; }
+.admin-toast-fade { opacity: 0; }
+
+/* "✓ saved" pulse */
+.saved-pulse {
+  display: inline-block;
+  margin-left: 0.4rem;
+  color: var(--green);
+  font-weight: bold;
+  animation: saved-fade 1.2s forwards;
+}
+@keyframes saved-fade {
+  0% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Edit toggle button in the row */
+body.page-admin .grid td .edit-toggle {
+  background: none;
+  border: 1px solid var(--blue);
+  color: var(--blue);
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.8rem;
+}
+body.page-admin .grid td .edit-toggle.active {
+  background: var(--blue);
+  color: #000;
+}
+
+/* Save status banner — pinned to the top of each editor panel so
+ * editors always see whether the most recent edit landed. AndreaJens
+ * was confused by the "auto-save on blur" pattern; this banner makes
+ * the state explicit. */
+body.page-admin .editor-panel .save-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  padding: 0.4rem 0.7rem;
+  border-left: 3px solid var(--green);
+  background: rgba(70, 200, 90, 0.08);
+  font-size: 0.85rem;
+}
+body.page-admin .editor-panel .save-status[data-state="saving"] {
+  border-left-color: var(--amber, #e8c060);
+  background: rgba(220, 200, 80, 0.12);
+}
+body.page-admin .editor-panel .save-status[data-state="saved"] {
+  border-left-color: var(--green);
+  background: rgba(70, 200, 90, 0.18);
+}
+body.page-admin .editor-panel .save-status[data-state="error"] {
+  border-left-color: var(--red);
+  background: rgba(220, 60, 60, 0.18);
+  color: #f0a0a0;
+}
+body.page-admin .editor-panel .save-status::before {
+  font-size: 0.9em;
+}
+body.page-admin .editor-panel .save-status[data-state="idle"]::before { content: "💾"; }
+body.page-admin .editor-panel .save-status[data-state="saving"]::before { content: "⏳"; }
+body.page-admin .editor-panel .save-status[data-state="saved"]::before { content: "✓"; color: var(--green); }
+body.page-admin .editor-panel .save-status[data-state="error"]::before { content: "⚠"; }
+
+/* "I have this" toggle inside each editor panel. Active state means
+ * the current logged-in editor has a copy of this game. Held-by list
+ * to the right shows which other editors hold copies. */
+body.page-admin .editor-panel .held-controls {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.3rem;
+}
+body.page-admin .btn-held-toggle {
+  padding: 0.4rem 0.9rem;
+  background: rgba(80, 130, 200, 0.15);
+  border: 1px solid var(--blue);
+  color: var(--blue);
+  cursor: pointer;
+  font-weight: bold;
+  white-space: nowrap;
+}
+body.page-admin .btn-held-toggle.active {
+  background: rgba(70, 200, 90, 0.18);
+  border-color: var(--green);
+  color: #6fe88e;
+}
+body.page-admin .editor-panel .held-list {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+body.page-admin .editor-panel .held-nick {
+  display: inline-block;
+  background: rgba(70, 200, 90, 0.15);
+  color: #6fe88e;
+  padding: 0.05rem 0.4rem;
+  border-radius: 2px;
+  border: 1px solid rgba(70, 200, 90, 0.3);
+  margin: 0 0.1rem;
+}
+
+/* "👥 N editors" badge on the row's status column */
+body.page-admin .grid td .held-count {
+  display: inline-block;
+  margin-top: 0.2rem;
+  padding: 0.05rem 0.4rem;
+  background: rgba(70, 200, 90, 0.12);
+  border: 1px solid rgba(70, 200, 90, 0.3);
+  color: #6fe88e;
+  font-size: 0.72rem;
+  font-weight: bold;
+}
+
+/* Status legend collapsible at top of /admin/. Expanded once, helps
+ * editors learn what each tag means without DM-ing me to ask. */
+body.page-admin details.status-legend {
+  margin: 1rem 0 0.5rem;
+  padding: 0.6rem 0.9rem;
+  background: rgba(60, 70, 90, 0.18);
+  border: 1px solid var(--line-bright);
+}
+body.page-admin details.status-legend summary {
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 0.95rem;
+}
+body.page-admin .status-legend-table {
+  margin-top: 0.6rem;
+  width: 100%;
+}
+body.page-admin .status-legend-table td {
+  padding: 0.5rem 0.7rem !important;
+  border-top: 1px solid var(--line) !important;
+  vertical-align: top;
+}
+body.page-admin .status-legend-table td:first-child { width: 180px; white-space: nowrap; }
+body.page-admin .status-help-toggle {
+  display: inline-block;
+  width: 1.1em;
+  height: 1.1em;
+  line-height: 1.1em;
+  text-align: center;
+  border: 1px solid var(--blue);
+  border-radius: 50%;
+  color: var(--blue);
+  text-decoration: none;
+  font-size: 0.75em;
+  margin-left: 0.3em;
+}
+
+/* The registry table sits in a horizontal-scroll wrap as a fallback
+ * for narrower laptops; mobile-specific styling intentionally removed
+ * (focus on desktop UX for now per user direction 2026-05-09). */
+body.page-admin .registry-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+/* Per-game hero with optional banner image. The .hero base rule
+ * already handles the gradient + glitch effects; .hero-game layers
+ * the registry-provided banner_url on top with a darken-fade so the
+ * title text stays readable regardless of source image colors. */
+.hero-game {
+  position: relative;
+  overflow: hidden;
+  min-height: 200px;
+}
+.hero-game .hero-art {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  opacity: 0.35;
+  z-index: 0;
+}
+.hero-game .hero-art-fade {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg,
+              rgba(15, 18, 26, 0.4) 0%,
+              rgba(15, 18, 26, 0.85) 100%);
+  z-index: 0;
+}
+.hero-game .hero-body {
+  position: relative;
+  z-index: 1;
+}
+.hero-game .engine-tag {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  background: rgba(80, 130, 200, 0.2);
+  border: 1px solid var(--blue);
+  color: var(--blue);
+  font-weight: bold;
+  font-size: 0.78em;
+}
+
+/* New-game card at top */
+body.page-admin .new-game-card {
+  display: none;
+  background: rgba(70, 200, 90, 0.08);
+  border: 1px solid rgba(70, 200, 90, 0.4);
+  padding: 1rem;
+  margin: 0 0 1rem;
+}
+body.page-admin .new-game-card.expanded { display: block; }
 
 footer {
   border-top: 1px solid var(--line);

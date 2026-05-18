@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Admin · Merge {{ src.game_id }} · 2DFM HUB{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <h1>Merge · {{ src.name or src.game_id }}</h1>
+  <p class="lede">
+    Combining two registry rows. The dropped row's <code>game_id</code> is preserved on the
+    kept row as an alias so match history doesn't orphan.
+    · <a href="/admin/g/{{ src.game_id }}">cancel</a>
+  </p>
+</section>
+
+<section style="margin-bottom: 1.5rem;">
+  <div class="sec-head">
+    <h2>Source row</h2>
+    <span class="count">// THE ROW YOU CAME FROM</span>
+  </div>
+  <table class="grid">
+    <tbody>
+      <tr><th>game_id</th><td><code>{{ src.game_id }}</code></td></tr>
+      <tr><th>name</th><td>{{ src.name or '' }}</td></tr>
+      <tr><th>atwiki_id</th><td>{{ src.atwiki_id or '' }}</td></tr>
+      <tr><th>resources</th><td>{{ (src.resources or [])|length }}</td></tr>
+      <tr><th>versions</th><td>{{ (src.versions or [])|length }}</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <div class="sec-head">
+    <h2>Suggested merge targets</h2>
+    <span class="count">// SAME atwiki_id OR SIMILAR NAME</span>
+  </div>
+
+  {% if candidates %}
+  <p class="empty" style="margin-bottom: 1rem;">
+    Pick a target. <strong>"into target"</strong> keeps the target row and drops the source;
+    <strong>"into self"</strong> keeps the source row and drops the target.
+  </p>
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>game_id</th>
+        <th>Name</th>
+        <th>atwiki_id</th>
+        <th class="num">res</th>
+        <th class="num">ver</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in candidates %}
+      <tr>
+        <td><code>{{ c.game_id }}</code></td>
+        <td>{{ c.name or '' }}</td>
+        <td>{{ c.atwiki_id or '' }}</td>
+        <td class="num">{{ (c.resources or [])|length }}</td>
+        <td class="num">{{ (c.versions or [])|length }}</td>
+        <td>
+          <form method="post" action="/admin/g/{{ src.game_id }}/merge" style="display:inline;">
+            <input type="hidden" name="target_id" value="{{ c.game_id }}">
+            <input type="hidden" name="direction" value="into_target">
+            <button type="submit" style="background: var(--blue); border: 0;
+                                          color: #000; padding: 0.3rem 0.75rem;
+                                          cursor: pointer;">into target</button>
+          </form>
+          <form method="post" action="/admin/g/{{ src.game_id }}/merge" style="display:inline; margin-left: 0.25rem;">
+            <input type="hidden" name="target_id" value="{{ c.game_id }}">
+            <input type="hidden" name="direction" value="into_self">
+            <button type="submit" style="background: var(--pink); border: 0;
+                                          color: #000; padding: 0.3rem 0.75rem;
+                                          cursor: pointer;">into self</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No similar rows found by atwiki_id or name. Use the search below to pick any target manually.</p>
+  {% endif %}
+</section>
+
+<section style="margin-top: 2rem;">
+  <div class="sec-head">
+    <h2>Merge with arbitrary game_id</h2>
+    <span class="count">// IF THE SUGGESTIONS DON'T COVER IT</span>
+  </div>
+  <form method="post" action="/admin/g/{{ src.game_id }}/merge"
+        style="display:flex; gap:0.5rem; flex-wrap: wrap; align-items:center;">
+    <input type="text" name="target_id" placeholder="target game_id" required
+           style="flex:1; padding: 0.5rem; min-width: 240px;
+                  background: rgba(0,0,0,0.4);
+                  border: 1px solid var(--line-bright); color: inherit;">
+    <select name="direction" style="padding: 0.5rem;
+                                     background: rgba(0,0,0,0.4);
+                                     border: 1px solid var(--line-bright);
+                                     color: inherit;">
+      <option value="into_target">keep target, drop source</option>
+      <option value="into_self">keep source, drop target</option>
+    </select>
+    <button type="submit"
+            style="padding: 0.5rem 1rem; background: var(--green);
+                   border: 0; color: #000; cursor: pointer;
+                   font-weight: bold;">MERGE</button>
+  </form>
+</section>
+
+{% endblock %}

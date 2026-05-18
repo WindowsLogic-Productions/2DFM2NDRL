@@ -2,13 +2,114 @@
 {% block title %}{{ friendly_name(g.game_id) }} · 2DFM HUB{% endblock %}
 {% block content %}
 
-<section class="hero">
-  <h1>{{ friendly_name(g.game_id) }}</h1>
-  <p class="lede">
-    <strong>{{ g.total }}</strong> match{{ 'es' if g.total != 1 else '' }} recorded ·
-    cabinet ID <strong>{{ g.game_id }}</strong>
-  </p>
+{% set meta = game_meta(g.game_id) %}
+{% set art = meta.banner_url or meta.thumb_url %}
+
+<section class="hero hero-game" {% if not art %}style="background: {{ banner_color(g.game_id) }};"{% endif %}>
+  {% if art %}
+    {# When a registry-provided banner exists, render it above the
+       gradient. Object-fit cover so portrait/landscape images both
+       look intentional. #}
+    <div class="hero-art" style="background-image: url('{{ art }}');"
+         role="img" aria-label="{{ friendly_name(g.game_id) }} banner"></div>
+    <div class="hero-art-fade"></div>
+  {% endif %}
+  <div class="hero-body">
+    <h1>{{ friendly_name(g.game_id) }}</h1>
+    {% if meta.alt_names %}
+      <div class="aliases">
+        {% for alt in meta.alt_names %}<span class="alias">{{ alt }}</span>{% endfor %}
+      </div>
+    {% endif %}
+    <p class="lede">
+      <strong>{{ g.total }}</strong> match{{ 'es' if g.total != 1 else '' }} recorded
+      · cabinet ID <strong>{{ g.game_id }}</strong>
+      {% if meta.engine %}· <span class="engine-tag">{{ meta.engine }}</span>{% endif %}
+      {% if meta.year %}· <strong>{{ meta.year }}</strong>{% endif %}
+      {% if meta.developer %}· by <strong>{{ meta.developer }}</strong>{% endif %}
+      {% if meta.publisher and meta.publisher != meta.developer %} (publisher: {{ meta.publisher }}){% endif %}
+      {% if g.archive and g.archive.archive_status %}
+        · <span class="archive-status archive-{{ g.archive.archive_status|lower }}">{{ g.archive.archive_status|replace('_',' ') }}</span>
+      {% endif %}
+    </p>
+    {% if meta.description %}
+      <p class="lede" style="opacity: 0.9; margin-top: 0.4rem;">{{ meta.description }}</p>
+    {% endif %}
+  </div>
 </section>
+
+{% if g.archive and (g.archive.resources or g.archive.versions) %}
+<section class="archive-panel">
+  <div class="sec-head">
+    <h2>Resources &amp; Archive</h2>
+    <span class="count">// LINKS, DOWNLOADS, BUILD VERSIONS</span>
+  </div>
+
+  <div class="cols-2">
+    <div>
+      {# Resources are an open-ended list. Group by kind so the page #}
+      {# has visual structure without locking us to a fixed schema.   #}
+      {% set rg = {} %}
+      {% for r in g.archive.resources %}
+        {% set _ = rg.setdefault(r.kind or 'other', []).append(r) %}
+      {% endfor %}
+
+      {# Render groups in a meaningful order; everything unknown      #}
+      {# falls through alphabetically at the bottom.                  #}
+      {% set order = ['atwiki','mizuumi','wiki','homepage','wayback','discord','gamefaqs','store','download','video','tutorial'] %}
+      {% set extras = [] %}
+      {% for k in rg.keys()|sort %}{% if k not in order %}{% set _ = extras.append(k) %}{% endif %}{% endfor %}
+      {% for kind in order + extras if kind in rg %}
+      <h3 class="resource-kind">{{ kind|upper }}</h3>
+      <ul class="archive-links">
+        {% for r in rg[kind] %}
+        <li>
+          {% if r.filename %}<strong>{{ r.filename }}</strong>{% else %}<strong>{{ r.name or r.url }}</strong>{% endif %}
+          {% if r.desc %}<small class="muted">— {{ r.desc }}</small>{% endif %}
+          <div class="resource-actions">
+            {% if r.url %}<a href="{{ r.url }}" target="_blank" rel="noopener">live</a>{% endif %}
+            {% if r.archive_url %}<a href="{{ r.archive_url }}" target="_blank" rel="noopener">wayback</a>{% endif %}
+            {% if r.pulled %}<span class="badge ok">pulled · {{ '{:,}'.format(r.size_bytes or 0) }} B · {{ r.kind_real }}</span>{% endif %}
+            {% if r.pulled is sameas false and r.error %}<span class="badge err" title="{{ r.error }}">failed</span>{% endif %}
+            {% if r.source %}<span class="badge src">{{ r.source }}</span>{% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endfor %}
+
+      {% if not g.archive.resources %}
+      <p class="empty">No resources catalogued yet.</p>
+      {% endif %}
+    </div>
+
+    <div>
+      <h3>Build Versions ({{ g.archive.versions|length }})</h3>
+      {% if g.archive.versions %}
+      <table class="grid">
+        <thead><tr><th>xxh64</th><th class="num">size</th><th>source</th><th>where</th></tr></thead>
+        <tbody>
+          {% for v in g.archive.versions %}
+          <tr>
+            <td><code>{{ v.xxh64 }}</code></td>
+            <td class="num">{{ '{:,}'.format(v.size_bytes or 0) }}</td>
+            <td>{{ v.source }}</td>
+            <td class="muted">
+              {% if v.exe_path %}{{ v.exe_path.split('/')[-1] }}{% endif %}
+              {% if v.from_archive %}<br><small>{{ v.from_archive }}</small>{% endif %}
+              {% if v.match_known %}<br><span class="badge known">{{ v.match_known }}</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty">No exe hashes recorded yet.</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+{% endif %}
 
 <div class="cols-2">
   <section>
@@ -36,18 +137,38 @@
 
   <section>
     <div class="sec-head">
-      <h2>Top Characters</h2>
-      <span class="count">// MOST PICKED</span>
+      <h2>Characters</h2>
+      <span class="count">// {{ g.top_chars|length }} TOTAL · PICKS · W-L-D · WINRATE</span>
     </div>
     {% if g.top_chars %}
     <table class="grid">
-      <thead><tr><th class="rank">#</th><th>Character</th><th class="num">Picks</th></tr></thead>
+      <thead>
+        <tr>
+          <th class="rank">#</th>
+          <th>Character</th>
+          <th class="num">Picks</th>
+          <th class="num">W</th>
+          <th class="num">L</th>
+          <th class="num">D</th>
+          <th class="num">Winrate</th>
+        </tr>
+      </thead>
       <tbody>
         {% for c in g.top_chars %}
         <tr>
           <td class="rank">{{ '%02d' % loop.index }}</td>
           <td><a href="/g/{{ g.game_id }}/c/{{ c.char }}">{{ c.char }}</a></td>
           <td class="num">{{ c.matches }}</td>
+          <td class="num">{{ c.wins }}</td>
+          <td class="num">{{ c.losses }}</td>
+          <td class="num">{{ c.draws }}</td>
+          <td class="num">
+            {% if c.wins + c.losses > 0 %}
+              {{ '%.1f' % (c.winrate * 100) }}%
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
