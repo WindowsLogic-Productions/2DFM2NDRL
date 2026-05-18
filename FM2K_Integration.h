@@ -658,12 +658,17 @@ public:
     // where the spectator's FM2K_REMOTE_ADDR points and SpectatorNode
     // JOIN_REQ is sent. mode default "current" — see LaunchLocalSpectator
     // for the 2026-05-13 v0.2.42 flip rationale.
+    // spec_transport ("tcp" or "relay") -- Phase 4. If "relay", the
+    // launcher sets FM2K_SPEC_TRANSPORT=relay on the spec game spawn
+    // so the hook enters relay mode without the user setting an env.
+    // Default "tcp" preserves legacy P2P TCP spec data plane.
     bool LaunchRemoteSpectator(const std::string& game_path,
                                int spectator_port,
                                const std::string& host_ip,
                                int host_port,
                                const std::string& session_kind = "menu",
-                               const std::string& mode = "current");
+                               const std::string& mode = "current",
+                               const std::string& spec_transport = "tcp");
 
     // Offline replay player. Launches the game with FM2K_SPECTATOR_MODE=1
     // + FM2K_REPLAY_FILE=<replay_path>; the hook reads the env var in
@@ -729,8 +734,14 @@ public:
     // "menu" / "css" / "battle" — the host's current game phase, used
     // to decide whether to /F-boot-to-battle (host in battle) or walk
     // the normal title→CSS path (host in lobby/CSS).
+    //
+    // spec_transport ("tcp" or "relay") -- Phase 4. Echoes the host's
+    // advertised transport so the spec launcher sets FM2K_SPEC_TRANSPORT
+    // on the spec game spawn matching the host's mode. Removes the
+    // "user must set env on both peers" requirement.
     std::function<void(const std::string& host_ip, int host_port,
-                       const std::string& session_kind)> on_spectate_match;
+                       const std::string& session_kind,
+                       const std::string& spec_transport)> on_spectate_match;
     // Hub fired a spectator_incoming event — we're the host of an active
     // match and a spectator wants in. Their external UDP addr is passed
     // so we can fire an outbound NAT-punch packet to open the inbound
