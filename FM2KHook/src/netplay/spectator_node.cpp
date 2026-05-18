@@ -1,4 +1,5 @@
 #include "spectator_node.h"
+#include "spec_relay_queue.h"     // hub-relay outbound queue (Phase 2c)
 #include "spectator_tcp.h"        // TCP transport for INPUT_BATCH stream
 #include "control_channel.h"
 #include "netplay.h"
@@ -84,10 +85,15 @@ struct State {
     InitialMatch              initial_match     = {};
     // spec_transport_relay -- Phase 2b. True when FM2K_SPEC_TRANSPORT=relay
     // was set at SpectatorNode_Init. In relay mode the TCP listener +
-    // PerformTcpStun are skipped entirely; spec data plane will flow
-    // through the hub once Phase 2c wires the launcher's binary-frame
-    // queue. False = legacy P2P TCP path (every shipped client to date).
+    // PerformTcpStun are skipped entirely; spec data flows out via the
+    // shared-mem ring below instead.
     bool                      spec_transport_relay = false;
+    // Outbound spec-relay ring (Phase 2c). Non-null only when relay mode
+    // is active. Hook produces (Enqueue) when shipping spec data; the
+    // launcher process (which opened the same kernel mapping by our
+    // pid) drains and forwards each Slot as a WS binary frame to the
+    // hub. Layout + ordering documented in spec_relay_queue.h.
+    fm2k::spec_relay::Ring*   spec_relay_out       = nullptr;
 
     // ─── HOST SIDE: session event log ──────────────────────────────────
     // Every confirmed event the host produces (INPUT pairs in C2; PIN_RNG
@@ -952,15 +958,26 @@ void SpectatorNode_Init() {
         g_state.spec_transport_relay = true;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: FM2K_SPEC_TRANSPORT=relay -- skipping TCP "
-            "listener + TCP-STUN (relay data plane not yet wired; spec "
-            "subscriptions will negotiate but not stream until Phase 2c)");
+            "listener + TCP-STUN, creating shared-mem outbound queue "
+            "for launcher to forward to hub");
+        // Create the outbound shared-mem ring (hook is the producer).
+        // Launcher opens the same mapping by pid and drains every tick.
+        // If creation fails, we log + continue in a degraded "negotiate
+        // but no data" state -- not worth aborting init over.
+        g_state.spec_relay_out = fm2k::spec_relay::CreateOutboundHere();
+        if (!g_state.spec_relay_out) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: spec_relay outbound mapping failed; "
+                "spec data plane unavailable for this session");
+        }
         // Capacity still applies (hub fan-out is bounded too). Match
         // the TCP path's default so behavior is identical from the
         // host-control-flow perspective.
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: Init (capacity=%zu, batch=%zu frames, "
-            "transport=relay)",
-            g_state.capacity, BROADCAST_BATCH_FRAMES);
+            "transport=relay, outbound_queue=%s)",
+            g_state.capacity, BROADCAST_BATCH_FRAMES,
+            g_state.spec_relay_out ? "ok" : "failed");
         return;
     }
 
@@ -1078,6 +1095,14 @@ void SpectatorNode_Shutdown() {
     g_state.subscribed_upstream = false;
     g_state.playing_back = false;
     SpectatorTCP::Shutdown();
+    // Tear down the relay outbound ring if we created one. Idempotent
+    // (Close handles nullptr). The kernel mapping object lives until
+    // both processes (us + launcher) drop their handles, so an in-
+    // flight launcher drain won't get torn out from under us mid-pop.
+    if (g_state.spec_relay_out) {
+        fm2k::spec_relay::Close(g_state.spec_relay_out);
+        g_state.spec_relay_out = nullptr;
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SpectatorNode: Shutdown");
 }
 

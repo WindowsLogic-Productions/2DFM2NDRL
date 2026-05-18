@@ -3683,6 +3683,15 @@ void LauncherUI::SendHubSessionKind(uint8_t kind) {
                 "Hub: forwarded session_kind=%s to hub", kind_str);
 }
 
+void LauncherUI::SendHubSpecRelayFrame(std::vector<uint8_t> frame) {
+    if (!hub_state_) return;
+    // No verbose log per call -- this fires many times per match
+    // during a snapshot transfer. Hub-side log via SPEC_RELAY shows
+    // overall traffic; if we want diagnostics here add a throttled
+    // counter.
+    hub_state_->client.SendSpecRelayFrame(std::move(frame));
+}
+
 void LauncherUI::SetFramesAhead(float frames_ahead) {
     frames_ahead_ = frames_ahead;
 }
