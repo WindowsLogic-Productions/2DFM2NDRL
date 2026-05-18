@@ -3628,10 +3628,30 @@ void SpectatorNode_TickHostMaintenance() {
     // first successful pair, ship INITIAL_MATCH + backfill — those bytes
     // were deferred at JOIN_REQ accept time because the socket didn't
     // exist yet.
+    //
+    // Relay mode (Phase 2c): there's no TCP listener and no async dial;
+    // the launcher's WS-to-hub data path is already up at JOIN_REQ time.
+    // So as soon as we have a spec_user_id (for addressing relay sends),
+    // mark the sub "bound" immediately so the snapshot+backfill ship.
+    // Without this short-circuit, sub.tcp_bound stayed false forever in
+    // relay mode and the spec saw zero data after subscribing.
     for (auto& sub : g_state.subscribers) {
         if (sub.tcp_bound) continue;
-        if (SpectatorTCP::RegisterAcceptedClient(sub.addr)) {
+        bool just_bound = false;
+        if (g_state.spec_transport_relay) {
+            // Need spec_user_id to address relay sends. If still empty
+            // (loopback race -- punch dict hadn't populated when first
+            // JOIN_REQ arrived), wait for the existing-sub re-JOIN path
+            // to backfill it. Next bind-loop tick succeeds.
+            if (!sub.spec_user_id.empty()) {
+                sub.tcp_bound = true;
+                just_bound = true;
+            }
+        } else if (SpectatorTCP::RegisterAcceptedClient(sub.addr)) {
             sub.tcp_bound = true;
+            just_bound = true;
+        }
+        if (just_bound) {
             char buf[48] = {}; FormatAddr(sub.addr, buf, sizeof(buf));
 
             // C5 backfill ordering fence:
