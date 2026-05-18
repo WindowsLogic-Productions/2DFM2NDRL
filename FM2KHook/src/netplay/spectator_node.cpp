@@ -2625,11 +2625,13 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
         }
         g_state.subscribers.push_back(sub);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: Accepted subscriber %s (%zu/%zu, mode=%s) — "
-                    "deferring INITIAL_MATCH until TCP binds",
+                    "SpectatorNode: Accepted subscriber %s (%zu/%zu, mode=%s, "
+                    "transport=%s, user_id=%s)",
                     addr_buf, g_state.subscribers.size(), g_state.capacity,
                     mode == SpecJoinMode::CURRENT_MATCH ? "CURRENT_MATCH"
-                                                       : "FULL_SESSION");
+                                                       : "FULL_SESSION",
+                    g_state.spec_transport_relay ? "RELAY" : "TCP",
+                    sub.spec_user_id.empty() ? "(none)" : sub.spec_user_id.c_str());
 
         CtrlPacket ack = BuildJoinAck();
         ControlChannel_SendTo(ack, from);
@@ -3715,11 +3717,15 @@ void SpectatorNode_TickHostMaintenance() {
                 sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
                 g_state.current_snapshot.valid;
 
+            const char* xport = g_state.spec_transport_relay ? "RELAY" : "TCP";
             if (use_snapshot) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: TCP bound for %s — CURRENT_MATCH "
+                    "SpectatorNode: %s bound for %s%s%s — CURRENT_MATCH "
                     "(snapshot match=%u + tail from INPUT-frame=%u)",
-                    buf, g_state.current_snapshot.match_index,
+                    xport, buf,
+                    g_state.spec_transport_relay ? " user_id=" : "",
+                    g_state.spec_transport_relay ? sub.spec_user_id.c_str() : "",
+                    g_state.current_snapshot.match_index,
                     g_state.current_snapshot.input_frame);
                 // Push current HOST_CONFIG over the UDP ctrl channel
                 // BEFORE the snapshot. Live broadcasts only fire at
@@ -3734,9 +3740,11 @@ void SpectatorNode_TickHostMaintenance() {
                     g_state.current_snapshot.input_frame);
             } else {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: TCP bound for %s — %s "
+                    "SpectatorNode: %s bound for %s%s%s — %s "
                     "(legacy from-frame-0 backfill)",
-                    buf,
+                    xport, buf,
+                    g_state.spec_transport_relay ? " user_id=" : "",
+                    g_state.spec_transport_relay ? sub.spec_user_id.c_str() : "",
                     sub.join_mode == SpecJoinMode::CURRENT_MATCH
                         ? "CURRENT_MATCH requested but no snapshot yet"
                         : "FULL_SESSION");
