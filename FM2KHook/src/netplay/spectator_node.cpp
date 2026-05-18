@@ -15,6 +15,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <array>
+#include <set>
+#include <string>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -238,6 +240,24 @@ struct State {
 };
 
 State g_state;
+
+// Per-session tracking of which GekkoSpectator addrs we've already added.
+// GekkoNet has no remove-actor API (gekkonet.h:185-203 -- only
+// gekko_add_actor exists), so a naive add-on-rejoin pattern leaks one
+// GekkoSpectator actor per spec retry. Over a 5s-retry storm, the host's
+// per-tick spectator iteration cost grows linearly and crushes the frame
+// budget down to single-digit FPS.
+//
+// Fix: gate gekko_add_actor on this set. Cleared once per session boundary
+// by SpectatorNode_ClearGekkoSpectatorTracking() (called from netplay.cpp
+// after each fresh gekko_create + gekko_start -- new session = no actors
+// yet = empty set). Worst case per session: one zombie actor per
+// ever-seen spec addr, instead of one per retry.
+//
+// Keyed by "ip:port" string (matches the addr_str gekko_add_actor sees).
+// std::set instead of unordered_set so we don't have to hash, and the
+// member count is tiny (single-digit per match in practice).
+std::set<std::string> g_gekko_spectator_addrs;
 
 // In-flight TCP punch sockets — see TickHostMaintenance comment for why
 // we defer close. Each entry holds a SOCKET handle and the wall-clock
@@ -1020,6 +1040,20 @@ void SpectatorNode_Shutdown() {
     g_state.playing_back = false;
     SpectatorTCP::Shutdown();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "SpectatorNode: Shutdown");
+}
+
+// Clear the GekkoSpectator addr-tracking set. Called from netplay.cpp
+// after each fresh gekko_create + gekko_start so the next session
+// starts with no "already added" entries. Without this, post-session
+// spec rejoins would be skipped because their addr is "remembered"
+// from the previous (now-destroyed) session.
+void SpectatorNode_ClearGekkoSpectatorTracking() {
+    if (!g_gekko_spectator_addrs.empty()) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: cleared %zu GekkoSpectator addr tracking entries (session boundary)",
+            g_gekko_spectator_addrs.size());
+        g_gekko_spectator_addrs.clear();
+    }
 }
 
 void SpectatorNode_SetCapacity(size_t max_direct) {
@@ -2288,10 +2322,26 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
                  ip_str, ntohs(spec_from.sin_port));
         GekkoSession* sess = Netplay_GetActiveSession();
         if (!sess) return;
+
+        // Dedup against this-session's previously-added spec addrs. Without
+        // this, a spec stuck in a 5s retry loop (e.g. TCP punch failing on
+        // symmetric NAT) re-fires SPEC_JOIN_REQ every cycle and we'd
+        // gekko_add_actor on each, leaking one actor per retry. GekkoNet
+        // has no remove_actor counterpart, so dedup-on-add is the only
+        // bound. Set is cleared at session boundaries from netplay.cpp.
+        const std::string addr_key(addr_str);
+        if (g_gekko_spectator_addrs.count(addr_key)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: GekkoSpectator already on %s session for %s -- skipping re-add",
+                k == NetplaySessionKind::CSS ? "CSS" : "BATTLE",
+                addr_str);
+            return;
+        }
         GekkoNetAddress addr = {};
         addr.data = (void*)addr_str;
         addr.size = (int)strlen(addr_str);
         gekko_add_actor(sess, GekkoSpectator, &addr);
+        g_gekko_spectator_addrs.insert(addr_key);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: Late-joiner added as GekkoSpectator on %s session -> %s",
             k == NetplaySessionKind::CSS ? "CSS" : "BATTLE",
