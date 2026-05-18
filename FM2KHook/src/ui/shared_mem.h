@@ -9,6 +9,13 @@
 // ============================================================================
 
 constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
+// v13 (2026-05-18): spec hub-relay user-id propagation — adds
+// spectator_punch_user_id[32] alongside the existing punch target so
+// the host hook can address relay-mode subs by hub user-id instead of
+// sockaddr. Set by launcher on every spec_incoming WS event from hub.
+// Empty string = legacy spec_incoming (pre-relay hub). Phase 2c of
+// the v0.3 spec rebuild; see docs/dev/spec_hub_relay_design.md.
+// v12 (2026-05-12): spec TCP-STUN external addr + session_kind blocks.
 // v11 (2026-05-09): spectator NAT-punch coordination — adds
 // spectator_punch_{ip_be,port,seq}. Launcher writes when hub forwards a
 // spectator_incoming event; hook's TickHostMaintenance polls the seq
@@ -21,7 +28,7 @@ constexpr uint32_t FM2K_SHARED_MEM_MAGIC = 0x464D324B;  // "FM2K"
 // breakdowns + session grouping.
 // v9 (2026-05-06): in-game HUD state block (scores, spectator count,
 // system-message slot).
-constexpr uint32_t FM2K_SHARED_MEM_VERSION = 12;
+constexpr uint32_t FM2K_SHARED_MEM_VERSION = 13;
 
 // Maximum bytes for a UTF-8-encoded character name in the shared mem
 // outcome payload. FM2K stores .player filenames as 256-byte CP932
@@ -234,6 +241,18 @@ struct FM2KSharedMemData {
                                          // 0 sentinel = TCP punch disabled
                                          // (older hub or non-TCP-capable spec).
     uint32_t spectator_punch_seq;
+    // Spec hub-relay user_id (v13). Launcher copies this from the
+    // spec_incoming WS event's spec_user_id field whenever the hub
+    // forwards a spectator-incoming notification. Hook reads on punch_seq
+    // bumps (same poll as the addr block above), stashes in a small
+    // (addr -> user_id) dict, and populates Subscriber.spec_user_id when
+    // HandleJoinReq accepts the matching JOIN_REQ.
+    //
+    // Empty string when the hub doesn't include spec_user_id (older hub)
+    // OR the launcher hasn't published yet. Relay-mode SendTo skips
+    // subscribers with empty user_id (can't address them through the
+    // hub); TCP-mode ignores the field entirely.
+    char     spectator_punch_user_id[32];
 
     // Hook → launcher: external TCP addr discovered by SpectatorTCP's
     // PerformTcpStun (outbound connect to hub TCP-STUN endpoint, source-
