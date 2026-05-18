@@ -1094,6 +1094,15 @@ void HubClient::OnMessage(const std::string& msg) {
             }
             // else: hub didn't supply — keep default "menu" from struct init
         }
+        {
+            // Phase 4: pick up host's spec_transport so we can match
+            // the mode on the spec game spawn. "tcp" or "relay" only;
+            // anything else is treated as default tcp.
+            std::string st = GetStr(msg, "spec_transport");
+            if (st == "tcp" || st == "relay") {
+                ev.spectate.spec_transport = std::move(st);
+            }
+        }
         EmitEvent(std::move(ev));
         return;
     }

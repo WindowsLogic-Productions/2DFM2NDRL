@@ -185,6 +185,12 @@ struct HubEvent {
         // will arrive over the wire). Default "menu" only fires if the
         // hub field is absent — shouldn't happen in practice.
         std::string session_kind = "menu";
+        // spec_transport — Phase 4 of v0.3 spec rebuild. Echoes the
+        // target host's hello spec_transport so the spec launcher can
+        // set FM2K_SPEC_TRANSPORT on the spec game spawn matching the
+        // host's mode. Default "tcp" matches legacy behavior for hosts
+        // (and hubs) that don't advertise the field.
+        std::string spec_transport = "tcp";
     } spectate;
 
     // SpecRelayBinary payload (Phase 3). Hub forwarded a SpecDataHeader-

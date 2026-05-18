@@ -1619,7 +1619,8 @@ bool FM2KLauncher::Initialize() {
     };
 
     ui_->on_spectate_match = [this](const std::string& host_ip, int host_port,
-                                    const std::string& session_kind) {
+                                    const std::string& session_kind,
+                                    const std::string& spec_transport) {
         // Need an installed game to point the spectator at; reuse whatever
         // the launcher currently has selected.
         if (selected_game_.exe_path.empty()) {
@@ -1633,7 +1634,7 @@ bool FM2KLauncher::Initialize() {
         // false; user can stop it from the multi-client tools first.
         constexpr int SPEC_LOCAL_PORT = 7002;
         LaunchRemoteSpectator(selected_game_.exe_path, SPEC_LOCAL_PORT,
-                              host_ip, host_port, session_kind);
+                              host_ip, host_port, session_kind, spec_transport);
     };
     ui_->on_exit = [this]() {
         running_ = false;
@@ -3352,12 +3353,14 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
                                          const std::string& host_ip,
                                          int host_port,
                                          const std::string& session_kind,
-                                         const std::string& mode)
+                                         const std::string& mode,
+                                         const std::string& spec_transport)
 {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s, session_kind=%s)",
+                "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s, "
+                "session_kind=%s, transport=%s)",
                 game_path.c_str(), spectator_port, host_ip.c_str(), host_port,
-                mode.c_str(), session_kind.c_str());
+                mode.c_str(), session_kind.c_str(), spec_transport.c_str());
 
     if (spectator_instance_ && spectator_instance_->IsRunning()) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Spectator already running");
@@ -3375,6 +3378,14 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
     spectator_instance_->SetEnvironmentVariable("FM2K_PRODUCTION_MODE", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_INPUT_RECORDING", "0");
     spectator_instance_->SetEnvironmentVariable("FM2K_FORCE_RNG_SEED",  "12345678");
+    // Phase 4: auto-derived spec transport from host's spectate_grant.
+    // Setting "tcp" explicitly clears any inherited relay env from a
+    // previous spec session; setting "relay" enables the hub-relay
+    // data plane in the spec hook. User no longer needs to set this
+    // env manually -- it's negotiated via hub.
+    if (spec_transport == "tcp" || spec_transport == "relay") {
+        spectator_instance_->SetEnvironmentVariable("FM2K_SPEC_TRANSPORT", spec_transport);
+    }
     {
         const std::string normalized =
             (mode == "full" || mode == "FULL" || mode == "FULL_SESSION") ? "full" : "current";

@@ -1696,7 +1696,12 @@ void LauncherUI::RenderDirectSpecInline() {
                 // snapshot. on_spectate_match (on the launcher side)
                 // validates a game is selected and warns if not.
                 if (on_spectate_match) {
-                    on_spectate_match(host_ip, host_port, "battle");
+                    // Manual "spectate by IP" dev path -- we don't know
+                    // the host's spec_transport here. Default to "tcp"
+                    // so the launcher uses the legacy P2P path; the
+                    // user can override by setting
+                    // FM2K_SPEC_TRANSPORT=relay before launching.
+                    on_spectate_match(host_ip, host_port, "battle", "tcp");
                 }
             }
         }
@@ -5723,7 +5728,8 @@ void LauncherUI::RenderHubPanel() {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hub: %s", hs.status_line.c_str());
                 if (on_spectate_match) {
                     on_spectate_match(ev.spectate.host_ip, ev.spectate.host_port,
-                                      ev.spectate.session_kind);
+                                      ev.spectate.session_kind,
+                                      ev.spectate.spec_transport);
                 }
                 break;
             }
