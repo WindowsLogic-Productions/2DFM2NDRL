@@ -35,6 +35,13 @@ struct Snapshot {
     uint32_t     downloaded_bytes = 0;  // populated during Downloading
     uint32_t     total_bytes      = 0;  // populated during Downloading (0 if unknown)
     std::string  error_detail;          // populated on State::Failed
+    // Both channels' latest versions, refreshed on every CheckForUpdates.
+    // Used by the menu-bar release-channel toggle to show what's available
+    // on each side so the user can decide whether flipping is worth it.
+    // Empty string = unknown (check hasn't completed or that channel has
+    // no releases yet).
+    std::string  latest_stable;
+    std::string  latest_dev;
 };
 
 // Kick off a non-blocking version check. Safe to call any time;
@@ -52,6 +59,13 @@ bool ApplyUpdateAndExit();
 
 // Snapshot the current state for UI rendering. Cheap.
 Snapshot Get();
+
+// True when remote is OLDER than local — i.e. the channel they're on
+// has a version below their installed one. Common case: user is on a
+// dev build (0.2.55) and flips channel to stable (latest 0.2.54). UI
+// uses this to switch the pill copy from "Update X -> Y" to
+// "Switch X -> Y" so the user knows they're going backwards.
+bool IsRemoteOlderThanLocal();
 
 // Tear down the worker thread (called from launcher shutdown).
 void Shutdown();

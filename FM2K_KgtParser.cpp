@@ -5,6 +5,7 @@
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 
+#include <cctype>
 #include <cstring>
 #include <vector>
 
@@ -284,7 +285,29 @@ bool ParseKgtSummary(const std::filesystem::path& kgt_path, KgtSummary& out) {
             std::string display = cp932_to_utf8(phdr.name.name,
                                                 sizeof(phdr.name.name));
             if (!display.empty() && display != fname) {
-                out.player_names[i] = std::move(display);
+                // Skip the override when the embedded name STARTS WITH
+                // the filename (case-insensitive). This is the
+                // "filename is already a real name + embedded has junk
+                // appended" case — e.g. filename="Primeape" but
+                // embedded="PrimeapeCThrow" (creator's internal
+                // naming convention). Keeping the filename gives the
+                // user the clean "Primeape" they expect. The
+                // intended override case ("c1" filename →
+                // 瑞希君 embedded) still fires because the embedded
+                // name doesn't start with the filename. v0.2.40.
+                auto starts_with_ci = [](const std::string& s,
+                                         const std::string& prefix) {
+                    if (s.size() < prefix.size()) return false;
+                    for (size_t k = 0; k < prefix.size(); ++k) {
+                        const unsigned char a = (unsigned char)s[k];
+                        const unsigned char b = (unsigned char)prefix[k];
+                        if (std::tolower(a) != std::tolower(b)) return false;
+                    }
+                    return true;
+                };
+                if (!starts_with_ci(display, fname)) {
+                    out.player_names[i] = std::move(display);
+                }
             }
         }
     }

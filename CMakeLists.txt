@@ -325,6 +325,27 @@ add_custom_target(fm2k_version
     VERBATIM
 )
 
+# Bake the hub log-upload shared secret into auto_upload_secret.h at
+# configure time. CI / dev shells set FM2K_LOG_UPLOAD_SECRET in the
+# environment before invoking cmake; if it's missing, the file still
+# gets generated with an empty string and the launcher auto-disables
+# the uploader. URL is overridable too (defaults to the prod hub).
+set(FM2K_LOG_UPLOAD_SECRET "$ENV{FM2K_LOG_UPLOAD_SECRET}")
+set(FM2K_LOG_UPLOAD_URL "$ENV{FM2K_LOG_UPLOAD_URL}")
+if(FM2K_LOG_UPLOAD_URL STREQUAL "")
+    set(FM2K_LOG_UPLOAD_URL "https://hub.2dfm.org/logs/upload")
+endif()
+if(FM2K_LOG_UPLOAD_SECRET STREQUAL "")
+    message(WARNING
+        "FM2K_LOG_UPLOAD_SECRET not set — log auto-upload will be DISABLED in this build. "
+        "Set it before configure to enable.")
+endif()
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/auto_upload_secret.h.in"
+    "${CMAKE_CURRENT_SOURCE_DIR}/auto_upload_secret.h"
+    @ONLY
+)
+
 add_executable(FM2K_RollbackLauncher
     # launcher.rc must be FIRST so its compiled .res is the first
     # resource-bearing object on the link line. MinGW's libwinpthread.a
@@ -347,6 +368,7 @@ add_executable(FM2K_RollbackLauncher
     FM2K_DDrawRedirect.cpp
     FM2K_CncDDraw.cpp
     FM2K_KgtParser.cpp
+    FM2K_UploadQueue.cpp
     # Stock miniz (public domain) for in-process zip extraction. SDL_image
     # ships its own statically-scoped copy with archive APIs disabled, so
     # this independent copy gives us mz_zip_reader_* without disturbing

@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
+#include <shlobj.h>   // SHGetSpecialFolderPathA, CSIDL_APPDATA
 
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,46 @@ struct InternalState {
 };
 
 InternalState g_st;
+
+// ---------------------------------------------------------------------------
+// Update channel — `stable` (default, GH non-prerelease) or `dev` (latest
+// release including prereleases). Persisted to dev_flags.ini alongside
+// other launcher settings so the in-process launcher UI and this updater
+// share the same value via the same file. Key = "update_channel",
+// int value: 0 = stable, 1 = dev.
+// ---------------------------------------------------------------------------
+
+enum class Channel : int { Stable = 0, Dev = 1 };
+
+std::string DevFlagsIniPath() {
+    char buf[MAX_PATH] = {};
+    if (!SHGetSpecialFolderPathA(nullptr, buf, CSIDL_APPDATA, FALSE) || !buf[0]) {
+        return {};
+    }
+    std::string dir = std::string(buf) + "\\FM2K_Rollback";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\dev_flags.ini";
+}
+
+Channel ReadUpdateChannel() {
+    const std::string path = DevFlagsIniPath();
+    if (path.empty()) return Channel::Stable;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return Channel::Stable;
+    char line[128];
+    int result = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t')) s.pop_back();
+        const size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        if (s.substr(0, eq) != "update_channel") continue;
+        result = std::atoi(s.substr(eq + 1).c_str());
+    }
+    std::fclose(f);
+    return (result == 1) ? Channel::Dev : Channel::Stable;
+}
 
 void SetState(State s) {
     std::lock_guard<std::mutex> lk(g_st.mtx);
@@ -304,15 +345,27 @@ std::string AppDir() {
 
 void CheckWorker() {
     SetState(State::Checking);
-    // v0.2.8: use api.github.com/.../releases/latest instead of
-    // raw.githubusercontent.com/.../LatestVersion. The raw endpoint is
-    // CDN-cached for 5–15 min, so a freshly-cut release wasn't visible
-    // to clients until the cache expired. The API endpoint reflects
-    // changes within seconds. Returns JSON; we extract "tag_name"
-    // (e.g. "v0.2.8") and strip the leading "v".
+    const Channel channel = ReadUpdateChannel();
+    // Stable channel (default): /releases/latest returns the most recent
+    // non-prerelease tag. Simple JSON, one tag_name field.
+    // Dev channel: /releases returns the full list (most recent first)
+    // including prereleases. We walk it and pick the first prerelease=true
+    // entry — that's the latest dev build. Note: if you switch from dev
+    // back to stable, the launcher's local version may already be NEWER
+    // than what `/releases/latest` returns; CompareVersions handles that
+    // (local > remote ⇒ UpToDate, no downgrade attempt).
+    // Always fetch BOTH channels so the menu-bar release toggle can
+    // display "Stable(0.2.53) Dev(0.2.54)" labels. We use the active
+    // channel's value for the upgrade pill's UpdateAvailable comparison.
+    //
+    // /releases?per_page=20 returns the most-recent N entries (any
+    // mix of prerelease/non-prerelease, newest first). Walking once
+    // extracts both: the first prerelease=true entry is `dev`, the
+    // first prerelease=false entry is `stable`. One HTTP round-trip
+    // vs the old two-roundtrip impl.
     char url[512];
     std::snprintf(url, sizeof(url),
-        "https://api.github.com/repos/%s/%s/releases/latest",
+        "https://api.github.com/repos/%s/%s/releases?per_page=20",
         kUpdateRepoOwner, kUpdateRepoName);
 
     GetResp r = HttpGetText(url);
@@ -321,42 +374,99 @@ void CheckWorker() {
         g_st.busy.store(false);
         return;
     }
-    // Minimal JSON parse: find "tag_name":"vX.Y.Z" and pull the value.
-    // No need for a full JSON lib here — body is small + the key/value
-    // shape is fixed by GitHub's API contract.
-    std::string remote;
+
+    // Walk releases JSON. For each entry capture (tag_name, prerelease).
+    // Stop once we've found one of each type; bail early on parse
+    // problems (better to ship partial data than nothing).
+    auto strip_v = [](std::string& s) {
+        if (!s.empty() && (s.front() == 'v' || s.front() == 'V')) s.erase(s.begin());
+    };
+    std::string latest_stable;
+    std::string latest_dev;
     {
         const std::string& body = r.body;
-        size_t p = body.find("\"tag_name\"");
-        if (p != std::string::npos) {
-            p = body.find('"', p + 10);  // open quote of value
-            if (p != std::string::npos) {
-                size_t end = body.find('"', p + 1);
-                if (end != std::string::npos) {
-                    remote = body.substr(p + 1, end - p - 1);
+        size_t cur = 0;
+        while (cur < body.size() && (latest_stable.empty() || latest_dev.empty())) {
+            size_t tn = body.find("\"tag_name\"", cur);
+            if (tn == std::string::npos) break;
+            size_t qp = body.find('"', tn + 10);
+            if (qp == std::string::npos) break;
+            size_t qe = body.find('"', qp + 1);
+            if (qe == std::string::npos) break;
+            std::string tag = body.substr(qp + 1, qe - qp - 1);
+
+            size_t next_tn = body.find("\"tag_name\"", qe);
+            size_t scan_end = (next_tn == std::string::npos) ? body.size() : next_tn;
+            size_t pr = body.find("\"prerelease\"", qe);
+            bool is_prerelease = false;
+            if (pr != std::string::npos && pr < scan_end) {
+                size_t colon = body.find(':', pr);
+                if (colon != std::string::npos && colon + 1 < scan_end) {
+                    size_t v = colon + 1;
+                    while (v < scan_end && (body[v] == ' ' || body[v] == '\t')) ++v;
+                    is_prerelease = (body.compare(v, 4, "true") == 0);
                 }
             }
+            if (is_prerelease) {
+                if (latest_dev.empty()) latest_dev = std::move(tag);
+            } else {
+                if (latest_stable.empty()) latest_stable = std::move(tag);
+            }
+            cur = scan_end;
         }
     }
-    // Strip leading "v" if present (tag_name is "v0.2.8" but we
-    // compare bare semver "0.2.8" against kAppVersion).
-    if (!remote.empty() && (remote.front() == 'v' || remote.front() == 'V')) {
-        remote.erase(remote.begin());
+    strip_v(latest_stable);
+    strip_v(latest_dev);
+
+    // Pick the value the active channel cares about for the upgrade
+    // pill.
+    //   Stable: latest non-prerelease tag only. Dev pre-releases are
+    //           invisible -- stable users shouldn't be pulled into them.
+    //   Dev:    max(latest_stable, latest_dev). Dev is a superset of
+    //           stable -- if we promote 0.2.56 to stable without leaving
+    //           a matching prerelease, dev users sitting on the previous
+    //           prerelease would otherwise be stuck forever because no
+    //           newer prerelease exists. Picking the higher of the two
+    //           keeps dev tracking the absolute newest build.
+    std::string remote;
+    if (channel == Channel::Dev) {
+        if (latest_dev.empty())      remote = latest_stable;
+        else if (latest_stable.empty()) remote = latest_dev;
+        else remote = (CompareVersions(latest_dev, latest_stable) >= 0)
+                     ? latest_dev : latest_stable;
+    } else {
+        remote = latest_stable;
+        if (remote.empty()) remote = latest_dev;  // bootstrap: no stable cut yet
     }
     if (remote.empty()) {
-        SetFail("Update server returned empty/unparseable version");
+        SetFail("Update server returned no parseable releases");
         g_st.busy.store(false);
         return;
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Updater: local=%s remote=%s", kAppVersion, remote.c_str());
+        "Updater: local=%s channel=%s stable=%s dev=%s -> remote=%s",
+        kAppVersion,
+        channel == Channel::Dev ? "dev" : "stable",
+        latest_stable.empty() ? "(none)" : latest_stable.c_str(),
+        latest_dev.empty()    ? "(none)" : latest_dev.c_str(),
+        remote.c_str());
 
+    // Trigger UpdateAvailable on ANY mismatch between local and the
+    // active channel's latest, not just remote-newer. Rationale: if a
+    // user is on a dev build (e.g. 0.2.55) and flips the channel to
+    // stable, the launcher should offer to "switch" them down to the
+    // current stable (0.2.54). Otherwise they sit on the dev binary
+    // forever even though they explicitly asked for stable. Pill text
+    // distinguishes upgrade ("Update X -> Y") from downgrade
+    // ("Switch X -> Y (stable)") — see RenderMenuBar.
     const int cmp = CompareVersions(kAppVersion, remote);
     {
         std::lock_guard<std::mutex> lk(g_st.mtx);
         g_st.snap.remote_version = remote;
-        g_st.snap.state = (cmp < 0) ? State::UpdateAvailable : State::UpToDate;
+        g_st.snap.latest_stable  = latest_stable;
+        g_st.snap.latest_dev     = latest_dev;
+        g_st.snap.state = (cmp != 0) ? State::UpdateAvailable : State::UpToDate;
     }
     g_st.busy.store(false);
 }
@@ -487,6 +597,12 @@ bool ApplyUpdateAndExit() {
 Snapshot Get() {
     std::lock_guard<std::mutex> lk(g_st.mtx);
     return g_st.snap;
+}
+
+bool IsRemoteOlderThanLocal() {
+    std::lock_guard<std::mutex> lk(g_st.mtx);
+    if (g_st.snap.remote_version.empty()) return false;
+    return CompareVersions(kAppVersion, g_st.snap.remote_version) > 0;
 }
 
 void Shutdown() {
