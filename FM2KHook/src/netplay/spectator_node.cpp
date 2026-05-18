@@ -58,6 +58,12 @@ struct Subscriber {
                                // Phase 1: stored only; phase 3 branches on it
                                // (CURRENT_MATCH ships snapshot+tail instead of
                                // SendSessionBackfillTo from frame 0).
+    // spec_user_id -- hub's identifier for this spectator. Populated in
+    // relay mode (Phase 2c) by parsing spec_incoming's spec_user_id
+    // field via shared-mem. In TCP mode this stays empty; addressing
+    // uses `addr` instead. Phase 2b just declares the field so the
+    // Subscriber shape is forward-compatible.
+    std::string  spec_user_id;
 };
 
 // Cached initial-match metadata so new joiners get a consistent handoff.
@@ -76,6 +82,12 @@ struct State {
     size_t                    capacity          = SPECTATOR_DEFAULT_CAPACITY;
     std::vector<Subscriber>   subscribers;
     InitialMatch              initial_match     = {};
+    // spec_transport_relay -- Phase 2b. True when FM2K_SPEC_TRANSPORT=relay
+    // was set at SpectatorNode_Init. In relay mode the TCP listener +
+    // PerformTcpStun are skipped entirely; spec data plane will flow
+    // through the hub once Phase 2c wires the launcher's binary-frame
+    // queue. False = legacy P2P TCP path (every shipped client to date).
+    bool                      spec_transport_relay = false;
 
     // ─── HOST SIDE: session event log ──────────────────────────────────
     // Every confirmed event the host produces (INPUT pairs in C2; PIN_RNG
@@ -924,6 +936,33 @@ size_t SessionEvent_Decode(const uint8_t* in, size_t in_len,
 void SpectatorNode_Init() {
     g_state = State{};
     g_state.capacity = SPECTATOR_DEFAULT_CAPACITY;
+
+    // FM2K_SPEC_TRANSPORT (Phase 2b of v0.3 spec rebuild). "relay" =
+    // route spec data through hub WS binary frames instead of P2P TCP.
+    // When set, we skip the entire TCP-listener + TCP-STUN dance below
+    // -- no listener to bind, no external port to discover, no NAT
+    // punch dance to coordinate. Spec data plane comes online once the
+    // launcher's shared-mem queue is wired (Phase 2c).
+    //
+    // Default "tcp" preserves legacy behavior for every client up
+    // through v0.2.57. Read once here at Init -- env changes mid-run
+    // wouldn't be safe (existing subscribers expect one mode).
+    if (const char* transport = std::getenv("FM2K_SPEC_TRANSPORT");
+        transport && std::strcmp(transport, "relay") == 0) {
+        g_state.spec_transport_relay = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: FM2K_SPEC_TRANSPORT=relay -- skipping TCP "
+            "listener + TCP-STUN (relay data plane not yet wired; spec "
+            "subscriptions will negotiate but not stream until Phase 2c)");
+        // Capacity still applies (hub fan-out is bounded too). Match
+        // the TCP path's default so behavior is identical from the
+        // host-control-flow perspective.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: Init (capacity=%zu, batch=%zu frames, "
+            "transport=relay)",
+            g_state.capacity, BROADCAST_BATCH_FRAMES);
+        return;
+    }
 
     // Bring up the TCP listener for the host→spectator INPUT_BATCH stream.
     //
