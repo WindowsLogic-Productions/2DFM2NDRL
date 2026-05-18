@@ -5755,6 +5755,18 @@ void LauncherUI::RenderHubPanel() {
                 }
                 break;
             }
+            case K::SpecRelayBinary: {
+                // Phase 3: hub forwarded spec data bytes to us. Hand to
+                // the launcher controller which writes them into the
+                // inbound shared-mem ring for the running spec game.
+                // Dispatch via the same callback pattern as
+                // on_spectator_punch_target so launcher controls the
+                // mapping lifecycle.
+                if (on_spec_relay_bytes && !ev.spec_relay_bytes.empty()) {
+                    on_spec_relay_bytes(ev.spec_relay_bytes);
+                }
+                break;
+            }
             case K::RecordReceived: {
                 // Only the unfiltered global-record reply (no opponent_id /
                 // game_id filter) carries the per-opponent breakdown that

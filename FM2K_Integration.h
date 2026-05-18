@@ -739,6 +739,11 @@ public:
                        int                spec_udp_port,
                        int                spec_tcp_port,
                        const std::string& spec_user_id)> on_spectator_punch_target;
+    // Phase 3: hub forwarded spec data bytes (we're the spec). Launcher
+    // writes the bytes into the inbound shared-mem ring of the running
+    // spec game so the hook can drain + dispatch. Bytes are a fully-
+    // formed SpecDataHeader-prefixed wire frame.
+    std::function<void(const std::vector<uint8_t>& bytes)> on_spec_relay_bytes;
     std::function<void()> on_session_stop;
     std::function<void()> on_exit;
     // C11 — replay browser dispatch. Called when the user clicks a row in

@@ -816,7 +816,10 @@ void HubClient::IoThread(std::string host, uint16_t port,
     });
 
     // Receive loop — assembles fragmented UTF-8 messages and dispatches.
+    // Binary frames (Phase 3 spec hub-relay) get accumulated separately
+    // and emitted as a SpecRelayBinary event when the message completes.
     std::string assembly;
+    std::vector<uint8_t> binary_assembly;
     BYTE buf[4096];
     while (running_.load()) {
         DWORD bytes = 0;
@@ -833,8 +836,17 @@ void HubClient::IoThread(std::string host, uint16_t port,
                 OnMessage(assembly);
                 assembly.clear();
             }
+        } else if (bt == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
+                   bt == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) {
+            binary_assembly.insert(binary_assembly.end(), buf, buf + bytes);
+            if (bt == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+                HubEvent ev;
+                ev.kind = HubEvent::Kind::SpecRelayBinary;
+                ev.spec_relay_bytes = std::move(binary_assembly);
+                EmitEvent(std::move(ev));
+                binary_assembly.clear();
+            }
         }
-        // Binary frames not used by our protocol — drop silently.
     }
 
     running_.store(false);
