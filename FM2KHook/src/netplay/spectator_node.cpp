@@ -2602,6 +2602,25 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
             if (it != g_state.pending_spec_user_ids.end()) {
                 sub.spec_user_id = it->second;
                 g_state.pending_spec_user_ids.erase(it);
+            } else {
+                // Race fallback: ControlChannel_Poll runs RawReceive
+                // (which dispatched this JOIN_REQ) BEFORE
+                // TickHostMaintenance's punch-target poll updates our
+                // dict. If launcher published the user_id just before
+                // this tick, the dict won't have it yet on this call.
+                // Read directly from shared mem as the
+                // single-source-of-truth fallback. If the shm punch
+                // target matches our `from` addr, use its user_id.
+                FM2KSharedMemData* shm = GetSharedMemory();
+                if (shm && shm->magic == FM2K_SHARED_MEM_MAGIC &&
+                    shm->spectator_punch_ip_be == from.sin_addr.s_addr &&
+                    shm->spectator_punch_port  == ntohs(from.sin_port) &&
+                    shm->spectator_punch_user_id[0]) {
+                    sub.spec_user_id = std::string(
+                        shm->spectator_punch_user_id,
+                        strnlen(shm->spectator_punch_user_id,
+                                sizeof(shm->spectator_punch_user_id)));
+                }
             }
         }
         g_state.subscribers.push_back(sub);
