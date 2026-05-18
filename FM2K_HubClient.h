@@ -171,6 +171,15 @@ struct HubEvent {
         std::string opponent_nick;
         std::string host_ip;
         int         host_port = 0;
+        // session_kind — "menu" / "css" / "battle". The hub relays the
+        // host's current game phase (host hook publishes on every
+        // game_mode transition). Spec launcher uses it to decide
+        // FM2K_BOOT_TO_BATTLE: "battle" → /F (instant join via snapshot
+        // apply); "css" → walk title→CSS for the mid-CSS-join handshake;
+        // "menu" → walk title→CSS naturally (host's CSS-entry transition
+        // will arrive over the wire). Default "menu" only fires if the
+        // hub field is absent — shouldn't happen in practice.
+        std::string session_kind = "menu";
     } spectate;
 
     // SpectatorIncoming payload — we're the host; hub forwarded the
@@ -315,6 +324,15 @@ public:
     void AcceptChallenge(const std::string& challenger_id);
     void DeclineChallenge(const std::string& challenger_id);
     void MatchEnded();
+
+    // Publish our session phase (menu/CSS/battle) to the hub. Used to
+    // populate user state so that when someone requests to spectate us,
+    // the hub can return our current session_kind in `spectate_grant`,
+    // letting the spec launcher decide whether to /F-boot-to-battle
+    // (we're in battle) or do natural CSS-walk (we're in CSS — needed
+    // for the CSS snapshot to apply with the correct surfaces/state).
+    //   kind ∈ {"menu", "css", "battle"}
+    void UpdateSessionKind(const std::string& kind);
 
     // Report end-of-match outcome to the hub for stats tracking. `match_id`
     // is the token from the `match_start` event we received (== relay

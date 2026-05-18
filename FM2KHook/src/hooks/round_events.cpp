@@ -21,6 +21,7 @@
 
 #include "../core/globals.h"           // g_is_rolling_back, g_player_index
 #include "../netplay/spectator_node.h" // SpectatorNode_AppendRound{Start,End}
+#include "per_game_patches.h"          // PerGamePatches_OnBattleInitComplete
 
 // vs_round_function dispatcher (FM2K)
 constexpr uintptr_t ADDR_VS_ROUND_FUNCTION = 0x004086A0;
@@ -65,6 +66,48 @@ static VsRoundFunc_t orig_vs_round_function = nullptr;
 // win counters and break the formula.
 static uint8_t s_round_idx_counter = 0;
 
+// KOF-style retention state. Snapshot is captured at the round-end edge
+// (pre != 900 → post == 900) for the winning side, and applied at the
+// next round's RSS_FIGHT_LATCH → RSS_ACTIVE edge by writing the
+// snapshotted HP and super_meter back into the active char slot.
+//
+// Toggle: FM2K_TEAM_KOF_RETENTION env var → RoundEvents_SetKofRetention.
+// Match-end: cleared in RoundEvents_OnMatchStart so a fresh match starts
+// at full HP/meter regardless of the previous match's last round outcome.
+#include <atomic>
+static std::atomic<bool> g_kof_retention_enabled{false};
+static struct KofSnapshot {
+    bool     pending = false;
+    uint8_t  winner_idx = 0;       // 0=P1, 1=P2 (only valid if pending)
+    uint32_t winner_hp = 0;
+    uint32_t winner_meter = 0;
+} s_kof_snapshot;
+
+// Substate values from the round-state machine (subset of the full set):
+//   100 = RSS_BATTLE_INIT — vs_round_function's round-init runs here, which
+//         INCLUDES the HP reset loop at 0x40899B-B0 (zeroes all 8 char slots,
+//         then player_data_file_loader repopulates with max_hp from file).
+//   110 = RSS_ANNOUNCE_WAIT — by this state, HP has been reset to max.
+//   112 = RSS_FIGHT_LATCH (existing constant)
+//   200 = RSS_ACTIVE (existing constant)
+//   900 = RSS_ROUND_END_BANNER (existing constant) — banner shows + result_kind set
+//   901 = RSS_ROUND_END_DONE — banner finishes, transitions back to BATTLE_INIT
+//
+// KOF apply edge: 100 → 110 (post-reset, before announce). Empirically the
+// HP reset happens during substate 100; by 110 the new round's HP_max is
+// stamped and our write of winner's snapshotted HP sticks. Trace from
+// 2026-05-10 (FM2K_P1_Debug.log):
+//   18:45:58.709  901 → 100   ← reset happens here
+//   18:45:58.761  100 → 110   ← apply here
+//   18:46:00.263  110 → 112
+//   18:46:00.563  112 → 200   ← old (broken) apply edge, too late visually
+constexpr int RSS_BATTLE_INIT   = 100;
+constexpr int RSS_ANNOUNCE_WAIT = 110;
+
+constexpr uintptr_t ADDR_GAME_MODE_FLAG_RND      = 0x00470058;  // 0=story 1=VS 2=team
+constexpr uintptr_t ADDR_P1_SUPER_METER          = 0x004DFCDD;  // g_charslot0_super_meter
+constexpr uintptr_t ADDR_P2_SUPER_METER          = 0x004EDD1C;  // g_charslot1_super_meter
+
 // Alternation guard. The pre→post substate edge fires multiple times per
 // logical round transition because gekkonet's rollback re-simulates
 // frames (runahead=4 means 1 forward + 4 replay = 5 fires per logical
@@ -90,6 +133,100 @@ static char __cdecl Hook_vs_round_function() {
 
     char ret = orig_vs_round_function ? orig_vs_round_function() : 0;
 
+    const int post = ReadSubstate();
+
+    // AI field writes per frame: drive ai_input_processor's switch via
+    // [slot+0xDF65] so the engine runs CPU AI (case 1), Imitate (case 2),
+    // or Jump (case 4) for the hijacked slot. Per-frame instead of one-
+    // shot because:
+    //   (a) health_damage_manager @ 0x40EA63 writes [slot+0xDF65] when the
+    //       CPU takes damage and can clobber our mode.
+    //   (b) training F2 cycles change the desired mode mid-battle and we
+    //       need the next frame to reflect it without a separate hook.
+    //   (c) char_state_machine's CSMK_PLAYER init runs the first frame
+    //       after spawn — its writes would clobber any pre-init one-shot.
+    // No-op when no hijack submode is active.
+    PerGamePatches_OnBattleInitComplete();
+
+    // KOF-style retention runs BEFORE the netplay/host guard below
+    // because it's a local state mutation, not a broadcast event.
+    // Both peers need to apply the retention to stay in sync.
+    //
+    // Strategy: snapshot at the round-end edge (any → 900), apply at
+    // the post-reset edge (100 → 110). The engine's HP reset loop
+    // runs during substate 100 (RSS_BATTLE_INIT @ vs_round_function
+    // 0x40899B-B0); by 110 (RSS_ANNOUNCE_WAIT) the reset is done and
+    // our write sticks until next round-end.
+    //
+    // Earlier delayed-frame approach (LilithPort-style 1-sec sleep)
+    // didn't work in our impl because the apply landed at substate
+    // 901 — HP was still the snapshotted value (write was a no-op),
+    // and the engine reset at 901→100 happened ~2sec after snapshot.
+    // Substate-edge apply at 100→110 is unambiguous and post-reset.
+    if (g_kof_retention_enabled.load(std::memory_order_relaxed)) {
+        const uint32_t mode_flag = *(const uint32_t*)ADDR_GAME_MODE_FLAG_RND;
+
+        // Trace every substate change while KOF is on so we can see
+        // the full transition timeline.
+        if (pre != post) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[KOF-TRACE] substate %d → %d (mode_flag=%u, "
+                "pending=%d snap_winner=%u snap_hp=%u snap_meter=%u)",
+                pre, post, (unsigned)mode_flag,
+                (int)s_kof_snapshot.pending,
+                (unsigned)s_kof_snapshot.winner_idx,
+                s_kof_snapshot.winner_hp, s_kof_snapshot.winner_meter);
+        }
+
+        // Snapshot: at any → RSS_ROUND_END_BANNER edge, capture the
+        // winner's HP/meter so we can restore at next round init.
+        const bool snapshot_edge = (pre != RSS_ROUND_END_BANNER &&
+                                    post == RSS_ROUND_END_BANNER);
+        if (snapshot_edge) {
+            if (mode_flag != 2u) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[KOF-RETAIN] snapshot edge hit but mode_flag=%u "
+                    "(need 2 = team) — skip", (unsigned)mode_flag);
+            } else {
+                const uint32_t r1_kind = *(uint32_t*)ADDR_P1_RESULT_KIND;
+                const uint32_t r2_kind = *(uint32_t*)ADDR_P2_RESULT_KIND;
+                const uint8_t  widx    = (r1_kind == 1) ? 0
+                                       : (r2_kind == 1) ? 1
+                                       : 2;
+                const uint32_t p1_hp_now    = *(uint32_t*)ADDR_P1_HP;
+                const uint32_t p2_hp_now    = *(uint32_t*)ADDR_P2_HP;
+                const uint32_t p1_meter_now = *(uint32_t*)ADDR_P1_SUPER_METER;
+                const uint32_t p2_meter_now = *(uint32_t*)ADDR_P2_SUPER_METER;
+                if (widx >= 2u) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[KOF-RETAIN] snapshot edge: draw "
+                        "(r1_kind=%u r2_kind=%u) — no snapshot taken",
+                        r1_kind, r2_kind);
+                } else {
+                    s_kof_snapshot.pending      = true;
+                    s_kof_snapshot.winner_idx   = widx;
+                    s_kof_snapshot.winner_hp    = (widx == 0u) ? p1_hp_now : p2_hp_now;
+                    s_kof_snapshot.winner_meter = (widx == 0u) ? p1_meter_now : p2_meter_now;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[KOF-RETAIN] SNAPSHOT: winner=P%u hp=%u meter=%u "
+                        "(r1_kind=%u r2_kind=%u, p1_hp=%u p2_hp=%u "
+                        "p1_meter=%u p2_meter=%u) — apply at next 100→110",
+                        (unsigned)widx + 1u,
+                        s_kof_snapshot.winner_hp, s_kof_snapshot.winner_meter,
+                        r1_kind, r2_kind, p1_hp_now, p2_hp_now,
+                        p1_meter_now, p2_meter_now);
+                }
+            }
+        }
+
+        // (Apply path removed — Option-A code-cave patch on
+        // character_state_machine 0x411CB1 intercepts the HP write
+        // directly, so the engine never overwrites with max_hp for
+        // the winner's slot. See PerGamePatches_InstallKofHpInitPatch
+        // in per_game_patches.cpp. The snapshot here remains for the
+        // interceptor to read.)
+    }
+
     // Only emit from the authoritative host path. Both peers + the spectator's
     // local sim run vs_round_function; if we appended on every node we'd
     // double-broadcast on relay nodes. Daisy-chain replay is handled in the
@@ -101,8 +238,6 @@ static char __cdecl Hook_vs_round_function() {
     if (g_player_index != 0 || g_is_rolling_back) {
         return ret;
     }
-
-    const int post = ReadSubstate();
 
     // ROUND_START — fires at RSS_FIGHT_LATCH → RSS_ACTIVE (the "FIGHT!" →
     // battle becomes interactive moment). HP_max is populated by then (see
@@ -159,6 +294,8 @@ static char __cdecl Hook_vs_round_function() {
             p1_wins, p2_wins,
             p1_hp, p2_hp, timer_remaining,
             r1_kind, r2_kind);
+        // (KOF-style retention snapshot lives BEFORE the netplay guard
+        // above so it fires on every peer's local instance, not just P1.)
     }
 
     return ret;
@@ -190,13 +327,49 @@ bool RoundEvents_Install() {
 void RoundEvents_OnMatchStart() {
     s_round_idx_counter = 0;
     s_last_emit         = LastEmit::NONE;
+    s_kof_snapshot.pending = false;
+}
+
+void RoundEvents_SetKofRetention(bool enabled) {
+    g_kof_retention_enabled.store(enabled, std::memory_order_relaxed);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "RoundEvents: KOF-style HP/meter retention %s",
+        enabled ? "ENABLED" : "disabled");
+}
+
+// Snapshot accessors — exposed so PerGamePatches's HpInitInterceptor
+// can read snapshot state from inside the patched CSMK_PLAYER init.
+bool RoundEvents_KofRetentionEnabled() {
+    return g_kof_retention_enabled.load(std::memory_order_relaxed);
+}
+bool RoundEvents_KofSnapshotPending() {
+    return s_kof_snapshot.pending;
+}
+int RoundEvents_KofSnapshotWinnerIdx() {
+    return (int)s_kof_snapshot.winner_idx;
+}
+uint32_t RoundEvents_KofSnapshotWinnerHp() {
+    return s_kof_snapshot.winner_hp;
+}
+uint32_t RoundEvents_KofSnapshotWinnerMeter() {
+    return s_kof_snapshot.winner_meter;
+}
+void RoundEvents_KofSnapshotMarkApplied() {
+    s_kof_snapshot.pending = false;
 }
 
 #else  // ENGINE_FM95
 
 #include "round_events.h"
 
-bool RoundEvents_Install()      { return true; }  // FM95 emit out of scope (separate hand-off)
-void RoundEvents_OnMatchStart() {}
+bool RoundEvents_Install()           { return true; }  // FM95 emit out of scope (separate hand-off)
+void RoundEvents_OnMatchStart()      {}
+void RoundEvents_SetKofRetention(bool) {}
+bool     RoundEvents_KofRetentionEnabled()    { return false; }
+bool     RoundEvents_KofSnapshotPending()     { return false; }
+int      RoundEvents_KofSnapshotWinnerIdx()   { return 0; }
+uint32_t RoundEvents_KofSnapshotWinnerHp()    { return 0; }
+uint32_t RoundEvents_KofSnapshotWinnerMeter() { return 0; }
+void     RoundEvents_KofSnapshotMarkApplied() {}
 
 #endif

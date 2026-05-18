@@ -5,6 +5,7 @@
 #include <SDL3/SDL_log.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>  // getenv for FM2K_FULL_CRCS diagnostic env-gate
 
 // Memory region addresses. RNG / object pool / input ring use the engine-
 // aware FM2K::ADDR_* constants from globals.h so the FM95 build picks up
@@ -246,6 +247,32 @@ void SaveState_Init() {
     g_initial_sync_done = false;  // Reset so next battle re-syncs
     g_last_saved_slot = -1;
     g_last_saved_frame = -1;
+}
+
+// Reset frame-index / edge-detection state to a deterministic value so
+// input-change detection produces identical local input streams on both
+// peers (or host vs replay). MUST be called BEFORE the first AdvanceEvent
+// — used to be lazy-fired on the first SaveEvent which is post-PGI, and
+// that off-by-one timing caused cumulative drift over rollback cycles
+// (replay_selftest harness's frame-91 RNG divergence). Now: eager call
+// at battle init from Netplay_Start*Battle.
+void SaveState_DoInitialSync() {
+    if (g_initial_sync_done) return;
+    *(uint32_t*)ADDR_INPUT_BUFFER_INDEX = 0;         // Reset buf_idx
+    *(uint32_t*)ADDR_RENDER_FRAME_COUNTER = 0;       // Reset render frame counter
+    memset((void*)0x447F00, 0, 0x20);   // g_prev_input_state
+    memset((void*)0x447F40, 0, 0x20);   // g_processed_input
+    memset((void*)0x447F60, 0, 0x20);   // g_input_changes
+    memset((void*)ADDR_INPUT_HISTORY, 0, SIZE_INPUT_HISTORY);
+    // REVERTED 2026-05-17: shake/palette zero on battle entry was
+    // helpful for replay-self-test parity (host vs replay both start
+    // at zero), but user reports cross-peer desync in real netplay
+    // after this change. Possibly the zero clobbers state real
+    // netplay needs. Reverting to bisect.
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SaveState: Initial sync (eager, pre-first-AdvEvent) — "
+        "reset buf_idx/render_fc/input edge state");
+    g_initial_sync_done = true;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SaveState: Initialized %d rollback slots (~%zuKB each)",
                 MAX_ROLLBACK_FRAMES, sizeof(SaveStateData) / 1024);
@@ -537,27 +564,27 @@ bool SaveState_Save(int frame) {
         frame = 0;
     }
 
-    // Initial-sync step: force a handful of frame-index / edge-detection
-    // counters to a deterministic value so input-change detection produces
-    // the same local input stream on both peers. We intentionally do NOT
-    // wipe object_pool, char_dynamic, or any other "game state" memory —
-    // the GekkoNet checksum is now a gameplay fingerprint (HP/pos/rng/
-    // timer), so per-process memory residue is allowed to differ and no
-    // longer triggers desync. Wiping pre-battle objects here only broke
-    // stage props / HUD sprites that the game had already populated.
+    // Initial-sync step: SaveState_DoInitialSync() now fires eagerly from
+    // Netplay_Start*Battle BEFORE the first AdvEvent — see the comment
+    // at SaveState_DoInitialSync() below for the full reasoning. The
+    // lazy reset that used to fire here (gated on g_initial_sync_done)
+    // clobbered the first frame's PGI work and mis-aligned host's
+    // buf_idx vs replay's. Now it's a no-op on the first Save (sync
+    // already done).
     if (!g_initial_sync_done) {
-        *(uint32_t*)ADDR_INPUT_BUFFER_INDEX = 0;         // Reset buf_idx
-        *(uint32_t*)ADDR_RENDER_FRAME_COUNTER = 0;       // Reset render frame counter
-        // Clear input-related state ONLY - do NOT clear screen dimensions!
-        // 0x447EE0-0x447F80 contains wDest, hDest, g_screen_x, g_screen_y
-        // which render_frame and camera_manager need. Zeroing them kills rendering.
-        memset((void*)0x447F00, 0, 0x20);   // g_prev_input_state
-        memset((void*)0x447F40, 0, 0x20);   // g_processed_input
-        memset((void*)0x447F60, 0, 0x20);   // g_input_changes
+        // Safety net: if for some reason eager-init wasn't called,
+        // fall back to the lazy reset. Should never fire in practice
+        // since Netplay_Start*Battle always calls
+        // SaveState_DoInitialSync() now.
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "SaveState_Save: eager-init didn't run? Falling back to "
+            "lazy reset (may misalign buf_idx).");
+        *(uint32_t*)ADDR_INPUT_BUFFER_INDEX = 0;
+        *(uint32_t*)ADDR_RENDER_FRAME_COUNTER = 0;
+        memset((void*)0x447F00, 0, 0x20);
+        memset((void*)0x447F40, 0, 0x20);
+        memset((void*)0x447F60, 0, 0x20);
         memset((void*)ADDR_INPUT_HISTORY, 0, SIZE_INPUT_HISTORY);
-
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "SaveState: Initial sync - reset buf_idx/render_fc/input edge state only");
         g_initial_sync_done = true;
     }
 
@@ -835,38 +862,47 @@ bool SaveState_Save(int frame) {
     // Save effect/shake state - affects animation script execution during rollback
     memcpy(state->effect_sys1, (void*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
     memcpy(state->effect_sys2, (void*)EffectAddrs::EFFECT_SYS2, EffectAddrs::EFFECT_SYS2_SZ);
-    // EFFECT_SYS1 (palette-flash-1 struct, 42 B at 0x447D7D): zero the saved
-    // buffer. Same rationale as shake_effects — ProcessColorInterpolation +
-    // update_game_state's timer decrement need to evolve uninterrupted.
-    // GekkoNet's per-frame Save+Load otherwise re-injects the post-advance
-    // timer every tick and palette flash never progresses.
+    // EFFECT_SYS1 (palette-flash-1, 42 B): zero the saved buffer + skip
+    // restore on Load. ProcessColorInterpolation (render-side) reads this
+    // every frame and may call game_rand based on its state — and the
+    // timer in update_game_state decrements each frame. For host+replay
+    // determinism, BOTH engines need to see the SAME palette state at
+    // each render. That happens iff palette evolves continuously through
+    // forward sims on both sides (1 decrement per main-loop tick). If we
+    // save/restore, host's rollback Load resets palette to pre-render-mod
+    // state while replay keeps accumulating — divergent palette → divergent
+    // render rng calls → drift. The "skip restore" pattern is the only one
+    // that keeps host's many rollbacks aligned with replay's straight
+    // forward-only sim. Same logic for shake_effects + pflash2 below.
     std::memset(state->effect_sys1, 0, EffectAddrs::EFFECT_SYS1_SZ);
-    // EFFECT_SYS2 carve-outs:
+    // EFFECT_SYS2 carve-outs (REVERTED back to original — same reasoning
+    // as effect_sys1 above):
     //   - 0x00..0x20 (sysvars): KEEP saved
-    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at 0x4456D0): zero
-    //   - 0x4C..0x50 (g_render_frame_counter, 4 B): zero (covered earlier)
+    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at 0x4456D0): ZERO + skip
+    //                  restore. Palette state must evolve naturally on both
+    //                  host and replay so render-side game_rand calls produce
+    //                  identical rng sequences.
+    //   - 0x4C..0x50 (g_render_frame_counter, 4 B): ZERO + skip restore.
     //   - 0x50..0x58 (tail): KEEP saved
     constexpr size_t PFLASH2_OFFSET_IN_SYS2 =
         0x4456D0 - EffectAddrs::EFFECT_SYS2;  // 0x20
-    constexpr size_t PFLASH2_SIZE           = 44;  // a1[0]..a1[10] inclusive
+    constexpr size_t PFLASH2_SIZE = 44;
     constexpr size_t RENDER_FRAME_COUNTER_OFFSET_IN_SYS2 =
         ADDR_RENDER_FRAME_COUNTER - EffectAddrs::EFFECT_SYS2;  // 0x4C
-    static_assert(PFLASH2_OFFSET_IN_SYS2 + PFLASH2_SIZE == RENDER_FRAME_COUNTER_OFFSET_IN_SYS2,
-                  "palette flash 2 struct must end exactly at render_frame_counter");
     std::memset(state->effect_sys2 + PFLASH2_OFFSET_IN_SYS2, 0, PFLASH2_SIZE);
     *(uint32_t*)(state->effect_sys2 + RENDER_FRAME_COUNTER_OFFSET_IN_SYS2) = 0;
     // Afterimage_pool overlap: EFFECT_SYS1 (0x447D7D, 42 B) is INSIDE the
     // afterimage_pool save range. Zero it in the saved afterimage_pool too
     // so the load doesn't re-inject palette state via that back-door.
     state->round_end_flag = *(uint32_t*)0x424718;
-    // Shake effects: zero the saved copy (so CRC is deterministic peer-to-peer)
-    // but DO NOT copy live state in. ProcessShakeEffect (called from render) is
-    // the only place that decrements g_shake_effect_*.timer. If we save+restore
-    // the live timer here, GekkoNet's per-frame Save+Load cycle resets it back
-    // to its post-[EB] value every tick, undoing render's decrement. The shake
-    // then plays for one render then ends — which is exactly the bug we were
-    // chasing. Live memory keeps decrementing forever; saved buffer is fixed
-    // zeros so fingerprints don't diverge.
+    // Shake effects: zero in save + skip restore. REVERTED to original.
+    // ProcessShakeEffect decrements g_shake_effect_*.timer in render. For
+    // host (with rollback) and replay (no rollback) to consume the same
+    // game_rand calls during render, shake state must evolve naturally
+    // through forward render passes on BOTH sides — saving/restoring on
+    // rollback would reset host's shake state to a pre-render-mod value
+    // each Load, while replay (no rollback) keeps the natural evolution.
+    // Divergent shake → divergent render rng → drift.
     memset(state->shake_effects, 0, EffectAddrs::SHAKE_EFFECTS_SZ);
 
     // Wave C additions: afterimage pool + object list topology.
@@ -891,11 +927,14 @@ bool SaveState_Save(int frame) {
     // mirror of the dedicated state->shake_effects treatment above. Without
     // this, the next Restore would re-inject the post-[EB] timer values via
     // the afterimage_pool path (defeating the dedicated-slot fix).
+    // Shake / palette-flash-1 overlap inside afterimage_pool: zero them
+    // in the saved copy so Load doesn't re-inject post-[EB] timer values
+    // via the afterimage_pool memcpy. The dedicated state->shake_effects
+    // and state->effect_sys1 slots are also zeroed (above) for the same
+    // reason. End result: render-side timer state evolves continuously
+    // across both host and replay without rollback resets.
     constexpr size_t SHAKE_OFFSET_IN_AI = EffectAddrs::SHAKE_EFFECTS - WaveCAddrs::AFTERIMAGE_POOL;
     memset(state->afterimage_pool + SHAKE_OFFSET_IN_AI, 0, EffectAddrs::SHAKE_EFFECTS_SZ);
-    // EFFECT_SYS1 overlap: palette-flash-1 struct @ 0x447D7D (42 B) ALSO
-    // sits inside the afterimage_pool slice (just before the shake block).
-    // Zero it on save for the same reason.
     constexpr size_t PFLASH1_OFFSET_IN_AI = EffectAddrs::EFFECT_SYS1 - WaveCAddrs::AFTERIMAGE_POOL;
     static_assert(PFLASH1_OFFSET_IN_AI + EffectAddrs::EFFECT_SYS1_SZ <= SHAKE_OFFSET_IN_AI,
                   "EFFECT_SYS1 must end before shake region in afterimage_pool");
@@ -922,7 +961,20 @@ bool SaveState_Save(int frame) {
     SaveState_CalculateFingerprint();
     static DWORD last_full_crc_tick = 0;
     DWORD full_crc_now = GetTickCount();
-    bool full_crcs_due = (full_crc_now - last_full_crc_tick) >= 1000;
+    // FM2K_FULL_CRCS=1 forces the expensive per-region CRC on EVERY save
+    // event (vs the default 1/sec throttle). For autonomous Phase F
+    // determinism diagnostics — without this, the desync dump's
+    // forward-vs-replay per-region diff shows "0x00000000 MATCH" for
+    // most regions (because they weren't computed on that save event)
+    // and we can't attribute the divergence to a specific region.
+    // Cost: ~5ms per save. Don't ship enabled.
+    static int s_full_crcs_cached = -1;
+    if (s_full_crcs_cached < 0) {
+        const char* v = getenv("FM2K_FULL_CRCS");
+        s_full_crcs_cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    bool full_crcs_due = s_full_crcs_cached == 1
+                         || (full_crc_now - last_full_crc_tick) >= 1000;
     if (full_crcs_due) {
         last_full_crc_tick = full_crc_now;
         SaveState_CalculateFullChecksum();
@@ -948,6 +1000,7 @@ bool SaveState_Save(int frame) {
         const auto& rc = g_region_checksums;
         this_save_crcs.rng                    = rc.rng;
         this_save_crcs.gameplay_fingerprint   = rc.gameplay_fingerprint;
+        this_save_crcs.fp_in                  = rc.fp_inputs;
         if (full_crcs_due) {
             this_save_crcs.game_state             = rc.game_state;
             this_save_crcs.object_pool            = rc.object_pool;
@@ -1058,14 +1111,107 @@ bool SaveState_Load(int frame) {
     memcpy((void*)ADDR_INPUT_TRACKING, state->input_tracking_state, SIZE_INPUT_TRACKING);
 
     // Restore dynamic portion of each character slot
+    //
+    // CROSS-PROCESS SPEC CARVE-OUT: the 57407-byte char slot was loaded
+    // from the .player file at engine init. It includes many heap-pointer
+    // fields (g_charslotN_action_table at slot+0x100, sprite tables, etc)
+    // populated by character_data_loader with addresses in THIS process's
+    // heap. Bulk-memcpy'ing the host's snapshot onto our slot overwrites
+    // those pointers with host-process heap addresses — they're wild here
+    // and the engine AVs the moment something dereferences them (observed
+    // in ui_state_manager on pkmncc spec join: `mov ebx, g_charslot0_-
+    // action_table` then `mov cx, [edx+ebx+0x20]` AV'd reading host's
+    // ~0x0B9B6708).
+    //
+    // The fix: BEFORE the memcpy, scan the live slot for DWORDs that
+    // LOOK like heap pointers (>= 0x01000000, i.e. above the static-mem
+    // ceiling on 32-bit Win). Capture them. After the memcpy, for each
+    // captured offset, if the host's value there ALSO looks heap-shaped
+    // (confirming the field is a pointer in BOTH processes — not a
+    // coincidentally-high non-pointer value), restore our local pointer.
+    // Non-pointer dynamic state (HP, super meter, anim frame indices,
+    // etc — all small values) flows through normally from snapshot.
+    //
+    // Only enabled for spec mode (g_player_index==2); single-process
+    // rollback for players keeps the bit-for-bit memcpy that determinism
+    // depends on (same heap, valid pointers).
+    extern int g_player_index;
+    const bool is_spec_apply = (g_player_index == 2);
+    constexpr uint32_t HEAP_PTR_FLOOR = 0x01000000u;
+
     for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
         uintptr_t slot_base = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE);
         uintptr_t dynamic_addr = slot_base + CHAR_SLOT_DYNAMIC_OFFSET;
         // Mirror of the active-slot save: only restore loaded slots (save
         // buffer's first byte != 0). Unloaded slots are left alone; if the
         // game hasn't loaded a character there nothing reads those bytes.
-        if (state->char_dynamic[i][0] != 0) {
+        if (state->char_dynamic[i][0] == 0) continue;
+
+        if (!is_spec_apply) {
             memcpy((void*)dynamic_addr, state->char_dynamic[i], CHAR_SLOT_DYNAMIC_SIZE);
+            continue;
+        }
+
+        // Spec path: capture pointer-shaped DWORDs in live slot first.
+        // CHAR_SLOT_DYNAMIC_SIZE is currently the full slot (14352
+        // DWORDs); the first cut at MAX_PRESERVED=1024 hit the cap on
+        // both active slots, so we sized up generously. Lives on stack
+        // (~64 KB × 2 fields = 128 KB) — well under the per-thread
+        // stack budget. SaveState_Load isn't called frequently enough
+        // for the upfront cost to matter.
+        struct PtrPreserve { uint32_t didx; uint32_t value; };
+        constexpr size_t MAX_PRESERVED = 8192;
+        PtrPreserve preserved[MAX_PRESERVED];
+        size_t preserved_count = 0;
+        size_t pointer_candidates = 0;  // total >= HEAP_PTR_FLOOR (may exceed cap)
+
+        const uint32_t* p = (const uint32_t*)dynamic_addr;
+        const size_t    dword_count = CHAR_SLOT_DYNAMIC_SIZE / sizeof(uint32_t);
+        for (size_t o = 0; o < dword_count; ++o) {
+            if (p[o] >= HEAP_PTR_FLOOR) {
+                ++pointer_candidates;
+                if (preserved_count < MAX_PRESERVED) {
+                    preserved[preserved_count++] = { (uint32_t)o, p[o] };
+                }
+            }
+        }
+
+        memcpy((void*)dynamic_addr, state->char_dynamic[i], CHAR_SLOT_DYNAMIC_SIZE);
+
+        // Restore preserved pointers IF the host's value there is also
+        // heap-shaped. Confirms the field is a pointer in both processes
+        // (rather than a non-pointer field that happened to be high in
+        // ours but low in theirs).
+        uint32_t* live = (uint32_t*)dynamic_addr;
+        size_t restored = 0;
+        for (size_t k = 0; k < preserved_count; ++k) {
+            const PtrPreserve& ps = preserved[k];
+            if (live[ps.didx] >= HEAP_PTR_FLOOR) {
+                live[ps.didx] = ps.value;
+                ++restored;
+            }
+        }
+        if (pointer_candidates > 0) {
+            // Diagnostic line — fires once per snapshot apply per active
+            // slot. `candidates` is the total count of heap-shaped
+            // DWORDs found in the live slot; `preserved` is how many fit
+            // in the buffer (cap = MAX_PRESERVED); `restored` is the
+            // subset whose post-memcpy host value was ALSO heap-shaped
+            // (confirming a real pointer field). If candidates > cap we
+            // need to bump MAX_PRESERVED — silently truncating would
+            // leave some host pointers in place and re-crash.
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SaveState: spec char_slot[%zu] candidates=%zu preserved=%zu "
+                "restored=%zu (scanned %zu DWORDs, cap=%zu)",
+                i, pointer_candidates, preserved_count, restored,
+                dword_count, MAX_PRESERVED);
+            if (pointer_candidates > MAX_PRESERVED) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SaveState: spec char_slot[%zu] pointer-preserve TRUNCATED "
+                    "(%zu > cap %zu) — host pointers in the uncaptured tail "
+                    "will fault on first deref; bump MAX_PRESERVED",
+                    i, pointer_candidates, MAX_PRESERVED);
+            }
         }
     }
 
@@ -1091,24 +1237,27 @@ bool SaveState_Load(int frame) {
     {
         constexpr size_t OBJ_SZ = OBJECT_POOL_STRIDE;
         constexpr size_t OBJ_COUNT = SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT;
-        constexpr size_t OVERRIDE_OFFSET = 68;   // *(obj + 68) etc
-        constexpr size_t OVERRIDE_SIZE   = 16;   // 4 dwords: +68, +72, +76, +80
-        constexpr size_t OVERRIDE_END    = OVERRIDE_OFFSET + OVERRIDE_SIZE;  // 84
+        constexpr size_t OVERRIDE_OFFSET = 68;
+        constexpr size_t OVERRIDE_SIZE   = 16;
+        constexpr size_t OVERRIDE_END    = OVERRIDE_OFFSET + OVERRIDE_SIZE;
         const uint8_t* src_base = state->object_pool;
         uint8_t* dst_base = (uint8_t*)ADDR_OBJECT_POOL;
+        // Color-override carve-out (REVERTED back to original): skip
+        // +68..+84 (16 B). ProcessColorInterpolation writes these during
+        // render and sprite_rendering_engine reads them; sim never reads
+        // them. Restoring on Load wipes Tyrogue mode-1 fade-to-black
+        // persistence. Skipping the restore matches the same "evolve
+        // render-side state continuously" pattern as effect_sys1 / shake
+        // — host's rollback Load leaves it alone, replay's forward sim
+        // evolves it naturally, both stay in sync at render time.
         for (size_t i = 0; i < OBJ_COUNT; i++) {
             const uint8_t* src = src_base + i * OBJ_SZ;
             uint8_t* dst = dst_base + i * OBJ_SZ;
             if (src[0] != 0) {
-                // Active: restore everything except the color override
-                // fields at +68..+84.
                 memcpy(dst, src, OVERRIDE_OFFSET);
                 memcpy(dst + OVERRIDE_END, src + OVERRIDE_END,
                        OBJ_SZ - OVERRIDE_END);
             } else if (dst[0] != 0) {
-                // Currently live-active but save says dead — zero to match.
-                // Skip the override window so any persistent color state
-                // from prior render passes survives.
                 memset(dst, 0, OVERRIDE_OFFSET);
                 memset(dst + OVERRIDE_END, 0, OBJ_SZ - OVERRIDE_END);
             }
@@ -1121,14 +1270,17 @@ bool SaveState_Load(int frame) {
     // Restore game state
     memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
 
-    // EFFECT_SYS1 restore: SKIP — entire 42 B is the palette-flash-1 struct
-    // (g_effect_id_1 + timer + colors), and update_game_state's per-tick
-    // timer decrement at 0x447D91 is what we need to preserve. Live memory
-    // keeps decrementing; saved buffer is zeros (fingerprint deterministic).
-    //
+    // EFFECT_SYS1 restore: SKIP. Render-side state must evolve continuously
+    // across both host (with rollback) and replay (no rollback) so they
+    // produce identical game_rand call sequences during render. (Reverted
+    // from a brief experiment that tried Save+Restore on the theory that
+    // re-sim decrements would converge — but that froze host's palette at
+    // pre-render-mod state while replay kept evolving, producing exactly
+    // the drift the experiment was meant to fix.)
+
     // EFFECT_SYS2 restore: three carved-out regions:
     //   - 0x00..0x20 (sysvars, 32 B): RESTORE
-    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at g_effect_id_2): SKIP
+    //   - 0x20..0x4C (palette-flash-2 struct, 44 B at 0x4456D0): SKIP
     //   - 0x4C..0x50 (g_render_frame_counter, 4 B): SKIP
     //   - 0x50..0x58 (tail, 8 B): RESTORE
     constexpr size_t PFLASH2_OFFSET = 0x4456D0 - EffectAddrs::EFFECT_SYS2;       // 0x20
@@ -1150,23 +1302,15 @@ bool SaveState_Load(int frame) {
     // runahead cycle.
 
     // Wave C additions: afterimage pool + object list topology.
-    // Restore afterimage_pool EXCEPT the 4 bytes at 0x447DD4 (g_last_frame_time).
-    // Those were zeroed in the saved copy so forward/replay CRCs match;
-    // restoring them into live memory would overwrite main_game_loop's current
-    // pacing anchor and cause frame-skip math to go wild. Split restore:
-    //   [start .. 0x4A4)          <- from save
-    //   [0x4A4 .. 0x4A8)          <- SKIP (leave live value untouched)
-    //   [0x4A8 .. end)            <- from save
+    // Restore afterimage_pool EXCEPT carve-outs (render-side state that
+    // must evolve continuously across host's rollback cycles to stay in
+    // sync with replay's forward-only sim):
+    //   - g_last_frame_time @ +0x4A4: per-process pacing anchor (skip)
+    //   - shake_effects (40 B at 0x447DA9): skip (same reason as
+    //     state->shake_effects)
+    //   - palette-flash-1 (42 B at 0x447D7D): skip (same as state->effect_sys1)
     constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
     constexpr size_t G_LAST_FRAME_TIME_SIZE   = 4;
-    // Carve-outs inside afterimage_pool, in address order:
-    //   [0           .. PFLASH1_OFFSET)        — restore (afterimage start)
-    //   [PFLASH1_OFFSET .. PFLASH1_END)        — SKIP (palette-flash-1 struct, EFFECT_SYS1)
-    //   [PFLASH1_END    .. SHAKE_OFFSET)       — restore (gap)
-    //   [SHAKE_OFFSET   .. SHAKE_END)          — SKIP (shake state)
-    //   [SHAKE_END      .. G_LAST_FRAME_TIME)  — restore (gap)
-    //   [G_LAST_FRAME_TIME .. +4)              — SKIP (pacing anchor)
-    //   [G_LAST_FRAME_TIME+4 .. end)           — restore
     constexpr size_t PFLASH1_OFFSET_IN_AI = EffectAddrs::EFFECT_SYS1 - WaveCAddrs::AFTERIMAGE_POOL;
     constexpr size_t PFLASH1_END_IN_AI    = PFLASH1_OFFSET_IN_AI + EffectAddrs::EFFECT_SYS1_SZ;
     constexpr size_t SHAKE_OFFSET_IN_AI = EffectAddrs::SHAKE_EFFECTS - WaveCAddrs::AFTERIMAGE_POOL;
@@ -1301,6 +1445,14 @@ uint32_t SaveState_CalculateFingerprint() {
     };
     g_region_checksums.gameplay_fingerprint =
         Fletcher32((const uint8_t*)&fp, sizeof(fp));
+
+    // Stash the raw scalars too. They're cheap (32 bytes) and on a
+    // fingerprint-DIFF dump we can name the specific field that diverged
+    // without needing FM2K_FULL_CRCS or per-region CRCs at all.
+    g_region_checksums.fp_inputs = {
+        fp.rng, fp.p1_hp, fp.p2_hp, fp.round_timer, fp.game_timer,
+        buf_idx, p1_in, p2_in,
+    };
     return g_region_checksums.gameplay_fingerprint;
 }
 
@@ -1619,6 +1771,39 @@ void SaveState_DumpDesyncDiagnostic(int frame, uint32_t local_crc, uint32_t remo
                 "        Any *** DIFF *** row is the bug: that region replayed nondeterministically.\n",
                 saved_frame, saved_frame);
 
+            // Raw scalar inputs to the fingerprint hash. Always captured (no
+            // throttle gate), so when fingerprint diverges we know which
+            // specific field broke determinism even without FM2K_FULL_CRCS.
+            if (fwd.gameplay_fingerprint != replay.gameplay_fingerprint) {
+                const auto& a = fwd.fp_in;
+                const auto& b = replay.fp_in;
+                fprintf(f, "\n=== Fingerprint Input Diff (forward vs replay) ===\n");
+                fprintf(f, "  %-14s  %-12s  %-12s  %s\n",
+                        "field", "forward", "replay", "status");
+                auto fp_row32 = [&](const char* n, uint32_t x, uint32_t y) {
+                    fprintf(f, "  %-14s  0x%08X    0x%08X    %s\n",
+                            n, x, y, (x == y) ? "MATCH" : "*** DIFF ***");
+                };
+                auto fp_row16 = [&](const char* n, uint16_t x, uint16_t y) {
+                    fprintf(f, "  %-14s  0x%04X        0x%04X        %s\n",
+                            n, x, y, (x == y) ? "MATCH" : "*** DIFF ***");
+                };
+                fp_row32("rng",         a.rng,         b.rng);
+                fp_row32("p1_hp(u32)",  a.p1_hp,       b.p1_hp);
+                fp_row32("p2_hp(u32)",  a.p2_hp,       b.p2_hp);
+                fp_row32("round_timer", a.round_timer, b.round_timer);
+                fp_row32("game_timer",  a.game_timer,  b.game_timer);
+                fp_row32("buf_idx",     a.buf_idx,     b.buf_idx);
+                fp_row16("p1_input",    a.p1_input,    b.p1_input);
+                fp_row16("p2_input",    a.p2_input,    b.p2_input);
+                fprintf(f,
+                    "  NOTE: p1_hp/p2_hp are read as uint32 from unaligned u16 HP\n"
+                    "        addresses (0x4DFC85 / 0x4EDCC4) — upper 16 bits include\n"
+                    "        adjacent CharDynamic bytes. A DIFF in only those upper\n"
+                    "        bits points at a neighboring field, not HP itself.\n"
+                    "        p?_input is read from input_history[buf_idx & 0x3FF].\n");
+            }
+
             // Per-object-slot breakdown. If ObjectPool(full) differed, this
             // pinpoints the exact slot indices. The per-slot CRCs aren't
             // computed at save time any more (too expensive — see
@@ -1787,19 +1972,17 @@ bool SaveState_LoadFromBytes(const uint8_t* bytes, size_t n) {
         return false;
     }
 
-    // Read the blob into a local first so we can pull frame_number out
-    // before deciding which slot to overwrite. The slot index must match
-    // SaveState_Load's `frame % MAX_ROLLBACK_FRAMES` calculation — and it
-    // must hold a state whose frame_number == frame, or Load fails its
-    // sanity check.
-    SaveStateData incoming;
-    std::memcpy(&incoming, bytes, sizeof(incoming));
-
-    const int frame  = (int)incoming.frame_number;
+    // frame_number is the first field of SaveStateData (see savestate.h:44),
+    // so we can read it straight off the wire bytes without round-tripping
+    // through a ~1MB stack-local SaveStateData. The previous version blew
+    // the 1MB default Windows main-thread stack on the spec /F-boot path
+    // for games with extra DLL init pressure (pkmncc crashed; wanwan was
+    // just within margin). Copy directly into the destination slot.
+    const int frame  = (int)*(const uint32_t*)bytes;
     const int slot   = ((frame % MAX_ROLLBACK_FRAMES) + MAX_ROLLBACK_FRAMES)
                        % MAX_ROLLBACK_FRAMES;
-    g_state_buffer[slot] = incoming;
-    g_last_saved_slot    = slot;
+    std::memcpy(&g_state_buffer[slot], bytes, sizeof(SaveStateData));
+    g_last_saved_slot = slot;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "SaveState_LoadFromBytes: applying %zu-byte snapshot "

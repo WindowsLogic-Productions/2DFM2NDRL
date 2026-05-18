@@ -7,6 +7,7 @@
 #include "netplay_state.h"
 #include "../audio/sound_rollback.h"  // Op apply: SOUND_INIT
 #include "../hooks/css_autoconfirm.h" // Replay-mode CSS lock-and-confirm
+#include "../hooks/per_game_patches.h" // PerGamePatches_SetRuntimeBtbOverrides
 #include "../ui/shared_mem.h"         // C10: SharedMem_PublishMatchSession / RoundResult
 #include "gekkonet.h"
 
@@ -122,10 +123,17 @@ struct State {
     // overwrites it.
     struct SnapshotCache {
         std::vector<uint8_t> blob;
-        uint32_t             input_frame  = 0;
-        uint32_t             match_index  = 0;
-        uint32_t             checksum     = 0;
-        bool                 valid        = false;
+        uint32_t             input_frame        = 0;
+        uint32_t             match_index        = 0;
+        uint32_t             checksum           = 0;
+        // captured_game_mode: g_game_mode at the moment we captured this
+        // snapshot (2000 = CSS, 3000 = battle). Phase E uses this to gate
+        // the spec-side apply on a matching mode so a CSS snapshot doesn't
+        // get applied during the spec's battle phase (wrong state regions
+        // would dominate). 0 means "legacy battle-only capture" — apply
+        // when spec reaches game_mode >= 3000.
+        uint32_t             captured_game_mode = 0;
+        bool                 valid              = false;
     } current_snapshot;
 
     // ─── VIEWER SIDE: playback queue ───────────────────────────────────
@@ -168,6 +176,13 @@ struct State {
     bool                      subscribed_upstream = false;
     bool                      join_req_pending    = false;  // We sent SPEC_JOIN_REQ; expect ACK.
     sockaddr_in               upstream_addr       = {};
+    // Sticky copy of the mode we declared on the FIRST RequestJoin from
+    // Netplay_StartSpectator. The reconnect path (silence failover) calls
+    // RequestJoin(root) without specifying a mode, which would otherwise
+    // fall through to the SpectatorNode_RequestJoin default (FULL_SESSION)
+    // and clobber the original CURRENT_MATCH preference — host then ships
+    // no snapshot, spec sits with placeholder chars on a /F-booted battle.
+    SpecJoinMode              last_requested_mode = SpecJoinMode::FULL_SESSION;
     // Failover support. root_addr is the originally-configured upstream
     // (the actual match host). If our current upstream goes silent we
     // fall back to root, which always-on by design. Liveness is tracked
@@ -203,6 +218,14 @@ struct State {
     uint8_t                   pb_stage_id         = 0;
     uint16_t                  pb_current_p1       = 0;
     uint16_t                  pb_current_p2       = 0;
+    // PIN_RNG seed deferred from event drain to battle-entry. The host
+    // emitted PIN_RNG at MATCH_START (battle entry). Applying it on the
+    // spec side at the first event drain (= title screen) would let the
+    // pre-battle sim mutate the seed further, breaking rng parity with
+    // host's battle frame 0. Stash it here; SpectatorSimOneFrame writes
+    // it to engine RNG when game_mode flips to 3000.
+    uint32_t                  pending_pin_rng_seed  = 0;
+    bool                      pending_pin_rng_valid = false;
 
     // C7 — host's session_id for this peer connection. Generated lazily
     // (first AppendSessionId call) and stays stable until the SpectatorNode
@@ -400,7 +423,15 @@ void FlushBatch() {
 // UDP MTU (1200 B safe) once we keep TCP — over TCP this only matters for
 // receive-buffer pacing and avoids an oversized syscall stalling the
 // session_events traversal.
-constexpr size_t BACKFILL_CHUNK_BYTES = 1024;
+// 8 KB chunks — a 1000-INPUT backfill (5 B/INPUT) + non-INPUT ops fits
+// in a single chunk. The previous 1 KB cap chunked into ~3 chunks; in
+// practice spectators only ever received the FIRST chunk, leaving a
+// 500+ frame gap that they couldn't bridge before live EVENT_BATCH
+// broadcasts started flowing (host's pkmncc match — see 07:54 logs).
+// Root cause of the multi-chunk delivery loss is still unclear (TCP
+// is reliable; both sides on localhost) but a single-chunk send
+// sidesteps it. 8 KB stays well under the uint16 hdr.flags cap (65 KB).
+constexpr size_t BACKFILL_CHUNK_BYTES = 8192;
 
 // Walk session_events from a given index/INPUT-frame anchor and stream
 // chunked EVENT_BATCH datagrams to a single subscriber. The legacy
@@ -526,7 +557,11 @@ void SendSessionEventsTo(const sockaddr_in& to,
 
         SpectatorTCP::SendTo(to, buf.data(), buf.size());
 
-        (void)chunk_first_idx;  // reserved for future per-chunk diagnostics
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode:   chunk sent: start_frame=%u count=%u "
+            "payload=%zu bytes (events [%zu..%zu))",
+            (unsigned)hdr.start_frame, (unsigned)hdr.frame_count,
+            payload.size(), chunk_first_idx, ev_idx);
     }
 }
 
@@ -616,9 +651,16 @@ void SendSnapshotTo(const sockaddr_in& to) {
     // ---- SNAPSHOT_BEGIN ----------------------------------------------
     {
         SnapshotMetadata meta = {};
-        meta.version     = SPECTATOR_SNAPSHOT_VERSION;
-        meta.total_bytes = (uint32_t)cache.blob.size();
-        meta.match_index = cache.match_index;
+        meta.version            = SPECTATOR_SNAPSHOT_VERSION;
+        meta.total_bytes        = (uint32_t)cache.blob.size();
+        meta.match_index        = cache.match_index;
+        // Phase E: tell the spec which mode this snapshot was captured
+        // at. v0.2.41 spectators see this as `reserved1` and ignore it
+        // (their apply gate is hard-coded to `game_mode >= 3000` which
+        // matches battle-only captures). v0.2.42+ spectators check the
+        // field and apply when their local engine reaches the matching
+        // mode.
+        meta.captured_game_mode = cache.captured_game_mode;
 
         std::vector<uint8_t> buf(sizeof(SpecDataHeader) + sizeof(meta));
         SpecDataHeader hdr = {};
@@ -864,16 +906,57 @@ void SpectatorNode_Init() {
     g_state.capacity = SPECTATOR_DEFAULT_CAPACITY;
 
     // Bring up the TCP listener for the host→spectator INPUT_BATCH stream.
-    // We bind TCP to the same port as the UDP control socket — TCP and UDP
-    // share the same port-number space without conflict, and reusing the
-    // UDP port means spectators already know it (they connected over UDP
-    // there) so the host_tcp_port field in JOIN_ACK is redundant but kept
-    // for explicitness. Idempotent — re-Init won't double-bind.
+    //
+    // Bind strategy is tiered because Windows reserves chunks of the
+    // dynamic port range for Hyper-V / WSL2 / docker / etc., and the
+    // reserved chunks shift across reboots. Three attempts in order:
+    //
+    //   1. UDP_port + 100  (deterministic, gives predictable port for
+    //      debugging when it succeeds)
+    //   2. UDP_port + 1000 (different bucket; usually clear of the
+    //      WSL-reserved range)
+    //   3. port = 0        (OS picks any free port; always succeeds)
+    //
+    // JOIN_ACK includes our actual listener port via
+    // SpectatorTCP::GetListenPort(), so spectators learn whichever port
+    // we ended up on with no client-side coordination. The deterministic
+    // attempts are first only to keep logs readable; the OS-picked
+    // fallback is what guarantees we never come up listener-less.
+    //
+    // Real-world repro on pkmncc 2026-05-13: P1 udp=51376 → +100=51476
+    // failed with WSAEACCES (Windows-reserved range), needed +1000 OR
+    // port=0 to bind successfully.
+    //
+    // Idempotent — re-Init won't double-bind.
     const uint16_t udp_port = NetSocket_GetLocalPort();
-    if (!SpectatorTCP::StartListener(udp_port)) {
+    const uint16_t candidate_ports[] = {
+        (uint16_t)(udp_port + 100),
+        (uint16_t)(udp_port + 1000),
+        0,  // OS picks
+    };
+    bool spec_listener_bound = false;
+    for (uint16_t cand : candidate_ports) {
+        if (SpectatorTCP::StartListener(cand)) {
+            spec_listener_bound = true;
+            if (cand == 0) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: TCP listener bound via OS-picked port "
+                    "(actual port %u — preferred offsets all hit "
+                    "WSAEACCES, usually Windows reserved-port range)",
+                    (unsigned)SpectatorTCP::GetListenPort());
+            }
+            break;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: TCP listener bind on port %u failed — "
+            "trying next candidate", (unsigned)cand);
+    }
+    if (!spec_listener_bound) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "SpectatorNode: Init — TCP listener failed to bind on port %u; "
-            "spectator subscriptions will fail", (unsigned)udp_port);
+            "SpectatorNode: Init — TCP listener failed to bind on ANY "
+            "candidate port (udp=%u, +100, +1000, OS-picked all failed); "
+            "spectator subscriptions will fail",
+            (unsigned)udp_port);
     }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: Init (capacity=%zu, batch=%zu frames, "
@@ -1367,43 +1450,61 @@ void SpectatorNode_StashSnapshot() {
     cache.match_index = g_state.match_headers.empty() ? 0u
                         : (uint32_t)(g_state.match_headers.size() - 1);
     cache.checksum    = Fletcher32(cache.blob.data(), cache.blob.size());
+    // Phase E: record game_mode at capture time so the spec-side apply
+    // can wait for a matching mode. CSS captures get applied during the
+    // spec's CSS; battle captures wait for battle.
+    cache.captured_game_mode = *(const uint32_t*)FM2K::ADDR_GAME_MODE;
     cache.valid       = true;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "SpectatorNode: snapshot cached (match=%u, %zu bytes, "
-        "input_frame=%u, fletcher32=0x%08X)",
+        "input_frame=%u, fletcher32=0x%08X, captured_game_mode=%u)",
         cache.match_index, cache.blob.size(),
-        cache.input_frame, cache.checksum);
+        cache.input_frame, cache.checksum, cache.captured_game_mode);
 }
 
 bool SpectatorNode_HasSnapshot() {
     return g_state.current_snapshot.valid;
 }
 
+void SpectatorNode_ApplyPendingPinRng() {
+    if (!g_state.pending_pin_rng_valid) return;
+    *(uint32_t*)0x41FB1C = g_state.pending_pin_rng_seed;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: applied deferred PIN_RNG=0x%08X at battle entry",
+        g_state.pending_pin_rng_seed);
+    g_state.pending_pin_rng_valid = false;
+}
+
 void SpectatorNode_ApplyPendingSnapshot() {
     auto& inbox = g_state.pb_snapshot_inbox;
     if (!inbox.pending_apply) return;
 
-    // Wait until the spectator's local engine has reached battle phase
-    // (game_mode >= 3000). The savestate captures BATTLE state — object
-    // pool with battle objects, character data with the recorded chars'
-    // .player file data, etc. Loading it before the local engine has
-    // performed its own battle-init (mode 1000=title, 2000=CSS) lands
-    // battle bytes into structurally-incompatible memory:
-    //   - DDraw/D3D9 surfaces sized for title rather than battle layout
-    //   - Audio sample handles for title BGM, not battle SFX
-    //   - Char-data block has wrong .player file content, broken pointers
+    // Wait until the spectator's local engine has reached the SAME
+    // phase the snapshot was captured at. The savestate captures the
+    // engine state — object pool, character data, DDraw surfaces, etc.
+    // — and applying it before the local engine has done its own
+    // init-for-that-phase lands the captured bytes into structurally-
+    // incompatible memory:
+    //   - DDraw/D3D9 surfaces sized for the wrong phase layout
+    //   - Audio sample handles for the wrong phase's audio set
+    //   - Char-data block has content the local engine hasn't loaded
     // Symptom: spectator crashes on the next render frame after apply.
     //
-    // By waiting for mode >= 3000 the local engine has already done its
-    // own battle-init; the apply just overlays dynamic state (RNG, HP,
-    // positions, frame counter) on top of an initialized battle. Cost:
-    // spectator briefly walks through title + CSS before "jumping" to
-    // host's live state via the apply. Future task: arm CssAutoConfirm
-    // with chars from a metadata payload so CSS auto-locks instead of
-    // walking randomly via leaked battle inputs.
+    // By waiting for game_mode >= captured_game_mode the local engine
+    // has already performed its own init for the captured phase; the
+    // apply just overlays dynamic state on top.
+    //
+    // Phase E (v0.2.42+): host writes captured_game_mode into the
+    // SnapshotMetadata so the spec knows whether to wait for CSS (2000)
+    // or battle (3000). Pre-Phase-E hosts (v0.2.41) left this field 0
+    // and always captured at battle entry; the captured==0 fallback
+    // keeps that wire compat with the v0.2.41 default of
+    // `game_mode >= 3000`.
     const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-    if (game_mode < 3000u) return;
+    const uint32_t captured  = inbox.meta.captured_game_mode;
+    const uint32_t apply_gate = (captured == 0u) ? 3000u : captured;
+    if (game_mode < apply_gate) return;
 
     if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1419,15 +1520,29 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // Anchor the EVENT_BATCH stream cursor at the snapshot's INPUT-frame
     // position. Subsequent batches start at this frame index — see
     // SendSessionBackfillFromFrame on the host side.
-    // have_frame_baseline=true short-circuits the first-batch baseline-
-    // init in the EVENT_BATCH handler. Drop any pb_queue contents that
-    // may have arrived prior to the snapshot (CURRENT_MATCH bind path
-    // doesn't pre-send events, but FULL_SESSION → CURRENT_MATCH
-    // renegotiation could have stale ones cached).
-    g_state.pb_queue.clear();
-    g_state.pb_match_headers.clear();
+    //
+    // 2026-05-17 fix: don't reflexively clear pb_queue + reset
+    // next_expected_frame. The CURRENT_MATCH bind path DOES pre-send
+    // anchor-onward events (SendSessionBackfillFromFrame fires right
+    // after SendSnapshotTo on the host), and live EVENT_BATCH broadcasts
+    // continue flowing through the deferred-apply window. Those events
+    // are EXACTLY what we want: pb_queue holds anchor..live, ready for
+    // sim catch-up the moment snapshot applies. Clearing them wiped
+    // ~750 events of valid backfill+live → spec stuck at expected=anchor
+    // with all subsequent live batches "out-of-order" (host at frame
+    // 1100+, spec expecting 333).
+    //
+    // Only reset state when our cursor is BEHIND the anchor — that's the
+    // FULL_SESSION → CURRENT_MATCH renegotiation case where pb_queue
+    // holds stale pre-anchor frames the snapshot supersedes.
+    if (!g_state.have_frame_baseline ||
+        g_state.next_expected_frame < anchor)
+    {
+        g_state.pb_queue.clear();
+        g_state.pb_match_headers.clear();
+        g_state.next_expected_frame = anchor;
+    }
     g_state.have_frame_baseline    = true;
-    g_state.next_expected_frame    = anchor;
     g_state.highest_consumed_frame = 0;
     g_state.playing_back           = true;
 
@@ -1636,6 +1751,53 @@ bool WriteSessionFileImpl(const char* path,
                                        : CountMatchesInSlice(events, first, last);
     hdr.match_index  = is_battle_slice ? 1 : 0;
     hdr.session_id   = g_state.session_id;
+
+    // Populate p1_nick / p2_nick / game_id from SharedMem + exe path.
+    // Previously these were left at the memset-zeroed default which made
+    // the launcher's replay browser show every match as "?" vs "?" and
+    // the stats/hub couldn't distinguish matches by participant. The
+    // launcher writes ui_my_nick + ui_peer_nick to SharedMem at HELLO
+    // exchange time; we read them here and assign to p1/p2 based on
+    // which side we are (host = player_index 0 = p1).
+    // Only host (0) and joiner (1) participate in the match — spec
+    // (player_index = 2 sentinel) has its own nick but neither matches
+    // P1 nor P2. For spec-written .fm2kset / .fm2krep we leave nicks
+    // zero rather than write spec's-own-nick as one of the participants.
+    // TODO: relay P1/P2 nicks via a SESSION_NICKS or MATCH_START extension
+    // so spec-written files can also carry the correct nicks.
+    if (FM2KSharedMemData* sm = GetSharedMemory();
+        sm && (g_player_index == 0 || g_player_index == 1)) {
+        const char* my_nick   = sm->ui_my_nick;
+        const char* peer_nick = sm->ui_peer_nick;
+        if (g_player_index == 0) {
+            std::strncpy(hdr.p1_nick, my_nick,   sizeof(hdr.p1_nick) - 1);
+            std::strncpy(hdr.p2_nick, peer_nick, sizeof(hdr.p2_nick) - 1);
+        } else {  // joiner (1)
+            std::strncpy(hdr.p1_nick, peer_nick, sizeof(hdr.p1_nick) - 1);
+            std::strncpy(hdr.p2_nick, my_nick,   sizeof(hdr.p2_nick) - 1);
+        }
+    }
+
+    // game_id from exe basename (matches the convention used by
+    // upload_queue manifests at netplay.cpp:198-209). Strip dirs + .exe.
+    {
+        char exe_path[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameA(nullptr, exe_path, sizeof(exe_path));
+        if (n > 0 && n < sizeof(exe_path)) {
+            const char* basename = exe_path;
+            for (const char* p = exe_path; *p; ++p) {
+                if (*p == '\\' || *p == '/') basename = p + 1;
+            }
+            std::strncpy(hdr.game_id, basename, sizeof(hdr.game_id) - 1);
+            // Strip ".exe" suffix — zero from dot to end (not just dot itself,
+            // otherwise trailing "exe" bytes after the inline NUL show up in
+            // downstream consumers that don't stop at first NUL).
+            if (char* dot = std::strrchr(hdr.game_id, '.')) {
+                std::memset(dot, 0,
+                            sizeof(hdr.game_id) - (size_t)(dot - hdr.game_id));
+            }
+        }
+    }
 
     const size_t n_rounds = std::min<size_t>(round_offsets.size(),
                                              sizeof(hdr.round_offsets) / sizeof(hdr.round_offsets[0]));
@@ -1906,9 +2068,24 @@ void ApplyResetInputState() {
 void ApplySessionEvent(const SessionEvent& ev) {
     switch (ev.type) {
         case SessionEventType::PIN_RNG:
-            *(uint32_t*)0x41FB1C = ev.u.pin_rng_seed;
+            // The host emitted PIN_RNG at battle-entry, AFTER title/CSS
+            // sim had already consumed RNG. If we apply it eagerly here
+            // (at first replay tick = title screen), then title/CSS run
+            // RNG-consuming code starting FROM the pinned seed, mutating
+            // it further → first battle frame's rng != host's first
+            // battle frame's rng. Visual / engine state matches (since
+            // title/CSS rng draws don't affect chars), but the parity
+            // recorder's rng field diverges.
+            //
+            // Defer: write rng AT battle-entry (game_mode flip to 3000)
+            // instead of immediately. Stash the seed; SpectatorSimOneFrame's
+            // initial-sync block applies it at the same logical instant
+            // host's PIN_RNG fired.
+            g_state.pending_pin_rng_seed  = ev.u.pin_rng_seed;
+            g_state.pending_pin_rng_valid = true;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: applied PIN_RNG=0x%08X", ev.u.pin_rng_seed);
+                "SpectatorNode: queued PIN_RNG=0x%08X (will apply at battle entry)",
+                ev.u.pin_rng_seed);
             break;
         case SessionEventType::RESET_INPUT_STATE:
             ApplyResetInputState();
@@ -2058,12 +2235,37 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
     auto BuildJoinAck = []() {
         CtrlPacket ack = {};
         ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
-        ack.data.spec_join_ack.host_session_kind =
-            static_cast<uint8_t>(Netplay_GetSessionKind());
+        const NetplaySessionKind k = Netplay_GetSessionKind();
+        ack.data.spec_join_ack.host_session_kind = static_cast<uint8_t>(k);
         // Tell the spectator which TCP port to dial for the INPUT_BATCH
         // stream. Zero would mean the listener failed at startup, in which
         // case the spectator refuses the subscription.
         ack.data.spec_join_ack.host_tcp_port = SpectatorTCP::GetListenPort();
+        // Default "unknown" — only valid when host is in battle.
+        ack.data.spec_join_ack.host_p1_char = 0xFF;
+        ack.data.spec_join_ack.host_p2_char = 0xFF;
+        ack.data.spec_join_ack.host_stage   = 0xFF;
+        if (k == NetplaySessionKind::BATTLE) {
+            // Read the engine's current post-CSS-confirm chars + stage so
+            // the spec can /F-boot with the RIGHT character files. These
+            // live at ADDR_P1_SELECTED_CHAR / ADDR_P2_SELECTED_CHAR (the
+            // same addresses Netplay_StartBattle reads for its "match
+            // chars p1=N(...) p2=N(...)" log) and ADDR_SELECTED_STAGE.
+            //
+            // Note: g_config_value1/3 (0x4300E0/0x4300F0) are only
+            // populated when the HOST itself was /F-launched — for a
+            // normal CSS walk they stay at 0, which is why the previous
+            // read gave us p1=0/p2=0 and pkmncc crashed loading a
+            // mirror Blaziken matchup.
+            const uint32_t p1 = *(const uint32_t*)FM2K::ADDR_P1_SELECTED_CHAR;
+            const uint32_t p2 = *(const uint32_t*)FM2K::ADDR_P2_SELECTED_CHAR;
+            const uint32_t st = (FM2K::ADDR_SELECTED_STAGE != 0)
+                                  ? *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE
+                                  : 0u;
+            if (p1 < 50u) ack.data.spec_join_ack.host_p1_char = (uint8_t)p1;
+            if (p2 < 50u) ack.data.spec_join_ack.host_p2_char = (uint8_t)p2;
+            if (st < 50u) ack.data.spec_join_ack.host_stage   = (uint8_t)st;
+        }
         return ack;
     };
 
@@ -2242,6 +2444,14 @@ std::vector<sockaddr_in> SpectatorNode_GetSubscriberAddrs() {
 bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
     g_state.upstream_addr       = upstream;
     g_state.subscribed_upstream = false;
+    g_state.last_requested_mode = mode;  // sticky — see comment in State decl
+    // Bump reconnect timestamp so TickHealth's failover backoff covers the
+    // INITIAL JOIN_REQ too. Without this, last_reconnect_attempt_ms stays
+    // 0 after the first send, the next TickHealth pass sees
+    // `now - 0 >= BACKOFF_MS`, and fires a second RequestJoin within
+    // milliseconds — clobbering the spectator's declared mode before the
+    // host's first JOIN_ACK even arrives.
+    g_state.last_reconnect_attempt_ms = GetTickCount64();
     g_state.join_req_pending    = true;  // Gates HandleJoinAck so a stray
                                          // JOIN_ACK from the wire doesn't
                                          // promote a non-spectator client
@@ -2255,7 +2465,28 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
 }
 
 void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
-                                 uint16_t host_tcp_port) {
+                                 uint16_t host_tcp_port,
+                                 uint8_t host_p1_char, uint8_t host_p2_char,
+                                 uint8_t host_stage) {
+    // If host advertised real chars (in-battle), forward to the BTB
+    // runtime-override channel so the slot-0 /F dispatcher loads the
+    // host's actual character files. We CAN'T use SetEnvironmentVariableA
+    // + getenv here — Win32 SetEnv updates the process env block but
+    // not the CRT's _environ cache, so getenv() in BTB returns the stale
+    // launcher-provided placeholder (char 0). PerGamePatches keeps a
+    // hook-internal struct that BTB reads first; this bypasses the CRT
+    // cache entirely.
+    if (host_session_kind == 2 /* BATTLE */) {
+        PerGamePatches_SetRuntimeBtbOverrides(host_p1_char,
+                                              host_p2_char,
+                                              host_stage);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: seeded runtime BTB from JOIN_ACK "
+            "(p1=%u p2=%u stage=%u)",
+            (unsigned)host_p1_char, (unsigned)host_p2_char,
+            (unsigned)host_stage);
+    }
+
     // SPEC_JOIN_ACK is dual-purpose:
     //   1. First-time arrival (initial subscribe): completes the JOIN_REQ
     //      handshake, pins RNG, marks subscribed_upstream, opens TCP up.
@@ -2379,8 +2610,10 @@ void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,
     target.sin_port        = htons(redirect_port);
     char buf[48] = {}; FormatAddr(target, buf, sizeof(buf));
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: Redirecting to %s", buf);
-    SpectatorNode_RequestJoin(target);
+                "SpectatorNode: Redirecting to %s (mode=%s)", buf,
+                g_state.last_requested_mode == SpecJoinMode::CURRENT_MATCH
+                    ? "CURRENT_MATCH" : "FULL_SESSION");
+    SpectatorNode_RequestJoin(target, g_state.last_requested_mode);
 }
 
 void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
@@ -2463,8 +2696,36 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: SNAPSHOT_BEGIN match=%u, %u bytes, "
-                "anchor INPUT-frame=%u",
-                meta.match_index, meta.total_bytes, inbox.anchor_frame);
+                "anchor INPUT-frame=%u, captured_game_mode=%u",
+                meta.match_index, meta.total_bytes, inbox.anchor_frame,
+                meta.captured_game_mode);
+
+            // Battle-snapshot fast-walk for spec: when the snapshot is
+            // captured at battle (game_mode=3000) but spec is still in
+            // boot/title/CSS, the pb_queue starts at a post-CSS frame
+            // and contains no CSS-confirm inputs. CssAutoConfirm gives
+            // us programmatic "pick chars + lock in" so the spec's
+            // local engine can transition CSS → battle on its own.
+            // Targets are arbitrary (0/0/stage 0); the snapshot apply
+            // at game_mode=3000 overwrites the entire char-data pool
+            // with the host's actual matchup state.
+            //
+            // For CSS snapshots (captured_game_mode=2000), DON'T arm —
+            // the snapshot itself will populate cursor positions +
+            // selected chars when it applies at game_mode==2000, and
+            // CssAutoConfirm's pinning logic would fight the loaded
+            // state.
+            if (g_spectator_mode && meta.captured_game_mode == 3000u) {
+                CssAutoConfirm_OnReplayMatchStart(
+                    /*p1_char=*/0, /*p1_color=*/0,
+                    /*p2_char=*/0, /*p2_color=*/0,
+                    /*stage_id=*/0);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: armed CssAutoConfirm for spec "
+                    "(battle snapshot — drive CSS forward to game_mode "
+                    "3000 with placeholder chars; snapshot apply will "
+                    "overwrite)");
+            }
             break;
         }
         case SpecDataType::SNAPSHOT_CHUNK: {
@@ -2927,9 +3188,11 @@ void SpectatorNode_TickHealth() {
     {
         char buf[48] = {}; FormatAddr(g_state.root_addr, buf, sizeof(buf));
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: reconnecting to root %s", buf);
+                    "SpectatorNode: reconnecting to root %s (mode=%s)", buf,
+                    g_state.last_requested_mode == SpecJoinMode::CURRENT_MATCH
+                        ? "CURRENT_MATCH" : "FULL_SESSION");
         g_state.last_reconnect_attempt_ms = now;
-        SpectatorNode_RequestJoin(g_state.root_addr);
+        SpectatorNode_RequestJoin(g_state.root_addr, g_state.last_requested_mode);
     }
 
     SpectatorNode_TickHostMaintenance();
@@ -3099,6 +3362,14 @@ void SpectatorNode_TickHostMaintenance() {
                     "(snapshot match=%u + tail from INPUT-frame=%u)",
                     buf, g_state.current_snapshot.match_index,
                     g_state.current_snapshot.input_frame);
+                // Push current HOST_CONFIG over the UDP ctrl channel
+                // BEFORE the snapshot. Live broadcasts only fire at
+                // match-start moments (Netplay_StartBattle) — a spec
+                // joining mid-match would otherwise run on whatever
+                // stale settings the engine spawned with (wrong stage,
+                // default SOCD, etc) until the next round-end.
+                extern void Netplay_SendHostConfigToSpec(const sockaddr_in& to);
+                Netplay_SendHostConfigToSpec(sub.addr);
                 SendSnapshotTo(sub.addr);
                 SendSessionBackfillFromFrame(sub.addr,
                     g_state.current_snapshot.input_frame);

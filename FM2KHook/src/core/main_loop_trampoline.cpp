@@ -427,6 +427,12 @@ static void SleepToTarget(uint64_t start_qpc, uint32_t target_ms,
 static void RunBattleTick() {
     Hook_CheckGameModeTransition_Public();
 
+    // Apply any pending F8 runahead toggle BEFORE gekko_update_session
+    // chews through the tick. Safe even when no session is alive
+    // (function early-exits) but most useful right here so the next
+    // AdvanceEvent reflects the new runahead immediately.
+    Netplay_PollRunaheadToggle();
+
     // Stress-mode path: no network, no peer sync. GekkoStressSession is the
     // determinism check — it rolls back every check_distance frames and
     // compares save hashes.
@@ -613,6 +619,11 @@ static void RunBattleTick() {
         }
         // Drift adjustment now lives in SleepToTarget at the outer
         // loop (see RunBattleTick comment in TRAMPOLINE_BATTLE case).
+
+        // [BEAT] heartbeat — rate-limited to ~10s wall-clock internally,
+        // safe to call every tick. Single INFO line with role/ping/jitter/
+        // FA/delay/ra/pred/rollback stats for support triage.
+        Netplay_TickHeartbeat();
 
         // Battle-exit swap-frame gate. Once CheckGameModeTransition has
         // detected game_mode leaving battle range it called
@@ -828,6 +839,16 @@ static bool SpectatorSimOneFrame() {
         if (!s_spec_trace_in_battle) {
             s_spec_trace_in_battle = true;
             s_spec_trace_bf = 0;
+            // First iteration where mode_pre==3000 = first FULL battle
+            // frame on the spec side (mode_pre==3000 at iteration start,
+            // mode_pre==3000 still at end; PGI/UG ran entirely in battle
+            // context). Apply PIN_RNG + initial-sync BEFORE PGI here so
+            // host's first battle frame post-PGI rng matches replay's.
+            SaveState_DoInitialSync();
+            SpectatorNode_ApplyPendingPinRng();
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpecSim: first mode_pre==3000 iteration — applied "
+                "initial-sync + PIN_RNG pre-PGI");
         }
     } else {
         s_spec_trace_in_battle = false;
@@ -835,6 +856,7 @@ static bool SpectatorSimOneFrame() {
 
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+
     ParityRecorder::Capture();
 
     // [SPEC-TRACE] per-frame for first 100 battle frames. Routed through
@@ -1089,6 +1111,17 @@ static void RunSpectatorTick() {
     // User-toggled FF (F12) is the explicit "speed up to live" lever.
     const bool needs_user_ff         = g_spectator_ff_user &&
                                        qd > SPECTATOR_LIVE_LAG_FRAMES;
+    // CSS-phase catchup: drain the backlog aggressively while the host
+    // sits in character select. Battle has no visible action to "fast-
+    // forward through" so the user can't tell catchup from steady-state,
+    // but if we let the queue accumulate across rounds we'd start the
+    // NEXT battle hundreds of frames behind. Engaging during CSS keeps
+    // the spec close to live without disrupting the in-battle viewing
+    // experience. (Render is gated on g_spectator_catchup so cursor
+    // animations still draw — see RenderFrameWithSnapshot in the loop.)
+    const uint32_t live_game_mode    = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    const bool needs_css_catchup     = (live_game_mode == 2000u) &&
+                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
     // Render parity is required during catchup — every phase. Render-side
     // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
     // mode 3, particle FX) run on the host once per simulated frame. If the
@@ -1100,7 +1133,7 @@ static void RunSpectatorTick() {
     // 50+ catchup-loop iterations. Render in the loop costs more GPU but
     // keeps RNG locked to host across CSS, battle, and inter-match drain.
     g_spectator_catchup = needs_initial_catchup || needs_always_catchup ||
-                          needs_user_ff;
+                          needs_user_ff       || needs_css_catchup;
 
     const uint64_t catchup_start_ms = GetTickCount64();
     while (g_spectator_catchup) {

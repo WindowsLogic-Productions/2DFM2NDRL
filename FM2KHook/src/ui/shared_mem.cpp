@@ -200,6 +200,16 @@ void SharedMem_PublishExternalTcp(uint32_t ip_be, uint16_t port) {
     g_shared_mem->tcp_stun_seq      += 1;
 }
 
+void SharedMem_PublishSessionKind(uint8_t kind) {
+    if (!g_shared_mem) return;
+    if (g_shared_mem->session_kind == kind &&
+        g_shared_mem->session_kind_seq != 0) {
+        return;  // unchanged — don't bump seq (launcher only forwards on change)
+    }
+    g_shared_mem->session_kind     = kind;
+    g_shared_mem->session_kind_seq += 1;
+}
+
 void SharedMem_PublishHudScores(uint16_t p1, uint16_t p2) {
     if (!g_shared_mem) return;
     g_shared_mem->hud_score_p1 = p1;

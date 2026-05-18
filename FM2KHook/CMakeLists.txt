@@ -25,6 +25,7 @@ set(FM2KHOOK_SOURCES
     src/hooks/round_events.cpp
     src/hooks/css_autoconfirm.cpp
     src/hooks/per_game_patches.cpp
+    src/hooks/csm_diag.cpp
     src/hooks/combat_state.cpp
     src/hooks/wndproc_subclass.cpp
     # Netplay

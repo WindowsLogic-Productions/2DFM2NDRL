@@ -4,6 +4,7 @@
 #include "globals.h"  // FM2K::kIsFM95 — engine-aware window class match
 #include "netplay.h"
 #include "savestate.h"
+#include "../hooks/per_game_patches.h"  // training / OPTION mode badges + F2 cycle
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx9.h>
@@ -11,6 +12,7 @@
 #include <SDL3/SDL_log.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // D3D9 function typedefs
 typedef HRESULT(APIENTRY* EndScene_t)(LPDIRECT3DDEVICE9 pDevice);
@@ -680,6 +682,11 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
+    // Per-game patches per-frame tick — F2 hotkey for training-mode P2
+    // behavior cycle, game_mode edge tracker for OPTION-mode submode
+    // application, etc. No-op when no relevant mode is active.
+    PerGamePatches_OnFrameTick();
+
     // Always-on HUD (Fightcade-style top bar inside the game rect).
     // Pushes its own data via setters from the netplay layer; here we
     // just hand it the rect and let it draw via ImDrawList. Skipped
@@ -717,6 +724,136 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
                  (float)(g_game_viewport.Y + g_game_viewport.Height));
         dl->AddRectFilled(a, b, IM_COL32(0, 255, 0, 28));
         dl->AddRect(a, b, IM_COL32(0, 255, 0, 220), 0.0f, 0, 2.0f);
+    }
+
+    // Per-game patch badges — small corner labels showing which
+    // experimental mode is currently engaged. Always visible (no F-key
+    // gate) so the user can see at a glance which mode is driving the
+    // input. Renders to the foreground draw list inside the game
+    // viewport. The "ALT CSS MODE = ..." status is always shown so the
+    // user sees "default" when no override is engaged, and the active
+    // submode otherwise.
+    if (g_game_viewport.Width > 0 && g_game_viewport.Height > 0) {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const float pad = 6.0f;
+        const float vx  = (float)g_game_viewport.X;
+        const float vy  = (float)g_game_viewport.Y;
+        const float vw  = (float)g_game_viewport.Width;
+        float       cy  = vy + pad;  // running top-left Y for stacked badges
+
+        auto draw_badge = [&](const char* text, ImU32 bg, ImU32 fg) {
+            ImVec2 sz = ImGui::CalcTextSize(text);
+            ImVec2 a(vx + vw - sz.x - pad * 3.0f, cy);
+            ImVec2 b(vx + vw - pad,                cy + sz.y + pad);
+            dl->AddRectFilled(a, b, bg, 4.0f);
+            dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.5f), fg, text);
+            cy += (sz.y + pad * 2.5f);
+        };
+
+        // ALT CSS MODE status — rendered ONLY when a non-default mode is
+        // engaged or queued. Default state stays visually quiet.
+        //
+        // Sources, in priority order:
+        //   1. An active mode flag (vs_cpu / training / cpu_vs_cpu).
+        //   2. On title with option_mode_selector on AND submode != 0 —
+        //      the QUEUED submode (what title→CSS will engage).
+        //   3. Otherwise — badge hidden.
+        //
+        // On title→non-title transition (i.e., the user confirms a mode
+        // and CSS init begins), the queued-label badge SLIDES OUT to the
+        // right over ~0.4s instead of snap-disappearing. The frozen label
+        // captured at transition stays drawn for the duration; the
+        // post-CSS active-mode badge appears normally once the slide
+        // completes (a tiny gap where no badge shows is fine — keeps the
+        // exit animation clean and avoids overlapping motion).
+        {
+            const uint32_t game_mode = *(const uint32_t*)0x00470054;
+            const bool on_title = (game_mode == 1000u);
+            const char* mode_label = nullptr;
+            if      (PerGamePatches_IsVsCpuModeActive())     mode_label = "VS CPU";
+            else if (PerGamePatches_IsCpuVsCpuModeActive())  mode_label = "CPU vs CPU";
+            else if (PerGamePatches_IsTrainingModeActive())  mode_label = "Training";
+            else if (PerGamePatches_IsOptionModeSelectorActive() && on_title) {
+                const int sub = PerGamePatches_GetVsSubmode();
+                if (sub != 0) {  // 0 = Default, hide badge
+                    const int menu_ctx = PerGamePatches_GetVsMenuContext();
+                    mode_label = PerGamePatches_VsSubmodeLabel(sub, menu_ctx);
+                }
+            }
+
+            // Title-exit slide-out tracker.
+            static uint32_t s_prev_game_mode_anim = 0;
+            static float    s_exit_t = 1.0f;       // 1.0 = at rest (no anim)
+            static char     s_exit_label[80]      = {};
+            constexpr float kExitAnimDur          = 0.4f;
+
+            // Detect 1000 → (not 1000) edge; start animation with the
+            // last-known on-title label.
+            if (s_prev_game_mode_anim == 1000u && game_mode != 1000u) {
+                if (mode_label || s_exit_label[0]) {
+                    // Prefer current frame's label; fall back to whatever
+                    // was last shown on title if the current is null
+                    // (e.g., transition raced the label clear).
+                    const char* src = mode_label ? mode_label : s_exit_label;
+                    std::snprintf(s_exit_label, sizeof(s_exit_label),
+                                  "ALT CSS MODE = %s", src);
+                    s_exit_t = 0.0f;
+                }
+            }
+            s_prev_game_mode_anim = game_mode;
+
+            // Snapshot the latest on-title label so it's available at
+            // the transition edge (the current-frame mode_label might
+            // already be the post-transition value).
+            if (on_title && mode_label) {
+                std::snprintf(s_exit_label, sizeof(s_exit_label),
+                              "ALT CSS MODE = %s", mode_label);
+            }
+
+            // Advance animation.
+            if (s_exit_t < 1.0f) {
+                s_exit_t += ImGui::GetIO().DeltaTime / kExitAnimDur;
+                if (s_exit_t > 1.0f) s_exit_t = 1.0f;
+            }
+
+            // Render the exit slide if active. Uses ease-out cubic so
+            // motion accelerates away quickly then settles, matching a
+            // "swipe off" feel.
+            if (s_exit_t < 1.0f && s_exit_label[0]) {
+                const float t      = s_exit_t;
+                const float inv    = 1.0f - t;
+                const float eased  = 1.0f - inv * inv * inv;  // ease-out cubic
+                ImVec2  sz = ImGui::CalcTextSize(s_exit_label);
+                const float bw   = sz.x + pad * 3.0f;
+                const float bh   = sz.y + pad * 2.0f;
+                const float dx   = eased * (bw + pad * 2.0f);
+                const float left = vx + vw - sz.x - pad * 3.0f + dx;
+                const float top  = cy;
+                ImVec2 a(left, top);
+                ImVec2 b(left + bw, top + bh);
+                dl->AddRectFilled(a, b, IM_COL32(30, 100, 60, 220), 4.0f);
+                dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.5f),
+                            IM_COL32(220, 255, 220, 255), s_exit_label);
+                cy += (sz.y + pad * 2.5f);
+            } else if (mode_label) {
+                // Steady-state badge — render once exit-anim is done OR
+                // when we're on title and have a queued label.
+                char buf[80];
+                std::snprintf(buf, sizeof(buf), "ALT CSS MODE = %s", mode_label);
+                draw_badge(buf, IM_COL32(30, 100, 60, 220),
+                           IM_COL32(220, 255, 220, 255));
+            }
+        }
+
+        // Training mode P2 behavior — shown below the ALT CSS MODE status
+        // when training is active so the user sees what dummy is doing.
+        if (PerGamePatches_IsTrainingModeActive()) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "Training [F2]: %s",
+                PerGamePatches_TrainingP2BehaviorLabel(
+                    PerGamePatches_GetTrainingP2Behavior()));
+            draw_badge(buf, IM_COL32(40, 100, 200, 200), IM_COL32(255, 255, 255, 255));
+        }
     }
 
     // Debug overlay window — F9-gated, drag-around, tabs etc. The

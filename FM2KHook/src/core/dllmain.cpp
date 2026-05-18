@@ -14,6 +14,14 @@
 // the older patch functions and the extern declarations would conflict.
 extern void PatchVsRoundCase200T4FalsePositive();
 extern void NeuterFullscreenTogglesForCncDdraw();
+
+// Per-game patches that delegate to css_autoconfirm.cpp's hook (already
+// detoured on game_state_manager — sharing the same MinHook entry).
+#include "../hooks/css_autoconfirm.h"
+#include "../hooks/round_events.h"
+#include "../hooks/per_game_patches.h"
+#include "../netplay/upload_queue.h"
+#include "../netplay/spectator_node.h"  // SpectatorNode_GetSessionId
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -345,6 +353,53 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     }
     fprintf(f, "=== END CRASH ===\n\n");
     fflush(f);
+
+    // Drop an upload manifest so the launcher posts the crash artifact
+    // to the hub on next launch (the launcher polls upload_queue/
+    // every tick — see PollUploadQueue). We're inside an unhandled
+    // exception filter so the heap may be unstable; the std::vector
+    // + std::string allocations Enqueue does are small (~520 bytes
+    // worst case) and use the same allocator the existing fprintf
+    // calls above already touched without crashing, so the marginal
+    // risk is low. If it ever blows up in the wild we can switch to
+    // an inline fprintf-only manifest writer here.
+    {
+        char cwd[MAX_PATH] = {};
+        GetCurrentDirectoryA(sizeof(cwd), cwd);
+        char debug_path[MAX_PATH], crash_path[MAX_PATH];
+        std::snprintf(debug_path, sizeof(debug_path),
+                      "%s\\logs\\FM2K_P%d_Debug.log",
+                      cwd, g_player_index + 1);
+        std::snprintf(crash_path, sizeof(crash_path),
+                      "%s\\logs\\FM2K_P%d_Crash.log",
+                      cwd, g_player_index + 1);
+
+        char exe_path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe_path, sizeof(exe_path));
+        const char* basename = exe_path;
+        for (char* p = exe_path; *p; ++p) {
+            if (*p == '\\' || *p == '/') basename = p + 1;
+        }
+        char game_id[128] = {};
+        std::strncpy(game_id, basename, sizeof(game_id) - 1);
+        if (char* dot = std::strrchr(game_id, '.')) *dot = '\0';
+
+        fm2k::upload_queue::Manifest m;
+        m.kind = "crash";
+        m.frame = -1;  // unknown — crashes can fire from any phase
+        m.session_id = SpectatorNode_GetSessionId();
+        m.player_index = g_player_index;
+        m.game_id = game_id;
+        // Reference both candidate log paths. The launcher's processor
+        // silently skips paths that don't exist, so listing both lets
+        // it pick up whichever one CrashHandler actually wrote to
+        // (fallback path used Crash.log; primary path appended to
+        // Debug.log via the shared g_log_file_fallback handle).
+        m.file_paths.emplace_back(debug_path);
+        m.file_paths.emplace_back(crash_path);
+        fm2k::upload_queue::Enqueue(m);
+    }
+
     return EXCEPTION_CONTINUE_SEARCH;  // let Windows' default handler
                                        // pop the WER dialog as usual
 }
@@ -565,6 +620,95 @@ static void DisableCursorHiding() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Patch: Disabled cursor hiding in fullscreen");
 }
 
+// Runtime fix for the GameSpeed (Editor.TestPlay.GameSpeed INI key) setting
+// breaking character / effect / VS-intro scripts at any value other than 10.
+//
+// Root cause (init_round_state_and_apply_gamespeed @ 0x406450):
+//
+//   v3 = (gs <= 10) ? (5*gs + 50) : (10*gs);   // gs=10 -> 100, gs=5 -> 75
+//   g_gamespeed_move_scalar  (0x541F78) = 0x10000 / v3
+//   g_gamespeed_accel_scalar (0x445700) = 3932160 / (v3*v3)
+//   g_gamespeed_pic_step     (0x445704) = v3
+//
+// op_MOVE in the script interpreter (character_state_machine @ 0x411bf0)
+// uses MOVE/ACCEL scalars to scale velocity per frame — fine. But op_PIC
+// (case 0x0C) ADDS `v3 * keepTime` to a per-object wait timer that gets
+// DECREMENTED by a HARDCODED 100 per frame at the top of the dispatch
+// loop. At gs=10 the two cancel exactly; at any other gs they don't:
+//
+//   keepTime  gs=10 frames  gs=5 frames
+//      1          2             1        (2x faster)
+//      2          3             2        (1.5x)
+//      3          4             3        (1.33x)
+//
+// Small waits collapse disproportionately and desync against unscaled
+// systems (hitstop, hurtbox lifetimes, BG_FX timers, g_game_timer).
+// Vanpri-style scripts with tight OP_PIC chains hit the dispatch loop's
+// 300-iter safety break and leave objects stuck.
+//
+// Fix: NOP the `mov [g_gamespeed_pic_step], ecx` write at 0x40649A and
+// pin g_gamespeed_pic_step = 100. MOVE/ACCEL scalars still vary with gs
+// (so the game still feels faster at lower gs) but the script-time clock
+// stays exact.
+//
+// Opt-out: FM2K_KEEP_GAMESPEED_PIC=1 leaves vanilla behavior for re-test.
+static void FixGameSpeedDesync() {
+    if (const char* e = std::getenv("FM2K_KEEP_GAMESPEED_PIC"); e && std::strcmp(e, "1") == 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "PATCH: FM2K_KEEP_GAMESPEED_PIC=1 — leaving vanilla "
+            "gs-pic-timer behavior (gs != 10 will desync scripts).");
+        return;
+    }
+
+    // NOP the 6-byte write `mov ds:[0x445704], ecx` at 0x40649A
+    // (89 0D 04 57 44 00 -> 90 90 90 90 90 90).
+    uint8_t* pic_write = (uint8_t*)0x40649A;
+    DWORD old_protect;
+    if (VirtualProtect(pic_write, 6, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        std::memset(pic_write, 0x90, 6);
+        VirtualProtect(pic_write, 6, old_protect, &old_protect);
+    }
+
+    // Pin g_gamespeed_pic_step = 100 so OP_PIC behaves as if gs=10 from
+    // frame 0 onward (init_round_state_and_apply_gamespeed no longer
+    // overwrites it, but we still need a defined initial value).
+    uint32_t* pic_step = (uint32_t*)0x445704;
+    if (VirtualProtect(pic_step, 4, PAGE_READWRITE, &old_protect)) {
+        *pic_step = 100;
+        VirtualProtect(pic_step, 4, old_protect, &old_protect);
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Patch: GameSpeed PIC desync fix applied "
+        "(pic_step pinned to 100; MOVE/ACCEL still scale with gs)");
+}
+
+// Configure per-game patches that live as runtime flags inside other
+// hook modules (rather than byte patches). Reads env vars set by the
+// launcher's ApplyGamePatchEnvVars before CreateProcess and forwards
+// them to the owning module.
+static void ApplyPerGameRuntimePatches() {
+    // Team-mode CSS duplicate-slot lock — handled inside
+    // css_autoconfirm.cpp's existing game_state_manager detour.
+    if (const char* e = std::getenv("FM2K_TEAM_CSS_DUPE_LOCK");
+        e && std::strcmp(e, "1") == 0) {
+        CssAutoConfirm_SetTeamDupeLock(true);
+    }
+
+    // KOF-style HP/meter retention — handled inside round_events.cpp's
+    // vs_round_function detour.
+    if (const char* e = std::getenv("FM2K_TEAM_KOF_RETENTION");
+        e && std::strcmp(e, "1") == 0) {
+        RoundEvents_SetKofRetention(true);
+    }
+
+    // Team size override + stubs (vs_cpu / cpu_vs_cpu / training /
+    // option_mode_selector). The damage multiplier MinHook is installed
+    // separately from InitializeHooks (it needs MH_Initialize to have
+    // run already).
+    PerGamePatches_ApplyRuntime();
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
@@ -695,6 +839,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 ApplyBootToCharacterSelectPatches();
                 ApplyCharacterSelectModePatches();
                 DisableCursorHiding();
+                FixGameSpeedDesync();
+                ApplyPerGameRuntimePatches();
             }
             // Neuter F4 / Alt+Enter game-side fullscreen toggles when
             // cnc-ddraw is loaded — its keyboard hook owns those keys

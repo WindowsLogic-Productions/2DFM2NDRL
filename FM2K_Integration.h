@@ -632,14 +632,19 @@ private:
     // Launch a local spectator pointing at the host (client1) on host_port.
     // Spectator-mode hook will SPEC_JOIN_REQ the host and start replaying
     // the streamed input history (CSS + battle).
-    // mode: "full" (default; replay-from-session-start input log) or
-    // "current" (CCCaster-style snapshot join — code path exists but has
-    // structural issues; see task #18). Default flipped to "full" 2026-05-08
-    // so the live-spec button works while CURRENT_MATCH bakes.
+    // mode: "current" (default; CCCaster-style snapshot join — v0.2.42's
+    // Phases C+D+E made this the preferred path: /F boots spec straight
+    // to battle for mid-battle joiners, per-round refresh keeps mid-set
+    // joiners fresh, CSS snapshot covers mid-CSS joiners) or "full"
+    // (legacy replay-from-session-start input log; falls back here when
+    // CURRENT_MATCH can't apply — version mismatch, snapshot transfer
+    // interrupted, etc.). Default flipped from "full" → "current" on
+    // 2026-05-13 after the vanpri sim-determinism leak in the replay
+    // path made FULL_SESSION untrustworthy past ~4000 frames.
     bool LaunchLocalSpectator(const std::string& game_path,
                               int spectator_port,
                               int host_port,
-                              const std::string& mode = "full");
+                              const std::string& mode = "current");
     // Daisy-chain test: launches a second spectator that subscribes to the
     // first spectator instead of the host. Verifies relay-node forwarding.
     bool LaunchLocalSpectator2(const std::string& game_path,
@@ -649,15 +654,16 @@ public:
     // Launch a spectator pointing at an arbitrary remote host (typically
     // received via hub spectate_grant). Used by the lobby UI's "click an
     // active match to watch it" path AND the --spectate CLI flag for e2e
-    // testing. spectator_port is local UDP bind; host_ip:host_port is where
-    // the spectator's FM2K_REMOTE_ADDR points and SpectatorNode JOIN_REQ
-    // is sent. mode: "full" (default) or "current". See LaunchLocalSpectator
-    // above for the rationale on the "full" default.
+    // testing. spectator_port is local UDP bind; host_ip:host_port is
+    // where the spectator's FM2K_REMOTE_ADDR points and SpectatorNode
+    // JOIN_REQ is sent. mode default "current" — see LaunchLocalSpectator
+    // for the 2026-05-13 v0.2.42 flip rationale.
     bool LaunchRemoteSpectator(const std::string& game_path,
                                int spectator_port,
                                const std::string& host_ip,
                                int host_port,
-                               const std::string& mode = "full");
+                               const std::string& session_kind = "menu",
+                               const std::string& mode = "current");
 
     // Offline replay player. Launches the game with FM2K_SPECTATOR_MODE=1
     // + FM2K_REPLAY_FILE=<replay_path>; the hook reads the env var in
@@ -719,8 +725,12 @@ public:
     std::function<void()> on_stress_session_start;  // Single-instance GekkoStressSession determinism test
     // Click-to-spectate. host_ip:host_port comes from the hub's
     // spectate_grant. Launcher should boot a local FM2K spectator instance
-    // pointing at that addr (LaunchRemoteSpectator).
-    std::function<void(const std::string& host_ip, int host_port)> on_spectate_match;
+    // pointing at that addr (LaunchRemoteSpectator). session_kind is
+    // "menu" / "css" / "battle" — the host's current game phase, used
+    // to decide whether to /F-boot-to-battle (host in battle) or walk
+    // the normal title→CSS path (host in lobby/CSS).
+    std::function<void(const std::string& host_ip, int host_port,
+                       const std::string& session_kind)> on_spectate_match;
     // Hub fired a spectator_incoming event — we're the host of an active
     // match and a spectator wants in. Their external UDP addr is passed
     // so we can fire an outbound NAT-punch packet to open the inbound
@@ -870,6 +880,12 @@ public:
     // from FM2KLauncher::Update on tcp_stun_seq SharedMem bumps.
     void SendHubTcpAddr(uint32_t ip_be, uint16_t port);
 
+    // Forward the hook's current session_kind (menu/CSS/battle) to the
+    // hub via a `session_kind` WS message. Called from FM2KLauncher::Update
+    // on session_kind_seq SharedMem bumps. Hub stores per-user and
+    // includes in spectate_grant so spec launchers can decide /F.
+    void SendHubSessionKind(uint8_t kind);
+
 private:
     // Logging
     void AddLog(const char* message);
@@ -924,6 +940,7 @@ private:
     void RenderDiscordAuthWindow();     // Stays separate — OAuth pairing flow has its own state machine.
     void RenderGamesFoldersWindow();    // Legacy.
     void RenderRecentMatchesWindow();   // Legacy.
+    void RenderDirectSpecInline();      // "Spectate by IP" — hub-less spec, rendered in Debug → Network tab
 
     // Single consolidated Settings window with tabs. Replaces the
     // five floating Settings sub-windows. Floats but is non-movable
@@ -1034,6 +1051,13 @@ private:
     // the peer drops.
     void PollMatchOutcome();
 
+    // Drain at most one hook-produced upload manifest per tick. Calls
+    // fm2k::upload_queue::Process() against the selected game's
+    // upload_queue/ directory, gated on the launcher's
+    // "Auto-upload diagnostics" dev checkbox. No-op when no game is
+    // selected, when the checkbox is off, or when the queue is empty.
+    void PollUploadQueue();
+
     // Developer mode toggle. End-user UI hides the offline-bisect
     // checkboxes, dual-client launcher, stress test, and spectator
     // chain test. Enabled via FM2K_DEV_MODE=1 env var on launch or
@@ -1054,6 +1078,7 @@ private:
     bool show_games_folders_   = false;
     bool show_recent_matches_  = false;
     bool show_replay_browser_  = false;
+    char direct_spec_addr_[64] = {};        // "Spectate by IP" addr buffer (Debug → Network tab)
     bool input_binder_initialized_ = false;
 
     // Settings → Display state. `ddraw_cfg_` is loaded once on first
