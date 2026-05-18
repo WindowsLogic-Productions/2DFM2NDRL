@@ -897,6 +897,23 @@ public:
     // from FM2KLauncher::Update on tcp_stun_seq SharedMem bumps.
     void SendHubTcpAddr(uint32_t ip_be, uint16_t port);
 
+    // Phase 4: status-bar surface for spec hub-relay ring counters.
+    // FM2KLauncher::Update calls every tick with the latest values
+    // pulled from spec_relay_out / spec_relay_in. RenderMenuBar shows
+    // a small "RELAY out=enq/drop in=enq/drop" widget when active.
+    // out_active / in_active flag which rings are currently open.
+    struct SpecRelayStatus {
+        bool     out_active   = false;
+        bool     in_active    = false;
+        uint64_t out_enqueued = 0;
+        uint64_t out_dropped  = 0;
+        uint64_t out_dequeued = 0;
+        uint64_t in_enqueued  = 0;
+        uint64_t in_dropped   = 0;
+        uint64_t in_dequeued  = 0;
+    };
+    void SetSpecRelayStatus(const SpecRelayStatus& st);
+
     // Forward the hook's current session_kind (menu/CSS/battle) to the
     // hub via a `session_kind` WS message. Called from FM2KLauncher::Update
     // on session_kind_seq SharedMem bumps. Hub stores per-user and
@@ -921,6 +938,7 @@ private:
     NetworkConfig network_config_;
     float frames_ahead_;
     LauncherState launcher_state_;
+    SpecRelayStatus spec_relay_status_{};
     SDL_Renderer* renderer_;
     SDL_Window* window_;
     std::vector<std::string> games_root_paths_;  // Configured games root directories

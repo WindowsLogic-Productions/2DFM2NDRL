@@ -1204,16 +1204,71 @@ void LauncherUI::RenderMenuBar() {
             std::snprintf(discord_pill, sizeof(discord_pill), "  Sign in with Discord  ");
         }
 
+        // Phase 4: spec hub-relay status. Only shown when a relay ring
+        // is active (mode flipped on for this session). Compact format
+        // so it fits in the menu bar alongside the existing pills:
+        //   RELAY out:E/D in:E/D
+        //   where E = total enqueued (k-suffixed when > 999), D = total
+        //   dropped (red if non-zero). Drops are what testers watch
+        //   for; they indicate a ring overflow or oversize payload.
+        char relay_pill[80] = {};
+        bool show_relay_pill = false;
+        ImVec4 relay_col(0.55f, 0.85f, 0.55f, 1.0f);  // muted green = healthy
+        if (spec_relay_status_.out_active || spec_relay_status_.in_active) {
+            show_relay_pill = true;
+            auto fmt_k = [](uint64_t v, char* buf, size_t n) {
+                if (v >= 10000) std::snprintf(buf, n, "%llu.%lluk",
+                    (unsigned long long)(v / 1000),
+                    (unsigned long long)((v / 100) % 10));
+                else std::snprintf(buf, n, "%llu", (unsigned long long)v);
+            };
+            char oe[16], od[16], ie[16], id[16];
+            fmt_k(spec_relay_status_.out_enqueued, oe, sizeof(oe));
+            fmt_k(spec_relay_status_.out_dropped,  od, sizeof(od));
+            fmt_k(spec_relay_status_.in_enqueued,  ie, sizeof(ie));
+            fmt_k(spec_relay_status_.in_dropped,   id, sizeof(id));
+            std::snprintf(relay_pill, sizeof(relay_pill),
+                "  RELAY out:%s/%s in:%s/%s  ", oe, od, ie, id);
+            // Any drops flip color to red. Even one drop in a real
+            // match means snapshot/event corruption -- worth investigating
+            // immediately.
+            if (spec_relay_status_.out_dropped > 0 ||
+                spec_relay_status_.in_dropped  > 0) {
+                relay_col = ImVec4(0.95f, 0.40f, 0.40f, 1.0f);
+            }
+        }
+
         const float discord_w = ImGui::CalcTextSize(discord_pill).x +
                                 ImGui::GetStyle().ItemSpacing.x * 2.0f;
         const float update_w  = show_update_pill
             ? ImGui::CalcTextSize(update_pill).x +
               ImGui::GetStyle().ItemSpacing.x * 2.0f
             : 0.0f;
-        const float total_w   = discord_w + update_w;
+        const float relay_w   = show_relay_pill
+            ? ImGui::CalcTextSize(relay_pill).x +
+              ImGui::GetStyle().ItemSpacing.x * 2.0f
+            : 0.0f;
+        const float total_w   = discord_w + update_w + relay_w;
         const float bar_w     = ImGui::GetContentRegionAvail().x;
         if (total_w < bar_w) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (bar_w - total_w));
+        }
+
+        // RELAY pill — informational; clicking does nothing (no
+        // associated action). MenuItem is the cheapest readonly text
+        // element that respects the menu-bar style.
+        if (show_relay_pill) {
+            ImGui::PushStyleColor(ImGuiCol_Text, relay_col);
+            ImGui::MenuItem(relay_pill, nullptr, false, false);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Spec hub-relay status (Phase 4 surface).\n"
+                    "out: hook -> launcher -> hub (host shipping spec data)\n"
+                    "in:  hub -> launcher -> hook (spec receiving data)\n"
+                    "Format: enqueued/dropped. Red = drops happened "
+                    "(snapshot or event corruption -- investigate).");
+            }
+            ImGui::PopStyleColor();
         }
 
         // Update pill (left of the Discord one) — clickable, advances
@@ -3695,6 +3750,10 @@ void LauncherUI::SendHubSpecRelayFrame(std::vector<uint8_t> frame) {
     // overall traffic; if we want diagnostics here add a throttled
     // counter.
     hub_state_->client.SendSpecRelayFrame(std::move(frame));
+}
+
+void LauncherUI::SetSpecRelayStatus(const SpecRelayStatus& st) {
+    spec_relay_status_ = st;
 }
 
 void LauncherUI::SetFramesAhead(float frames_ahead) {
