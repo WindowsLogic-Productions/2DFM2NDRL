@@ -1250,16 +1250,76 @@ bool SaveState_Load(int frame) {
         // render-side state continuously" pattern as effect_sys1 / shake
         // — host's rollback Load leaves it alone, replay's forward sim
         // evolves it naturally, both stay in sync at render time.
+        //
+        // Spec hub-relay: same cross-process heap-pointer hazard as
+        // char_slot above. Object slots contain pointers to per-object
+        // animation tables / effect lists / etc. that the host's
+        // process allocated; copying them verbatim into our process
+        // would AV on first deref. Capture live heap-shaped DWORDs
+        // per-slot, memcpy, conditionally restore. Per-slot scan keeps
+        // the preserve buffer small (~37 DWORDs per slot max);
+        // MAX_PRESERVED_PER_OBJ=64 has headroom.
+        constexpr size_t MAX_PRESERVED_PER_OBJ = 64;
+        size_t total_obj_candidates = 0;
+        size_t total_obj_restored   = 0;
+        size_t total_obj_truncated  = 0;
         for (size_t i = 0; i < OBJ_COUNT; i++) {
             const uint8_t* src = src_base + i * OBJ_SZ;
             uint8_t* dst = dst_base + i * OBJ_SZ;
             if (src[0] != 0) {
+                if (!is_spec_apply) {
+                    memcpy(dst, src, OVERRIDE_OFFSET);
+                    memcpy(dst + OVERRIDE_END, src + OVERRIDE_END,
+                           OBJ_SZ - OVERRIDE_END);
+                    continue;
+                }
+                // Spec path: preserve heap-shaped DWORDs in live slot
+                // BEFORE memcpy, conditionally restore after. Skip the
+                // override carve-out region (we don't write to it anyway).
+                struct ObjPtrPreserve { uint16_t didx; uint32_t value; };
+                ObjPtrPreserve preserved[MAX_PRESERVED_PER_OBJ];
+                size_t pcount = 0;
+                const uint32_t* live_r = (const uint32_t*)dst;
+                const size_t obj_dwords          = OBJ_SZ / sizeof(uint32_t);
+                const size_t override_start_dw   = OVERRIDE_OFFSET / sizeof(uint32_t);
+                const size_t override_end_dw     = OVERRIDE_END / sizeof(uint32_t);
+                for (size_t o = 0; o < obj_dwords; ++o) {
+                    if (o >= override_start_dw && o < override_end_dw) continue;
+                    if (live_r[o] >= HEAP_PTR_FLOOR) {
+                        ++total_obj_candidates;
+                        if (pcount < MAX_PRESERVED_PER_OBJ) {
+                            preserved[pcount++] = { (uint16_t)o, live_r[o] };
+                        } else {
+                            ++total_obj_truncated;
+                        }
+                    }
+                }
                 memcpy(dst, src, OVERRIDE_OFFSET);
                 memcpy(dst + OVERRIDE_END, src + OVERRIDE_END,
                        OBJ_SZ - OVERRIDE_END);
+                uint32_t* live_w = (uint32_t*)dst;
+                for (size_t k = 0; k < pcount; ++k) {
+                    if (live_w[preserved[k].didx] >= HEAP_PTR_FLOOR) {
+                        live_w[preserved[k].didx] = preserved[k].value;
+                        ++total_obj_restored;
+                    }
+                }
             } else if (dst[0] != 0) {
                 memset(dst, 0, OVERRIDE_OFFSET);
                 memset(dst + OVERRIDE_END, 0, OBJ_SZ - OVERRIDE_END);
+            }
+        }
+        if (is_spec_apply && total_obj_candidates > 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SaveState: spec object_pool: candidates=%zu restored=%zu "
+                "truncated=%zu (per-obj cap=%zu)",
+                total_obj_candidates, total_obj_restored,
+                total_obj_truncated, MAX_PRESERVED_PER_OBJ);
+            if (total_obj_truncated > 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SaveState: spec object_pool pointer-preserve TRUNCATED "
+                    "in some slot(s) -- host pointers in the uncaptured tail "
+                    "will fault on first deref; bump MAX_PRESERVED_PER_OBJ");
             }
         }
     }
@@ -1267,8 +1327,51 @@ bool SaveState_Load(int frame) {
     // Restore input history
     memcpy((void*)ADDR_INPUT_HISTORY, state->input_history, SIZE_INPUT_HISTORY);
 
-    // Restore game state
-    memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
+    // Restore game state. Same cross-process heap-pointer hazard as
+    // char_slot / object_pool above -- game_state may include resource-
+    // table pointers (e.g. asset list heads, palette pool, music handle)
+    // that the host's process allocated. Single contiguous 544-byte
+    // region, so one scan + memcpy + conditional restore.
+    if (!is_spec_apply) {
+        memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
+    } else {
+        constexpr size_t MAX_PRESERVED_GAME = 256;
+        struct GamePtrPreserve { uint16_t didx; uint32_t value; };
+        GamePtrPreserve preserved[MAX_PRESERVED_GAME];
+        size_t pcount = 0;
+        size_t pcandidates = 0;
+        const uint32_t* live_r = (const uint32_t*)ADDR_GAME_STATE;
+        const size_t dword_count = SIZE_GAME_STATE / sizeof(uint32_t);
+        for (size_t o = 0; o < dword_count; ++o) {
+            if (live_r[o] >= HEAP_PTR_FLOOR) {
+                ++pcandidates;
+                if (pcount < MAX_PRESERVED_GAME) {
+                    preserved[pcount++] = { (uint16_t)o, live_r[o] };
+                }
+            }
+        }
+        memcpy((void*)ADDR_GAME_STATE, state->game_state, SIZE_GAME_STATE);
+        uint32_t* live_w = (uint32_t*)ADDR_GAME_STATE;
+        size_t restored = 0;
+        for (size_t k = 0; k < pcount; ++k) {
+            if (live_w[preserved[k].didx] >= HEAP_PTR_FLOOR) {
+                live_w[preserved[k].didx] = preserved[k].value;
+                ++restored;
+            }
+        }
+        if (pcandidates > 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SaveState: spec game_state: candidates=%zu preserved=%zu "
+                "restored=%zu (scanned %zu DWORDs, cap=%zu)",
+                pcandidates, pcount, restored, dword_count, MAX_PRESERVED_GAME);
+            if (pcandidates > MAX_PRESERVED_GAME) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SaveState: spec game_state pointer-preserve TRUNCATED "
+                    "(%zu > cap %zu) -- bump MAX_PRESERVED_GAME",
+                    pcandidates, MAX_PRESERVED_GAME);
+            }
+        }
+    }
 
     // EFFECT_SYS1 restore: SKIP. Render-side state must evolve continuously
     // across both host (with rollback) and replay (no rollback) so they
