@@ -142,6 +142,36 @@ SpectatorNode: MATCH_START frame=X ...    (from snapshot+events)
 | `relay SendTo ... no spec_user_id, dropping`   | spec_user_id propagation broke -- check shared mem v13  |
 | Hub says "Not registered as a relay host"      | Host wasn't in_match when fan-out fired                 |
 | Spec stays on "Connecting..."                  | Mixed mode (host TCP + spec relay or vice versa)        |
+| `SpecRelayQueue: Enqueue payload_len=N > MAX`  | Some send path exceeded SLOT_PAYLOAD_MAX (32 KB).       |
+|                                                | Means a new payload type is bigger than the slot;       |
+|                                                | bump SLOT_PAYLOAD_MAX or fragment that payload.         |
+| `SpecRelayQueue: ring full ...`                | Producer (hook) faster than consumer (launcher drain).  |
+|                                                | Often = WS upload saturated. Subsequent drops are       |
+|                                                | counted in total_dropped but silent.                    |
+
+## Bugs caught in the post-Phase-3 audit (already fixed; here so we
+## remember they EXISTED if symptoms reappear)
+
+- **SLOT_PAYLOAD_MAX was 16 KB, snapshot chunks are 16 KB + 10 B
+  SpecDataHeader = 16394 B.** Every snapshot chunk would have been
+  silently dropped. Fixed by bumping to 32 KB.
+- **Ring of 64 slots overflowed during snapshot transfer.** Bumped
+  to 128.
+- **Launcher static cache didn't retry OpenInboundFor/OpenOutbound-
+  For when the first attempt raced past hook init.** Fixed: retry
+  every tick while ring is null.
+- **Snapshot+backfill never shipped in relay mode** because the
+  bind loop's RegisterAcceptedClient always returned false (no
+  TCP listener). Fixed: relay mode treats sub as auto-bound the
+  moment spec_user_id is populated.
+- **TARGET_BROADCAST hub fan-out raced pre-bind specs into
+  receiving live events before their snapshot.** Fixed: relay-mode
+  OutboundBroadcast iterates bound subs and Enqueues TARGET_DIRECT
+  per spec, exactly mirroring the TCP path's backfill_done fence.
+- **HandleJoinReq dispatched BEFORE the punch-target poll updated
+  the user_id dict in the same tick** (ControlChannel_Poll runs
+  RawReceive then TickHostMaintenance). Fixed: dict miss falls
+  back to direct shared-mem read of the latest punch target.
 
 ## Diagnostic counters
 
