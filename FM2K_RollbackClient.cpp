@@ -1628,6 +1628,25 @@ bool FM2KLauncher::Initialize() {
                 "Spectate: no game selected — pick one before clicking Spectate");
             return;
         }
+        // Phase 4: tell the user-facing log clearly which mode they're
+        // about to enter. Relay-mode hosts route spec data through the
+        // hub which costs ~30-50 ms extra latency but works behind any
+        // NAT class. TCP-mode hosts use direct P2P (faster but blocked
+        // by symmetric NAT). The auto-derivation already set the env;
+        // this log is purely informational so testers know which path
+        // is active.
+        if (spec_transport == "relay") {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectate: host advertises spec_transport=relay -- spec "
+                "will receive data via hub WS binary frames. Watch the "
+                "RELAY pill in the menu bar for ring counters; drops "
+                "(red) indicate snapshot or event corruption.");
+        } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Spectate: legacy P2P TCP mode (spec_transport=tcp). "
+                "If this fails behind symmetric NAT, ask host to set "
+                "FM2K_SPEC_TRANSPORT=relay and retry.");
+        }
         // Pick a free local UDP port for the spectator's bind. 7002 by
         // convention (above the host's 7000 and the client's 7001).
         // If a spectator is already running, LaunchRemoteSpectator returns

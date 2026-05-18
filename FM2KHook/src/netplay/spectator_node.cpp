@@ -2825,8 +2825,25 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
             "inbound shared-mem ring)");
     } else {
         if (host_tcp_port == 0) {
+            // Mixed-mode failure: we're a TCP-mode spec but the host
+            // didn't advertise a TCP port. Two likely causes:
+            //   1. Host is running FM2K_SPEC_TRANSPORT=relay; their hook
+            //      skipped the TCP listener, so GetListenPort()=0. Our
+            //      launcher should have auto-set FM2K_SPEC_TRANSPORT=relay
+            //      via spectate_grant.spec_transport (Phase 4). If we're
+            //      here, our launcher is older than that or the env
+            //      didn't propagate.
+            //   2. Host has a genuinely broken hook init (listener bind
+            //      failed on all candidates).
+            // Either way the spec won't get data; refuse cleanly with
+            // an actionable error message rather than the silent dial.
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: JOIN_ACK from host has no TCP port — refusing");
+                "SpectatorNode: JOIN_ACK from host advertises no TCP port "
+                "AND we are in legacy TCP mode -- likely a relay-mode host "
+                "but our launcher didn't auto-derive (Phase 4 requires "
+                ">= v0.2.58). Workaround: set FM2K_SPEC_TRANSPORT=relay "
+                "in the spec's env before launching, OR update the spec's "
+                "launcher. Refusing the subscription.");
             g_state.subscribed_upstream = false;
             return;
         }
