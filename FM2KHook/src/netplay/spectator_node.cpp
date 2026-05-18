@@ -358,14 +358,36 @@ void FormatAddr(const sockaddr_in& a, char* out, size_t out_sz);
 void OutboundBroadcast(const void* buf, size_t len) {
     if (g_state.spec_transport_relay) {
         if (!g_state.spec_relay_out) return;
-        fm2k::spec_relay::Enqueue(
-            g_state.spec_relay_out,
-            fm2k::spec_relay::TARGET_BROADCAST,
-            /*spec_user_id=*/nullptr,
-            /*spec_data_type=*/0,
-            /*frame_count=*/0,
-            /*spec_data_flags=*/0,
-            buf, static_cast<uint32_t>(len));
+        // Per-bound-sub direct send rather than hub-side broadcast.
+        // Why: the TCP path's BroadcastToAll has a backfill_done fence
+        // (g_subs[i].backfill_done gate at spectator_tcp.cpp:285) that
+        // suppresses live events to a sub until snapshot+backfill have
+        // landed. The hub doesn't know about backfill_done state, so a
+        // TARGET_BROADCAST would race pre-bind specs into receiving
+        // EVENT_BATCH frames AHEAD of their snapshot -- bad ordering,
+        // spec applies events on uninitialized state.
+        //
+        // Iterating bound subs and Enqueuing TARGET_DIRECT per spec
+        // exactly mirrors the TCP path's gate. Pre-bind specs (no
+        // tcp_bound or no spec_user_id yet) get skipped here; they'll
+        // catch up via snapshot + backfill in TickHostMaintenance.
+        //
+        // Cost: O(N) Enqueue calls instead of one. Hub does the same
+        // O(N) sends either way, so net throughput is identical;
+        // ring slot consumption goes up by N -- factored into the
+        // 128-slot capacity sizing.
+        for (const auto& sub : g_state.subscribers) {
+            if (!sub.tcp_bound) continue;
+            if (sub.spec_user_id.empty()) continue;
+            fm2k::spec_relay::Enqueue(
+                g_state.spec_relay_out,
+                fm2k::spec_relay::TARGET_DIRECT,
+                sub.spec_user_id.c_str(),
+                /*spec_data_type=*/0,
+                /*frame_count=*/0,
+                /*spec_data_flags=*/0,
+                buf, static_cast<uint32_t>(len));
+        }
         return;
     }
     SpectatorTCP::BroadcastToAll(buf, len);
