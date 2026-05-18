@@ -1586,6 +1586,12 @@ bool FM2KLauncher::Initialize() {
                 s_in_ring = nullptr;
             }
             s_in_pid = target_pid;
+        }
+        // Retry open until success. Hook's mapping creation races our
+        // first WS-binary delivery; the static cache would otherwise
+        // stick at nullptr if the first open happens before the hook
+        // is ready. Cheap on the miss path.
+        if (!s_in_ring) {
             s_in_ring = fm2k::spec_relay::OpenInboundFor(target_pid);
             if (s_in_ring) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1594,8 +1600,8 @@ bool FM2KLauncher::Initialize() {
             }
         }
         if (!s_in_ring) {
-            // Hook may not have created it yet (still booting) or it's
-            // not in relay mode. Drop -- next frame might succeed.
+            // Mapping still not available (hook still booting, or hook
+            // not in relay mode). Drop this WS frame; next one retries.
             return;
         }
         // The bytes are exactly the payload the hook hands to
@@ -2152,22 +2158,26 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
         static DWORD                       s_relay_pid  = 0;
         static fm2k::spec_relay::Ring*     s_relay_ring = nullptr;
 
-        // Game pid changed (or fresh process); drop the old mapping and
-        // try to open the new one. Open is best-effort -- the hook may
-        // not be in relay mode, in which case there's no mapping yet.
+        // Game pid changed (or fresh process); drop the old mapping.
         if (target_pid != s_relay_pid) {
             if (s_relay_ring) {
                 fm2k::spec_relay::Close(s_relay_ring);
                 s_relay_ring = nullptr;
             }
             s_relay_pid = target_pid;
-            if (target_pid != 0) {
-                s_relay_ring = fm2k::spec_relay::OpenOutboundFor(target_pid);
-                if (s_relay_ring) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "SpecRelay: opened outbound ring for game pid %lu",
-                        (unsigned long)target_pid);
-                }
+        }
+        // Retry open every tick when we have a pid but no ring. Hook
+        // creates the mapping during SpectatorNode_Init which races our
+        // first tick after game spawn; without retry the static cache
+        // sticks at nullptr forever even though the hook came up
+        // milliseconds later. OpenFileMappingA returns fast on miss so
+        // tick-rate retry is cheap.
+        if (target_pid != 0 && !s_relay_ring) {
+            s_relay_ring = fm2k::spec_relay::OpenOutboundFor(target_pid);
+            if (s_relay_ring) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpecRelay: opened outbound ring for game pid %lu",
+                    (unsigned long)target_pid);
             }
         }
 
