@@ -2535,6 +2535,24 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
             sub.ack_frame    = 0;
             sub.join_mode    = mode;
             sub.last_seen_ms = GetTickCount64();
+            // Phase 2c: late-arriving spec_user_id backfill. If the
+            // first JOIN_REQ raced past our spec_incoming poll (common
+            // on loopback where UDP RTT is microseconds), sub.spec_user_id
+            // stayed empty -- relay-mode SendTo can't address it. The
+            // launcher refreshes the punch dict on every WS event for
+            // this addr, so a retry JOIN_REQ should find the user_id
+            // by now. Pop on success.
+            if (sub.spec_user_id.empty()) {
+                auto it = g_state.pending_spec_user_ids.find(addr_buf);
+                if (it != g_state.pending_spec_user_ids.end()) {
+                    sub.spec_user_id = it->second;
+                    g_state.pending_spec_user_ids.erase(it);
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: backfilled spec_user_id=%s on existing "
+                        "sub %s (raced past first JOIN_REQ)",
+                        sub.spec_user_id.c_str(), addr_buf);
+                }
+            }
             CtrlPacket ack = BuildJoinAck();
             ControlChannel_SendTo(ack, from);
             return;
