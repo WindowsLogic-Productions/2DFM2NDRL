@@ -137,12 +137,39 @@ bool Enqueue(Ring* ring,
              uint32_t payload_len)
 {
     if (!ring || ring->magic != QUEUE_MAGIC) return false;
-    if (payload_len > SLOT_PAYLOAD_MAX) return false;
+    if (payload_len > SLOT_PAYLOAD_MAX) {
+        // Throttled-once warn -- silent drops here ate every snapshot
+        // chunk on the first build until the slot size mismatch was
+        // caught in audit. Surface so we notice if anyone passes
+        // payload_len > the slot size budget again.
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "SpecRelayQueue: Enqueue payload_len=%u > SLOT_PAYLOAD_MAX=%u "
+                "-- dropping. This bytes-on-the-floor failure mode is silent "
+                "past this first warn; expect spec to receive nothing.",
+                payload_len, (unsigned)SLOT_PAYLOAD_MAX);
+        }
+        return false;
+    }
 
     const uint64_t write_idx = ring->write_idx;
     const uint64_t read_idx  = ring->read_idx;
     if (write_idx - read_idx >= QUEUE_CAPACITY) {
         ring->total_dropped = ring->total_dropped + 1;
+        // First drop warns; subsequent counted silently via total_dropped.
+        // Drops mid-snapshot = spec gets corrupt state. The launcher's
+        // drain should normally keep up; if drops happen, our drain
+        // rate is too low or WS bandwidth is saturated.
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "SpecRelayQueue: ring full at write_idx=%llu read_idx=%llu "
+                "-- dropping (subsequent drops counted via total_dropped)",
+                (unsigned long long)write_idx, (unsigned long long)read_idx);
+        }
         return false;
     }
 

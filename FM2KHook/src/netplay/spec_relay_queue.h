@@ -42,15 +42,24 @@ namespace fm2k::spec_relay {
 constexpr uint32_t QUEUE_MAGIC   = 0x53504247;
 constexpr uint32_t QUEUE_VERSION = 1;
 
-// 64 slots * 16 KB = 1 MB per ring. A typical snapshot transfer is ~106
-// chunks * 8 KB = ~850 KB, which fits in ~53 slots. Backfill EVENT_BATCH
-// chunks are capped at 8 KB by BACKFILL_CHUNK_BYTES. 16 KB slots leave
-// headroom for the SpecDataHeader prefix + any future framing growth.
+// 128 slots * 32 KB = 4 MB per ring. Sizing rationale (audited 2026-05-18):
+//
+//   * SPECTATOR_SNAPSHOT_CHUNK_BYTES = 16384 (16 KB). Each chunk is
+//     wrapped in a 10-byte SpecDataHeader before being handed to
+//     OutboundBroadcast / OutboundSendTo. So per-slot payload = up to
+//     16394 bytes -- which is why SLOT_PAYLOAD_MAX must be > 16384.
+//     Earlier 16384 cap silently dropped every snapshot chunk. We pad
+//     to 32 KB for growth headroom + alignment ease.
+//   * 850 KB snapshot / 16 KB chunk = ~54 chunks. 128-slot ring fits
+//     two back-to-back snapshots with margin; bursty live event batches
+//     between snapshots have room.
+//   * Backfill EVENT_BATCH chunks are capped at BACKFILL_CHUNK_BYTES =
+//     8192 (also +10 SpecDataHeader = 8202 bytes; trivially fits).
 //
 // Capacity must be a power of two so write_idx % capacity simplifies to
 // write_idx & (capacity-1).
-constexpr uint32_t QUEUE_CAPACITY    = 64;
-constexpr uint32_t SLOT_PAYLOAD_MAX  = 16384;
+constexpr uint32_t QUEUE_CAPACITY    = 128;
+constexpr uint32_t SLOT_PAYLOAD_MAX  = 32768;
 
 // Slot targeting kinds. Mirror Phase 1 hub.py SpecDataBinary target_kind:
 //   BROADCAST = fan out to every spec subscribed to this host
