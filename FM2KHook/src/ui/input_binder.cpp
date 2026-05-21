@@ -1022,14 +1022,17 @@ uint16_t Sample_Win32(int player_slot) {
                     if (ok) return true;
                 }
                 if (const XINPUT_STATE* st = get_xinput(b.gamepad_index)) {
-                    SHORT v = 0;
+                    // Compute in int, not SHORT: negating sThumbL/RY at full
+                    // deflection (-32768) overflows a SHORT back to -32768,
+                    // which flips full-down into full-up (and vice versa).
+                    int v = 0;
                     switch (b.code) {
                         case SDL_GAMEPAD_AXIS_LEFTX:        v = st->Gamepad.sThumbLX; break;
-                        case SDL_GAMEPAD_AXIS_LEFTY:        v = (SHORT)-st->Gamepad.sThumbLY; break;
+                        case SDL_GAMEPAD_AXIS_LEFTY:        v = -(int)st->Gamepad.sThumbLY; break;
                         case SDL_GAMEPAD_AXIS_RIGHTX:       v = st->Gamepad.sThumbRX; break;
-                        case SDL_GAMEPAD_AXIS_RIGHTY:       v = (SHORT)-st->Gamepad.sThumbRY; break;
-                        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = (SHORT)(st->Gamepad.bLeftTrigger * 128); break;
-                        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = (SHORT)(st->Gamepad.bRightTrigger * 128); break;
+                        case SDL_GAMEPAD_AXIS_RIGHTY:       v = -(int)st->Gamepad.sThumbRY; break;
+                        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: v = st->Gamepad.bLeftTrigger * 128; break;
+                        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:v = st->Gamepad.bRightTrigger * 128; break;
                         default: break;
                     }
                     return (b.axis_dir < 0) ? (v < -kAxisSampleThreshold)
