@@ -98,6 +98,13 @@ enum class CtrlMsg : uint8_t {
     // changes a value or a new match starts. Client mem-writes the
     // mapped fields and adopts the SOCD mode locally.
     HOST_CONFIG,
+
+    // DELAY_PROPOSAL — each peer broadcasts its own input-delay
+    // candidate over the control channel through CSS so both sides
+    // converge on max(mine, theirs) at battle start. Without it peers
+    // computed delay independently off their own RTT samples and ended
+    // up asymmetric on jittery links (#24).
+    DELAY_PROPOSAL,
 };
 
 // Convert message type to string for logging
@@ -126,6 +133,7 @@ inline const char* CtrlMsgToString(CtrlMsg msg) {
         case CtrlMsg::SPEC_HEARTBEAT:    return "SPEC_HEARTBEAT";
         case CtrlMsg::SPEC_LEAVE:        return "SPEC_LEAVE";
         case CtrlMsg::HOST_CONFIG:       return "HOST_CONFIG";
+        case CtrlMsg::DELAY_PROPOSAL:    return "DELAY_PROPOSAL";
         default:                         return "UNKNOWN";
     }
 }
@@ -245,6 +253,14 @@ struct CtrlPacket {
             uint8_t  socd_mode;         // 0..5 per Hook_GetSOCDMode. 0xFF = unset
             uint8_t  reserved[3];
         } host_config;
+
+        // DELAY_PROPOSAL — this peer's input-delay candidate. See the
+        // CtrlMsg::DELAY_PROPOSAL comment. mode is informational (which
+        // formula produced the number); the receiver only needs delay.
+        struct {
+            uint8_t delay;   // proposed input delay frames, 0..16
+            uint8_t mode;    // 0 = avg ping, 1 = peak ping
+        } delay_proposal;
 
         // Raw bytes for unknown/future use
         uint8_t raw[24];

@@ -9,6 +9,8 @@
 #include <SDL3/SDL_log.h>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <mmsystem.h>
@@ -76,6 +78,14 @@ static uint32_t g_ping_send_time = 0;
 static uint32_t g_rtt_worst_ms = 0;
 static uint32_t g_rtt_sample_count = 0;
 
+// Input-delay negotiation (#24). g_delay_mode picks the formula (avg vs
+// peak RTT); g_remote_delay_candidate holds the last value the peer
+// advertised via DELAY_PROPOSAL (-1 = none received). Both are touched
+// from the MM-timer thread (send) and the main thread (receive / battle
+// start), so they're atomic.
+static std::atomic<int> g_delay_mode{0};               // 0=avg, 1=peak
+static std::atomic<int> g_remote_delay_candidate{-1};
+
 // Player ID (set from globals)
 static uint8_t g_local_player_id = 0;
 
@@ -125,6 +135,10 @@ static void CALLBACK KeepaliveTimerProc(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_
         const uint32_t now_send = (uint32_t)timeGetTime();
         if (now_send - g_last_ping_time >= PING_INTERVAL_MS / 2) {
             ControlChannel_SendPing();
+            // Piggyback the delay-candidate broadcast on the ping
+            // cadence so both peers have each other's value well
+            // before the CSS->battle transition (#24).
+            ControlChannel_SendDelayProposal();
         }
     }
     // Inbound poll — runs whether connected or not so the handshake
@@ -436,6 +450,15 @@ static void RawReceive() {
                 } else if (packet->header.type == CtrlMsg::PONG) {
                     // Calculate RTT from echoed timestamp
                     ControlChannel_HandlePong(packet->data.sync.frame);
+                } else if (packet->header.type == CtrlMsg::DELAY_PROPOSAL) {
+                    // Stash the peer's delay candidate (#24). Battle
+                    // start adopts max(local, this) so both peers run
+                    // identical input delay.
+                    const int d = packet->data.delay_proposal.delay;
+                    if (d >= 0 && d <= 16) {
+                        g_remote_delay_candidate.store(
+                            d, std::memory_order_relaxed);
+                    }
                 }
 
                 // Forward all messages to callback (including PING/PONG for logging)
@@ -631,6 +654,54 @@ void ControlChannel_ResetWorstRttMs() {
 
 void ControlChannel_SetCallback(ControlMsgCallback callback) {
     g_msg_callback = callback;
+}
+
+// --- Input-delay negotiation (#24) -------------------------------------
+
+void ControlChannel_SetDelayMode(int mode) {
+    g_delay_mode.store(mode == 1 ? 1 : 0, std::memory_order_relaxed);
+}
+
+int ControlChannel_GetDelayMode() {
+    return g_delay_mode.load(std::memory_order_relaxed);
+}
+
+int ControlChannel_GetLocalDelayCandidate() {
+    // A manual FM2K_LOCAL_DELAY override is the user's explicit choice
+    // and is exchanged like any other candidate, so a peer who pins
+    // delay 14 pulls the other peer up to 14 via the max() at battle
+    // start instead of leaving them on a desynced computed value.
+    if (const char* env = std::getenv("FM2K_LOCAL_DELAY"); env && env[0]) {
+        int v = std::atoi(env);
+        if (v >= 0 && v <= 16) return v;
+    }
+    // No override: compute from measured RTT. avg mode sizes to mean
+    // RTT (lower delay, spikes can rollback); peak mode sizes to the
+    // worst RTT seen (higher delay, rides out jitter).
+    const uint32_t rtt = (g_delay_mode.load(std::memory_order_relaxed) == 1)
+                             ? g_rtt_worst_ms
+                             : g_rtt_ms;
+    if (rtt == 0) return -1;  // no measurement yet
+    int d = (int)(((rtt / 2) + 9) / 10);  // ceil(one_way_ms / 10ms)
+    if (d < 2)  d = 2;
+    if (d > 15) d = 15;
+    return d;
+}
+
+int ControlChannel_GetRemoteDelayCandidate() {
+    return g_remote_delay_candidate.load(std::memory_order_relaxed);
+}
+
+void ControlChannel_SendDelayProposal() {
+    if (!g_connected) return;
+    const int cand = ControlChannel_GetLocalDelayCandidate();
+    if (cand < 0) return;  // nothing measured to propose yet
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::DELAY_PROPOSAL;
+    pkt.data.delay_proposal.delay = (uint8_t)cand;
+    pkt.data.delay_proposal.mode  =
+        (uint8_t)g_delay_mode.load(std::memory_order_relaxed);
+    ControlChannel_Send(pkt);
 }
 
 // =============================================================================
@@ -939,5 +1010,9 @@ void ControlChannel_SetConnected(bool connected) {
     g_connected = connected;
     if (connected) {
         g_last_recv_time = GetTimeMs();
+    } else {
+        // Drop the peer's delay candidate so a reconnect renegotiates
+        // from scratch instead of reusing a stale value (#24).
+        g_remote_delay_candidate.store(-1, std::memory_order_relaxed);
     }
 }
