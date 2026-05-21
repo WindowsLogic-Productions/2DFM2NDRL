@@ -496,25 +496,6 @@ static void RunBattleTick() {
         // we capture the value the game's case-200 walk actually sees.
         int32_t  pre_score = *(int32_t*)0x470050;
         uint32_t pre_ref   = *(uint32_t*)0x424718;
-        // Recount t4 with the same exact walk vs_round_function uses.
-        // Pool @ 0x4701E0, stride 382, type uint32 == 4, alive @ +346
-        // == 0, hp[entry+342] != 0.
-        constexpr uintptr_t HP_BASE_LOCAL = 0x4DFC85;
-        constexpr uintptr_t HP_STRIDE_L   = 57407;
-        int pre_t4 = 0;
-        {
-            const uint8_t* pool = (const uint8_t*)0x4701E0;
-            for (int i = 0; i < 1024; i++) {
-                const uint8_t* e = pool + i * 382;
-                if (*(const uint32_t*)(e + 0) != 4) continue;
-                if (*(const uint32_t*)(e + 346) != 0) continue;
-                uint32_t s = *(const uint32_t*)(e + 342);
-                if (s >= 8) continue;
-                if (*(const uint32_t*)(HP_BASE_LOCAL + s * HP_STRIDE_L) == 0)
-                    continue;
-                pre_t4++;
-            }
-        }
         uint32_t pre_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
 
         if (original_process_game_inputs) original_process_game_inputs();
@@ -535,45 +516,19 @@ static void RunBattleTick() {
                         ref_after_pgi, ref_after_ug);
         }
 
-        // Post-update bracket of case-200 exit conditions. If pre/post
-        // differ on score from non-negative to negative, score path
-        // fired. If pre_t4 was < 2, t4 path fired. If pre_ref was non-0,
-        // round_end_flag path fired (already covered by REF-TRIP above
-        // if it persisted). Log only when game_mode is battle and
-        // anything actionable changed — avoid log spam.
-        int32_t  post_score = *(int32_t*)0x470050;
-        int post_t4 = 0;
-        {
-            const uint8_t* pool = (const uint8_t*)0x4701E0;
-            for (int i = 0; i < 1024; i++) {
-                const uint8_t* e = pool + i * 382;
-                if (*(const uint32_t*)(e + 0) != 4) continue;
-                if (*(const uint32_t*)(e + 346) != 0) continue;
-                uint32_t s = *(const uint32_t*)(e + 342);
-                if (s >= 8) continue;
-                if (*(const uint32_t*)(HP_BASE_LOCAL + s * HP_STRIDE_L) == 0)
-                    continue;
-                post_t4++;
-            }
-        }
+        // Post-update bracket of case-200 exit conditions. Only fires
+        // on rare real transitions; t4 path is patched out in
+        // game_patches.cpp (PatchVsRoundCase200T4FalsePositive) so no
+        // longer diagnosed here.
+        int32_t post_score = *(int32_t*)0x470050;
         if (pre_mode >= 3000 && pre_mode < 4000) {
             // Score-cross trigger: only the actual zero crossing
             // (pre>=0, post<0) fires the case-200 → state-300 path.
-            // Some games (Vanguard Princess, etc.) use score as a
-            // per-frame ticking meter, so any-decrement detection
-            // floods the log without capturing a real transition.
             if (pre_score >= 0 && post_score < 0) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "[CASE200-TRIP] score path fired: %d -> %d (case 200 "
-                    "decremented past 0 → state 300)",
+                    "decremented past 0 -> state 300)",
                     pre_score, post_score);
-            }
-            // t4 trigger: at the moment case 200 walked, t4 was < 2
-            if (pre_t4 < 2) {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "[CASE200-TRIP] t4 path candidate: pre_t4=%d (post=%d) "
-                    "— if case 200 saw <2, transitioned to state 300",
-                    pre_t4, post_t4);
             }
             // round_end_flag trigger: pre_ref was non-zero
             if (pre_ref != 0) {
