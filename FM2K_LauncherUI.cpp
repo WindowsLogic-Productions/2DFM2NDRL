@@ -5950,16 +5950,16 @@ void LauncherUI::RenderHubPanel() {
         const char* def   = (env_h && env_h[0]) ? env_h : "hub.2dfm.org";
         std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
     }
-    // Delay override panel. Default is "computed" (CCCaster-style auto-
-    // pick at match session creation from the worst measured RTT — see
-    // Netplay_StartBattleSession). Combo lets the user pin a manual
-    // value if they want to eat a fixed delay rather than rely on the
-    // computed pick. Manual override persists across matches via the
-    // FM2K_LOCAL_DELAY env var; "computed" clears the var so the hook
-    // falls back to the auto path.
-    // s_delay_override: 0 = "computed" (use auto-pick), 1..17 = manual
-    // frames N-1 (so index 1 = manual 0 frames, index 2 = manual 1, ...,
-    // index 17 = manual 16).
+    // Delay override panel. Both peers exchange their delay candidate
+    // over the control channel and adopt max(both), so delay is always
+    // identical on both sides (#24). This combo picks how THIS peer's
+    // candidate is sized:
+    //   index 0 "computed (avg ping)"  -> FM2K_DELAY_MODE=0, mean RTT
+    //   index 1 "computed (peak ping)" -> FM2K_DELAY_MODE=1, worst RTT
+    //   index 2..18 manual 0..16       -> FM2K_LOCAL_DELAY=N
+    // FM2K_LOCAL_DELAY is cleared for the two computed modes so the hook
+    // computes from RTT; a manual pick still rides the exchange, so a
+    // peer who pins a high value pulls the other peer up to match.
     static int s_delay_override = 0;
     {
         // Manual delay range: 0..16. 0 is opt-in for sub-1ms LAN /
@@ -5969,7 +5969,8 @@ void LauncherUI::RenderHubPanel() {
         // computed. 16 = 160 ms, basically the upper limit of playable
         // delay-only netcode.
         const char* delay_items[] = {
-            "computed",
+            "computed (avg ping)",
+            "computed (peak ping)",
             "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
             "9", "10", "11", "12", "13", "14", "15", "16",
         };
@@ -5978,21 +5979,28 @@ void LauncherUI::RenderHubPanel() {
                      IM_ARRAYSIZE(delay_items));
         ImGui::PopItemWidth();
         ImGui::SetItemTooltip(
-            "Input delay (frames at 100 Hz). \"computed\" applies a "
-            "CCCaster-style pick at match start: ceil(mean_one_way_ms "
-            "/ 10), clamped [2, 15] — covers the worst spike since "
-            "the prior match. Pin 0..16 to override and ride a fixed "
-            "delay instead. 0 = same-frame input, only safe on "
-            "near-zero-latency links (LAN / loopback / hotseat). "
-            "16 = 160 ms, upper limit of playable delay-only netcode.");
-        if (s_delay_override > 0) {
-            // Manual override: index 1 -> "0", index 2 -> "1", ...
+            "Input delay (frames at 100 Hz). Both peers exchange their "
+            "pick and adopt the higher one, so delay is always the "
+            "same on both sides. \"computed (avg ping)\" sizes delay to "
+            "mean RTT -- lower delay, but spikes can cause rollbacks. "
+            "\"computed (peak ping)\" sizes to the worst RTT seen -- "
+            "higher delay, rides out jitter. Pin 0..16 to force a "
+            "manual value. 0 = same-frame input, only safe on near-"
+            "zero-latency links (LAN / loopback / hotseat). 16 = 160 "
+            "ms, upper limit of playable delay-only netcode.");
+        if (s_delay_override >= 2) {
+            // Manual override: index 2 -> "0", index 3 -> "1", ...
             char buf[8];
-            std::snprintf(buf, sizeof(buf), "%d", s_delay_override - 1);
+            std::snprintf(buf, sizeof(buf), "%d", s_delay_override - 2);
             ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", buf);
         } else {
             ::SetEnvironmentVariableA("FM2K_LOCAL_DELAY", nullptr);
         }
+        // Computed-delay formula: index 0 = avg ping, index 1 = peak.
+        // Harmless when a manual value is pinned (the hook ignores mode
+        // once FM2K_LOCAL_DELAY is set).
+        ::SetEnvironmentVariableA("FM2K_DELAY_MODE",
+                                  s_delay_override == 1 ? "1" : "0");
     }
 
     // Runahead / prediction-window tuning. Same mechanism as the Delay

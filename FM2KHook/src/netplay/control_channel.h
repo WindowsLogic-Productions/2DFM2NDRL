@@ -82,6 +82,31 @@ uint32_t ControlChannel_GetWorstRttMs();
 uint32_t ControlChannel_GetRttSampleCount();
 void     ControlChannel_ResetWorstRttMs();
 
+// --- Input-delay negotiation (#24) -------------------------------------
+// Each peer periodically broadcasts its own delay candidate over the
+// control channel during CSS; Netplay_StartBattleSession then adopts
+// max(local, remote) so both peers always run identical input delay.
+// Fixes the asymmetric-delay bug where two peers computed different
+// values off their own RTT samples (Melancholy/Spooder, bug bumbler).
+
+// Delay-mode formula: 0 = avg ping (mean RTT), 1 = peak ping (worst
+// RTT). Set once at init from the launcher's FM2K_DELAY_MODE env var.
+void ControlChannel_SetDelayMode(int mode);
+int  ControlChannel_GetDelayMode();
+
+// This peer's delay candidate: the manual override (FM2K_LOCAL_DELAY)
+// if set, otherwise computed from measured RTT per the delay mode.
+// Returns -1 if no RTT has been measured yet and no manual override.
+int  ControlChannel_GetLocalDelayCandidate();
+
+// Last delay candidate received from the peer via DELAY_PROPOSAL.
+// Returns -1 if none received (e.g. the peer runs an older build).
+int  ControlChannel_GetRemoteDelayCandidate();
+
+// Compute and broadcast this peer's DELAY_PROPOSAL. No-op until
+// connected with a candidate available. Driven on the ping cadence.
+void ControlChannel_SendDelayProposal();
+
 // =============================================================================
 // CONTROL CHANNEL - CONVENIENCE FUNCTIONS
 // =============================================================================
@@ -115,10 +140,10 @@ void ControlChannel_SendCharUnlock();
 // Send CSS start signal (both players synced, start counting frames NOW)
 void ControlChannel_SendCSSStart();
 
-// Send battle ready signal (for CSS sync). GekkoNet supports per-player local
-// input delay natively — each peer sets its own value via gekko_set_local_delay,
-// so no cross-peer negotiation is needed here. This packet is just a CSS-sync
-// signal with no payload.
+// Send battle ready signal (for CSS sync). No payload — just a CSS-sync
+// rendezvous signal. Input delay is negotiated separately over
+// DELAY_PROPOSAL (see ControlChannel_SendDelayProposal) so both peers
+// run an identical value rather than each picking its own.
 void ControlChannel_SendBattleReady();
 
 // Send battle acknowledgment

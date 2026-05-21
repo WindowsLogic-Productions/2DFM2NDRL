@@ -820,6 +820,15 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     // Initialize control channel
     ControlChannel_SetCallback(OnControlMessage);
 
+    // Delay-negotiation mode (#24). 0 = avg ping (mean RTT), 1 = peak
+    // ping (worst RTT). Picked by the launcher's Delay combo; absent
+    // env defaults to avg. Drives ControlChannel_GetLocalDelayCandidate.
+    if (const char* env = std::getenv("FM2K_DELAY_MODE"); env && env[0]) {
+        ControlChannel_SetDelayMode(std::atoi(env));
+    } else {
+        ControlChannel_SetDelayMode(0);
+    }
+
     if (!NetSocket_IsInitialized()) {
         if (!NetSocket_Init(local_port, remote_addr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Failed to init socket");
@@ -1950,76 +1959,55 @@ bool Netplay_StartBattle() {
     g_remote_css_ready  = false;
     g_css_advance_ready = false;
 
-    // Per-player local delay. Computed ONCE per connection at the first
-    // battle-session start, then cached and reused across every CSS->
-    // battle transition until disconnect.
+    // Per-player input delay (#24 -- Melancholy/Spooder, bug bumbler).
     //
-    // Formula uses MEAN one-way latency (not worst). CCCaster's
-    // `latency.getWorst() + 1` works for them because they run a tight
-    // 30-ping burst right before session creation; we opportunistically
-    // accumulate samples over the entire CSS period, so a single
-    // outlier (Discord notification spike, Windows scheduler hiccup)
-    // would inflate "worst" and lock in a too-high delay for the rest
-    // of the match. Mean is robust to that and gives matched delays
-    // between peers on stable links.
+    // Peers used to compute delay INDEPENDENTLY off their own RTT
+    // samples. On jittery links the two means drifted apart and the
+    // peers ran different delays (Melancholy 10 / Spooder 5); a manual-
+    // delay challenger likewise desynced a computed-delay opponent.
     //
-    // TODO(#24, Melancholy + toki bug reports): peers compute this
-    // INDEPENDENTLY. On stable links both see the same RTT and pick
-    // the same delay, but on jittery links one peer's mean drifts and
-    // they end up with different local_delays (Melancholy = 10,
-    // Spooder = 5). With prediction=0 lockstep, GekkoNet still
-    // converges but the game feel is asymmetric (one player's input
-    // lag is bigger than the other's). CCCaster's fix is to gossip
-    // the computed value over the control channel right before
-    // session start and pick max(local, peer). We don't have that
-    // exchange yet — needs a new CtrlMsg::DELAY_PROPOSAL round before
-    // gekko_set_local_delay below. Until then, document the asymmetry
-    // and recommend manual override (FM2K_LOCAL_DELAY) for matches
-    // where the auto-pick visibly diverges.
+    // Now each peer broadcasts a DELAY_PROPOSAL over the control channel
+    // through CSS (ControlChannel_SendDelayProposal on the ping cadence)
+    // and we adopt max(local candidate, remote candidate) here. max is
+    // commutative, so both peers land on the SAME delay. The candidate
+    // already folds in a manual FM2K_LOCAL_DELAY override, so a peer who
+    // pins 14 pulls the other peer up to 14 instead of desyncing.
     //
-    // FM2K runs at 100 Hz, so 10 ms is one frame budget.
-    //   local_delay = max(2, ceil(mean_one_way_ms / 10))
-    // Floor of 2 keeps GekkoNet's prediction window happy on
-    // sub-millisecond loopback.
+    // ControlChannel computes the local candidate from measured RTT per
+    // the delay mode (FM2K_DELAY_MODE: avg = mean RTT, peak = worst
+    // RTT) at FM2K's 100 Hz, where 10 ms is one frame budget:
+    //   candidate = clamp(ceil(one_way_ms / 10), 2, 15)
+    // A manual override instead yields the user's 0..16 verbatim.
     //
-    // FM2K_LOCAL_DELAY env var set to 0..16 forces a manual value (UI
-    // override). Manual override is checked every battle so the user
-    // can flip the override mid-session; AUTO is pinned for the
-    // connection lifetime.
-    //
-    // 0 is a valid manual choice for sub-1ms LAN / loopback / hot-seat
-    // play — GekkoNet's prediction-0 mode handles delay=0 cleanly,
-    // input is applied same frame. The COMPUTED branch below clamps
-    // to >= 2 because that path is for over-the-internet matches where
-    // any RTT spike requires headroom; manual 0 is opt-in by users
-    // who know they're on near-zero latency.
-    int  local_delay = -1;  // -1 sentinel = no manual override
-    enum DelaySource { DS_MANUAL, DS_COMPUTED, DS_CACHED } delay_source = DS_COMPUTED;
+    // The negotiated value is pinned for the connection lifetime
+    // (g_session_delay_cached) so it stays stable across every CSS->
+    // battle transition. A manual override bypasses the cache so the
+    // user can still flip it mid-session.
+    bool has_manual_delay = false;
     if (const char* env = std::getenv("FM2K_LOCAL_DELAY"); env && env[0]) {
         int v = std::atoi(env);
-        if (v >= 0 && v <= 16) { local_delay = v; delay_source = DS_MANUAL; }
+        if (v >= 0 && v <= 16) has_manual_delay = true;
     }
     const uint32_t rtt_mean_ms  = ControlChannel_GetRttMs();
     const uint32_t rtt_worst_ms = ControlChannel_GetWorstRttMs();
-    const uint32_t mean_one_way = rtt_mean_ms / 2;
-    if (local_delay < 0) {
-        // No manual override — fall through to cached or compute.
-        if (g_session_delay_cache_valid) {
-            local_delay  = g_session_delay_cached;
-            delay_source = DS_CACHED;
-        } else {
-            // First battle of this connection: compute, pin, log.
-            // ceil(mean_one_way / 10), then max(2, ...).
-            local_delay = (int)((mean_one_way + 9) / 10);
-            if (local_delay < 2)  local_delay = 2;
-            if (local_delay > 15) local_delay = 15;
+    const int local_cand  = ControlChannel_GetLocalDelayCandidate();
+    const int remote_cand = ControlChannel_GetRemoteDelayCandidate();
+
+    int local_delay;
+    enum DelaySource { DS_MANUAL, DS_COMPUTED, DS_CACHED } delay_source;
+    if (g_session_delay_cache_valid && !has_manual_delay) {
+        local_delay  = g_session_delay_cached;
+        delay_source = DS_CACHED;
+    } else {
+        // local_cand is -1 only when no RTT has been measured AND no
+        // manual override -- fall back to the conservative CSS delay.
+        const int lc = (local_cand < 0) ? CSS_LOCAL_DELAY : local_cand;
+        local_delay  = (remote_cand > lc) ? remote_cand : lc;
+        delay_source = has_manual_delay ? DS_MANUAL : DS_COMPUTED;
+        if (!has_manual_delay) {
             g_session_delay_cached      = local_delay;
             g_session_delay_cache_valid = true;
-            delay_source = DS_COMPUTED;
-            // Worst-RTT bucket reset on first compute. We don't read it
-            // for the formula anymore but TickHealth still updates it,
-            // and a fresh window helps the diagnostic log line stay
-            // tied to the upcoming match window.
+            // Fresh worst-RTT window for the next match's diagnostics.
             ControlChannel_ResetWorstRttMs();
         }
     }
@@ -2041,13 +2029,16 @@ bool Netplay_StartBattle() {
 
     const char* source_str =
         delay_source == DS_MANUAL   ? "manual" :
-        delay_source == DS_CACHED   ? "auto (cached)" :
-                                      "auto (computed)";
+        delay_source == DS_CACHED   ? "negotiated (cached)" :
+                                      "negotiated";
+    const char* mode_str =
+        ControlChannel_GetDelayMode() == 1 ? "peak" : "avg";
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: RTT mean=%ums worst=%ums one_way_mean=%ums -> "
-        "local_delay=%d (%s), prediction_window=%d",
-        rtt_mean_ms, rtt_worst_ms, mean_one_way, local_delay,
-        source_str, prediction_window);
+        "Netplay: RTT mean=%ums worst=%ums -> delay candidate "
+        "local=%d remote=%d, local_delay=%d (%s, mode=%s), "
+        "prediction_window=%d",
+        rtt_mean_ms, rtt_worst_ms, local_cand, remote_cand,
+        local_delay, source_str, mode_str, prediction_window);
 
     GekkoConfig config = {};
     config.num_players = 2;
