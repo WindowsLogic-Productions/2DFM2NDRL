@@ -5995,6 +5995,65 @@ void LauncherUI::RenderHubPanel() {
         }
     }
 
+    // Runahead / prediction-window tuning. Same mechanism as the Delay
+    // combo above: set a launcher-process env var the hooked game
+    // inherits at spawn; the hook reads it at session init. "default"
+    // clears the var so the hook uses its built-in value (runahead 6,
+    // prediction window 16). Manual values are for netcode iteration.
+    // index 0 = default, index N = manual N-1.
+    static int s_runahead_override   = 0;
+    static int s_prediction_override = 0;
+    {
+        const char* runahead_items[] = {
+            "default",
+            "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",
+            "8",  "9", "10", "11", "12", "13", "14", "15",
+        };
+        ImGui::PushItemWidth(-120);
+        ImGui::Combo("Runahead", &s_runahead_override, runahead_items,
+                     IM_ARRAYSIZE(runahead_items));
+        ImGui::PopItemWidth();
+        ImGui::SetItemTooltip(
+            "GekkoNet runahead frames -- how far the rollback engine "
+            "re-simulates ahead to hide remote input latency. "
+            "\"default\" = 6. Higher = smoother under latency but more "
+            "CPU per frame; 0 disables runahead. F8 in-game toggles "
+            "between 0 and this value. Tuning knob -- leave on default "
+            "for normal play.");
+        if (s_runahead_override > 0) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%d", s_runahead_override - 1);
+            ::SetEnvironmentVariableA("FM2K_RUNAHEAD", buf);
+        } else {
+            ::SetEnvironmentVariableA("FM2K_RUNAHEAD", nullptr);
+        }
+
+        const char* prediction_items[] = {
+            "default",
+            "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+            "9", "10", "11", "12", "13", "14", "15", "16", "17",
+            "18","19", "20", "21", "22", "23", "24", "25", "26",
+            "27","28", "29", "30", "31", "32",
+        };
+        ImGui::PushItemWidth(-120);
+        ImGui::Combo("Prediction", &s_prediction_override, prediction_items,
+                     IM_ARRAYSIZE(prediction_items));
+        ImGui::PopItemWidth();
+        ImGui::SetItemTooltip(
+            "GekkoNet input-prediction window -- max frames the engine "
+            "predicts remote input before forcing a stall. \"default\" "
+            "= 16. Larger absorbs bigger latency spikes without "
+            "stalling but deepens rollbacks on misprediction. Tuning "
+            "knob -- leave on default for normal play.");
+        if (s_prediction_override > 0) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%d", s_prediction_override - 1);
+            ::SetEnvironmentVariableA("FM2K_PREDICTION_WINDOW", buf);
+        } else {
+            ::SetEnvironmentVariableA("FM2K_PREDICTION_WINDOW", nullptr);
+        }
+    }
+
     if (!hs.client.IsConnected()) {
         // "Use Discord name" checkbox — when checked, the nick input is
         // grayed and shows the user's Discord global_name (read-only).
