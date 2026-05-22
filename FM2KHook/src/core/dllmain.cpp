@@ -22,6 +22,7 @@ extern void NeuterFullscreenTogglesForCncDdraw();
 #include "../hooks/per_game_patches.h"
 #include "../netplay/upload_queue.h"
 #include "../netplay/spectator_node.h"  // SpectatorNode_GetSessionId
+#include "version_local.h"  // fm2k::kAppBranch / kAppVersion / kAppRevision
 #include <SDL3/SDL_log.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -756,6 +757,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             InstallCrashHandler();
             SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "=== FM2K Hook Starting (Player %d) ===", g_player_index + 1);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "FM2KHook build: %s %s rev %s (%s)",
+                fm2k::kAppBranch, fm2k::kAppVersion,
+                fm2k::kAppRevision, fm2k::kAppBuildTime);
 
             // ddraw-redirect diagnostic: enumerate every loaded module and
             // log the names + paths of anything matching ddraw / 2dfmd. This

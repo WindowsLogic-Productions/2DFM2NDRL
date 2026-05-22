@@ -32,6 +32,10 @@ FM2K_VER_BUILD="${FM2K_VER_BUILD:-0}"
 
 if git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
     REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    # Branch name for build self-identification in logs ("bleeding"
+    # vs "main"). Detached HEAD (release builds cut from a tag) reports
+    # "HEAD" — harmless, the revision still pins the exact commit.
+    BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     # `git status --porcelain` here was the dirty-check, but on WSL
     # drvfs (Windows-mounted /mnt/c) it stat()'s every tracked file
     # and adds ~30 s per build. Skipped — kAppBuildTime already
@@ -45,6 +49,7 @@ if git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
     fi
 else
     REVISION="unknown"
+    BRANCH="unknown"
 fi
 BUILD_TIME="$(date -u +'%Y-%m-%d %H:%M UTC')"
 
@@ -57,6 +62,7 @@ namespace fm2k {
 
 inline constexpr const char* kAppVersion   = "${FM2K_VERSION}";
 inline constexpr const char* kAppRevision  = "${REVISION}";
+inline constexpr const char* kAppBranch    = "${BRANCH}";
 inline constexpr const char* kAppBuildTime = "${BUILD_TIME}";
 
 // GitHub repo hosting public release artifacts. The auto-updater pulls
@@ -84,4 +90,4 @@ cat > "$OUT_RC" <<EOF
 #define FM2K_VER_STRING "${FM2K_VERSION}"
 EOF
 
-echo "version_local.h: ${FM2K_VERSION} rev=${REVISION}"
+echo "version_local.h: ${FM2K_VERSION} rev=${REVISION} branch=${BRANCH}"
