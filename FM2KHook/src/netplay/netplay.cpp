@@ -2104,20 +2104,23 @@ bool Netplay_StartBattle() {
     // Runahead: speculatively advance local frames past confirmed input
     // to hide input delay. GekkoNet rewinds runahead frames each tick
     // and replays them — free latency reduction at the cost of extra
-    // sim CPU per real tick (N speculative AdvanceEvents).
+    // sim CPU per real tick (N speculative AdvanceEvents); save/load
+    // count is fixed at 2/1 regardless of N.
     //
-    // Default 6 at 100 FPS gives 60 ms of hidden input lag. Cost vs
-    // runahead=4 is +2 speculative sim ticks per real tick; save/load
-    // count is fixed at 2/1 regardless of N (GekkoNet uses a single
-    // _runahead_state buffer).
+    // Runahead's correct value is exactly the input delay: re-simulating
+    // `local_delay` frames cancels the VISUAL lag of that delay, so
+    // local input feels instant. Less leaves lag visible; more just
+    // re-simulates frames that buy nothing. So it tracks the negotiated
+    // local_delay rather than a fixed number — a static value would
+    // under- or over-shoot whatever delay the connection ended up with.
+    // FM2K's sim is microseconds-cheap, so even runahead 15 is fine.
     //
-    // FM2K_RUNAHEAD env override accepts 0..15. 0 disables runahead
-    // entirely — gekko_set_runahead(0) makes the per-tick driver skip
-    // the speculative advance loop. Useful for A/B testing input feel.
-    //
-    // F8 hotkey toggles between 0 and this user_pref live. See
-    // Netplay_RequestRunaheadToggle / Netplay_PollRunaheadToggle.
-    int runahead = 6;
+    // FM2K_RUNAHEAD env override force-pins 0..15 for A/B feel testing.
+    // 0 disables runahead entirely. F8 toggles between 0 and this value
+    // live (Netplay_RequestRunaheadToggle / Netplay_PollRunaheadToggle).
+    int runahead = local_delay;
+    if (runahead < 0)  runahead = 0;
+    if (runahead > 15) runahead = 15;  // GekkoNet runahead is a u8 cap
     if (const char* env = std::getenv("FM2K_RUNAHEAD"); env && env[0]) {
         int v = std::atoi(env);
         if (v >= 0 && v <= 15) runahead = v;
@@ -2126,9 +2129,9 @@ bool Netplay_StartBattle() {
     g_runahead_active.store(runahead, std::memory_order_release);
     gekko_set_runahead(g_session, (unsigned char)runahead);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: prediction_window=%d runahead=%d (user_pref) — "
-        "F8 toggles runahead between 0 and %d",
-        prediction_window, runahead, runahead);
+        "Netplay: prediction_window=%d runahead=%d (tracks local_delay=%d) "
+        "— F8 toggles runahead between 0 and %d",
+        prediction_window, runahead, local_delay, runahead);
 
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
     SpectatorNode_AppendPinRng(0x12345678);
