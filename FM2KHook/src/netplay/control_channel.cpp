@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <mmsystem.h>
@@ -85,6 +86,20 @@ static uint32_t g_rtt_sample_count = 0;
 // start), so they're atomic.
 static std::atomic<int> g_delay_mode{0};               // 0=avg, 1=peak
 static std::atomic<int> g_remote_delay_candidate{-1};
+
+// Recent RTT samples for delay sizing (#24). A single cold-start ping
+// (peer still injecting / loading) or a scheduler hiccup easily round-
+// trips in 200-300 ms even on a 10 ms link -- and an all-time-max
+// worst-RTT latches that forever, which is exactly why worst-based
+// delay was a bad idea. avg mode takes the mean of this window; peak
+// mode takes the p90, which sizes above the median but discards the
+// worst ~10% of outliers. Lock-free: written on the receive path, read
+// from the timer thread / battle start -- a torn read just nudges one
+// delay estimate by a sample, self-corrects next tick.
+static constexpr int kRttRingCap = 64;
+static uint32_t g_rtt_ring[kRttRingCap] = {};
+static int      g_rtt_ring_count = 0;   // valid entries (caps at cap)
+static int      g_rtt_ring_head  = 0;   // next write index
 
 // Player ID (set from globals)
 static uint8_t g_local_player_id = 0;
@@ -666,6 +681,23 @@ int ControlChannel_GetDelayMode() {
     return g_delay_mode.load(std::memory_order_relaxed);
 }
 
+// RTT (ms) used for delay sizing in the given mode. 0 if no samples.
+// avg = mean of the window; peak = p90 (sorted, index floor(0.9*(n-1)))
+// so a lone cold-start / hiccup spike can't dominate the pick.
+static uint32_t RttForDelayMode(int mode) {
+    const int n = g_rtt_ring_count;
+    if (n == 0) return 0;
+    if (mode != 1) {
+        uint64_t sum = 0;
+        for (int i = 0; i < n; ++i) sum += g_rtt_ring[i];
+        return (uint32_t)(sum / n);
+    }
+    uint32_t tmp[kRttRingCap];
+    for (int i = 0; i < n; ++i) tmp[i] = g_rtt_ring[i];
+    std::sort(tmp, tmp + n);
+    return tmp[(n - 1) * 9 / 10];   // p90
+}
+
 int ControlChannel_GetLocalDelayCandidate() {
     // A manual FM2K_LOCAL_DELAY override is the user's explicit choice
     // and is exchanged like any other candidate, so a peer who pins
@@ -677,10 +709,8 @@ int ControlChannel_GetLocalDelayCandidate() {
     }
     // No override: compute from measured RTT. avg mode sizes to mean
     // RTT (lower delay, spikes can rollback); peak mode sizes to the
-    // worst RTT seen (higher delay, rides out jitter).
-    const uint32_t rtt = (g_delay_mode.load(std::memory_order_relaxed) == 1)
-                             ? g_rtt_worst_ms
-                             : g_rtt_ms;
+    // p90 RTT (higher delay, rides out jitter).
+    const uint32_t rtt = RttForDelayMode(g_delay_mode.load(std::memory_order_relaxed));
     if (rtt == 0) return -1;  // no measurement yet
     int d = (int)(((rtt / 2) + 9) / 10);  // ceil(one_way_ms / 10ms)
     if (d < 2)  d = 2;
@@ -1003,6 +1033,10 @@ void ControlChannel_HandlePong(uint32_t sent_time) {
     g_rtt_ms = GetTimeMs() - sent_time;
     if (g_rtt_ms > g_rtt_worst_ms) g_rtt_worst_ms = g_rtt_ms;
     ++g_rtt_sample_count;
+    // Feed the delay-sizing window (#24).
+    g_rtt_ring[g_rtt_ring_head] = g_rtt_ms;
+    g_rtt_ring_head = (g_rtt_ring_head + 1) % kRttRingCap;
+    if (g_rtt_ring_count < kRttRingCap) ++g_rtt_ring_count;
 }
 
 // Mark connection as established (called when HELLO_ACK received)
@@ -1011,8 +1045,11 @@ void ControlChannel_SetConnected(bool connected) {
     if (connected) {
         g_last_recv_time = GetTimeMs();
     } else {
-        // Drop the peer's delay candidate so a reconnect renegotiates
-        // from scratch instead of reusing a stale value (#24).
+        // Drop the peer's delay candidate + our RTT window so a
+        // reconnect renegotiates from scratch instead of reusing a
+        // stale value or another peer's latency samples (#24).
         g_remote_delay_candidate.store(-1, std::memory_order_relaxed);
+        g_rtt_ring_count = 0;
+        g_rtt_ring_head  = 0;
     }
 }
