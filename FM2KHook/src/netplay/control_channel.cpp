@@ -1,5 +1,6 @@
 // Control Channel - Multiplexed UDP Socket Implementation
 #include "control_channel.h"
+#include "delay_math.h"
 #include "globals.h"
 #include "gekkonet.h"
 #include "spectator_node.h"
@@ -681,23 +682,6 @@ int ControlChannel_GetDelayMode() {
     return g_delay_mode.load(std::memory_order_relaxed);
 }
 
-// RTT (ms) used for delay sizing in the given mode. 0 if no samples.
-// avg = mean of the window; peak = p90 (sorted, index floor(0.9*(n-1)))
-// so a lone cold-start / hiccup spike can't dominate the pick.
-static uint32_t RttForDelayMode(int mode) {
-    const int n = g_rtt_ring_count;
-    if (n == 0) return 0;
-    if (mode != 1) {
-        uint64_t sum = 0;
-        for (int i = 0; i < n; ++i) sum += g_rtt_ring[i];
-        return (uint32_t)(sum / n);
-    }
-    uint32_t tmp[kRttRingCap];
-    for (int i = 0; i < n; ++i) tmp[i] = g_rtt_ring[i];
-    std::sort(tmp, tmp + n);
-    return tmp[(n - 1) * 9 / 10];   // p90
-}
-
 int ControlChannel_GetLocalDelayCandidate() {
     // A manual FM2K_LOCAL_DELAY override is the user's explicit choice
     // and is exchanged like any other candidate, so a peer who pins
@@ -707,15 +691,14 @@ int ControlChannel_GetLocalDelayCandidate() {
         int v = std::atoi(env);
         if (v >= 0 && v <= 16) return v;
     }
-    // No override: compute from measured RTT. avg mode sizes to mean
-    // RTT (lower delay, spikes can rollback); peak mode sizes to the
-    // p90 RTT (higher delay, rides out jitter).
-    const uint32_t rtt = RttForDelayMode(g_delay_mode.load(std::memory_order_relaxed));
-    if (rtt == 0) return -1;  // no measurement yet
-    int d = (int)(((rtt / 2) + 9) / 10);  // ceil(one_way_ms / 10ms)
-    if (d < 2)  d = 2;
-    if (d > 15) d = 15;
-    return d;
+    // No override: size from the measured RTT window. avg mode uses the
+    // mean (lower delay, spikes can rollback); peak mode uses the p90
+    // (higher delay, rides out jitter). The window math is pure and
+    // lives in delay_math.h -- see tests/delay_math_test.cpp.
+    const uint32_t rtt = fm2k::delay::RttFromWindow(
+        g_rtt_ring, g_rtt_ring_count,
+        g_delay_mode.load(std::memory_order_relaxed));
+    return fm2k::delay::DelayCandidateFromRtt(rtt);
 }
 
 int ControlChannel_GetRemoteDelayCandidate() {
