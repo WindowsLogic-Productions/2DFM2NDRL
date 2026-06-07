@@ -40,14 +40,22 @@ struct InternalState {
 InternalState g_st;
 
 // ---------------------------------------------------------------------------
-// Update channel — `stable` (default, GH non-prerelease) or `dev` (latest
-// release including prereleases). Persisted to dev_flags.ini alongside
-// other launcher settings so the in-process launcher UI and this updater
-// share the same value via the same file. Key = "update_channel",
-// int value: 0 = stable, 1 = dev.
+// Update channel. Three nested tiers, each a superset of the one below:
+//   stable   (0) = GH non-prerelease only.
+//   dev      (1) = stable + plain prereleases (NOT bleeding).
+//   bleeding (2) = everything, including -bleeding-tagged prereleases.
+// Tier is encoded on the GitHub release: stable = prerelease:false; dev =
+// prerelease:true with a plain tag (v0.2.58); bleeding = prerelease:true
+// with a "-bleeding" suffix on the tag (v0.2.58-bleeding). The numeric
+// version compare (CompareVersions) ignores the suffix, so a bleeding cut
+// just needs a version >= the stable/dev it sits above (bump it ahead).
+// Persisted to dev_flags.ini alongside other launcher settings so the
+// in-process launcher UI and this updater share the same value via the
+// same file. Key = "update_channel", int value: 0 = stable, 1 = dev,
+// 2 = bleeding.
 // ---------------------------------------------------------------------------
 
-enum class Channel : int { Stable = 0, Dev = 1 };
+enum class Channel : int { Stable = 0, Dev = 1, Bleeding = 2 };
 
 std::string DevFlagsIniPath() {
     char buf[MAX_PATH] = {};
@@ -76,7 +84,11 @@ Channel ReadUpdateChannel() {
         result = std::atoi(s.substr(eq + 1).c_str());
     }
     std::fclose(f);
-    return (result == 1) ? Channel::Dev : Channel::Stable;
+    switch (result) {
+        case 2:  return Channel::Bleeding;
+        case 1:  return Channel::Dev;
+        default: return Channel::Stable;
+    }
 }
 
 void SetState(State s) {
@@ -358,14 +370,15 @@ void CheckWorker() {
     // display "Stable(0.2.53) Dev(0.2.54)" labels. We use the active
     // channel's value for the upgrade pill's UpdateAvailable comparison.
     //
-    // /releases?per_page=20 returns the most-recent N entries (any
+    // /releases?per_page=40 returns the most-recent N entries (any
     // mix of prerelease/non-prerelease, newest first). Walking once
-    // extracts both: the first prerelease=true entry is `dev`, the
-    // first prerelease=false entry is `stable`. One HTTP round-trip
-    // vs the old two-roundtrip impl.
+    // extracts all three tiers: first non-prerelease = stable, first
+    // plain prerelease = dev, first "-bleeding" prerelease = bleeding.
+    // One HTTP round-trip. Window is 40 (not 20) so a run of bleeding
+    // cuts can't bury the latest stable/dev off the first page.
     char url[512];
     std::snprintf(url, sizeof(url),
-        "https://api.github.com/repos/%s/%s/releases?per_page=20",
+        "https://api.github.com/repos/%s/%s/releases?per_page=40",
         kUpdateRepoOwner, kUpdateRepoName);
 
     GetResp r = HttpGetText(url);
@@ -376,17 +389,22 @@ void CheckWorker() {
     }
 
     // Walk releases JSON. For each entry capture (tag_name, prerelease).
-    // Stop once we've found one of each type; bail early on parse
-    // problems (better to ship partial data than nothing).
+    // Three buckets by tier: non-prerelease -> stable; prerelease with a
+    // "-bleeding" tag -> bleeding; any other prerelease -> dev. Entries
+    // arrive newest-first, so the first hit per bucket is that tier's
+    // latest. Stop once all three are found; bail early on parse problems
+    // (better to ship partial data than nothing).
     auto strip_v = [](std::string& s) {
         if (!s.empty() && (s.front() == 'v' || s.front() == 'V')) s.erase(s.begin());
     };
     std::string latest_stable;
     std::string latest_dev;
+    std::string latest_bleeding;
     {
         const std::string& body = r.body;
         size_t cur = 0;
-        while (cur < body.size() && (latest_stable.empty() || latest_dev.empty())) {
+        while (cur < body.size() &&
+               (latest_stable.empty() || latest_dev.empty() || latest_bleeding.empty())) {
             size_t tn = body.find("\"tag_name\"", cur);
             if (tn == std::string::npos) break;
             size_t qp = body.find('"', tn + 10);
@@ -407,7 +425,13 @@ void CheckWorker() {
                     is_prerelease = (body.compare(v, 4, "true") == 0);
                 }
             }
-            if (is_prerelease) {
+            // Tier marker lives in the tag itself (checked on the raw tag,
+            // before strip_v) so a "-bleeding" build is routed away from
+            // the dev bucket.
+            const bool is_bleeding = (tag.find("bleeding") != std::string::npos);
+            if (is_prerelease && is_bleeding) {
+                if (latest_bleeding.empty()) latest_bleeding = std::move(tag);
+            } else if (is_prerelease) {
                 if (latest_dev.empty()) latest_dev = std::move(tag);
             } else {
                 if (latest_stable.empty()) latest_stable = std::move(tag);
@@ -417,23 +441,29 @@ void CheckWorker() {
     }
     strip_v(latest_stable);
     strip_v(latest_dev);
+    strip_v(latest_bleeding);
 
-    // Pick the value the active channel cares about for the upgrade
-    // pill.
-    //   Stable: latest non-prerelease tag only. Dev pre-releases are
-    //           invisible -- stable users shouldn't be pulled into them.
-    //   Dev:    max(latest_stable, latest_dev). Dev is a superset of
-    //           stable -- if we promote 0.2.56 to stable without leaving
-    //           a matching prerelease, dev users sitting on the previous
-    //           prerelease would otherwise be stuck forever because no
-    //           newer prerelease exists. Picking the higher of the two
-    //           keeps dev tracking the absolute newest build.
+    // Pick the value the active channel cares about for the upgrade pill.
+    // Each tier is a superset of the one below, so the channel's "remote"
+    // is the max version across all tiers at or below it:
+    //   Stable:   latest non-prerelease only. Pre-releases are invisible --
+    //             stable users shouldn't be pulled into them.
+    //   Dev:      max(stable, dev). Excludes bleeding. Dev is a superset of
+    //             stable -- if we promote 0.2.56 to stable without leaving
+    //             a matching prerelease, dev users on the previous
+    //             prerelease would otherwise be stuck forever; picking the
+    //             higher keeps dev tracking the newest dev-or-stable build.
+    //   Bleeding: max(stable, dev, bleeding). The absolute newest of all.
+    auto pick_max = [](const std::string& a, const std::string& b) -> std::string {
+        if (a.empty()) return b;
+        if (b.empty()) return a;
+        return (CompareVersions(a, b) >= 0) ? a : b;
+    };
     std::string remote;
-    if (channel == Channel::Dev) {
-        if (latest_dev.empty())      remote = latest_stable;
-        else if (latest_stable.empty()) remote = latest_dev;
-        else remote = (CompareVersions(latest_dev, latest_stable) >= 0)
-                     ? latest_dev : latest_stable;
+    if (channel == Channel::Bleeding) {
+        remote = pick_max(pick_max(latest_stable, latest_dev), latest_bleeding);
+    } else if (channel == Channel::Dev) {
+        remote = pick_max(latest_stable, latest_dev);
     } else {
         remote = latest_stable;
         if (remote.empty()) remote = latest_dev;  // bootstrap: no stable cut yet
@@ -444,12 +474,15 @@ void CheckWorker() {
         return;
     }
 
+    const char* channel_name = (channel == Channel::Bleeding) ? "bleeding"
+                             : (channel == Channel::Dev)      ? "dev"
+                                                              : "stable";
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Updater: local=%s channel=%s stable=%s dev=%s -> remote=%s",
-        kAppVersion,
-        channel == Channel::Dev ? "dev" : "stable",
-        latest_stable.empty() ? "(none)" : latest_stable.c_str(),
-        latest_dev.empty()    ? "(none)" : latest_dev.c_str(),
+        "Updater: local=%s channel=%s stable=%s dev=%s bleeding=%s -> remote=%s",
+        kAppVersion, channel_name,
+        latest_stable.empty()   ? "(none)" : latest_stable.c_str(),
+        latest_dev.empty()      ? "(none)" : latest_dev.c_str(),
+        latest_bleeding.empty() ? "(none)" : latest_bleeding.c_str(),
         remote.c_str());
 
     // Trigger UpdateAvailable on ANY mismatch between local and the
@@ -463,9 +496,10 @@ void CheckWorker() {
     const int cmp = CompareVersions(kAppVersion, remote);
     {
         std::lock_guard<std::mutex> lk(g_st.mtx);
-        g_st.snap.remote_version = remote;
-        g_st.snap.latest_stable  = latest_stable;
-        g_st.snap.latest_dev     = latest_dev;
+        g_st.snap.remote_version  = remote;
+        g_st.snap.latest_stable   = latest_stable;
+        g_st.snap.latest_dev      = latest_dev;
+        g_st.snap.latest_bleeding = latest_bleeding;
         g_st.snap.state = (cmp != 0) ? State::UpdateAvailable : State::UpToDate;
     }
     g_st.busy.store(false);
