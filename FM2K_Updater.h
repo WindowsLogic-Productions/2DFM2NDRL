@@ -42,6 +42,7 @@ struct Snapshot {
     // no releases yet).
     std::string  latest_stable;
     std::string  latest_dev;
+    std::string  latest_bleeding;       // newest -bleeding-tagged prerelease
 };
 
 // Kick off a non-blocking version check. Safe to call any time;

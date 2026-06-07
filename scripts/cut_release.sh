@@ -13,10 +13,12 @@
 #   - export FM2KTEST_REPO_DIR=~/projects/fm2ktest
 #
 # Usage:
-#   ./scripts/cut_release.sh                       # STABLE release
-#   ./scripts/cut_release.sh "release notes"       # STABLE w/ notes
-#   ./scripts/cut_release.sh --dev                 # DEV pre-release
-#   ./scripts/cut_release.sh --dev "release notes" # DEV w/ notes
+#   ./scripts/cut_release.sh                            # STABLE release
+#   ./scripts/cut_release.sh "release notes"            # STABLE w/ notes
+#   ./scripts/cut_release.sh --dev                      # DEV pre-release
+#   ./scripts/cut_release.sh --dev "release notes"      # DEV w/ notes
+#   ./scripts/cut_release.sh --bleeding                 # BLEEDING pre-release
+#   ./scripts/cut_release.sh --bleeding "release notes" # BLEEDING w/ notes
 #
 # Bump the version IN scripts/make_version.sh BEFORE running this.
 #
@@ -25,8 +27,15 @@
 #     (= what /releases/latest returns to the launcher's auto-updater).
 #   - Dev cuts a PRE-release GH tag. LatestVersion is NOT touched, so
 #     stable-channel clients ignore it. Dev-channel clients ask for
-#     /releases?per_page=20 and pick the first prerelease entry — that's
-#     this build.
+#     /releases?per_page=20 and pick the first plain (non-bleeding)
+#     prerelease entry — that's this build.
+#   - Bleeding cuts a PRE-release GH tag SUFFIXED "-bleeding"
+#     (v0.2.58-bleeding) so the launcher routes it to the bleeding
+#     channel only -- dev/stable clients never see it. It also SKIPS the
+#     Discord webhook: bleeding is the silent fast lane, no @notify spam.
+#     Bump make_version.sh AHEAD of the current stable/dev before cutting
+#     (the version compare ignores the "-bleeding" suffix, so a bleeding
+#     build at the same number as stable won't be offered as an update).
 
 set -euo pipefail
 
@@ -37,6 +46,9 @@ CHANNEL="stable"
 if [ "${1:-}" = "--dev" ]; then
     CHANNEL="dev"
     shift
+elif [ "${1:-}" = "--bleeding" ]; then
+    CHANNEL="bleeding"
+    shift
 fi
 
 VERSION="$(grep -E '^FM2K_VERSION=' "$SCRIPT_DIR/make_version.sh" | head -1 | cut -d'"' -f2)"
@@ -45,7 +57,16 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-NOTES="${1:-Released v${VERSION}}"
+# The version that lands in the GH tag, zip name, and download URL. For
+# bleeding it carries the tier-marker suffix so the launcher's parser
+# routes it to the bleeding channel; the binary's own kAppVersion stays
+# the plain number (make_version.sh isn't told about the suffix).
+TAG_VERSION="$VERSION"
+if [ "$CHANNEL" = "bleeding" ]; then
+    TAG_VERSION="${VERSION}-bleeding"
+fi
+
+NOTES="${1:-Released v${TAG_VERSION}}"
 
 if ! command -v gh >/dev/null 2>&1; then
     echo "cut_release: gh CLI not installed (https://cli.github.com)" >&2
@@ -92,17 +113,19 @@ echo "==> building (channel=${CHANNEL})"
 ( cd "$REPO_ROOT" && ./go.sh )
 
 echo "==> packaging"
-"$SCRIPT_DIR/package_release.sh" "$VERSION"
-ZIP_PATH="$REPO_ROOT/dist/fm2k_v${VERSION}.zip"
+"$SCRIPT_DIR/package_release.sh" "$TAG_VERSION"
+ZIP_PATH="$REPO_ROOT/dist/fm2k_v${TAG_VERSION}.zip"
 
-echo "==> creating gh release v${VERSION} (channel=${CHANNEL})"
+echo "==> creating gh release v${TAG_VERSION} (channel=${CHANNEL})"
 GH_FLAGS=()
-if [ "$CHANNEL" = "dev" ]; then
+# Both dev and bleeding ship as GH pre-releases; only the tag suffix
+# (handled via TAG_VERSION) tells the launcher which of the two it is.
+if [ "$CHANNEL" = "dev" ] || [ "$CHANNEL" = "bleeding" ]; then
     GH_FLAGS+=(--prerelease)
 fi
-gh release create "v${VERSION}" "$ZIP_PATH" \
+gh release create "v${TAG_VERSION}" "$ZIP_PATH" \
     --repo "Armonte/fm2ktest" \
-    --title "v${VERSION}" \
+    --title "v${TAG_VERSION}" \
     --notes "$NOTES" \
     "${GH_FLAGS[@]}"
 
@@ -123,15 +146,28 @@ fi
 # itself — no per-shell rc setup needed. Optional: a release-step
 # failure here is non-fatal (release itself already succeeded), so we
 # set OPTIONAL=1 to keep the channel-flag schema permissive.
-echo "==> posting Discord webhook"
-FM2K_RELEASE_WEBHOOK_OPTIONAL=1 \
-    "$SCRIPT_DIR/post_release_webhook.sh" "$CHANNEL" "$VERSION" "$NOTES" || \
-    echo "    (webhook step failed but release itself succeeded — fix env then run:"
-echo "    ./scripts/post_release_webhook.sh $CHANNEL $VERSION 'notes...')"
+#
+# Bleeding is the silent fast lane: it skips the webhook entirely so it
+# never pings the release channel. That's the whole reason the tier
+# exists -- iterate without spamming @notify.
+if [ "$CHANNEL" = "bleeding" ]; then
+    echo "==> skipping Discord webhook (bleeding is silent)"
+else
+    echo "==> posting Discord webhook"
+    FM2K_RELEASE_WEBHOOK_OPTIONAL=1 \
+        "$SCRIPT_DIR/post_release_webhook.sh" "$CHANNEL" "$VERSION" "$NOTES" || \
+        echo "    (webhook step failed but release itself succeeded — fix env then run:"
+    echo "    ./scripts/post_release_webhook.sh $CHANNEL $VERSION 'notes...')"
+fi
 
 echo
 if [ "$CHANNEL" = "stable" ]; then
     echo "released v${VERSION} (stable). all clients pick it up on next launcher start."
+elif [ "$CHANNEL" = "bleeding" ]; then
+    echo "released v${TAG_VERSION} (bleeding pre-release, no webhook)."
+    echo "Only bleeding-channel clients see it. Stable/dev clients ignore it."
+    echo "When it soaks well, cut it forward as a dev build: bump make_version.sh, then"
+    echo "  ./scripts/cut_release.sh --dev 'notes'"
 else
     echo "released v${VERSION} (dev pre-release)."
     echo "Stable-channel clients ignore this. Dev-channel clients pick it up on next check."

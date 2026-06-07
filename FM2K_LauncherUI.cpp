@@ -1073,12 +1073,13 @@ void LauncherUI::RenderMenuBar() {
 
         // Release channel toggle — RIGHT in the menu bar, always visible.
         // Persisted to dev_flags.ini under "update_channel" (0=stable,
-        // 1=dev); fm2k::updater::ReadUpdateChannel reads the same key.
-        // Switching auto-fires CheckForUpdates because that's the only
-        // reason anyone would flip it. Each MenuItem label includes the
-        // latest known version on that channel so the user can decide
+        // 1=dev, 2=bleeding); fm2k::updater::ReadUpdateChannel reads the
+        // same key. Switching auto-fires CheckForUpdates because that's the
+        // only reason anyone would flip it. Each MenuItem label includes
+        // the latest known version on that channel so the user can decide
         // whether flipping is worth it without poking around — they see
-        // "Stable(0.2.53)  Dev(0.2.54)" or similar inline.
+        // "Stable(0.2.53)  Dev(0.2.54)  Bleeding(0.2.58-bleeding)" inline.
+        // Tiers nest: dev shows stable+dev, bleeding shows everything.
         {
             static int s_channel = LoadDevFlagInt("update_channel", 0);
             const auto upd_snap = fm2k::updater::Get();
@@ -1089,24 +1090,22 @@ void LauncherUI::RenderMenuBar() {
                 else             std::snprintf(buf, cap, "%s(%s)##bar_channel",
                                                 name, ver.c_str());
             };
-            char lbl_stable[48], lbl_dev[48];
-            channel_label("Stable", upd_snap.latest_stable, lbl_stable, sizeof(lbl_stable));
-            channel_label("Dev",    upd_snap.latest_dev,    lbl_dev,    sizeof(lbl_dev));
+            char lbl_stable[64], lbl_dev[64], lbl_bleeding[64];
+            channel_label("Stable",   upd_snap.latest_stable,   lbl_stable,   sizeof(lbl_stable));
+            channel_label("Dev",      upd_snap.latest_dev,      lbl_dev,      sizeof(lbl_dev));
+            channel_label("Bleeding", upd_snap.latest_bleeding, lbl_bleeding, sizeof(lbl_bleeding));
 
-            if (ImGui::MenuItem(lbl_stable, nullptr, s_channel == 0)) {
-                if (s_channel != 0) {
-                    s_channel = 0;
-                    SaveDevFlagInt("update_channel", 0);
+            auto select_channel = [&](int ch) {
+                if (s_channel != ch) {
+                    s_channel = ch;
+                    SaveDevFlagInt("update_channel", ch);
                     fm2k::updater::CheckForUpdates();
                 }
-            }
-            if (ImGui::MenuItem(lbl_dev, nullptr, s_channel == 1)) {
-                if (s_channel != 1) {
-                    s_channel = 1;
-                    SaveDevFlagInt("update_channel", 1);
-                    fm2k::updater::CheckForUpdates();
-                }
-            }
+            };
+
+            if (ImGui::MenuItem(lbl_stable,   nullptr, s_channel == 0)) select_channel(0);
+            if (ImGui::MenuItem(lbl_dev,      nullptr, s_channel == 1)) select_channel(1);
+            if (ImGui::MenuItem(lbl_bleeding, nullptr, s_channel == 2)) select_channel(2);
         }
 
         // Lazy-load auth state on first menu-bar render. File is only
