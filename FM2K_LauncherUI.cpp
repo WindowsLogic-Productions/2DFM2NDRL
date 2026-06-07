@@ -6351,12 +6351,15 @@ void LauncherUI::RenderHubPanel() {
             // Tier → color mapping. Tester ($5) gets blue (0x2C7BDB,
             // matching Patreon's hub branding); Special Thanks ($10) gets
             // gold (0xFFBF03); monte (operator) gets red (0xE53935, Material
-            // red 600 — distinct from gold without being garish). Anything
-            // else (legacy hub, missing field) renders in the default text
-            // color so stale clients don't turn invisible.
+            // red 600 — distinct from gold without being garish); guest
+            // (open-access non-patron, when the hub gate is lifted) gets grey
+            // (0x9E9E9E, Material grey 500) — clearly not a paying tier.
+            // Anything else (legacy hub, missing field) renders in the default
+            // text color so stale clients don't turn invisible.
             const ImVec4 kTierTester(0x2C / 255.0f, 0x7B / 255.0f, 0xDB / 255.0f, 1.0f);
             const ImVec4 kTierThanks(0xFF / 255.0f, 0xBF / 255.0f, 0x03 / 255.0f, 1.0f);
             const ImVec4 kTierMonte (0xE5 / 255.0f, 0x39 / 255.0f, 0x35 / 255.0f, 1.0f);
+            const ImVec4 kTierGuest (0x9E / 255.0f, 0x9E / 255.0f, 0x9E / 255.0f, 1.0f);
             for (auto& [uid, u] : hs.users) {
                 // Self is shown in the list (top row, naturally — most
                 // hubs put your row at the top so you can see your own
@@ -6372,6 +6375,8 @@ void LauncherUI::RenderHubPanel() {
                     ImGui::TextColored(kTierThanks, "%s", u.nick.c_str());
                 } else if (u.tier == "tester") {
                     ImGui::TextColored(kTierTester, "%s", u.nick.c_str());
+                } else if (u.tier == "guest") {
+                    ImGui::TextColored(kTierGuest, "%s", u.nick.c_str());
                 } else {
                     ImGui::TextUnformatted(u.nick.c_str());
                 }
