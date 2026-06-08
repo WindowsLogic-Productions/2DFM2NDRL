@@ -110,9 +110,52 @@ static int g_local_delay = 1;  // Computed from RTT at battle start
 // the running session right now, which can differ when the user
 // hits F8 mid-match to toggle between 0 and user_pref.
 static int                g_pred_window               = 16;
-static int                g_runahead_user_pref        = 6;
-static std::atomic<int>   g_runahead_active{6};
+// Runahead is DEFAULT OFF (too CPU-heavy at 100fps/10ms budget). These get
+// overwritten per battle in Netplay_StartBattle (pref = local_delay, active
+// = 0 unless FM2K_RUNAHEAD forces it); the static defaults just keep it off
+// before/between matches.
+static int                g_runahead_user_pref        = 0;
+static std::atomic<int>   g_runahead_active{0};
 static std::atomic<bool>  g_runahead_toggle_requested{false};
+
+// --- re-sim profiler (FM2K_PERF_PROFILE=1) ---------------------------------
+// Times the three hot ops in the rollback loop so we can see where the 10ms
+// (100 FPS) per-frame budget actually goes: SaveState_Save, SaveState_Load,
+// and the game tick (process_game_inputs + update_game). Reports avg microsec
+// + count every 500 advances. Off unless the env var is set, so production
+// builds pay nothing. (#62/#63)
+namespace {
+struct PerfBucket { uint64_t ns = 0; uint32_t n = 0; };
+static const bool g_perf_on = [] {
+    const char* v = std::getenv("FM2K_PERF_PROFILE");
+    return v && v[0] && v[0] != '0';
+}();
+static uint64_t PerfQpcFreq() {
+    static uint64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return (uint64_t)q.QuadPart; }();
+    return f;
+}
+static inline uint64_t PerfNowNs() {
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (uint64_t)((long double)c.QuadPart * 1e9L / (long double)PerfQpcFreq());
+}
+static PerfBucket g_perf_save, g_perf_load, g_perf_adv;
+struct PerfScope {
+    PerfBucket* b; uint64_t t0;
+    explicit PerfScope(PerfBucket* x) : b(g_perf_on ? x : nullptr), t0(b ? PerfNowNs() : 0) {}
+    ~PerfScope() { if (b) { b->ns += PerfNowNs() - t0; b->n++; } }
+};
+static void PerfMaybeReport() {
+    if (!g_perf_on) return;
+    static uint32_t ticks = 0;
+    if (++ticks % 500 != 0) return;
+    auto us = [](const PerfBucket& b) { return b.n ? (double)b.ns / b.n / 1000.0 : 0.0; };
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "[PERF] save n=%u avg=%.1fus | load n=%u avg=%.1fus | tick(PGI+UG) n=%u avg=%.1fus "
+        "(budget is 10000us/frame at 100fps)",
+        g_perf_save.n, us(g_perf_save), g_perf_load.n, us(g_perf_load),
+        g_perf_adv.n, us(g_perf_adv));
+}
+}  // namespace
 
 // Rolling window for [BEAT] line. Reset every emit so the per-window
 // avg + max numbers describe the most recent ~10s, not session totals.
@@ -1606,7 +1649,10 @@ static GekkoConfig MakeSpectateConfig(SessionKind host_kind) {
     // history on connect. See vendored/GekkoNet patch for README.md:36.
     config.input_history_size  = 60000;
     if (host_kind == SessionKind::BATTLE) {
-        config.input_prediction_window = 8;
+        // Must match the players' battle prediction_window (16) so the
+        // spectator's rollback + desync-checkpoint budget lines up with the
+        // session it's mirroring. Was stale at 8.
+        config.input_prediction_window = 16;
     } else {
         // CSS or anything else → lockstep config
         config.input_prediction_window = 0;
@@ -2101,37 +2147,39 @@ bool Netplay_StartBattle() {
 
     AddSubscribedSpectatorsToSession();
 
-    // Runahead: speculatively advance local frames past confirmed input
-    // to hide input delay. GekkoNet rewinds runahead frames each tick
-    // and replays them — free latency reduction at the cost of extra
-    // sim CPU per real tick (N speculative AdvanceEvents); save/load
-    // count is fixed at 2/1 regardless of N.
+    // Runahead: speculatively advance `runahead` extra frames PAST confirmed
+    // input EVERY tick, re-simulating them, to hide the VISUAL lag of input
+    // delay. The catch: that's `1 + runahead` full sim passes per wall-clock
+    // frame, ALWAYS (not just on rollback). At 100 FPS the per-frame budget
+    // is only 10 ms, and a lot of 2DFM players are on weak hardware where
+    // even plain rollback strains — runahead on top routinely blows the
+    // budget and drops frames. So:
     //
-    // Runahead's correct value is exactly the input delay: re-simulating
-    // `local_delay` frames cancels the VISUAL lag of that delay, so
-    // local input feels instant. Less leaves lag visible; more just
-    // re-simulates frames that buy nothing. So it tracks the negotiated
-    // local_delay rather than a fixed number — a static value would
-    // under- or over-shoot whatever delay the connection ended up with.
-    // FM2K's sim is microseconds-cheap, so even runahead 15 is fine.
+    //   DEFAULT OFF. Runahead is opt-in, not automatic.
     //
-    // FM2K_RUNAHEAD env override force-pins 0..15 for A/B feel testing.
-    // 0 disables runahead entirely. F8 toggles between 0 and this value
-    // live (Netplay_RequestRunaheadToggle / Netplay_PollRunaheadToggle).
-    int runahead = local_delay;
-    if (runahead < 0)  runahead = 0;
-    if (runahead > 15) runahead = 15;  // GekkoNet runahead is a u8 cap
+    // It's a latency-feel nicety, not a correctness feature — turning it off
+    // costs only visible input lag (which the input delay already covers),
+    // never desync. F8 toggles it on to `runahead_pref` (= local_delay, the
+    // value that exactly cancels the delay's visual lag) for anyone who wants
+    // it and has the CPU headroom. FM2K_RUNAHEAD env force-pins 0..15.
+    int runahead_pref = local_delay;            // the "on" value F8 enables
+    if (runahead_pref < 0)  runahead_pref = 0;
+    if (runahead_pref > 15) runahead_pref = 15; // GekkoNet runahead is a u8 cap
+    int runahead = 0;                           // DEFAULT OFF (see above)
     if (const char* env = std::getenv("FM2K_RUNAHEAD"); env && env[0]) {
         int v = std::atoi(env);
-        if (v >= 0 && v <= 15) runahead = v;
+        if (v >= 0 && v <= 15) {
+            runahead = v;
+            if (v > 0) runahead_pref = v;       // env-on also sets the F8 target
+        }
     }
-    g_runahead_user_pref = runahead;
+    g_runahead_user_pref = runahead_pref;
     g_runahead_active.store(runahead, std::memory_order_release);
     gekko_set_runahead(g_session, (unsigned char)runahead);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Netplay: prediction_window=%d runahead=%d (tracks local_delay=%d) "
-        "— F8 toggles runahead between 0 and %d",
-        prediction_window, runahead, local_delay, runahead);
+        "Netplay: prediction_window=%d runahead=%d (DEFAULT OFF; F8 toggles "
+        "0<->%d, local_delay=%d)",
+        prediction_window, runahead, runahead_pref, local_delay);
 
     *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
     SpectatorNode_AppendPinRng(0x12345678);
@@ -2246,7 +2294,9 @@ bool Netplay_StartBattle() {
     g_battle_entry_armed = false;
     g_battle_end_armed   = true;
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: GekkoNet session created (runahead=4)");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: GekkoNet battle session created (runahead=%d, prediction_window=%d)",
+        g_runahead_active.load(std::memory_order_acquire), g_pred_window);
     return true;
 }
 
@@ -2733,7 +2783,7 @@ bool Netplay_ProcessBattleInputPhase() {
                         frame, g_netplay_frame,
                         *(uint32_t*)FM2K::ADDR_RANDOM_SEED);
                 }
-                SaveState_Save(frame);
+                { PerfScope _ps(&g_perf_save); SaveState_Save(frame); }  // profile save cost (#62)
                 (void)SaveState_GetLastChecksum(frame);  // updates RegionChecksums via side effect
                 // Use the gameplay fingerprint as GekkoNet's desync checksum.
                 // If both peers see the same HP/pos/rng/timer values at this
@@ -2788,7 +2838,7 @@ bool Netplay_ProcessBattleInputPhase() {
                         s_rb_window_rewind_max = 0;
                     }
                 }
-                SaveState_Load(frame);
+                { PerfScope _pl(&g_perf_load); SaveState_Load(frame); }  // profile load cost (#62)
                 // Rewind the deterministic virtual clock to match the loaded
                 // frame. Without this g_virtual_time_ms stays at its forward-sim
                 // value, replay main_game_loop iterations read timeGetTime()
@@ -2954,12 +3004,16 @@ bool Netplay_ProcessBattleInputPhase() {
 
                 // Run a FULL game tick for EVERY AdvanceEvent (matching GekkoNet examples).
                 // The game loop must NOT run its own tick - we handle everything here.
-                if (original_process_game_inputs) {
-                    original_process_game_inputs();
+                {
+                    PerfScope _pa(&g_perf_adv);  // profile game-tick cost (#62)
+                    if (original_process_game_inputs) {
+                        original_process_game_inputs();
+                    }
+                    if (original_update_game) {
+                        original_update_game();
+                    }
                 }
-                if (original_update_game) {
-                    original_update_game();
-                }
+                PerfMaybeReport();
 
                 if (running_ahead) {
                     // Restore palette-flash TIMER only (see snapshot above).
