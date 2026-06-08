@@ -2625,10 +2625,14 @@ bool Netplay_ProcessBattleInputPhase() {
             gekko_add_local_input(g_session, 0, &auto_p1);
             gekko_add_local_input(g_session, 1, &auto_p2);
         } else {
-            // Legacy: same keyboard input on both slots (self-contained
-            // idle-stress test).
+            // Local 2P: P1 keeps the captured local input (binder slot 0);
+            // P2 gets its OWN binder mask (slot 1). Previously both slots got
+            // the same local_input — a leftover from idle-only stress — which
+            // made the P1 controller drive BOTH players, so you couldn't set
+            // up a real combo against an independent P2 (e.g. keyboard).
+            uint16_t p2_input = Input_CaptureLocalPlayer(1);
             gekko_add_local_input(g_session, 0, &local_input);
-            gekko_add_local_input(g_session, 1, &local_input);
+            gekko_add_local_input(g_session, 1, &p2_input);
         }
     } else {
         gekko_add_local_input(g_session, g_player_index, &local_input);
