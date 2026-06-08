@@ -17,6 +17,12 @@
 
 IDI_APP_ICON ICON "assets/icon.ico"
 
+// Application manifest (RT_MANIFEST=24, CREATEPROCESS_MANIFEST_RESOURCE_ID=1).
+// Suppresses the Program Compatibility Assistant "might not have installed
+// correctly" popup by marking the EXE UAC-aware + modern-OS aware. See
+// app.manifest for the rationale.
+1 24 "app.manifest"
+
 1 VERSIONINFO
 FILEVERSION    FM2K_VER_MAJOR,FM2K_VER_MINOR,FM2K_VER_PATCH,FM2K_VER_BUILD
 PRODUCTVERSION FM2K_VER_MAJOR,FM2K_VER_MINOR,FM2K_VER_PATCH,FM2K_VER_BUILD

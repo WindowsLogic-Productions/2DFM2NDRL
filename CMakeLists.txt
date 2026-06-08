@@ -408,7 +408,7 @@ add_dependencies(FM2K_RollbackLauncher FM2KHook fm2k_version libwinpthread_no_rs
 # FM2KUpdater.exe — companion process spawned by the launcher to
 # perform the actual EXE/DLL replacement after launcher exit. Tiny
 # binary, zero deps beyond Win32. See tools/FM2KUpdater.cpp.
-add_executable(FM2KUpdater tools/FM2KUpdater.cpp)
+add_executable(FM2KUpdater tools/FM2KUpdater.cpp updater.rc)
 target_link_options(FM2KUpdater PRIVATE
     -static
     -static-libgcc

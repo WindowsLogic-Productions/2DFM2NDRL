@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for FM2K_RollbackLauncher.exe and FM2KUpdater.exe.
+
+  Why this exists: without a manifest, Windows treats the EXE as a legacy
+  (UAC-unaware) program and the Program Compatibility Assistant's
+  installer-detection heuristic fires the "This program might not have
+  installed correctly" popup -- triggered by the auto-updater replacing
+  files on disk, which "looks like" an install. Declaring
+  requestedExecutionLevel marks the app UAC-aware (PCA skips installer
+  detection), and the <compatibility> supportedOS list marks it modern-OS
+  aware (PCA skips the compatibility-shim prompt).
+
+  asInvoker (NOT requireAdministrator): the launcher injects into a child
+  process it created itself as the same user, which does not need elevation.
+  Keep it asInvoker so users never see a UAC prompt.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32"
+                    name="FM2K.RollbackLauncher"
+                    version="1.0.0.0"
+                    processorArchitecture="*"/>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- Windows 10 / 11 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/> <!-- Windows 8.1 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/> <!-- Windows 8 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/> <!-- Windows 7 -->
+    </application>
+  </compatibility>
+</assembly>
