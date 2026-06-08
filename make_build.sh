@@ -17,7 +17,17 @@ fi
 
 cd build # change to build directory
 
-
+# Load build secrets (FM2K_LOG_UPLOAD_SECRET etc.) into the environment so
+# CMake bakes them at configure time. Without this the crash/desync auto-upload
+# secret bakes empty and EVERY upload is 4xx-rejected (telemetry blackout).
+# `set +x` around the source so the secret is never echoed to the build log.
+if [ -f "$HOME/.config/fm2k-release.env" ]; then
+    set +x
+    set -a
+    . "$HOME/.config/fm2k-release.env"
+    set +a
+    set -x
+fi
 
 # Force CMake to run
 cmake .. -G "Ninja" -D CMAKE_BUILD_TYPE=RelWithDebInfo \
