@@ -2,6 +2,7 @@
 // See FM2K_UploadQueue.h for the design.
 
 #include "FM2K_UploadQueue.h"
+#include "FM2KHook/src/util/pii_scrub.h"  // fm2k::pii::Scrub — redact OS username etc. from the meta we transmit
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_log.h>
@@ -494,8 +495,17 @@ bool ProcessImpl(const ProcessorConfig& cfg) {
         attachments.push_back({std::move(base), std::move(body)});
     }
 
+    // Scrub PII from the META we transmit (OS username in the "files" path,
+    // public IPs, emails, etc.). file_paths were already resolved from the
+    // un-scrubbed manifest_text above and the attachments are already loaded,
+    // so this affects ONLY what's sent to the server, never local file lookup.
+    // Log *contents* in the zip are already scrubbed at write time by the hook;
+    // this closes the last leak (the absolute path in the manifest) so we can
+    // safely default auto-upload ON for the community.
+    const std::string meta_to_send = fm2k::pii::Scrub(manifest_text);
+
     HttpResp resp;
-    bool sent = HttpPostMultipart(cfg.upload_url, cfg.secret, manifest_text,
+    bool sent = HttpPostMultipart(cfg.upload_url, cfg.secret, meta_to_send,
                                   attachments, resp);
 
     if (sent && resp.status == 200) {
