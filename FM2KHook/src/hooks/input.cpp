@@ -208,3 +208,32 @@ uint16_t Input_CaptureLocal() {
 
     return input;
 }
+
+uint16_t Input_CaptureLocalPlayer(int player) {
+    // Same focus guard as Input_CaptureLocal — no input when we're not the
+    // foreground window (prevents cross-instance bleed).
+    if (!IsOurWindowFocused()) {
+        return 0;
+    }
+    // Only the binder path is meaningful per-player; the vanilla
+    // get_player_input fallback is P1-only. So if this slot has no bound
+    // keys, return 0. Bindings are assumed already loaded this frame by the
+    // Input_CaptureLocal() call that runs just before us in the stress path.
+    const auto& pb = FM2KInputBinder::Bindings(player);
+    bool active = false;
+    for (const auto& b : pb.bits) {
+        if (b.source != FM2KInputBinder::Binding::Source::NONE) {
+            active = true;
+            break;
+        }
+    }
+    if (!active) {
+        return 0;
+    }
+    uint16_t bound = FM2KInputBinder::Sample_Win32(player);
+    // Mask START on CSS, same as Input_CaptureLocal (pressing it on
+    // character-select bails to title and wedges the session).
+    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    if (game_mode == 2000) bound &= (uint16_t)~0x400u;
+    return bound;
+}

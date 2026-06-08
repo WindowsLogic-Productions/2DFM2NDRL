@@ -16,3 +16,11 @@
 //   0x400 = Pause
 
 uint16_t Input_CaptureLocal();
+
+// Sample ONE player's bound input (binder slot `player`), with the same
+// focus guard + CSS START mask as Input_CaptureLocal. Returns 0 if our
+// window isn't focused or that slot has no bindings. Used by the local-2P
+// stress path so P2 reads its OWN bindings (e.g. keyboard) instead of being
+// shadowed by P1's controller. Assumes the binder was already Init/Load'd
+// this frame by an Input_CaptureLocal() call (the stress path does that).
+uint16_t Input_CaptureLocalPlayer(int player);
