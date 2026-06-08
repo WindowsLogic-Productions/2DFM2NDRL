@@ -221,8 +221,9 @@ struct LauncherUI::HubState {
 // PollUploadQueue (a class method) can read it without piping a class
 // member through. Initialized from dev_flags.ini on first Render() and
 // kept in sync when the checkbox flips. See FM2K_UploadQueue.cpp for
-// the upload pipeline.
-static bool g_auto_upload_logs = false;
+// the upload pipeline. Default ON (meta is PII-scrubbed before transmit);
+// the loaded dev_flags.ini value overrides this once the user opts out.
+static bool g_auto_upload_logs = true;
 
 static bool HubPreflightPunch(uint16_t local_port,
                               const std::string& peer_ip,
@@ -3828,14 +3829,17 @@ void LauncherUI::RenderSessionControls() {
                                       v ? "1" : nullptr);
             return v;
         }();
-        // Auto-upload crash + desync diagnostics to the hub. Default
-        // OFF until the user explicitly opts in — uploading game logs
-        // is sensitive even though they're already partially redacted.
+        // Auto-upload crash + desync diagnostics to the hub. Default ON
+        // now that the META is PII-scrubbed before transmit (fm2k::pii::Scrub
+        // in FM2K_UploadQueue) and log contents are scrubbed at write time —
+        // so we actually get crash telemetry from the playerbase instead of
+        // chasing manual log sends. Users can still opt OUT via the dev
+        // checkbox (the saved flag overrides this default once they touch it).
         // No env var: the launcher reads g_auto_upload_logs directly
         // in PollUploadQueue and the hook side doesn't need to know.
         // File-scope (not function-static) so PollUploadQueue can read.
         static bool s_auto_upload_logs_loaded = []() {
-            g_auto_upload_logs = LoadDevFlag("auto_upload_logs", false);
+            g_auto_upload_logs = LoadDevFlag("auto_upload_logs", true);
             return true;
         }();
         (void)s_auto_upload_logs_loaded;
