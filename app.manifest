@@ -2,25 +2,32 @@
 <!--
   Application manifest for FM2K_RollbackLauncher.exe and FM2KUpdater.exe.
 
+  NOTE: XML comments may NOT contain a double hyphen anywhere except the
+  closing delimiter. Earlier revisions used the project's "no em dash, use
+  double hyphen" prose style inside these comments, which produced
+  "Error in manifest or policy file on line 1. Invalid Xml syntax" from the
+  SxS activation-context parser, so the launcher died at startup with "the
+  application has failed to start because its side-by-side configuration is
+  incorrect" (rc=1, never reaching WinMain). Keep these comments free of
+  double hyphens.
+
   Why this exists: without a manifest, Windows treats the EXE as a legacy
-  (UAC-unaware) program and the Program Compatibility Assistant's
-  installer-detection heuristic fires the "This program might not have
-  installed correctly" popup -- triggered by the auto-updater replacing
-  files on disk, which "looks like" an install. Declaring
-  requestedExecutionLevel marks the app UAC-aware (PCA skips installer
-  detection), and the <compatibility> supportedOS list marks it modern-OS
-  aware (PCA skips the compatibility-shim prompt).
+  (UAC unaware) program and the Program Compatibility Assistant's
+  installer detection heuristic fires the "This program might not have
+  installed correctly" popup, triggered by the auto updater replacing files
+  on disk, which looks like an install. Declaring requestedExecutionLevel
+  marks the app UAC aware (PCA skips installer detection), and the
+  compatibility supportedOS list marks it modern OS aware (PCA skips the
+  compatibility shim prompt).
 
   asInvoker (NOT requireAdministrator): the launcher injects into a child
   process it created itself as the same user, which does not need elevation.
   Keep it asInvoker so users never see a UAC prompt.
+
+  No top level assemblyIdentity element: it is optional for an application
+  (EXE) manifest. trustInfo and compatibility below are what suppress PCA.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32"
-                    name="FM2K.RollbackLauncher"
-                    version="1.0.0.0"
-                    processorArchitecture="*"/>
-
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

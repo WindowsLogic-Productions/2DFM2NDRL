@@ -22,6 +22,7 @@
 #include <chrono>
 #include <string>
 #include <cstring>
+#include <cstdlib>  // std::getenv for FM2K_FULL_CRCS perf-run override
 #include <optional>
 #include <vector>
 #include <iostream>
@@ -1164,8 +1165,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         ::SetEnvironmentVariableA("FM2K_PARITY_AUTOPLAY_BATTLE", "1");
         // Force per-save full per-region CRC so the desync diagnostic
         // dump can attribute first-divergent region (vs the default
-        // 1/sec throttle that shows everything as 0x0).
-        ::SetEnvironmentVariableA("FM2K_FULL_CRCS", "1");
+        // 1/sec throttle that shows everything as 0x0). Respect an
+        // explicit FM2K_FULL_CRCS=0 from the environment so a perf run
+        // (FM2K_PERF_PROFILE=1) can measure the TRUE production save cost
+        // without the ~1.2ms/save diagnostic hash that stress mode adds.
+        if (const char* fc = std::getenv("FM2K_FULL_CRCS"); !(fc && fc[0] == '0')) {
+            ::SetEnvironmentVariableA("FM2K_FULL_CRCS", "1");
+        }
         // Apply optional --stress <filter> game-name substring match
         // (case-insensitive). Default = first discovered.
         size_t pick = 0;

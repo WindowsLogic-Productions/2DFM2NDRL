@@ -110,8 +110,25 @@ def run_phase(label: str, args: list[str], env: dict[str, str],
     on artifact appearance (.fm2krep file, .pty file) instead of process
     exit.
     """
+    # Forward opt-in debug/profiler env vars from the calling shell so a dev
+    # can do `FM2K_PERF_PROFILE=1 python3 replay_selftest.py ...` and have it
+    # reach the Windows launcher (and thus the injected hook). The phase env
+    # dicts only carry the harness-essential vars; anything in this passthrough
+    # list is layered on top if present in os.environ (phase env wins on clash).
+    env = dict(env)
+    for k in ("FM2K_PERF_PROFILE", "FM2K_STRESS_DIAG", "FM2K_FULL_CRCS",
+              "FM2K_RUNAHEAD", "FM2K_PRED_WINDOW", "FM2K_LOCAL_DELAY"):
+        if k not in env and os.environ.get(k):
+            env[k] = os.environ[k]
+
     print(f"[selftest] {label}: launching")
     print(f"[selftest]   args: {' '.join(args)}")
+    if any(k.startswith("FM2K_") and k not in
+           ("FM2K_AUTO_TERMINATE_AT_FRAME", "FM2K_PARITY_RECORD_PATH")
+           for k in env):
+        extra = {k: v for k, v in env.items() if k not in
+                 ("FM2K_AUTO_TERMINATE_AT_FRAME", "FM2K_PARITY_RECORD_PATH")}
+        print(f"[selftest]   extra env: {extra}")
     print(f"[selftest]   FM2K_AUTO_TERMINATE_AT_FRAME="
           f"{env.get('FM2K_AUTO_TERMINATE_AT_FRAME', '(unset)')}")
     print(f"[selftest]   FM2K_PARITY_RECORD_PATH="

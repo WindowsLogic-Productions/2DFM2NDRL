@@ -346,6 +346,15 @@ configure_file(
     @ONLY
 )
 
+# windres compiles launcher.rc / updater.rc, but CMake can't see the
+# `1 24 "app.manifest"` include inside the .rc, so editing app.manifest
+# alone would NOT retrigger the resource recompile (stale .res relinked,
+# the SxS/manifest fix silently doesn't ship). Declare the dependency
+# explicitly. version_rc.h is regenerated every build by make_version.sh
+# so it doesn't need listing here.
+set_source_files_properties(launcher.rc updater.rc
+    PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
+
 add_executable(FM2K_RollbackLauncher
     # launcher.rc must be FIRST so its compiled .res is the first
     # resource-bearing object on the link line. MinGW's libwinpthread.a
