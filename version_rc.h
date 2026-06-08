@@ -8,6 +8,6 @@
 
 #define FM2K_VER_MAJOR  0
 #define FM2K_VER_MINOR  2
-#define FM2K_VER_PATCH  60
+#define FM2K_VER_PATCH  61
 #define FM2K_VER_BUILD  0
-#define FM2K_VER_STRING "0.2.60"
+#define FM2K_VER_STRING "0.2.61"
