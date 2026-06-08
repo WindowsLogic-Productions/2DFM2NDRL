@@ -2430,7 +2430,13 @@ void __cdecl Hook_RenderGame() {
     bool do_render = !gate_render || g_frame_pending_render;
     EbDiag_Dump("PRE-RENDER");
     if (do_render && original_render_game) {
+        // Render RNG isolation: re-seed the render stream from the gameplay
+        // seed, then route render's game_rand draws to it (see globals.h /
+        // Hook_GameRand). Gameplay seed is left untouched by render.
+        g_render_rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+        g_in_render_rng = true;
         original_render_game();
+        g_in_render_rng = false;
         g_frame_pending_render = false;
     }
     EbDiag_Dump("POST-RENDER");
@@ -2566,6 +2572,22 @@ void Hook_FlushRngTrace() {
 // Hook: GameRand
 // Records the call to the trace file (if enabled) then forwards.
 uint32_t __cdecl Hook_GameRand() {
+    // Render RNG stream isolation (see globals.h). During render_game, draw
+    // from g_render_rng_seed via a seed-swap so render's color/effect
+    // randomness NEVER advances the gameplay seed (0x41FB1C). That keeps the
+    // gameplay rng cadence-independent -> deterministic across rollback and
+    // across peers (the root fix for the palette/afterimage desync + crash).
+    // The render seed is re-seeded from the gameplay seed each render, so
+    // colors stay deterministic per confirmed frame and identical on both
+    // peers. Render rng is intentionally NOT traced (it's a separate stream).
+    if (g_in_render_rng) {
+        const uint32_t gameplay = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = g_render_rng_seed;
+        const uint32_t r = original_game_rand ? original_game_rand() : 0;
+        g_render_rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = gameplay;  // gameplay seed untouched
+        return r;
+    }
     RngTrace_ResolveOnce();
     if (!g_rng_trace_enabled) {
         return original_game_rand ? original_game_rand() : 0;

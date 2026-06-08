@@ -2895,24 +2895,18 @@ bool Netplay_ProcessBattleInputPhase() {
                 // drains naturally over forward sim so host needs to
                 // match by also draining during re-sim.
                 if (running_ahead) {
+                    // Palette-flash TIMER snapshot only (prevents the flash
+                    // timer draining ~5x under runahead -> the "flash cuts
+                    // out" bug). The RNG snapshot/restore that used to live
+                    // here is GONE: render-side rng is now its own stream
+                    // (see Hook_GameRand / globals.h), so speculative sim
+                    // advances no longer over-consume render rng, and manually
+                    // restoring the gameplay seed here is exactly what made
+                    // cross-peer rng diverge under real rollback.
                     std::memcpy(pal_pre.effect_sys1,
                                 (void*)kEffectSys1Addr,
                                 kEffectSys1Size);
                     std::memcpy(pal_pre.pflash2, (void*)kPflash2Addr, kPflash2Size);
-                    // Snapshot RNG too. Same reason: under runahead, PGI
-                    // (character_state_machine and friends) calls game_rand()
-                    // multiple times per advance. With 1 confirmed + 4
-                    // speculative advances per wall-clock frame, sim RNG
-                    // progresses ~5x faster than vanilla, which means
-                    // ProcessColorInterpolation mode 3 (the random palette
-                    // flash mode used by Bewear 214B) reads a different
-                    // seed than vanilla would — same draw-rate, same
-                    // duration, but different colors per frame. Restoring
-                    // RNG after speculative advances makes sim RNG progress
-                    // 1/wall-clock-frame matching vanilla, so palette mode 3
-                    // (and any other render-side RNG consumer) sees the
-                    // same seed at render time as offline 2DFM_Player.
-                    pal_pre.rng_seed = *(uint32_t*)0x41FB1C;
                 }
 
                 // v0.2.48's Phase F PostRenderRng restore was re-tested
@@ -2968,11 +2962,12 @@ bool Netplay_ProcessBattleInputPhase() {
                 }
 
                 if (running_ahead) {
+                    // Restore palette-flash TIMER only (see snapshot above).
+                    // Gameplay RNG is intentionally NOT restored here anymore.
                     std::memcpy((void*)kEffectSys1Addr,
                                 pal_pre.effect_sys1,
                                 kEffectSys1Size);
                     std::memcpy((void*)kPflash2Addr, pal_pre.pflash2, kPflash2Size);
-                    *(uint32_t*)0x41FB1C = pal_pre.rng_seed;
                 }
 
                 if (diag_enabled) {
