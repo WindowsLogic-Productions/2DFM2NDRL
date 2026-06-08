@@ -59,6 +59,45 @@ namespace EffectAddrs {
     constexpr size_t    SHAKE_EFFECTS_SZ = 40;
 }
 
+// --- TEMP per-region save sub-profiler (FM2K_PERF_PROFILE=1) -------------
+// Attributes the 1.58ms/save cost to specific memcpy blocks so #62 can
+// target the heaviest one. Same env gate as the netplay-side [PERF] line.
+// Reports avg microsec/region every 500 saves. Remove once #62 lands.
+namespace {
+struct SBucket { uint64_t ns = 0; uint32_t n = 0; };
+static const bool g_ss_perf_on = [] {
+    const char* v = std::getenv("FM2K_PERF_PROFILE");
+    return v && v[0] && v[0] != '0';
+}();
+static uint64_t SsQpcFreq() {
+    static uint64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return (uint64_t)q.QuadPart; }();
+    return f;
+}
+static inline uint64_t SsNowNs() {
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (uint64_t)((long double)c.QuadPart * 1e9L / (long double)SsQpcFreq());
+}
+static SBucket g_ss_char, g_ss_obj, g_ss_after, g_ss_misc, g_ss_fp, g_ss_sound;
+static SBucket g_ss_head, g_ss_tail, g_ss_full;
+struct SScope {
+    SBucket* b; uint64_t t0;
+    explicit SScope(SBucket* x) : b(g_ss_perf_on ? x : nullptr), t0(b ? SsNowNs() : 0) {}
+    ~SScope() { if (b) { b->ns += SsNowNs() - t0; b->n++; } }
+};
+static void SsMaybeReport() {
+    if (!g_ss_perf_on) return;
+    static uint32_t t = 0;
+    if (++t % 500 != 0) return;
+    auto us = [](const SBucket& b) { return b.n ? (double)b.ns / b.n / 1000.0 : 0.0; };
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "[PERF-SAVE] head=%.1fus char=%.1fus obj=%.1fus afterimage=%.1fus misc=%.1fus "
+        "fingerprint=%.1fus sound=%.1fus tail=%.1fus fullcrc=%.1fus(x%u) (n=%u)",
+        us(g_ss_head), us(g_ss_char), us(g_ss_obj), us(g_ss_after), us(g_ss_misc),
+        us(g_ss_fp), us(g_ss_sound), us(g_ss_tail), us(g_ss_full), g_ss_full.n,
+        g_ss_char.n);
+}
+}  // namespace
+
 // Rollback buffer
 static constexpr int MAX_ROLLBACK_FRAMES = 64;
 static SaveStateData g_state_buffer[MAX_ROLLBACK_FRAMES];
@@ -558,6 +597,7 @@ const RegionChecksums& SaveState_GetRegionChecksums() {
 #else  // FM2K — full body below
 
 bool SaveState_Save(int frame) {
+    const uint64_t _ss_t_entry = g_ss_perf_on ? SsNowNs() : 0;
     // Handle frame -1 as frame 0 (initial state before first frame)
     // GekkoNet sends this during initialization
     if (frame < 0) {
@@ -818,6 +858,8 @@ bool SaveState_Save(int frame) {
     //
     //   Typical cost before: 460 KB memcpy per save.
     //   Typical cost after : 8 × 1-byte check + 2 × 57 KB memcpy ≈ 114 KB.
+    if (g_ss_perf_on) { g_ss_head.ns += SsNowNs() - _ss_t_entry; g_ss_head.n++; }
+    { SScope _s(&g_ss_char);
     for (size_t i = 0; i < NUM_CHAR_SLOTS; i++) {
         uintptr_t slot_base = CHAR_SLOT_BASE + (i * CHAR_SLOT_SIZE);
         uintptr_t dynamic_addr = slot_base + CHAR_SLOT_DYNAMIC_OFFSET;
@@ -826,6 +868,7 @@ bool SaveState_Save(int frame) {
         } else {
             state->char_dynamic[i][0] = 0;  // mark slot inactive for Load
         }
+    }
     }
 
     // Save object pool (projectiles, effects)
@@ -838,6 +881,7 @@ bool SaveState_Save(int frame) {
     //   Typical cost before: 391 KB memcpy per save.
     //   Typical cost after : 1023 × 1-byte read + ~10 × 382 B memcpy ≈ 5 KB.
     {
+        SScope _s(&g_ss_obj);
         constexpr size_t OBJ_SZ = OBJECT_POOL_STRIDE;
         constexpr size_t OBJ_COUNT = SaveStateData::SavedRegionCRCs::OBJ_SLOT_COUNT;
         const uint8_t* src_base = (const uint8_t*)ADDR_OBJECT_POOL;
@@ -854,10 +898,12 @@ bool SaveState_Save(int frame) {
     }
 
     // Save input history
+    g_ss_misc.ns -= g_ss_perf_on ? SsNowNs() : 0;
     memcpy(state->input_history, (void*)ADDR_INPUT_HISTORY, SIZE_INPUT_HISTORY);
 
     // Save game state
     memcpy(state->game_state, (void*)ADDR_GAME_STATE, SIZE_GAME_STATE);
+    if (g_ss_perf_on) { g_ss_misc.ns += SsNowNs(); g_ss_misc.n++; }
 
     // Save effect/shake state - affects animation script execution during rollback
     memcpy(state->effect_sys1, (void*)EffectAddrs::EFFECT_SYS1, EffectAddrs::EFFECT_SYS1_SZ);
@@ -919,7 +965,8 @@ bool SaveState_Save(int frame) {
     // same saved bytes there, killing the f=9 AfterimagePool +0x4A4 diff.
     // Live memory keeps whatever main_game_loop last wrote; the save buffer
     // has a deterministic 0 at that slot.
-    memcpy(state->afterimage_pool,         (void*)WaveCAddrs::AFTERIMAGE_POOL,      WaveCAddrs::AFTERIMAGE_POOL_SZ);
+    { SScope _s(&g_ss_after);
+      memcpy(state->afterimage_pool,       (void*)WaveCAddrs::AFTERIMAGE_POOL,      WaveCAddrs::AFTERIMAGE_POOL_SZ); }
     constexpr size_t G_LAST_FRAME_TIME_OFFSET = 0x447DD4 - WaveCAddrs::AFTERIMAGE_POOL;  // 0x4A4
     *(uint32_t*)(state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET) = 0;
     // Shake region overlap: g_shake_effect_1/_2 (40 bytes at 0x447DA9) live
@@ -947,7 +994,7 @@ bool SaveState_Save(int frame) {
     // DSound hardware state — it's the sim's record of what each channel
     // should be playing. Actual DSound plays are driven post-advance by the
     // sync step; hardware state is deliberately not rolled back.
-    SoundRollback::CaptureDesired(state->sound_desired);
+    { SScope _s(&g_ss_sound); SoundRollback::CaptureDesired(state->sound_desired); }
 
     // Checksum path split for perf:
     //   - Always compute the cheap gameplay fingerprint (~44 B hash). This
@@ -958,7 +1005,8 @@ bool SaveState_Save(int frame) {
     //     times saved_region_crcs contains only fingerprint + rng;
     //     per-region fields are zeroed (not a problem because nothing
     //     reads them outside the throttled scan path).
-    SaveState_CalculateFingerprint();
+    { SScope _s(&g_ss_fp); SaveState_CalculateFingerprint(); }
+    const uint64_t _ss_t_tail = g_ss_perf_on ? SsNowNs() : 0;
     static DWORD last_full_crc_tick = 0;
     DWORD full_crc_now = GetTickCount();
     // FM2K_FULL_CRCS=1 forces the expensive per-region CRC on EVERY save
@@ -977,6 +1025,7 @@ bool SaveState_Save(int frame) {
                          || (full_crc_now - last_full_crc_tick) >= 1000;
     if (full_crcs_due) {
         last_full_crc_tick = full_crc_now;
+        SScope _s(&g_ss_full);
         SaveState_CalculateFullChecksum();
     }
     state->checksum = g_region_checksums.combined;  // zero on non-due saves, fine
@@ -1066,6 +1115,8 @@ bool SaveState_Save(int frame) {
             SaveState_GetRegionChecksums().gameplay_fingerprint);
     }
 
+    if (g_ss_perf_on) { g_ss_tail.ns += SsNowNs() - _ss_t_tail; g_ss_tail.n++; }
+    SsMaybeReport();
     return true;
 }
 
