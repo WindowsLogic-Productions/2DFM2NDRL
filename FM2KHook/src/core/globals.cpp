@@ -10,6 +10,11 @@ RenderGameFunc original_render_game = nullptr;
 GameRandFunc original_game_rand = nullptr;
 ProcessGameInputsFunc original_process_game_inputs = nullptr;
 
+// Render RNG stream (see globals.h). Re-seeded from the gameplay seed each
+// render; advanced only by render-side game_rand draws via Hook_GameRand.
+uint32_t g_render_rng_seed = 0;
+bool     g_in_render_rng   = false;
+
 // Minimal global state
 int g_player_index = 0;
 uint32_t g_frame_counter = 0;

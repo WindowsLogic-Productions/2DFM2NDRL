@@ -25,6 +25,18 @@ extern RenderGameFunc original_render_game;
 extern GameRandFunc original_game_rand;
 extern ProcessGameInputsFunc original_process_game_inputs;
 
+// Render RNG stream isolation (rollback/cross-peer determinism).
+// game_rand() is a single shared LCG used by BOTH sim and render. Render runs
+// at per-peer-variable cadence (frame-skip/runahead/rollback), so its
+// game_rand consumption can't be made cross-peer-deterministic on the shared
+// seed. Fix: while g_in_render_rng is set (around render_game), Hook_GameRand
+// draws from g_render_rng_seed instead of the gameplay seed, leaving the
+// gameplay rng (g_rand_seed @ 0x41FB1C) untouched by render. g_render_rng_seed
+// is re-seeded from the gameplay seed at the start of each render, so render
+// colors are deterministic per confirmed frame AND identical across peers.
+extern uint32_t g_render_rng_seed;
+extern bool     g_in_render_rng;
+
 // ============================================================================
 // ENGINE TARGET — the same source compiles into:
 //   FM2KHook.dll : default build, addresses target Fighter Maker 2nd binaries

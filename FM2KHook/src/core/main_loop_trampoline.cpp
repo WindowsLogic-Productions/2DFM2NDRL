@@ -245,7 +245,14 @@ static void RenderFrameWithSnapshot() {
     }
 
     EbDiag_Dump("PRE-RENDER");
+    // Render RNG isolation: re-seed the render stream from the gameplay seed,
+    // then route render's game_rand draws to it (see globals.h / Hook_GameRand).
+    // Render never advances the gameplay seed -> rollback/cross-peer
+    // determinism; render colors stay deterministic per confirmed frame.
+    g_render_rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
+    g_in_render_rng = true;
     original_render_game();
+    g_in_render_rng = false;
     EbDiag_Dump("POST-RENDER");
 
     if (protect) {
@@ -277,15 +284,13 @@ static void RenderFrameWithSnapshot() {
     }
     EbDiag_Dump("POST-RESTORE");
 
-    // Back-patch the most-recently-saved slot's rng_seed with the post-
-    // render rng so rollback Load gives replay sim the same starting rng
-    // forward sim sees on the next frame. Without this, forward accumulated
-    // render-side game_rand calls (ProcessShakeEffect mode 4 +
-    // ProcessColorInterpolation mode 3) but replay didn't, and they
-    // diverged on the rng region after any rollback — exactly the
-    // "RNG_Seed forward 0x... replay 0x... DIFF" dump in
-    // FM2K_P*_desync_f*.log. Cheap (single uint32 store).
-    SaveState_PatchPostRenderRng(*(uint32_t*)FM2K::ADDR_RANDOM_SEED);
+    // (PostRenderRng back-patch REMOVED.) It existed because render-side
+    // game_rand calls advanced the shared gameplay seed, so the saved slot
+    // had to be patched to post-render rng for forward/replay to agree. With
+    // render RNG now isolated to g_render_rng_seed (see Hook_GameRand), render
+    // no longer touches the gameplay seed at all — the saved seed is already
+    // the pure sim rng, identical across peers. No patch needed, and the
+    // patch was what made cross-peer rng diverge under real rollback.
 
     SharedMem_Update();
 }
