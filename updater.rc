@@ -1,0 +1,11 @@
+// Win32 resource script for FM2KUpdater.exe.
+//
+// Embeds the shared app manifest so the Program Compatibility Assistant
+// doesn't fire "This program might not have installed correctly" -- the
+// updater extracts a zip and overwrites the launcher's files, which is
+// exactly the installer-like behavior PCA flags on UAC-unaware EXEs.
+// The manifest marks it UAC-aware (asInvoker) + modern-OS aware. See
+// app.manifest.
+
+// RT_MANIFEST=24, CREATEPROCESS_MANIFEST_RESOURCE_ID=1.
+1 24 "app.manifest"
