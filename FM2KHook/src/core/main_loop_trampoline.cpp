@@ -349,15 +349,25 @@ static bool PumpMessages() {
                 (unsigned)msg.wParam, (void*)msg.hwnd);
             return false;
         }
-        // Diagnostic: dump every key/cheat-relevant message coming through.
+        // Diagnostic: dump cheat-relevant key messages coming through.
         // FM2K's WindowProc maps F1-F12 to debug cheats (F1 hit-boxes, F5/F6
         // instant-KO, F12 force round-end). StudioS games are mysteriously
-        // receiving F12 events the user isn't actually pressing. Need to see
-        // what the OS / synthesizer is queuing. Filter is gone for now —
-        // we want to *see* the F12s before deciding how to handle.
-        if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP
-            || msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP
-            || msg.message == WM_CHAR)
+        // receiving F12 events the user isn't actually pressing, so we want to
+        // *see* the phantom F-keys.
+        //
+        // Default: only the function keys (VK_F1=0x70 .. VK_F24=0x87) on
+        // key-up/down — that's the entire point of this probe. Logging every
+        // keystroke at INFO floods the log with movement keys (each WASD tap is
+        // a KEYDOWN + KEYUP + WM_CHAR), so the firehose is gated behind
+        // FM2K_MSG_DIAG=1 for when someone's actively debugging input routing.
+        static const bool s_msg_diag = []() {
+            const char* v = std::getenv("FM2K_MSG_DIAG");
+            return v && v[0] == '1';
+        }();
+        const bool is_key = (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP
+            || msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP);
+        const bool is_fkey = is_key && msg.wParam >= VK_F1 && msg.wParam <= VK_F24;
+        if (is_fkey || (s_msg_diag && (is_key || msg.message == WM_CHAR)))
         {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "[MSG] msg=0x%04X wParam=0x%02X (%u) lParam=0x%08lX hwnd=%p",
