@@ -129,6 +129,31 @@ gh release create "v${TAG_VERSION}" "$ZIP_PATH" \
     --notes "$NOTES" \
     "${GH_FLAGS[@]}"
 
+# Tag the SOURCE repo at the exact built commit. A git tag pins the commit
+# object, so even if this branch is later rebased/squashed the build commit
+# survives and the released binary stays traceable to source. This is the
+# fix for the v0.2.46 incident: history was rebased after release, the
+# build commit was orphaned, and the baked rev no longer existed in git --
+# so a real regression was un-bisectable for six weeks. make_version.sh
+# bakes `git rev-parse --short HEAD` into the binary; this tag pins that
+# exact HEAD. NEVER rebase/squash a branch after it has shipped a release.
+SRC_TAG="v${TAG_VERSION}"
+if git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/${SRC_TAG}" >/dev/null 2>&1; then
+    EXISTING="$(git -C "$REPO_ROOT" rev-list -n1 "${SRC_TAG}")"
+    HEADREV="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    if [ "$EXISTING" != "$HEADREV" ]; then
+        echo "  WARNING: source tag ${SRC_TAG} already exists at ${EXISTING:0:9}" >&2
+        echo "           but HEAD is ${HEADREV:0:9} -- NOT moving it. Resolve by hand." >&2
+    else
+        echo "  source tag ${SRC_TAG} already at HEAD -- ok"
+    fi
+else
+    git -C "$REPO_ROOT" tag -a "${SRC_TAG}" \
+        -m "release ${TAG_VERSION} (rev $(git -C "$REPO_ROOT" rev-parse --short HEAD))"
+    echo "  tagged source ${SRC_TAG} @ $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    echo "  (push tags to preserve traceability: git push --tags)"
+fi
+
 if [ "$CHANNEL" = "stable" ]; then
     echo "==> bumping LatestVersion in $FM2KTEST_REPO_DIR"
     ( cd "$FM2KTEST_REPO_DIR" \
