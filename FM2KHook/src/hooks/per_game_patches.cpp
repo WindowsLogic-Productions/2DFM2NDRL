@@ -322,7 +322,15 @@ int PerGamePatches_TryOverrideInput(int player_id, uint32_t game_mode) {
         g_vs_cpu_mode.load(std::memory_order_relaxed) ||
         g_cpu_vs_cpu_mode.load(std::memory_order_relaxed) ||
         g_training_mode.load(std::memory_order_relaxed);
-    if (css && any_solo_driver_mode && player_id == 1 && original_get_player_input) {
+    // Fast-out before any input read. With no solo-driver mode engaged
+    // (the default for normal play) there's nothing to override -- and we
+    // must NOT pay for the extra original_get_player_input(0,0) DirectInput
+    // poll the battle branch below would otherwise do EVERY frame. That
+    // redundant per-frame poll is the 0.2.46 fps regression (#63); its cost
+    // scales with the machine's HID/driver stack, which is why it dropped
+    // some users to ~95fps and not others.
+    if (!any_solo_driver_mode) return -1;
+    if (css && player_id == 1 && original_get_player_input) {
         const uint16_t p1_input =
             (uint16_t)(original_get_player_input(0, 0) & 0x7FFu);
         return (int)PerGamePatches_GatedP2CssInput(p1_input);

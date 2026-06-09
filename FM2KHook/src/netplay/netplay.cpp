@@ -2800,7 +2800,23 @@ bool Netplay_ProcessBattleInputPhase() {
             case GekkoLoadEvent: {
                 int frame = update->data.load.frame;
                 load_events_in_batch++;
-                const bool is_runahead_rewind = (load_events_in_batch == 1);
+                // The first LoadEvent in a batch is the runahead rewind from
+                // last tick's speculative advance -- a fixed-distance load
+                // every tick, NOT a network rollback -- so it's excluded from
+                // the stats. BUT that's only true when runahead is actually
+                // ON. With runahead OFF (the bleeding default since the
+                // runahead-off change), there IS no speculative rewind: a
+                // real network rollback is a SINGLE LoadEvent (batch==1).
+                // Gating only on (batch==1) then misclassified every real
+                // rollback as a runahead rewind, so g_rollback_count stayed
+                // pinned at 0 forever even while rollbacks visibly happened
+                // (pringle's "visual rollbacks but the number stays 0", and
+                // the rb_total=0 on the 200ms c785d0ca desync). Only skip the
+                // first load when runahead is live.
+                const bool runahead_on =
+                    g_runahead_active.load(std::memory_order_acquire) > 0;
+                const bool is_runahead_rewind =
+                    runahead_on && (load_events_in_batch == 1);
                 g_last_rollback_frame = g_netplay_frame;
                 // Rolling stats only fire for real (non-runahead) rollbacks.
                 // The first LoadEvent in any batch is the runahead rewind

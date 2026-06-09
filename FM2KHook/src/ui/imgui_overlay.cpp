@@ -678,6 +678,21 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
     ComputeCncDdrawGameRect(pDevice, g_game_viewport);
 
     ClipCursor(nullptr);
+
+    // Hard overlay bypass for A/B perf testing (#63). FM2K_OVERLAY_OFF=1
+    // skips the ENTIRE ImGui pipeline (NewFrame + Render + RenderDrawData)
+    // for this present. The in-game overlay landed in the v0.2.5x catchup
+    // (~5/18) and runs unconditionally every frame; it's the prime suspect
+    // for the field-wide 95fps regression. This flag lets a user confirm
+    // that by toggling it -- if fps snaps back to 100 with it set, the
+    // overlay is the cause. (The empty-draw-list skip below is the actual
+    // always-on fix; this is the measurement tool / escape hatch.)
+    static const bool s_overlay_off = []{
+        const char* v = std::getenv("FM2K_OVERLAY_OFF");
+        return v && v[0] == '1';
+    }();
+    if (s_overlay_off) return EndScene_orig(pDevice);
+
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -864,7 +879,19 @@ HRESULT APIENTRY Hook_EndScene(LPDIRECT3DDEVICE9 pDevice) {
 
     ImGui::EndFrame();
     ImGui::Render();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    // Skip the D3D9 draw submission when the frame produced no geometry.
+    // ImGui_ImplDX9_RenderDrawData saves and restores the entire device
+    // state (state block + render/sampler/transform state) on EVERY call --
+    // ~0.3-0.5ms on many drivers -- which is pure waste when the HUD,
+    // overlay, badges and chat are all idle (the default for a normal
+    // match). That always-on cost, added with the in-game overlay in the
+    // v0.2.5x catchup, is what dropped slower machines from 100 to ~95fps
+    // (#63). When anything IS visible, TotalVtxCount > 0 and it renders
+    // normally, so this is safe with no per-element visibility predicate.
+    ImDrawData* draw_data = ImGui::GetDrawData();
+    if (draw_data && draw_data->TotalVtxCount > 0) {
+        ImGui_ImplDX9_RenderDrawData(draw_data);
+    }
 
     return EndScene_orig(pDevice);
 }
