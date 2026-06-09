@@ -4671,26 +4671,35 @@ void LauncherUI::PollUploadQueue() {
     // in the developer section).
     if (!g_auto_upload_logs) return;
 
-    // Need a game selected to know which game_dir to scan.
-    if (selected_game_index_ < 0 ||
-        selected_game_index_ >= (int)games_.size()) return;
-
     // Bail when the build had no secret baked in — nowhere to upload.
     if (!fm2k::kLogUploadSecret || fm2k::kLogUploadSecret[0] == '\0') return;
 
-    std::filesystem::path exe =
-        fm2k::utf8path::Utf8ToWide(games_[selected_game_index_].exe_path);
+    if (games_.empty()) return;
+
+    // Round-robin through ALL installed games, one game per tick, instead
+    // of only the UI-selected one. The old code scanned
+    // games_[selected_game_index_] only, which meant a crash/desync bundle
+    // in (say) pkmncc/upload_queue never uploaded unless the user happened
+    // to reopen the launcher AND re-select pkmncc — and selected_game_index_
+    // defaults to -1, so a fresh launcher start drained nothing at all.
+    // That stranded the bulk of field reports (match c785d0ca's two peers
+    // among them). Rotating one game per frame keeps the per-tick cost
+    // identical (still one Process() call) while guaranteeing every game's
+    // queue drains regardless of selection.
+    static size_t s_rr = 0;
+    if (s_rr >= games_.size()) s_rr = 0;
+    const FM2K::FM2KGameInfo& game = games_[s_rr++];
+
+    // Convert wide path to UTF-8 for the upload-queue API. fs::path
+    // already supports that natively via .u8string() but the return
+    // type changed in C++20; use string() and accept the system-
+    // codepage round-trip for the launcher (game dirs are ASCII in
+    // practice for FM2K installs).
+    std::filesystem::path exe = fm2k::utf8path::Utf8ToWide(game.exe_path);
     std::filesystem::path game_dir = exe.parent_path();
 
     fm2k::upload_queue::ProcessorConfig cfg;
-    {
-        // Convert wide path to UTF-8 for the upload-queue API. fs::path
-        // already supports that natively via .u8string() but the return
-        // type changed in C++20; use string() and accept the system-
-        // codepage round-trip for the launcher (game dirs are ASCII in
-        // practice for FM2K installs).
-        cfg.game_dir = game_dir.string();
-    }
+    cfg.game_dir   = game_dir.string();
     cfg.upload_url = fm2k::kLogUploadUrl;
     cfg.secret     = fm2k::kLogUploadSecret;
     cfg.enabled    = true;
