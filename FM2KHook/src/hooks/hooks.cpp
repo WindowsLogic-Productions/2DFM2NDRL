@@ -1629,7 +1629,13 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             // CPU vs CPU so the engine's script-driven AI takes over;
             // applies training-mode P2 behavior for training. P1 is
             // overridden too in CPU vs CPU.
-            if (game_mode >= 3000u && game_mode < 4000u) {
+            if (game_mode >= 3000u && game_mode < 4000u &&
+                (PerGamePatches_IsVsCpuModeActive() ||
+                 PerGamePatches_IsCpuVsCpuModeActive() ||
+                 PerGamePatches_IsTrainingModeActive())) {
+                // Gated on an active solo-driver mode so normal binder users
+                // don't pay the extra Sample_Win32(0) every battle frame (#63
+                // sibling to the no-binder DirectInput fix).
                 const uint16_t p1_bound_battle =
                     FM2KInputBinder::Sample_Win32(0)
                         & FM2KInputBinder::kEngineInputMask;
@@ -1668,10 +1674,15 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
     }
 
     // OPTION-button title-screen submode cycle (no-binder fallback path).
-    // Engine's original_get_player_input only produces 11 bits so OPTION
-    // (bit 11) can't fire here — but we still call the tick so the
-    // rising-edge tracker stays consistent on game_mode transitions.
-    if (player_id == 0 && original_get_player_input) {
+    // Gated on the OPTION-mode selector actually being active. When it's
+    // off (the default) OnTitleInputTick is a no-op, but the
+    // original_get_player_input(0,0) read below still cost a redundant
+    // DirectInput poll EVERY frame for player 0 -- a chunk of the 0.2.46
+    // fps regression (#63), since that poll's cost scales with the user's
+    // HID/driver stack (machine-specific 95fps). Skip the read entirely
+    // unless the selector is engaged.
+    if (player_id == 0 && original_get_player_input &&
+        PerGamePatches_IsOptionModeSelectorActive()) {
         const uint16_t raw = (uint16_t)(original_get_player_input(0, 0) & 0x7FF);
         PerGamePatches_OnTitleInputTick(raw, game_mode);
     }

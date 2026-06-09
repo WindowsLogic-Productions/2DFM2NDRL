@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -52,6 +53,14 @@ struct GamepadEntry {
 };
 std::vector<SDL_JoystickID> g_gamepad_ids;
 std::unordered_map<SDL_JoystickID, SDL_Gamepad*> g_gamepad_handles;
+// Joystick ids we've already examined and found are NOT gamepads (e.g. a
+// vJoy virtual stick). Without this, RefreshGamepadList re-ran
+// SDL_OpenJoystick + SDL_CloseJoystick on every such device EVERY refresh
+// -- a ~tens-of-ms HID open/close. On the 1s RefreshGamepads cadence added
+// in v0.2.46 that produced a once-per-second frame hitch that read as
+// ~95fps (#63). Examine each non-gamepad stick once; forget it only when
+// it's unplugged so a re-plug is re-examined.
+std::unordered_set<SDL_JoystickID> g_non_gamepad_ids;
 
 std::string g_config_path;
 bool g_initialized = false;
@@ -228,11 +237,17 @@ void RefreshGamepadList() {
     // in our binder UI.
     int joy_count = 0;
     SDL_JoystickID* joys = SDL_GetJoysticks(&joy_count);
+    std::unordered_set<SDL_JoystickID> present_joysticks;
     if (joys) {
         for (int i = 0; i < joy_count; ++i) {
             SDL_JoystickID jid = joys[i];
-            // Skip if pass 1 already opened it.
+            present_joysticks.insert(jid);
+            // Skip if pass 1 already opened it, or if we already examined it
+            // and found it is not a gamepad. The reject-cache (below) is what
+            // stops the per-refresh SDL_OpenJoystick+SDL_CloseJoystick on a
+            // non-gamepad stick (vJoy etc.) -- the ~46ms/sec hitch = "#63 95fps".
             if (g_gamepad_handles.find(jid) != g_gamepad_handles.end()) continue;
+            if (g_non_gamepad_ids.find(jid) != g_non_gamepad_ids.end()) continue;
             // SDL_IsGamepad sometimes returns false right after a
             // joystick-added event before SDL loads the device's
             // mapping. Pump + retry once before giving up.
@@ -254,6 +269,9 @@ void RefreshGamepadList() {
                         guid);
                     SDL_CloseJoystick(j);
                 }
+                // Remember it's not a gamepad so we never re-open/close it
+                // on subsequent refreshes (the #63 per-second hitch).
+                g_non_gamepad_ids.insert(jid);
                 continue;
             }
             SDL_Gamepad* gp = SDL_OpenGamepad(jid);
@@ -268,6 +286,15 @@ void RefreshGamepadList() {
             }
         }
         SDL_free(joys);
+    }
+
+    // Forget rejected sticks that were unplugged, so a re-plug gets
+    // examined once more (and isn't skipped forever by the cache above).
+    for (auto it = g_non_gamepad_ids.begin(); it != g_non_gamepad_ids.end();) {
+        if (present_joysticks.find(*it) == present_joysticks.end())
+            it = g_non_gamepad_ids.erase(it);
+        else
+            ++it;
     }
 
     // Drop any handles that disappeared.

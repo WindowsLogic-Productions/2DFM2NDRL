@@ -431,6 +431,52 @@ static void SleepToTarget(uint64_t start_qpc, uint32_t target_ms,
     }
 }
 
+// Offline-inclusive frame-pacing instrument (#63). The [PERF] and
+// BATTLE STATUS lines only fire on the netplay path, so they're blind to
+// the offline loop -- exactly the case bug bumbler hit (consistent ~95 FPS
+// offline). This samples the outer trampoline loop directly:
+//   work  = engine + render time for this frame (measured just before the
+//           pacing sleep), and
+//   frame = full wall-clock since the previous tick_start (== work + sleep).
+// Read it as: if `work` approaches/exceeds 10 ms the box is render/CPU bound
+// and SleepToTarget is innocent (it can only pad up to 10 ms, never stretch
+// past work). If `work` is small but `frame` > 10 ms, the pacing is
+// overshooting. Gated on FM2K_PERF_PROFILE=1 so it's free in normal play.
+// Call once per outer iteration, BEFORE SleepToTarget.
+static void MaybeLogFrametime(uint64_t tick_start) {
+    static const bool on = []{
+        const char* v = std::getenv("FM2K_PERF_PROFILE");
+        return v && v[0] == '1';
+    }();
+    if (!on) return;
+    const uint64_t freq = SDL_GetPerformanceFrequency();
+    const uint64_t work_end = SDL_GetPerformanceCounter();
+    static uint64_t s_prev_start = 0;
+    static uint64_t s_work_sum = 0, s_work_max = 0;
+    static uint64_t s_frame_sum = 0, s_frame_max = 0;
+    static uint32_t s_n = 0, s_frames = 0;
+    const uint64_t work = work_end - tick_start;
+    s_work_sum += work;
+    if (work > s_work_max) s_work_max = work;
+    if (s_prev_start) {
+        const uint64_t frame = tick_start - s_prev_start;
+        s_frame_sum += frame;
+        if (frame > s_frame_max) s_frame_max = frame;
+        ++s_frames;
+    }
+    s_prev_start = tick_start;
+    if (++s_n >= 300) {
+        auto ms = [freq](uint64_t t) { return (double)t * 1000.0 / (double)freq; };
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[FRAMETIME] n=%u work avg=%.2fms max=%.2fms | frame avg=%.2fms "
+            "max=%.2fms (target 10.00ms = 100fps)",
+            s_n, ms(s_work_sum) / s_n, ms(s_work_max),
+            s_frames ? ms(s_frame_sum) / s_frames : 0.0, ms(s_frame_max));
+        s_work_sum = s_work_max = s_frame_sum = s_frame_max = 0;
+        s_n = s_frames = 0;
+    }
+}
+
 // ============================================================================
 // PER-PHASE TICK BODIES
 // ============================================================================
@@ -1295,6 +1341,10 @@ BOOL TrampolineMainLoop() {
         // Run one frame's worth of engine work. The body lives in
         // TrampolineFrameTick so the FM95 host-driven path can reuse it.
         LoopPhase phase = TrampolineFrameTick();
+
+        // Sample work-vs-frame timing (offline-inclusive, #63). Must run
+        // before the pacing sleep so `work` excludes the sleep itself.
+        MaybeLogFrametime(tick_start);
 
         // Phase-specific pacing.
         switch (phase) {
