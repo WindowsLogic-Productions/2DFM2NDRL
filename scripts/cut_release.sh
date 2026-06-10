@@ -109,8 +109,36 @@ if [ "$CHANNEL" = "stable" ]; then
     fi
 fi
 
+# Load build secrets (FM2K_LOG_UPLOAD_SECRET etc.) into the environment so
+# the configure step bakes a NON-empty auto_upload_secret.h. cut_release runs
+# go.sh (build-only), which can pick up a stale empty-secret configure -- that
+# is exactly how 0.2.62-0.2.64 shipped with auto-upload silently dead (#66's
+# third recurrence). Source the env, then force a reconfigure so the header is
+# regenerated with the real secret BEFORE the build.
+if [ -f "$HOME/.config/fm2k-release.env" ]; then
+    set -a; . "$HOME/.config/fm2k-release.env"; set +a
+fi
+( cd "$REPO_ROOT" && cmake -S . -B build >/dev/null 2>&1 || true )
+
 echo "==> building (channel=${CHANNEL})"
 ( cd "$REPO_ROOT" && ./go.sh )
+
+# HARD GATE: refuse to ship a telemetry-blackout build. The secret bakes into
+# auto_upload_secret.h at configure; if it's empty the launcher's PollUploadQueue
+# bails and NO crash/desync log ever uploads -- invisible until someone notices
+# the hub is dead weeks later (which is exactly what happened). Override only for
+# a deliberate secret-less build with FM2K_RELEASE_ALLOW_NO_SECRET=1.
+if [ -z "${FM2K_RELEASE_ALLOW_NO_SECRET:-}" ]; then
+    SECRET_HDR="$REPO_ROOT/auto_upload_secret.h"
+    if ! grep -qE 'kLogUploadSecret[[:space:]]*=[[:space:]]*"[^"]+"' "$SECRET_HDR" 2>/dev/null; then
+        echo "cut_release: auto_upload_secret.h has an EMPTY kLogUploadSecret --" >&2
+        echo "  this build would ship with crash/desync auto-upload DISABLED." >&2
+        echo "  ensure FM2K_LOG_UPLOAD_SECRET is set (in ~/.config/fm2k-release.env)," >&2
+        echo "  then re-run. Override (NOT recommended) with FM2K_RELEASE_ALLOW_NO_SECRET=1." >&2
+        exit 1
+    fi
+    echo "==> auto-upload secret baked OK"
+fi
 
 echo "==> packaging"
 "$SCRIPT_DIR/package_release.sh" "$TAG_VERSION"
