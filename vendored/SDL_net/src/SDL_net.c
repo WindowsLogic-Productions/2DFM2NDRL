@@ -171,6 +171,7 @@ static int WindowsPoll(struct pollfd *fds, unsigned int nfds, int timeout)
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>  /* TCP_NODELAY (wanwan patch) */
 #include <net/if.h>
 #include <netdb.h>
 #include <errno.h>
@@ -1448,6 +1449,14 @@ NET_StreamSocket *NET_CreateClient(NET_Address *addr, Uint16 port)
         return NULL;
     }
 
+    {   /* wanwan patch: disable Nagle. The spectator stream sends small
+           frequent EVENT_BATCH packets at 50-100Hz; coalescing adds up
+           to ~200ms of avoidable latency per send. Best-effort. */
+        const int nodelay = 1;
+        setsockopt(sock->handle, IPPROTO_TCP, TCP_NODELAY,
+                   (const char *) &nodelay, sizeof (nodelay));
+    }
+
     const int rc = connect(sock->handle, addrwithport->ai_addr, (SockLen) addrwithport->ai_addrlen);
 
     freeaddrinfo(addrwithport);
@@ -1527,6 +1536,14 @@ NET_StreamSocket *NET_CreateClientBound(NET_Address *addr, Uint16 port, Uint16 l
         SDL_free(sock);
         SDL_SetError("Failed to make new socket non-blocking");
         return NULL;
+    }
+
+    {   /* wanwan patch: disable Nagle. The spectator stream sends small
+           frequent EVENT_BATCH packets at 50-100Hz; coalescing adds up
+           to ~200ms of avoidable latency per send. Best-effort. */
+        const int nodelay = 1;
+        setsockopt(sock->handle, IPPROTO_TCP, TCP_NODELAY,
+                   (const char *) &nodelay, sizeof (nodelay));
     }
 
     const int rc = connect(sock->handle, addrwithport->ai_addr, (SockLen) addrwithport->ai_addrlen);
@@ -1713,6 +1730,14 @@ bool NET_AcceptClient(NET_Server *server, NET_StreamSocket **client_stream)
         if (MakeSocketNonblocking(handle) < 0) {
             CloseSocketHandle(handle);
             return SDL_SetError("Failed to make incoming socket non-blocking");
+        }
+
+        {   /* wanwan patch: disable Nagle on accepted streams too --
+               accepted sockets do not reliably inherit options from the
+               listener. Best-effort. */
+            const int nodelay = 1;
+            setsockopt(handle, IPPROTO_TCP, TCP_NODELAY,
+                       (const char *) &nodelay, sizeof (nodelay));
         }
 
         char portbuf[16];

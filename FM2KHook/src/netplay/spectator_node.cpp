@@ -4412,20 +4412,46 @@ size_t SpectatorNode_TargetDelayFrames() {
         const uint32_t max_gap_ms =
             (g_admit_gap_bucket_cur > g_admit_gap_bucket_prev)
                 ? g_admit_gap_bucket_cur : g_admit_gap_bucket_prev;
-        size_t want = (size_t)(max_gap_ms + max_gap_ms / 2) / 10;  // x1.5, ms -> frames
+        size_t want = (size_t)(max_gap_ms + max_gap_ms / 4) / 10;  // x1.25, ms -> frames
         if (want > 2000) want = 2000;
+        const uint64_t now = GetTickCount64();
+        static uint64_t s_last_grow_ms   = 0;
+        static uint64_t s_last_shrink_ms = 0;
         if (want > g_adaptive_bank_frames) {
             g_adaptive_bank_frames = want;
+            s_last_grow_ms = now;
             if (g_adaptive_bank_frames > floor_eff) {
                 static uint64_t s_grow_log_ms = 0;
-                const uint64_t now = GetTickCount64();
                 if (now - s_grow_log_ms >= 1000) {
                     s_grow_log_ms = now;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "[SPEC-BANK] adaptive bank grew to %zu frames "
-                        "(max admission gap %ums x1.5)",
+                        "(max admission gap %ums x1.25)",
                         g_adaptive_bank_frames, max_gap_ms);
                 }
+            }
+        } else if (g_adaptive_bank_frames > want &&
+                   g_adaptive_bank_frames > floor_eff &&
+                   s_last_grow_ms != 0 &&
+                   now - s_last_grow_ms > 60000 &&
+                   now - s_last_shrink_ms >= 100) {
+            // Shrink-back: grow-only pinned the session at its WORST
+            // moment forever -- one early 9s burst meant 12s+ latency
+            // for the rest of the night even on a recovered link. The
+            // rolling buckets age the bad gap out within 60s; once no
+            // growth has been needed for 60s, drift the target down at
+            // 10 frames/s (the gentle 2x drain bleeds the excess cushion
+            // as the target falls -- smooth catch-up, no jump cut).
+            // Never below the current window's want or the floor.
+            s_last_shrink_ms = now;
+            --g_adaptive_bank_frames;
+            static uint64_t s_shrink_log_ms = 0;
+            if (now - s_shrink_log_ms >= 5000) {
+                s_shrink_log_ms = now;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[SPEC-BANK] calm link -- bank drifting down: %zu "
+                    "frames (window want %zu)",
+                    g_adaptive_bank_frames, want);
             }
         }
     }
