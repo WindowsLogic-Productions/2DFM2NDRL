@@ -223,9 +223,11 @@ def main():
     }
     if args.total_frames > 0:
         common_env["FM2K_AUTO_TERMINATE_TOTAL"] = str(args.total_frames)
+        common_env.setdefault("FM2K_AUTOPLAY_CSS_DWELL",
+                              os.environ.get("FM2K_AUTOPLAY_CSS_DWELL", "8"))
     else:
         common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 

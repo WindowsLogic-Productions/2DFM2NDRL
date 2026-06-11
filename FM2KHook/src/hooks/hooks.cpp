@@ -1310,7 +1310,52 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             // frames show pure-idle physics with no synthetic attack
             // inputs polluting the comparison against kgt's idle run.
             if (game_mode < 3000u) {
-                if ((frame % 30u) == 0u) out = Z;
+                // FM2K_AUTOPLAY_CSS_DWELL=<seconds>: browse the CSS like a
+                // human before locking in -- wander the cursor (d-pad
+                // only, no confirm bits) for the dwell window, then
+                // confirm with a deterministic per-player button so color
+                // variety still gets exercised. Default 0 = legacy
+                // instant-confirm. Real players move around at CSS for
+                // 5-30s; the instant mash never exercised the spectator
+                // seam hold (or the host's own CSS phase) at realistic
+                // durations.
+                static int s_css_dwell_frames = -1;
+                if (s_css_dwell_frames < 0) {
+                    const char* v = std::getenv("FM2K_AUTOPLAY_CSS_DWELL");
+                    s_css_dwell_frames = v ? (int)(std::atof(v) * 100.0) : 0;
+                    if (s_css_dwell_frames < 0) s_css_dwell_frames = 0;
+                }
+                static bool     s_in_css = false;
+                static uint32_t s_css_entry_buf = 0;
+                const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                if (game_mode == 2000u && s_css_dwell_frames > 0) {
+                    if (!s_in_css) { s_in_css = true; s_css_entry_buf = buf_idx; }
+                    const uint32_t in_css = buf_idx - s_css_entry_buf;
+                    if (in_css < (uint32_t)s_css_dwell_frames) {
+                        // Wander: direction (or idle) stable for ~20-frame
+                        // steps, derived from buf_idx so record/replay see
+                        // identical inputs. Per-player offset gives P1/P2
+                        // independent browsing.
+                        const uint32_t step = in_css / 20u;
+                        uint32_t h = (step + 1u) * 0x9E3779B9u
+                                   ^ ((uint32_t)player_id << 16);
+                        h = (h ^ (h >> 16)) * 0x7feb352du;
+                        h ^= h >> 15;
+                        out = (h & 1u) ? (uint16_t)(1u << ((h >> 1) & 3u))
+                                       : 0u;
+                    } else if ((frame % 30u) == 0u) {
+                        // Post-dwell confirm: button derived from the
+                        // dwell hash -> colors 0..3 vary per player/match.
+                        uint32_t h = (buf_idx / 64u + 1u) * 0x85EBCA6Bu
+                                   ^ ((uint32_t)player_id << 8);
+                        h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+                        out = (uint16_t)(1u << (4 + (h & 3u)));
+                    }
+                } else {
+                    if (game_mode != 2000u) s_in_css = false;
+                    if ((frame % 30u) == 0u) out = Z;
+                }
+                if (game_mode != 2000u) s_in_css = false;
             }
             // mode >= 3000: idle (out stays 0)
             //
