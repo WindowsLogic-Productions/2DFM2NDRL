@@ -97,3 +97,4 @@ tools/.netplay_manual/
 # Stray shell-redirect accidents (e.g. `sleep 5 > 5s` -> empty file
 # named "5s"). Don't bother committing.
 /5s
+tools/.spec_selftest/
