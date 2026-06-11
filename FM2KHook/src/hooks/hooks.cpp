@@ -716,6 +716,15 @@ uint16_t Hook_ComputeAutoplayCssInput(int player_id) {
         return 0;
     }
     const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+    // Re-entry detection: in the netplay path this function is only
+    // called while ProcessCSS drives a live CSS session, so it never
+    // sees the mode leave 2000 during a battle -- the dwell anchor from
+    // match 1 went stale and CSS-2 computed in_css ~8000, skipping the
+    // dwell entirely (instant confirm pulses, 2026-06-11 15:50). A big
+    // buf_idx gap between calls means a battle ran in between: re-anchor.
+    static uint32_t s_last_call_buf = 0;
+    if (s_in_css && buf_idx - s_last_call_buf > 120) s_in_css = false;
+    s_last_call_buf = buf_idx;
     if (!s_in_css) { s_in_css = true; s_entry_buf = buf_idx; }
     const uint32_t in_css = buf_idx - s_entry_buf;
     if (s_dwell > 0 && in_css < (uint32_t)s_dwell) {
@@ -1548,6 +1557,22 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
 
     // Battle mode with GekkoNet active - return synced input with facing fix
     if (Netplay_IsActive()) {
+        // Swap-window input guard (CSS-2 confirm leak, 2026-06-11 15:50):
+        // the battle session outlives the local game's exit from battle
+        // mode by a few hundred ms (battle-end barrier + EndBattle drain).
+        // Hook calls in that window served the LAST gekko-delivered battle
+        // inputs to the freshly-initialized rematch CSS -- held attack
+        // bits read as confirm edges, asymmetrically per peer (each froze
+        // on a different final input pair), locking ghost chars before
+        // lockstep even started (P1 opened CSS-2 at act=1/1 timer=53, P2
+        // at act=0/1: P1 auto-flipped to battle at css_frame=50, P2
+        // waited forever). game_state_manager's CSS init already
+        // canonicalizes act/timer/sel, so neutral here keeps the new CSS
+        // pristine; battle re-sims read game_mode 3000 from restored
+        // state and are unaffected.
+        if (!IsBattleMode(game_mode) && Netplay_IsConnected()) {
+            return capture_and_return(0);
+        }
         uint16_t input = Netplay_GetInput(player_id);
 
         // Apply facing direction swap (same logic as original get_player_input).

@@ -1331,6 +1331,18 @@ bool Netplay_ProcessCSS() {
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
         SpectatorNode_AppendPinRng(0x12345678);
 
+        // Canonical CSS open (belt-and-braces for the swap-window input
+        // guard in Hook_GetPlayerInput): no confirm state and no rematch
+        // countdown may survive into the lockstep stream. The engine's
+        // own CSS init zeroes these, so in a healthy run this writes 0
+        // over 0 -- it only corrects state if some input leaked into the
+        // unsynchronized window between CSS init and the first advance.
+        *(uint32_t*)FM2K::ADDR_P1_ACTION_STATE = 0;
+        *(uint32_t*)FM2K::ADDR_P2_ACTION_STATE = 0;
+        if constexpr (FM2K::ADDR_ROUND_TIMER_COUNTER != 0) {
+            *(uint32_t*)FM2K::ADDR_ROUND_TIMER_COUNTER = 0;
+        }
+
         if (!Netplay_StartCSSSession()) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                 "CSS: Netplay_StartCSSSession failed");
