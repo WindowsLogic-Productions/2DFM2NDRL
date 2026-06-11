@@ -146,6 +146,18 @@ struct State {
     uint16_t                  udp_ring_p1[SPEC_UDP_WINDOW] = {};
     uint16_t                  udp_ring_p2[SPEC_UDP_WINDOW] = {};
     uint32_t                  total_op_count         = 0;
+    // Redundant ops tail: the last few non-INPUT events, pre-encoded, so
+    // UDP datagrams can deliver boundary ops when the TCP stream is dead
+    // (this box's loopback kills established TCP connections at will --
+    // both ends see "forcibly closed"; inputs already survive via the
+    // accelerator, ops were the remaining hostage).
+    struct OpWire {
+        uint32_t op_index;
+        uint8_t  len;
+        uint8_t  bytes[100];
+    };
+    static constexpr size_t   OPS_RING = 8;
+    OpWire                    udp_ops_ring[OPS_RING] = {};
 
     // Index of the most recent MATCH_START event in session_events. Used by
     // SpectatorNode_WriteCurrentBattleFile to slice the per-battle segment.
@@ -304,6 +316,13 @@ struct State {
     // on every (re)join so a stale stream can't poison the count, re-armed
     // when the host's OP_BASELINE for the new connection arrives.
     uint32_t                  ops_seen              = 0;
+    // Per-TCP-connection op cursor: the stream delivers ops in global
+    // order starting at the OP_BASELINE, so conn_ops_baseline +
+    // conn_ops_decoded = the global index of the next op this connection
+    // will deliver. Ops the UDP tail already accepted (index < ops_seen)
+    // are skipped as duplicates.
+    uint32_t                  conn_ops_baseline     = 0;
+    uint32_t                  conn_ops_decoded      = 0;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -690,13 +709,13 @@ void SendUdpInputBatches() {
     const uint32_t window = (uint32_t)std::min<uint64_t>(SPEC_UDP_WINDOW, total);
     const uint32_t start  = total - window;
 
-    uint8_t buf[sizeof(SpecDataHeader) + 4 + SPEC_UDP_WINDOW * 4];
+    uint8_t buf[sizeof(SpecDataHeader) + 4 + SPEC_UDP_WINDOW * 4
+                + 1 + State::OPS_RING * (5 + sizeof(State::OpWire::bytes))];
     SpecDataHeader hdr = {};
     hdr.magic       = SPEC_DATA_MAGIC;
     hdr.type        = SpecDataType::UDP_INPUT_BATCH;
     hdr.start_frame = start;
     hdr.frame_count = (uint16_t)window;
-    hdr.flags       = (uint16_t)(4 + window * 4);
     std::memcpy(buf, &hdr, sizeof(hdr));
     const uint32_t op_seq = g_state.total_op_count;
     std::memcpy(buf + sizeof(hdr), &op_seq, 4);
@@ -706,7 +725,28 @@ void SendUdpInputBatches() {
         std::memcpy(w, &g_state.udp_ring_p1[slot], 2); w += 2;
         std::memcpy(w, &g_state.udp_ring_p2[slot], 2); w += 2;
     }
-    const size_t len = sizeof(SpecDataHeader) + 4 + (size_t)window * 4;
+    // Redundant ops tail: [u8 count] then per op [u32 op_index][u8 len]
+    // [len bytes]. The last few ops re-ship in every datagram; the
+    // receiver accepts them strictly in order (op_index == ops_seen), so
+    // boundary clusters survive a dead TCP stream.
+    {
+        const uint32_t total_ops = g_state.total_op_count;
+        const uint32_t n = (uint32_t)std::min<uint64_t>(State::OPS_RING, total_ops);
+        uint8_t* count_at = w; *w++ = 0;
+        uint8_t emitted = 0;
+        for (uint32_t i = total_ops - n; i < total_ops; ++i) {
+            const auto& slot = g_state.udp_ops_ring[i % State::OPS_RING];
+            if (slot.len == 0 || slot.op_index != i) continue;  // overwritten
+            std::memcpy(w, &slot.op_index, 4); w += 4;
+            *w++ = slot.len;
+            std::memcpy(w, slot.bytes, slot.len); w += slot.len;
+            ++emitted;
+        }
+        *count_at = emitted;
+    }
+    const size_t len = (size_t)(w - buf);
+    hdr.flags = (uint16_t)(len - sizeof(SpecDataHeader));
+    std::memcpy(buf, &hdr, sizeof(hdr));  // re-stamp with final flags
 
     size_t fanned = 0;
     for (const auto& sub : g_state.subscribers) {
@@ -1652,6 +1692,17 @@ void AppendOpAndFlush(const SessionEvent& ev) {
     // Phase F: single choke point for non-INPUT appends -- the running op
     // count ships as op_seq in UDP_INPUT_BATCH so viewers can order
     // inputs after ops (see admission invariant in spectator_node.h).
+    // Pre-encode into the redundant ops ring for the datagram tail.
+    {
+        std::vector<uint8_t> w;
+        AppendEventToWire(w, ev, g_state.match_headers);
+        if (!w.empty() && w.size() <= sizeof(State::OpWire::bytes)) {
+            auto& slot = g_state.udp_ops_ring[g_state.total_op_count % State::OPS_RING];
+            slot.op_index = g_state.total_op_count;
+            slot.len      = (uint8_t)w.size();
+            std::memcpy(slot.bytes, w.data(), w.size());
+        }
+    }
     ++g_state.total_op_count;
     g_state.session_events.push_back(ev);
     // Flush eagerly when subscribers exist (host with live spectators OR
@@ -3681,12 +3732,17 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             if (payload_len >= 4) {
                 uint32_t baseline = 0;
                 std::memcpy(&baseline, payload, 4);
-                g_state.ops_seen        = baseline;
+                g_state.conn_ops_baseline = baseline;
+                g_state.conn_ops_decoded  = 0;
+                if (baseline > g_state.ops_seen) {
+                    g_state.ops_seen = baseline;
+                }
                 g_state.udp_epoch_armed = SpecUdpEnabled();
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: OP_BASELINE=%u received -- UDP "
-                    "admission %s", baseline,
-                    g_state.udp_epoch_armed ? "armed" : "disabled by env");
+                    "admission %s (ops_seen=%u)", baseline,
+                    g_state.udp_epoch_armed ? "armed" : "disabled by env",
+                    g_state.ops_seen);
             }
             break;
         }
@@ -3761,13 +3817,19 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                     }
                     ++cursor_input;
                 } else {
-                    // Phase F: exact op count for the UDP admission gate.
-                    // Counted for EVERY decoded non-INPUT event on this
-                    // connection (pushed or stale) -- TCP delivers each op
-                    // exactly once per connection, and OP_BASELINE seeded
-                    // the count for ops from before this connection's
-                    // backfill start.
-                    ++g_state.ops_seen;
+                    // Phase F: op identity = global index. The connection
+                    // delivers ops in order from its baseline; ops the UDP
+                    // tail already accepted are duplicates -- skip their
+                    // push/relay entirely (a second MATCH_START apply
+                    // would corrupt the boundary).
+                    const uint32_t conn_op_idx =
+                        g_state.conn_ops_baseline + g_state.conn_ops_decoded;
+                    ++g_state.conn_ops_decoded;
+                    if (conn_op_idx < g_state.ops_seen) {
+                        off += consumed;
+                        continue;  // duplicate of a UDP-accepted op
+                    }
+                    g_state.ops_seen = conn_op_idx + 1;
 
                     // Non-INPUT event. Apply when its position (= cursor_input,
                     // i.e. the index of the next INPUT) is at or after the
@@ -3888,10 +3950,82 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
 
     uint32_t op_seq = 0;
     std::memcpy(&op_seq, buf + sizeof(SpecDataHeader), 4);
-    const size_t frames = (len - sizeof(SpecDataHeader) - 4) / 4;
-    if (frames == 0 || frames != hdr.frame_count) return;  // malformed
+    const size_t frames = hdr.frame_count;
+    const size_t inputs_end = sizeof(SpecDataHeader) + 4 + frames * 4;
+    if (frames == 0 || len < inputs_end) return;  // malformed
     if (op_seq > g_state.udp_highest_op_seq) {
         g_state.udp_highest_op_seq = op_seq;
+    }
+
+    // Redundant ops tail: accept strictly in order (op_index == ops_seen).
+    // This is what makes a dead TCP stream invisible mid-session -- the
+    // boundary op cluster (ROUND/MATCH_END, CSS_ENTERED, PIN/RESET/SOUND,
+    // MATCH_START) re-ships in every datagram until acknowledged by
+    // progression. Ops the TCP stream later re-delivers dedup by index.
+    if (len > inputs_end + 1) {
+        const uint8_t* t   = buf + inputs_end;
+        const uint8_t* end = buf + len;
+        uint8_t n = *t++;
+        for (uint8_t i = 0; i < n && t + 5 <= end; ++i) {
+            uint32_t op_index = 0;
+            std::memcpy(&op_index, t, 4); t += 4;
+            const uint8_t wlen = *t++;
+            if (t + wlen > end) break;
+            if (op_index == g_state.ops_seen) {
+                SessionEvent ev{};
+                uint8_t hdr_buf[SESSION_EVENT_MATCH_HDR_SIZE];
+                const size_t consumed =
+                    SessionEvent_Decode(t, wlen, &ev, hdr_buf);
+                if (consumed == wlen && ev.type != SessionEventType::INPUT) {
+                    if (ev.type == SessionEventType::MATCH_START) {
+                        MatchHeader hdr_copy;
+                        std::memcpy(hdr_copy.data(), hdr_buf, hdr_copy.size());
+                        g_state.pb_match_headers.push_back(hdr_copy);
+                        ev.u.match_start_idx =
+                            (uint16_t)(g_state.pb_match_headers.size() - 1);
+                    }
+                    g_state.pb_queue.push_back(ev);
+                    ++g_state.ops_seen;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[SPEC-UDP] accepted op #%u type=%u via datagram "
+                        "tail (TCP-independent)",
+                        op_index, (unsigned)ev.type);
+                    // Hop-1 relay parity with the TCP walk.
+                    switch (ev.type) {
+                        case SessionEventType::PIN_RNG:
+                            SpectatorNode_AppendPinRng(ev.u.pin_rng_seed); break;
+                        case SessionEventType::RESET_INPUT_STATE:
+                            SpectatorNode_AppendResetInputState(); break;
+                        case SessionEventType::SOUND_INIT:
+                            SpectatorNode_AppendSoundInit(); break;
+                        case SessionEventType::FINGERPRINT:
+                            SpectatorNode_AppendFingerprint(ev.u.fingerprint_hash); break;
+                        case SessionEventType::MATCH_START:
+                            SpectatorNode_AppendMatchStart(hdr_buf); break;
+                        case SessionEventType::MATCH_END:
+                            SpectatorNode_AppendMatchEnd(ev.u.match_end); break;
+                        case SessionEventType::SESSION_ID:
+                            SpectatorNode_AppendSessionId(ev.u.session_id); break;
+                        case SessionEventType::CSS_ENTERED:
+                            SpectatorNode_AppendCssEntered(); break;
+                        case SessionEventType::ROUND_START: {
+                            const auto& p = ev.u.round_start;
+                            SpectatorNode_AppendRoundStart(p.round_idx,
+                                p.p1_hp_max, p.p2_hp_max, p.timer_seconds);
+                            break;
+                        }
+                        case SessionEventType::ROUND_END: {
+                            const auto& p = ev.u.round_end;
+                            SpectatorNode_AppendRoundEnd(p.winner_idx,
+                                p.p1_hp_remaining, p.p2_hp_remaining);
+                            break;
+                        }
+                        default: break;
+                    }
+                }
+            }
+            t += wlen;
+        }
     }
 
     // [SPEC-UDP] 1Hz heartbeat BEFORE the gates -- pause periods are
