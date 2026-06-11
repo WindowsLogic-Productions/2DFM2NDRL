@@ -427,7 +427,7 @@ def main():
         spec_log = OUT_DIR / "live_FM2K_P3_Debug.log"
         if spec_log.exists():
             txt = spec_log.read_text(errors="replace")
-            pins = txt.count("applied deferred PIN_RNG at battle entry")
+            pins = txt.count("applied deferred PIN_RNG")
             needed = segs - 1  # first battle is snapshot-anchored
             print(f"[harness] deferred PIN_RNG applies: {pins} "
                   f"(boundary crossings: {needed})")

@@ -95,6 +95,17 @@ std::atomic<bool> g_team_dupe_lock{false};
 // Spectator seam hold (Phase F) -- see header. Holds CSS unadvanceable
 // while the spectator waits for the next MATCH_START's pin targets.
 std::atomic<bool> g_seam_hold{false};
+// Colors carried from the just-finished match for the held portraits.
+// AssignPlayerColor only writes the per-slot color at confirm time, and
+// the hold suppresses confirms -- without these writes the held CSS
+// renders palette 0 for both players ("wrong colors" vs the battle they
+// just watched). Per-slot color lives at slot+0xE00B (g_charslot0_color
+// _pick @ 0x4DFD8B, byte stride 0xE03F; see AssignPlayerColor @ 0x406F20).
+// 1v1 mapping: P1 = slot 0, P2 = slot 1 (team CSS out of scope here).
+std::atomic<uint8_t> g_seam_hold_p1_color{0};
+std::atomic<uint8_t> g_seam_hold_p2_color{0};
+constexpr uintptr_t ADDR_CHARSLOT0_COLOR_PICK = 0x4DFD8B;
+constexpr size_t    CHARSLOT_STRIDE_BYTES     = 0xE03F;
 
 // Apply team-mode dupe-lock: in team mode CSS, mask each player's confirm
 // bits if their cursor would land on a character already locked into one
@@ -179,6 +190,13 @@ char __cdecl Hook_GameStateManager() {
             uint32_t* in_changes = (uint32_t*)ADDR_INPUT_CHANGES;
             in_changes[0] &= ~0x3F0u;
             in_changes[1] &= ~0x3F0u;
+            // Keep the held portraits in the colors from the match the
+            // viewer just watched (confirm-time color assignment never
+            // runs while held).
+            *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 0 * CHARSLOT_STRIDE_BYTES) =
+                g_seam_hold_p1_color.load(std::memory_order_relaxed);
+            *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 1 * CHARSLOT_STRIDE_BYTES) =
+                g_seam_hold_p2_color.load(std::memory_order_relaxed);
         }
     }
 
@@ -348,11 +366,15 @@ void CssAutoConfirm_SetTeamDupeLock(bool enabled) {
         enabled ? "ENABLED" : "disabled");
 }
 
-void CssAutoConfirm_SetSeamHold(bool enabled) {
+void CssAutoConfirm_SetSeamHold(bool enabled,
+                                uint8_t p1_color, uint8_t p2_color) {
+    g_seam_hold_p1_color.store(p1_color, std::memory_order_relaxed);
+    g_seam_hold_p2_color.store(p2_color, std::memory_order_relaxed);
     const bool was = g_seam_hold.exchange(enabled, std::memory_order_acq_rel);
     if (was != enabled) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "CssAutoConfirm: seam hold %s", enabled ? "ENGAGED" : "released");
+            "CssAutoConfirm: seam hold %s (carry colors p1=c%u p2=c%u)",
+            enabled ? "ENGAGED" : "released", p1_color, p2_color);
     }
 }
 
@@ -364,6 +386,6 @@ bool CssAutoConfirm_Install()                              { return true; }
 void CssAutoConfirm_OnReplayMatchStart(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
 void CssAutoConfirm_Disengage()                            {}
 void CssAutoConfirm_SetTeamDupeLock(bool)                  {}
-void CssAutoConfirm_SetSeamHold(bool)                      {}
+void CssAutoConfirm_SetSeamHold(bool, uint8_t, uint8_t)    {}
 
 #endif

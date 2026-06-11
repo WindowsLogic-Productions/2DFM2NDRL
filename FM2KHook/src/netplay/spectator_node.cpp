@@ -2744,7 +2744,8 @@ void ApplySessionEvent(const SessionEvent& ev) {
                     // pins -- the VS-rematch CSS auto-advances on neutral
                     // inputs (carried locks) and raced into battle-2
                     // BEFORE the pin targets arrived.
-                    CssAutoConfirm_SetSeamHold(true);
+                    CssAutoConfirm_SetSeamHold(true,
+                        g_state.pb_p1_color, g_state.pb_p2_color);
                 }
             }
             const auto& p = ev.u.match_end;
@@ -3953,6 +3954,12 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 "resuming exact input pops, q=%zu)", g_state.pb_queue.size());
             // fall through to the normal pop below
         } else {
+            // No upstream = nothing will ever end this seam (host quit or
+            // terminated; reconnect may still be trying). Hold the frame
+            // instead of feeding confirm edges -- the old behavior had the
+            // spec visibly mashing through the results screen at session
+            // end under the CONNECTING overlay.
+            if (!g_state.subscribed_upstream) return false;
             // Results screens / title need a confirm-button edge to
             // advance; CSS gets neutral (CssAutoConfirm pins cursor +
             // confirm bits directly once armed, and before arming a
