@@ -124,6 +124,11 @@ void DropConnectionsFromAddr(const sockaddr_in& sub_addr);
 // implicitly). Returns false on resolve failure / already connected.
 bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port);
 
+// True while an upstream dial/connection socket exists (pending or
+// established). Used to make session-kind-change JOIN_ACK re-broadcasts
+// idempotent -- re-dialing over a healthy connection would churn it.
+bool IsUpstreamConnected();
+
 // Run an outbound TCP-STUN probe against the hub's TCP-STUN endpoint
 // (FM2K_HUB_TCP_STUN_ADDR env). Source-binds the connect to the
 // listener's port (g_listen_port) so the kernel-NAT registers a

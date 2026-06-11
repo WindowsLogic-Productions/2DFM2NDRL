@@ -661,6 +661,10 @@ void PollUpstream() {
     }
 }
 
+bool IsUpstreamConnected() {
+    return g_upstream_sock != nullptr;
+}
+
 void DisconnectUpstream() {
     if (g_upstream_sock) {
         NET_DestroyStreamSocket(g_upstream_sock);

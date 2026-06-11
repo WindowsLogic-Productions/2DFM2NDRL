@@ -1079,6 +1079,43 @@ void ApplyBootToBattleStateOverrides() {
 // function gates itself on g_object_data_ptr[338] and runs exactly
 // once per process).
 int __cdecl Hook_InitializeGameFromCommandLine() {
+    // Spectator BTB hold (Phase F): a viewer's /F boot must load the
+    // HOST'S character files, which arrive via the JOIN_ACK runtime
+    // overrides -- but this dispatcher fires within ~1s of boot, long
+    // before any ACK can land when the host is still at CSS (its first
+    // ACK says kind=CSS with no chars; the battle-entry re-broadcast
+    // carries the real ones). Booting early loaded default chars and the
+    // later snapshot applied onto the wrong .player data (join-during-CSS
+    // = ryu/ryu garbage, 2026-06-11). Hold the dispatch -- the engine
+    // re-calls every tick while the title runs -- until the overrides are
+    // seeded, with a timeout so a vanished host can't strand the title.
+    {
+        static int s_is_spec = -1;
+        if (s_is_spec < 0) {
+            const char* v = std::getenv("FM2K_SPECTATOR_MODE");
+            s_is_spec = (v && v[0] == '1') ? 1 : 0;
+        }
+        if (s_is_spec == 1 && g_runtime_btb_p1_char == 0xFF) {
+            static uint64_t s_hold_start_ms = 0;
+            const uint64_t now = GetTickCount64();
+            if (s_hold_start_ms == 0) s_hold_start_ms = now;
+            if (now - s_hold_start_ms < 20000) {
+                static uint64_t s_last_hold_log_ms = 0;
+                if (now - s_last_hold_log_ms > 2000) {
+                    s_last_hold_log_ms = now;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: holding /F dispatch -- waiting for "
+                        "JOIN_ACK battle chars (host pre-battle), %llums",
+                        (unsigned long long)(now - s_hold_start_ms));
+                }
+                return 0;
+            }
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "PerGamePatches: /F dispatch hold timed out (20s) -- "
+                "proceeding with env-default chars");
+        }
+    }
+
     WriteKgtNameToOverride();
     ApplyBootToBattleStateOverrides();
     int result = g_orig_init_game_from_cmd ? g_orig_init_game_from_cmd() : 0;

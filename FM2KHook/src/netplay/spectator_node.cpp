@@ -1893,6 +1893,8 @@ uint64_t SpectatorNode_GetSessionId() {
 // INPUT event the host appends becomes the spectator's first popped
 // frame after Load.
 
+static CtrlPacket BuildJoinAckPacket();  // defined with HandleJoinReq below
+
 void SpectatorNode_StashSnapshot() {
     // Skip during a rollback rewind — the FM2K state at this moment isn't
     // the canonical battle-start state we want to capture. In practice
@@ -1950,6 +1952,22 @@ void SpectatorNode_StashSnapshot() {
         "input_frame=%u, fletcher32=0x%08X, captured_game_mode=%u)",
         cache.match_index, cache.blob.size(),
         cache.input_frame, cache.checksum, cache.captured_game_mode);
+
+    // Session-kind-change re-broadcast: battle just started, so the
+    // chars/stage in a JOIN_ACK are now real. Viewers that joined during
+    // CSS hold their /F boot until this arrives (their first ACK said
+    // kind=CSS with no chars); HandleJoinAck's kind==BATTLE path seeds
+    // their runtime BTB overrides. Idempotent for already-running
+    // viewers (their dial guard skips reconnecting).
+    if (!g_state.subscribers.empty()) {
+        const CtrlPacket ack = BuildJoinAckPacket();
+        for (const auto& sub : g_state.subscribers) {
+            ControlChannel_SendTo(ack, sub.addr);
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: battle-entry JOIN_ACK re-broadcast to %zu sub(s)",
+            g_state.subscribers.size());
+    }
 }
 
 bool SpectatorNode_HasSnapshot() {
@@ -2827,50 +2845,57 @@ void ApplySessionEvent(const SessionEvent& ev) {
 // JOIN / REDIRECT
 // -----------------------------------------------------------------------------
 
+// Build SPEC_JOIN_ACK with the host's current session kind so the
+// spectator knows which GekkoSpectateSession config to create. File-scope
+// because it's sent from TWO places: the JOIN_REQ reply paths below, and
+// the session-kind-change re-broadcast in SpectatorNode_StashSnapshot
+// (battle entry) -- HandleJoinAck's receive side always supported the
+// re-broadcast, but the send side was never wired, so a viewer that
+// joined during the host's CSS never learned the battle characters.
+static CtrlPacket BuildJoinAckPacket() {
+    CtrlPacket ack = {};
+    ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
+    const NetplaySessionKind k = Netplay_GetSessionKind();
+    ack.data.spec_join_ack.host_session_kind = static_cast<uint8_t>(k);
+    // Tell the spectator which TCP port to dial for the INPUT_BATCH
+    // stream. Zero would mean the listener failed at startup, in which
+    // case the spectator refuses the subscription.
+    ack.data.spec_join_ack.host_tcp_port = SpectatorTCP::GetListenPort();
+    // Default "unknown" — only valid when host is in battle.
+    ack.data.spec_join_ack.host_p1_char = 0xFF;
+    ack.data.spec_join_ack.host_p2_char = 0xFF;
+    ack.data.spec_join_ack.host_stage   = 0xFF;
+    if (k == NetplaySessionKind::BATTLE) {
+        // Read the engine's current post-CSS-confirm chars + stage so
+        // the spec can /F-boot with the RIGHT character files. These
+        // live at ADDR_P1_SELECTED_CHAR / ADDR_P2_SELECTED_CHAR (the
+        // same addresses Netplay_StartBattle reads for its "match
+        // chars p1=N(...) p2=N(...)" log) and ADDR_SELECTED_STAGE.
+        //
+        // Note: g_config_value1/3 (0x4300E0/0x4300F0) are only
+        // populated when the HOST itself was /F-launched — for a
+        // normal CSS walk they stay at 0, which is why the previous
+        // read gave us p1=0/p2=0 and pkmncc crashed loading a
+        // mirror Blaziken matchup.
+        const uint32_t p1 = *(const uint32_t*)FM2K::ADDR_P1_SELECTED_CHAR;
+        const uint32_t p2 = *(const uint32_t*)FM2K::ADDR_P2_SELECTED_CHAR;
+        const uint32_t st = (FM2K::ADDR_SELECTED_STAGE != 0)
+                              ? *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE
+                              : 0u;
+        if (p1 < 50u) ack.data.spec_join_ack.host_p1_char = (uint8_t)p1;
+        if (p2 < 50u) ack.data.spec_join_ack.host_p2_char = (uint8_t)p2;
+        if (st < 50u) ack.data.spec_join_ack.host_stage   = (uint8_t)st;
+    }
+    return ack;
+}
+
 void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
                                  uint8_t caps) {
     const bool udp_ok = SpecUdpEnabled() && (caps & SPEC_JOIN_UDP_OK) != 0;
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
-    // Helper: build SPEC_JOIN_ACK with the host's current session kind so
-    // the spectator knows which GekkoSpectateSession config to create.
-    auto BuildJoinAck = []() {
-        CtrlPacket ack = {};
-        ack.header.type = CtrlMsg::SPEC_JOIN_ACK;
-        const NetplaySessionKind k = Netplay_GetSessionKind();
-        ack.data.spec_join_ack.host_session_kind = static_cast<uint8_t>(k);
-        // Tell the spectator which TCP port to dial for the INPUT_BATCH
-        // stream. Zero would mean the listener failed at startup, in which
-        // case the spectator refuses the subscription.
-        ack.data.spec_join_ack.host_tcp_port = SpectatorTCP::GetListenPort();
-        // Default "unknown" — only valid when host is in battle.
-        ack.data.spec_join_ack.host_p1_char = 0xFF;
-        ack.data.spec_join_ack.host_p2_char = 0xFF;
-        ack.data.spec_join_ack.host_stage   = 0xFF;
-        if (k == NetplaySessionKind::BATTLE) {
-            // Read the engine's current post-CSS-confirm chars + stage so
-            // the spec can /F-boot with the RIGHT character files. These
-            // live at ADDR_P1_SELECTED_CHAR / ADDR_P2_SELECTED_CHAR (the
-            // same addresses Netplay_StartBattle reads for its "match
-            // chars p1=N(...) p2=N(...)" log) and ADDR_SELECTED_STAGE.
-            //
-            // Note: g_config_value1/3 (0x4300E0/0x4300F0) are only
-            // populated when the HOST itself was /F-launched — for a
-            // normal CSS walk they stay at 0, which is why the previous
-            // read gave us p1=0/p2=0 and pkmncc crashed loading a
-            // mirror Blaziken matchup.
-            const uint32_t p1 = *(const uint32_t*)FM2K::ADDR_P1_SELECTED_CHAR;
-            const uint32_t p2 = *(const uint32_t*)FM2K::ADDR_P2_SELECTED_CHAR;
-            const uint32_t st = (FM2K::ADDR_SELECTED_STAGE != 0)
-                                  ? *(const uint32_t*)FM2K::ADDR_SELECTED_STAGE
-                                  : 0u;
-            if (p1 < 50u) ack.data.spec_join_ack.host_p1_char = (uint8_t)p1;
-            if (p2 < 50u) ack.data.spec_join_ack.host_p2_char = (uint8_t)p2;
-            if (st < 50u) ack.data.spec_join_ack.host_stage   = (uint8_t)st;
-        }
-        return ack;
-    };
+    auto BuildJoinAck = []() { return BuildJoinAckPacket(); };
 
     // Helper: if there's a live GekkoNet session on this node (player slot),
     // add the joining spectator as a GekkoSpectator actor so confirmed-input
@@ -3261,7 +3286,11 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
         }
         char host_ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, (void*)&from.sin_addr, host_ip, sizeof(host_ip));
-        if (!SpectatorTCP::ConnectUpstream(host_ip, host_tcp_port)) {
+        if (SpectatorTCP::IsUpstreamConnected()) {
+            // Session-kind-change re-broadcast over a healthy connection
+            // (e.g. the battle-entry JOIN_ACK that seeds BTB chars):
+            // nothing to dial, keep the stream.
+        } else if (!SpectatorTCP::ConnectUpstream(host_ip, host_tcp_port)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: SpectatorTCP::ConnectUpstream(%s:%u) failed",
                 host_ip, (unsigned)host_tcp_port);
@@ -4400,6 +4429,26 @@ void SpectatorNode_TickHostMaintenance() {
     // relay mode and the spec saw zero data after subscribing.
     for (auto& sub : g_state.subscribers) {
         if (sub.tcp_bound) continue;
+        // Never frame-0-backfill a CURRENT_MATCH viewer: defer the bind
+        // until a snapshot exists (next StashSnapshot = next battle
+        // entry). The legacy fallback replayed the host's title/CSS
+        // inputs into a /F-booted battle (join-during-CSS = total state
+        // garbage, exposed by the CSS-dwell harness 2026-06-11), and
+        // binding at the battle-entry tick raced StashSnapshot by ~50ms.
+        // The viewer meanwhile holds at title until the battle-entry
+        // JOIN_ACK re-broadcast seeds its BTB chars.
+        if (sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
+            !g_state.current_snapshot.valid) {
+            static uint64_t s_last_defer_log_ms = 0;
+            if (now - s_last_defer_log_ms > 2000) {
+                s_last_defer_log_ms = now;
+                char dbuf[48] = {}; FormatAddr(sub.addr, dbuf, sizeof(dbuf));
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: deferring CURRENT_MATCH bind for %s "
+                    "until first snapshot (host pre-battle)", dbuf);
+            }
+            continue;
+        }
         bool just_bound = false;
         if (g_state.spec_transport_relay) {
             // Need spec_user_id to address relay sends. If still empty
