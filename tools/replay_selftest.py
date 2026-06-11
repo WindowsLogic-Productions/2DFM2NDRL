@@ -119,7 +119,8 @@ def run_phase(label: str, args: list[str], env: dict[str, str],
     for k in ("FM2K_PERF_PROFILE", "FM2K_STRESS_DIAG", "FM2K_FULL_CRCS",
               "FM2K_RUNAHEAD", "FM2K_PRED_WINDOW", "FM2K_LOCAL_DELAY",
               "FM2K_CHECK_DISTANCE", "FM2K_PARITY_CAPTURE_TRACE",
-              "FM2K_CAMTRACE", "FM2K_CAMTRACE_HEX", "FM2K_CAM_DIAG"):
+              "FM2K_CAMTRACE", "FM2K_CAMTRACE_HEX", "FM2K_CAM_DIAG",
+              "FM2K_RING_TRACE"):
         if k not in env and os.environ.get(k):
             env[k] = os.environ[k]
 

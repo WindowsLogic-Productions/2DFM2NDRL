@@ -1417,6 +1417,42 @@ void Netplay_PollBattleSync() {
     // Poll control channel to receive BATTLE_ENTERING from remote
     ControlChannel_Poll();
 
+    // CSS-session transport keepalive while waiting for the trailing peer
+    // (CSS->battle swap deadlock, found 2026-06-11). The peer whose
+    // game_mode flips to 3000 first stops running Netplay_ProcessCSS (the
+    // phase classifier moves it to the battle wait = this function), so
+    // its CSS gekko session went silent: the final CSS input packets the
+    // trailing peer still needs to reach ITS OWN detection frame could sit
+    // unflushed, ACKs stopped, and the trailing peer either stalled a few
+    // frames short of detection forever or hit the 5s gekko disconnect ->
+    // CSS_ABORT. 3-for-3 repro in the autoplay loopback harness (which
+    // races the flip); real matches usually masked it because humans idle
+    // on CSS long enough for the transport to flush. Fix: keep polling the
+    // session, keep feeding neutral padding inputs (frames past both
+    // peers' detection point -- never consumed by either sim, both flip at
+    // the same lockstep-determined frame), and drain-discard its events
+    // until both peers signal and the swap runs.
+    if (g_session && g_session_kind == SessionKind::CSS) {
+        gekko_network_poll(g_session);
+        uint16_t neutral = 0;
+        gekko_add_local_input(g_session, g_player_index, &neutral);
+        int event_count = 0;
+        auto events = gekko_session_events(g_session, &event_count);
+        for (int i = 0; i < event_count; i++) {
+            if (events[i]->type == GekkoPlayerDisconnected) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "BATTLE SYNC: CSS peer disconnected while waiting for "
+                    "swap -- publishing CSS_ABORT");
+                SharedMem_PublishMatchOutcome(FM2K_MATCH_OUTCOME_CSS_ABORT);
+            }
+        }
+        int update_count = 0;
+        (void)gekko_update_session(g_session, &update_count);
+        // AdvanceEvents drained here are post-detection padding frames;
+        // the local sim already left CSS, so they are intentionally not
+        // applied.
+    }
+
     // Resend BATTLE_ENTERING until remote acknowledges, carrying the latest
     // agreed swap_frame each time. If remote's proposal arrived higher than
     // ours, the agreed value bumped — keep both sides in sync via resend.
@@ -2771,6 +2807,15 @@ bool Netplay_ProcessBattleInputPhase() {
     // the same batch from HandleRollback. The first LoadEvent of every
     // batch is therefore the runahead rewind; only the 2nd+ should be
     // counted as user-visible rollbacks.
+    // [RING] trace gate (task #34): cached FM2K_RING_TRACE env check.
+    static auto RingTraceOn = []() {
+        static int c = -1;
+        if (c < 0) {
+            const char* v = std::getenv("FM2K_RING_TRACE");
+            c = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        return c == 1;
+    };
     int load_events_in_batch = 0;
     for (int i = 0; i < update_count; i++) {
         auto update = updates[i];
@@ -2793,6 +2838,18 @@ bool Netplay_ProcessBattleInputPhase() {
                         *(uint32_t*)FM2K::ADDR_RANDOM_SEED);
                 }
                 { PerfScope _ps(&g_perf_save); SaveState_Save(frame); }  // profile save cost (#62)
+                // [RING] trace (FM2K_RING_TRACE=1, frames 0..40): buf_idx +
+                // ring slots at every Save/Load/Advance so the one-slot
+                // input-history shift (task #34) can be watched being born
+                // at the first rollback.
+                if (RingTraceOn() && frame <= 40) {
+                    const uint32_t b = *(uint32_t*)0x447EE0;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[RING] SAVE f=%d buf=%u h1[b]=%03X h1[b-1]=%03X",
+                        frame, b,
+                        *(uint32_t*)(0x4280E0 + (b & 0x3FF) * 4),
+                        *(uint32_t*)(0x4280E0 + ((b - 1) & 0x3FF) * 4));
+                }
                 (void)SaveState_GetLastChecksum(frame);  // updates RegionChecksums via side effect
                 // Use the gameplay fingerprint as GekkoNet's desync checksum.
                 // If both peers see the same HP/pos/rng/timer values at this
@@ -2864,6 +2921,14 @@ bool Netplay_ProcessBattleInputPhase() {
                     }
                 }
                 { PerfScope _pl(&g_perf_load); SaveState_Load(frame); }  // profile load cost (#62)
+                if (RingTraceOn() && frame <= 40) {
+                    const uint32_t b = *(uint32_t*)0x447EE0;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[RING] LOAD f=%d buf=%u h1[b]=%03X h1[b-1]=%03X",
+                        frame, b,
+                        *(uint32_t*)(0x4280E0 + (b & 0x3FF) * 4),
+                        *(uint32_t*)(0x4280E0 + ((b - 1) & 0x3FF) * 4));
+                }
                 // Rewind the deterministic virtual clock to match the loaded
                 // frame. Without this g_virtual_time_ms stays at its forward-sim
                 // value, replay main_game_loop iterations read timeGetTime()
@@ -2881,6 +2946,23 @@ bool Netplay_ProcessBattleInputPhase() {
             }
 
             case GekkoAdvanceEvent: {
+                // Authoritative frame label straight from gekko (task #34
+                // root-cause fix, 2026-06-11). The old scheme (increment at
+                // the end of each advance + relabel to load.frame at
+                // LoadEvent) went ONE LOW after the first rollback batch:
+                // gekko's Load(N) restores POST-frame-N state, so the next
+                // advance produces frame N+1 -- but we relabeled to N. The
+                // recorder's monotonic dedup gate below then swallowed the
+                // first confirmed frame after the batch, leaving every
+                // .fm2krep one INPUT short from the session's first
+                // rollback onward. Replay playback consumed the shifted
+                // stream (each input one frame early), eventually visibly
+                // desyncing -- the "replays desync from matches" bug.
+                // Proven via [RING] trace + raw .fm2krep diff: sim frame
+                // 11's input (000,006) absent from the file, two confirmed
+                // advances both labeled f=10.
+                g_netplay_frame = (uint32_t)update->data.adv.frame;
+
                 // Record the pre-sim frame for the Mike Z sound sync window.
                 // `g_netplay_frame` here is the frame we're about to *produce*;
                 // Hook_DispatchScriptSoundCommand tags desired[] with this same
@@ -3057,6 +3139,17 @@ bool Netplay_ProcessBattleInputPhase() {
                         post_sim_rng - pre_sim_rng);
                 }
 
+                if (RingTraceOn() && g_netplay_frame <= 40) {
+                    const uint32_t b = *(uint32_t*)0x447EE0;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[RING] ADV  f=%u rb=%d ra=%d buf=%u h1[b]=%03X in1=%03X in2=%03X h2[b]=%03X",
+                        g_netplay_frame, (int)update->data.adv.rolling_back,
+                        (int)update->data.adv.running_ahead, b,
+                        *(uint32_t*)(0x4280E0 + (b & 0x3FF) * 4),
+                        g_p1_input, g_p2_input,
+                        *(uint32_t*)(0x4290E0 + (b & 0x3FF) * 4));
+                }
+
                 g_is_rolling_back = false;
                 g_netplay_frame++;
                 has_advance = true;
@@ -3129,8 +3222,16 @@ bool Netplay_ProcessBattleInputPhase() {
                         std::time_t now = std::time(nullptr);
                         std::tm tm_buf{};
                         localtime_s(&tm_buf, &now);
-                        std::strftime(ts, sizeof(ts),
-                            "replays/%Y-%m-%d_%H%M%S_harness.fm2krep", &tm_buf);
+                        // Per-player filename: in the loopback netplay
+                        // harness BOTH peers hit this terminator in the
+                        // same second and previously wrote the SAME path,
+                        // P2 clobbering P1's canonical file (P1's carries
+                        // session_id + ROUND events; P2's does not).
+                        char pattern[64];
+                        std::snprintf(pattern, sizeof(pattern),
+                            "replays/%%Y-%%m-%%d_%%H%%M%%S_p%d_harness.fm2krep",
+                            g_player_index);
+                        std::strftime(ts, sizeof(ts), pattern, &tm_buf);
                         CreateDirectoryA("replays", nullptr);
                         bool wrote = SpectatorNode_WriteCurrentBattleFile(ts);
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
