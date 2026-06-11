@@ -3041,6 +3041,19 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
                                  uint8_t caps, uint32_t resume_frame) {
     const bool udp_ok = SpecUdpEnabled() && (caps & SPEC_JOIN_UDP_OK) != 0;
     if ((caps & SPEC_JOIN_RESUME) == 0) resume_frame = 0;
+    // Pin the mode NOW, from the host's state at this instant -- the
+    // same instant the ACK's kind is computed from, so the viewer's
+    // natural-boot/battle-boot decision and the host's delivery path
+    // can never diverge. (The bind used to decide from its own LATER
+    // state: a CSS-time joiner whose bind fired after battle started
+    // got a battle snapshot against a title-screen engine = deadlock.)
+    if (mode == SpecJoinMode::CURRENT_MATCH && resume_frame == 0 &&
+        Netplay_GetSessionKind() != NetplaySessionKind::BATTLE) {
+        mode = SpecJoinMode::FULL_SESSION;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: pre-battle JOIN -- pinning mode to "
+            "FULL_SESSION (from-frame-0 stream, no snapshot)");
+    }
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
@@ -3351,18 +3364,11 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
         // watching the lock-ins live.
         PerGamePatches_AbortBtbNaturalBoot();
         g_state.natural_boot = true;
-        // Lock the choice in protocol-side: the host's BIND runs later
-        // and decides from ITS state at that moment -- if its battle
-        // started in between, a CURRENT_MATCH sub gets the snapshot
-        // path (binds 15s late, ships battle-captured state to a
-        // title-screen engine = deadlock; observed 12:40 2026-06-11).
-        // FULL_SESSION pins the host to the from-frame-0 stream no
-        // matter when the bind fires.
-        if (g_state.last_requested_mode != SpecJoinMode::FULL_SESSION) {
-            g_state.last_requested_mode = SpecJoinMode::FULL_SESSION;
-            SpectatorNode_RequestJoin(g_state.root_addr,
-                                      SpecJoinMode::FULL_SESSION);
-        }
+        // The join mode is pinned HOST-side at JOIN_REQ time (a
+        // CURRENT_MATCH request reaching a pre-battle host becomes
+        // FULL_SESSION there) -- a spec-side re-request raced: it made
+        // the host reset bind state and drop the freshly-dialed TCP
+        // conn, leaving a 15s zombie (2026-06-11 12:49).
     }
     if (host_session_kind == 2 /* BATTLE */) {
         PerGamePatches_SetRuntimeBtbOverrides(host_p1_char,
@@ -4422,45 +4428,18 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
         }
     }
 
-    if (g_state.pb_queue.empty()) return false;
-    if (g_state.pb_queue.front().type != SessionEventType::INPUT) return false;
-
-    // Offline-replay gate (FM2K only for now).
-    //
-    // The .fm2krep file is sliced from MATCH_START → MATCH_END — its INPUTs
-    // are battle-phase inputs, not CSS-traversal inputs. If we pop them
-    // during the spectator's own CSS phase (driven by the auto-CSS hook's
-    // direct memory writes rather than these INPUTs), they get applied to
-    // the wrong logical frames and the input timeline misaligns with the
-    // host's recording by the count of frames CSS took (~134 in practice).
-    // Symptom: rounds may coincidentally match (BATTLE_INIT inputs are
-    // mostly neutral), but mid-round positions/scripts are visibly off.
-    //
-    // Live-spec doesn't have this issue: host streams CSS-traversal inputs
-    // from session start, so they consume during the spectator's CSS phase
-    // as intended. Gate only fires when FM2K_REPLAY_FILE is set.
-    //
-    // Pre-battle: feed neutral inputs (p1=p2=0) so PGI+UG still runs and
-    // the local CSS state machine advances under the auto-CSS hook's pins;
-    // the pb_queue's first real INPUT stays at the head until the local
-    // game crosses into mode==3000.
+    // Natural-boot walk + mirrored-CSS guards run BEFORE the queue-empty
+    // checks: at boot the queue is legitimately EMPTY (the stream hasn't
+    // arrived), and the old ordering made the synthetic title presses
+    // unreachable -- the viewer sat in the attract demo at q=0 until the
+    // host's backfill happened to land (2026-06-11 12:49).
     if constexpr (FM2K::kIsFM2K) {
-        static int s_offline_replay_cached = -1;
-        if (s_offline_replay_cached < 0) {
+        static int s_natboot_offline_cached = -1;
+        if (s_natboot_offline_cached < 0) {
             const char* v = std::getenv("FM2K_REPLAY_FILE");
-            s_offline_replay_cached = (v && v[0]) ? 1 : 0;
+            s_natboot_offline_cached = (v && v[0]) ? 1 : 0;
         }
-        // Live natural-boot alignment gate (tournament-flow CSS join):
-        // the host's stream begins at ITS CSS, so a viewer that boots
-        // naturally must NOT let its TITLE screen eat those inputs --
-        // that shifted the stream cursor and the viewer's CSS started
-        // mid-dance with diverged state (locked early, entered battle
-        // BEFORE the players). Park the stream and walk the title on
-        // synthetic confirm edges until the local CSS opens; from there
-        // the dance replays in true lockstep from the host's CSS frame 0.
-        // One-shot: once CSS (or any later phase) has been reached, the
-        // gate never re-engages (boundaries are mid-session lockstep).
-        if (s_offline_replay_cached == 0) {
+        if (s_natboot_offline_cached == 0) {
             static bool s_css_reached = false;
             const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
             if (mode_now >= 2000u && !s_css_reached) {
@@ -4537,6 +4516,46 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 }
             }
         }
+    }
+
+    if (g_state.pb_queue.empty()) return false;
+    if (g_state.pb_queue.front().type != SessionEventType::INPUT) return false;
+
+    // Offline-replay gate (FM2K only for now).
+    //
+    // The .fm2krep file is sliced from MATCH_START → MATCH_END — its INPUTs
+    // are battle-phase inputs, not CSS-traversal inputs. If we pop them
+    // during the spectator's own CSS phase (driven by the auto-CSS hook's
+    // direct memory writes rather than these INPUTs), they get applied to
+    // the wrong logical frames and the input timeline misaligns with the
+    // host's recording by the count of frames CSS took (~134 in practice).
+    // Symptom: rounds may coincidentally match (BATTLE_INIT inputs are
+    // mostly neutral), but mid-round positions/scripts are visibly off.
+    //
+    // Live-spec doesn't have this issue: host streams CSS-traversal inputs
+    // from session start, so they consume during the spectator's CSS phase
+    // as intended. Gate only fires when FM2K_REPLAY_FILE is set.
+    //
+    // Pre-battle: feed neutral inputs (p1=p2=0) so PGI+UG still runs and
+    // the local CSS state machine advances under the auto-CSS hook's pins;
+    // the pb_queue's first real INPUT stays at the head until the local
+    // game crosses into mode==3000.
+    if constexpr (FM2K::kIsFM2K) {
+        static int s_offline_replay_cached = -1;
+        if (s_offline_replay_cached < 0) {
+            const char* v = std::getenv("FM2K_REPLAY_FILE");
+            s_offline_replay_cached = (v && v[0]) ? 1 : 0;
+        }
+        // Live natural-boot alignment gate (tournament-flow CSS join):
+        // the host's stream begins at ITS CSS, so a viewer that boots
+        // naturally must NOT let its TITLE screen eat those inputs --
+        // that shifted the stream cursor and the viewer's CSS started
+        // mid-dance with diverged state (locked early, entered battle
+        // BEFORE the players). Park the stream and walk the title on
+        // synthetic confirm edges until the local CSS opens; from there
+        // the dance replays in true lockstep from the host's CSS frame 0.
+        // One-shot: once CSS (or any later phase) has been reached, the
+        // gate never re-engages (boundaries are mid-session lockstep).
         if (s_offline_replay_cached == 1) {
             // Latch: gate is active only UNTIL the first mode==3000 entry.
             // The gate's purpose is to keep the queue's first INPUT at the
