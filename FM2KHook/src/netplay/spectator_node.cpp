@@ -741,8 +741,14 @@ void SendUdpInputBatches() {
     const uint32_t window = (uint32_t)std::min<uint64_t>(SPEC_UDP_WINDOW, total);
     const uint32_t start  = total - window;
 
+    // Per-op tail overhead is 9 bytes (u32 op_index + u32 input_pos +
+    // u8 len) -- the original 5-byte budget undersized this array and the
+    // emitter wrote up to 32 bytes past it once the ring held 8 ops
+    // (exactly at battle entry, when MATCH_START joins the ring): silent
+    // host-side stack corruption, observed as the UDP feed going dark at
+    // 14:57:58 2026-06-11.
     uint8_t buf[sizeof(SpecDataHeader) + 4 + SPEC_UDP_WINDOW * 4
-                + 1 + State::OPS_RING * (5 + sizeof(State::OpWire::bytes))];
+                + 1 + State::OPS_RING * (9 + sizeof(State::OpWire::bytes))];
     SpecDataHeader hdr = {};
     hdr.magic       = SPEC_DATA_MAGIC;
     hdr.type        = SpecDataType::UDP_INPUT_BATCH;
@@ -769,6 +775,9 @@ void SendUdpInputBatches() {
         for (uint32_t i = total_ops - n; i < total_ops; ++i) {
             const auto& slot = g_state.udp_ops_ring[i % State::OPS_RING];
             if (slot.len == 0 || slot.op_index != i) continue;  // overwritten
+            // MTU guard: never let the datagram exceed ~1400B -- a
+            // fragmented datagram under loss dies as a unit.
+            if ((size_t)(w - buf) + 9 + slot.len > 1400) break;
             std::memcpy(w, &slot.op_index, 4); w += 4;
             std::memcpy(w, &slot.input_pos, 4); w += 4;
             *w++ = slot.len;
