@@ -315,6 +315,10 @@ def main() -> int:
         # events drive identical battle evolution.
         "FM2K_BOOT_TO_BATTLE": "1",
         "FM2K_AUTO_TITLE_SKIP": "1",
+        # Replays now play 1:1 for humans (the bank drains are disabled
+        # in offline replay); the harness opts back into full-speed
+        # drain so test wall time stays short.
+        "FM2K_SPECTATOR_ALWAYS_CATCHUP": "1",
     }
     # Replay phase: target the SAME snapshot count as the record side so
     # the parity diff has comparable windows. 32-byte header + 260 bytes

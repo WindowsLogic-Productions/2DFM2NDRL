@@ -456,7 +456,10 @@ def main():
     wait_ports_free([P1_PORT, P2_PORT, SPEC_PORT])
     # NOTE: no FM2K_BOOT_TO_BATTLE -- netplay-recorded replays must walk the
     # title/CSS path (see replay_netplay_diff.py:81-85).
-    rep_env = {"FM2K_PARITY_RECORD_PATH": to_win(replay_pty)}
+    rep_env = {"FM2K_PARITY_RECORD_PATH": to_win(replay_pty),
+               # Harness-only: full-speed drain (offline replays play 1:1
+               # for humans now that the bank drains skip replay mode).
+               "FM2K_SPECTATOR_ALWAYS_CATCHUP": "1"}
     rep_state = {"size": -1, "since": 0.0}
     def rep_done():
         try:

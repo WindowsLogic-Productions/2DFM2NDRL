@@ -1223,8 +1223,14 @@ static void RunSpectatorTick() {
     const bool needs_css_catchup     = false;
     // Emergency battle drain: entering battle hundreds of frames behind
     // previously had NO recovery path -- lag compounded into a perceived
-    // hang. Battle frames are cheap; turbo to the live band.
-    const bool needs_battle_emergency = (live_game_mode >= 3000u) &&
+    // hang. Battle frames are cheap; turbo to the live band. NEVER for
+    // offline replay: the whole file sits in the queue from boot, so
+    // queue depth is meaningless and this turbo fast-forwarded the
+    // entire match (user report 2026-06-11). Replays play 1:1; F12 is
+    // the explicit speed lever, and the harnesses opt into fast drain
+    // via FM2K_SPECTATOR_ALWAYS_CATCHUP=1.
+    const bool needs_battle_emergency = !s_offline_replay_env_active &&
+                                        (live_game_mode >= 3000u) &&
                                         qd > SpectatorTargetDelayFrames() + 600;
     // Render parity is required during catchup — every phase. Render-side
     // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
@@ -1286,8 +1292,10 @@ static void RunSpectatorTick() {
     // 2x playback, barely perceptible, converges a multi-second lag in
     // tens of seconds. This is the ONLY drain mechanism at CSS (see
     // needs_css_catchup above); battle additionally has the emergency
-    // turbo.
-    if (SpectatorNode_PendingFrameCount() >
+    // turbo. Skipped for offline replay (whole file queued at boot --
+    // permanent 2x is not "playback").
+    if (!s_offline_replay_env_active &&
+        SpectatorNode_PendingFrameCount() >
         SpectatorTargetDelayFrames() + 100) {
         SpectatorSimOneFrame();
     }
