@@ -720,6 +720,14 @@ bool SpectatorNode_QueueHasPendingOp();
 uint32_t SpectatorNode_MsSinceLastAdmit();
 void SpectatorNode_StampInputAdmit();
 
+// Broadcast delay-bank target in frames (Phase G adaptive): the larger
+// of the FM2K_SPEC_DELAY floor (default 300) and the rolling-30-60s max
+// inter-admission gap x1.5 (grow-only per session, capped 2000, gaps
+// over 5s ignored as outages). FM2K_SPEC_ADAPTIVE=0 pins to the floor.
+// Single source of truth for every pacing regime (bank build hold,
+// glide, gentle drain, battle emergency, catchup exit).
+size_t SpectatorNode_TargetDelayFrames();
+
 // Natural-boot viewer still walking title/menu (pre-CSS) -- the jitter
 // floor must not hold the tick on queue depth during this phase.
 bool SpectatorNode_InNaturalBootWalk();

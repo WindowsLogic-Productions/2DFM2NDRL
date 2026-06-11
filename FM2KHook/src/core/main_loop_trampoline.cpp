@@ -841,19 +841,14 @@ constexpr size_t SPECTATOR_LIVE_LAG_FRAMES = 100;
 // Broadcast delay target: the spectator deliberately sits this many
 // frames behind live (default 3s at 100fps). Riding the live edge made
 // playback arrival-limited -- every loss burst or host stall hit the
-// picture as a stall (q=0, pops=0). With a 300-frame bank, any arrival
-// gap shorter than the bank is structurally invisible; drains target
-// the bank, never the edge. FM2K_SPEC_DELAY overrides (frames).
+// picture as a stall (q=0, pops=0). With the bank, any arrival gap
+// shorter than the bank is structurally invisible; drains target the
+// bank, never the edge. Single source of truth lives in spectator_node
+// (Phase G: FM2K_SPEC_DELAY floor + adaptive growth from measured
+// inter-admission gaps, so links worse than the default profile widen
+// their own cushion instead of stalling).
 inline size_t SpectatorTargetDelayFrames() {
-    static size_t v = []() -> size_t {
-        const char* e = std::getenv("FM2K_SPEC_DELAY");
-        if (e && e[0]) {
-            const long n = std::strtol(e, nullptr, 10);
-            if (n >= 50 && n <= 2000) return (size_t)n;
-        }
-        return 300;
-    }();
-    return v;
+    return SpectatorNode_TargetDelayFrames();
 }
 
 // One sim step (popped INPUT → PGI → UG → diagnostics). Returns false if

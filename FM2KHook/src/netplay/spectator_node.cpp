@@ -4325,10 +4325,45 @@ void SpectatorNode_KickJoin() {
 }
 
 static uint64_t g_last_input_admit_ms = 0;
-void SpectatorNode_StampInputAdmit() { g_last_input_admit_ms = GetTickCount64(); }
 
-static size_t SpecDelayBankFrames() {
-    static size_t v = []() -> size_t {
+// Adaptive delay bank (Phase G). The static 300-frame bank absorbs any
+// arrival gap shorter than 3s -- enough for the tested clumsy profile,
+// but a link with longer retransmit bursts still drains to q:0 and
+// stalls. Measure the real inter-admission gaps (two rotating 30s
+// buckets = rolling 30-60s max) and GROW the bank target to fit the
+// link: target = max(env floor, observed_max_gap * 1.5), capped at
+// 2000 frames (20s). Grow-only per session -- over-buffering after a
+// bad patch is the right bias (no-stall beats low-latency here), and
+// shrinking mid-stream would oscillate the glide. Gaps above 5s are
+// ignored: that's an outage (TCP death, host frozen) owned by the
+// failover/rejoin machinery, not jitter for the pacing layer to absorb.
+// FM2K_SPEC_ADAPTIVE=0 pins the bank to the static floor.
+static uint32_t g_admit_gap_bucket_cur   = 0;   // max gap (ms), current 30s bucket
+static uint32_t g_admit_gap_bucket_prev  = 0;
+static uint64_t g_admit_gap_bucket_start = 0;
+static size_t   g_adaptive_bank_frames   = 0;   // grow-only published target
+
+void SpectatorNode_StampInputAdmit() {
+    const uint64_t now = GetTickCount64();
+    if (g_last_input_admit_ms != 0) {
+        const uint64_t gap = now - g_last_input_admit_ms;
+        if (gap <= 5000) {
+            if (g_admit_gap_bucket_start == 0) g_admit_gap_bucket_start = now;
+            if (now - g_admit_gap_bucket_start >= 30000) {
+                g_admit_gap_bucket_prev  = g_admit_gap_bucket_cur;
+                g_admit_gap_bucket_cur   = 0;
+                g_admit_gap_bucket_start = now;
+            }
+            if ((uint32_t)gap > g_admit_gap_bucket_cur) {
+                g_admit_gap_bucket_cur = (uint32_t)gap;
+            }
+        }
+    }
+    g_last_input_admit_ms = now;
+}
+
+size_t SpectatorNode_TargetDelayFrames() {
+    static size_t s_floor = []() -> size_t {
         const char* e = std::getenv("FM2K_SPEC_DELAY");
         if (e && e[0]) {
             const long n = std::strtol(e, nullptr, 10);
@@ -4336,7 +4371,38 @@ static size_t SpecDelayBankFrames() {
         }
         return 300;
     }();
-    return v;
+    static int s_adaptive = -1;
+    if (s_adaptive < 0) {
+        const char* v = std::getenv("FM2K_SPEC_ADAPTIVE");
+        s_adaptive = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    if (s_adaptive == 1) {
+        const uint32_t max_gap_ms =
+            (g_admit_gap_bucket_cur > g_admit_gap_bucket_prev)
+                ? g_admit_gap_bucket_cur : g_admit_gap_bucket_prev;
+        size_t want = (size_t)(max_gap_ms + max_gap_ms / 2) / 10;  // x1.5, ms -> frames
+        if (want > 2000) want = 2000;
+        if (want > g_adaptive_bank_frames) {
+            g_adaptive_bank_frames = want;
+            if (g_adaptive_bank_frames > s_floor) {
+                static uint64_t s_grow_log_ms = 0;
+                const uint64_t now = GetTickCount64();
+                if (now - s_grow_log_ms >= 1000) {
+                    s_grow_log_ms = now;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[SPEC-BANK] adaptive bank grew to %zu frames "
+                        "(max admission gap %ums x1.5)",
+                        g_adaptive_bank_frames, max_gap_ms);
+                }
+            }
+        }
+    }
+    return (g_adaptive_bank_frames > s_floor) ? g_adaptive_bank_frames
+                                              : s_floor;
+}
+
+static size_t SpecDelayBankFrames() {
+    return SpectatorNode_TargetDelayFrames();
 }
 uint32_t SpectatorNode_MsSinceLastAdmit() {
     if (g_last_input_admit_ms == 0) return 0;  // nothing admitted yet
