@@ -3453,12 +3453,17 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     g_state.upstream_addr         = from;
     g_state.subscribed_upstream   = true;
 
-    // Phase F: every (re)subscribe starts a fresh UDP admission epoch.
-    // The host's OP_BASELINE on the new connection re-arms it with an
-    // exact count; until then incoming datagrams are dropped. Without
-    // this, ops re-delivered by the new connection's backfill would
-    // double-count into ops_seen and over-permit admission.
-    g_state.udp_epoch_armed = false;
+    // Phase F: a fresh UDP admission epoch starts ONLY when a new TCP
+    // connection (whose OP_BASELINE re-arms it exactly) is coming --
+    // i.e. when we are NOT currently connected and will dial below.
+    // The host re-broadcasts JOIN_ACK informationally at every battle
+    // entry (char/color refresh for late joiners); disarming on those
+    // killed UDP admission on every viewer at every battle start, with
+    // no OP_BASELINE ever coming to re-arm it -- the recurring "UDP
+    // dies at battle entry" (2026-06-11 15:04).
+    if (!SpectatorTCP::IsUpstreamConnected()) {
+        g_state.udp_epoch_armed = false;
+    }
 
     // RNG sync + queue clear: ONLY apply on FIRST-TIME subscribe (spectator
     // is still at title/pre-CSS, no game state to lose). On reconnect-after-
@@ -5147,6 +5152,14 @@ void SpectatorNode_TickHostMaintenance() {
             }
 
             const char* xport = g_state.spec_transport_relay ? "RELAY" : "TCP";
+            // Host settings (rounds-to-win, timer, SOCD, etc) go to EVERY
+            // joiner regardless of bind flavor -- the push lived only in
+            // the snapshot branch, so natural/FULL_SESSION viewers ran
+            // engine defaults (wrong round settings, 2026-06-11).
+            {
+                extern void Netplay_SendHostConfigToSpec(const sockaddr_in& to);
+                Netplay_SendHostConfigToSpec(sub.addr);
+            }
             if (resume_bind) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: %s bound for %s — LIGHT RESUME "
