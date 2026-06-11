@@ -3968,39 +3968,20 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     // drive the spectator's local sim (see PbBoundary). The drain
     // naturally reaches the boundary init ops + MATCH_START, whose apply
     // flips the state to PINNING and stops the discard.
-    {
-        uint32_t seam_discarded = 0;
-        while (!g_state.pb_queue.empty()) {
-            const SessionEvent& head = g_state.pb_queue.front();
-            if (head.type != SessionEventType::INPUT) {
-                ApplySessionEvent(head);
-                g_state.pb_queue.erase(g_state.pb_queue.begin());
-                continue;
-            }
-            if (g_state.pb_boundary == State::PbBoundary::SEAM) {
-                g_state.pb_queue.erase(g_state.pb_queue.begin());
-                ++seam_discarded;
-                continue;
-            }
-            break;
-        }
-        if (seam_discarded > 0) {
-            static uint64_t s_last_seam_log_ms = 0;
-            const uint64_t now = GetTickCount64();
-            if (now - s_last_seam_log_ms > 1000) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: seam discarded %u host seam INPUT(s) "
-                    "(q=%zu)", seam_discarded, g_state.pb_queue.size());
-                s_last_seam_log_ms = now;
-            }
-        }
+    while (!g_state.pb_queue.empty() &&
+           g_state.pb_queue.front().type != SessionEventType::INPUT) {
+        ApplySessionEvent(g_state.pb_queue.front());
+        g_state.pb_queue.erase(g_state.pb_queue.begin());
     }
 
-    // Boundary synthetic feed. SEAM: queue may be empty or waiting on the
-    // wire for the boundary ops — keep the local sim moving. PINNING:
-    // battle INPUTs are parked at the head while CssAutoConfirm walks the
-    // local CSS to the announced picks; resume exact pops when the local
-    // game re-enters battle.
+    // Boundary handling. SEAM: fall through to the normal pop -- the
+    // viewer MIRRORS the host's seam (results presses, CSS cursor
+    // movements) at the host's own pace; the seam hold masks confirm
+    // bits + locks so the rematch flow can never advance early, and the
+    // final picks come from the MATCH_START pin. PINNING: battle INPUTs
+    // are parked at the head while CssAutoConfirm walks the local CSS to
+    // the announced picks on synthetic neutral; exact pops resume when
+    // the local game re-enters battle.
     //
     // Release is EDGE-triggered: the local mode must first drop below
     // 3000 (leave the old match's results screen) before a value >= 3000
@@ -4011,36 +3992,33 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     if (g_state.pb_boundary != State::PbBoundary::NONE) {
         const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
         if (mode < 3000u) g_state.pb_boundary_left_battle = true;
-        if (g_state.pb_boundary == State::PbBoundary::PINNING &&
-            g_state.pb_boundary_left_battle && mode >= 3000u) {
-            g_state.pb_boundary = State::PbBoundary::NONE;
-            CssAutoConfirm_SetSeamHold(false);
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: boundary PINNING -> NONE (battle entered, "
-                "resuming exact input pops, q=%zu)", g_state.pb_queue.size());
-            // fall through to the normal pop below
-        } else {
-            // No upstream = nothing will ever end this seam (host quit or
-            // terminated; reconnect may still be trying). Hold the frame
-            // instead of feeding confirm edges -- the old behavior had the
-            // spec visibly mashing through the results screen at session
-            // end under the CONNECTING overlay.
-            if (!g_state.subscribed_upstream) return false;
-            // Results screens / title need a confirm-button edge to
-            // advance; CSS gets neutral (CssAutoConfirm pins cursor +
-            // confirm bits directly once armed, and before arming a
-            // neutral CSS must not lock anything).
-            uint16_t synthetic = 0;
-            if (mode != 2000u) {
-                static uint32_t s_seam_tick = 0;
-                synthetic = (s_seam_tick++ & 1u) ? 0x010u : 0u;
+        if (g_state.pb_boundary == State::PbBoundary::PINNING) {
+            if (g_state.pb_boundary_left_battle && mode >= 3000u) {
+                g_state.pb_boundary = State::PbBoundary::NONE;
+                CssAutoConfirm_SetSeamHold(false);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: boundary PINNING -> NONE (battle entered, "
+                    "resuming exact input pops, q=%zu)", g_state.pb_queue.size());
+                // fall through to the normal pop below
+            } else {
+                // Pin walk in progress: park the new match's inputs and
+                // feed neutral (CssAutoConfirm drives cursor + confirm
+                // directly; the results screen, if still up, advances on
+                // a synthetic confirm edge).
+                if (!g_state.subscribed_upstream) return false;
+                uint16_t synthetic = 0;
+                if (mode != 2000u) {
+                    static uint32_t s_seam_tick = 0;
+                    synthetic = (s_seam_tick++ & 1u) ? 0x010u : 0u;
+                }
+                g_state.pb_current_p1 = synthetic;
+                g_state.pb_current_p2 = synthetic;
+                if (p1_input) *p1_input = synthetic;
+                if (p2_input) *p2_input = synthetic;
+                return true;
             }
-            g_state.pb_current_p1 = synthetic;
-            g_state.pb_current_p2 = synthetic;
-            if (p1_input) *p1_input = synthetic;
-            if (p2_input) *p2_input = synthetic;
-            return true;
         }
+        // SEAM falls through: mirror the host's seam inputs 1:1.
     }
 
     if (g_state.pb_queue.empty()) return false;

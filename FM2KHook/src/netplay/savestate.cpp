@@ -1227,7 +1227,20 @@ bool SaveState_Load(int frame) {
             }
         }
 
+        // FORCED carve-out windows (resource bookkeeping the per-slot
+        // cleanup walks; same rationale as the stage block in the
+        // afterimage apply below -- the heap-shape heuristic fails open
+        // when the live slot hasn't finished loading):
+        //   buffer 0x100..0x10C = game slot+0x110/0x114/0x118 ptrs
+        //   buffer 0x220C..0x2224 = game slot+0x221C sound bookkeeping
+        uint8_t live_res_a[0x0C], live_res_b[0x18];
+        std::memcpy(live_res_a, (const uint8_t*)dynamic_addr + 0x100, sizeof(live_res_a));
+        std::memcpy(live_res_b, (const uint8_t*)dynamic_addr + 0x220C, sizeof(live_res_b));
+
         memcpy((void*)dynamic_addr, state->char_dynamic[i], CHAR_SLOT_DYNAMIC_SIZE);
+
+        std::memcpy((uint8_t*)dynamic_addr + 0x100,  live_res_a, sizeof(live_res_a));
+        std::memcpy((uint8_t*)dynamic_addr + 0x220C, live_res_b, sizeof(live_res_b));
 
         // Restore preserved pointers IF the host's value there is also
         // heap-shaped. Confirms the field is a pointer in both processes
@@ -1499,9 +1512,14 @@ bool SaveState_Load(int frame) {
     struct AiPtrPreserve { uint32_t didx; uint32_t value; };
     constexpr size_t MAX_PRESERVED_AI = 16384;
     static AiPtrPreserve s_ai_preserved[MAX_PRESERVED_AI];
+    static uint8_t s_ai_live_stage_snd[0x18];
     size_t ai_pcount = 0;
     size_t ai_candidates = 0;
     if (is_spec_apply) {
+        std::memcpy(s_ai_live_stage_snd,
+                    (const uint8_t*)WaveCAddrs::AFTERIMAGE_POOL +
+                        (0x44795Cu - WaveCAddrs::AFTERIMAGE_POOL),
+                    sizeof(s_ai_live_stage_snd));
         const uint32_t* live_r = (const uint32_t*)WaveCAddrs::AFTERIMAGE_POOL;
         const size_t dword_count = WaveCAddrs::AFTERIMAGE_POOL_SZ / sizeof(uint32_t);
         for (size_t o = 0; o < dword_count; ++o) {
@@ -1533,6 +1551,20 @@ bool SaveState_Load(int frame) {
                 live_w[s_ai_preserved[k].didx] = s_ai_preserved[k].value;
                 ++restored;
             }
+        }
+        // FORCED carve-out: the stage block's sound bookkeeping (game
+        // 0x44795C..0x44797x = AI offset 0x2C..0x44: entry-array ptr, bank
+        // idx, loaded flag, counts) must ALWAYS keep the live values. The
+        // heap-shape heuristic above fails open when the spec's own stage
+        // sounds haven't finished loading at apply time (live ptr still 0
+        // -> host pointer flows in -> ClearStageData AV at the NEXT stage
+        // confirm; recurred 2026-06-11 on the fast CSS-join path). A live
+        // window of zeros is a safe cleanup no-op; a host pointer never is.
+        {
+            constexpr size_t kStageSndOff = 0x44795Cu - WaveCAddrs::AFTERIMAGE_POOL;
+            constexpr size_t kStageSndLen = 0x18;  // ptr, bank, flag, ?, cnt, cnt2
+            std::memcpy((uint8_t*)WaveCAddrs::AFTERIMAGE_POOL + kStageSndOff,
+                        s_ai_live_stage_snd, kStageSndLen);
         }
         if (ai_candidates > 0) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
