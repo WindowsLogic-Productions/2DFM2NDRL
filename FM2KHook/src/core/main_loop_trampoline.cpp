@@ -820,7 +820,13 @@ static void RunNativeTick() {
 // JOIN_ACK fires SendSessionBackfillTo from the host → queue fills with
 // every confirmed frame from session start → spectator drains those at
 // FF speed → catches up to live edge.
-constexpr size_t SPECTATOR_LIVE_TARGET = 8;   // jitter buffer floor
+// Jitter cushion: hold playback until this many frames are buffered,
+// and rebuild the cushion after a drain-out. 8 (80ms) was a netplay-
+// grade number -- the spec rode the live edge and every production
+// hiccup hit the picture (q racing 10 -> 1 -> 0). A spectator trades
+// 400ms of extra delay for smoothness; the starvation bypass caps any
+// hold at 250ms of silence so this can never become a freeze.
+constexpr size_t SPECTATOR_LIVE_TARGET = 40;
 constexpr size_t SPECTATOR_FF_ENTER    = 100; // ~1 sec of host frames queued
 constexpr size_t SPECTATOR_FF_EXIT     = 16;  // hysteresis: 2x live target
 
