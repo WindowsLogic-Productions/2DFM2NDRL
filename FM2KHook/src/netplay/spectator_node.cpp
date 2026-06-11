@@ -4153,8 +4153,19 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
         if (s_offline_replay_cached == 0) {
             static bool s_css_reached = false;
             const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-            if (mode_now >= 2000u) {
+            if (mode_now >= 2000u && !s_css_reached) {
                 s_css_reached = true;
+                // The title-mash press straddles the title->CSS
+                // transition: the engine's edge detector reads it as a
+                // rising confirm on CSS frame ~1 for BOTH players --
+                // instant 0/0 lock, 100-frame countdown, battle before
+                // the players ever confirmed (NATCSS trace 2026-06-11:
+                // act=1/1 by pop 10, timer==pop). Engage the confirm-
+                // masking hold for the first 60 CSS frames to eat the
+                // stray edge; released in the post-release guard below.
+                if (mode_now == 2000u) {
+                    CssAutoConfirm_SetSeamHold(true, 0, 0);
+                }
             }
             if (!s_css_reached) {
                 // Keep the boot in the VS context: without the netplay
@@ -4193,10 +4204,15 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
             // silence; the early replayed CSS frames are mostly idle).
             if (mode_now == 2000u) {
                 *(uint32_t*)0x47010Cu = 0;
+                static uint32_t s_natcss_pop = 0;
+                if (s_natcss_pop == 60) {
+                    // Stray title-edge window over; hand CSS to the
+                    // live mirror (real confirms must pass from here).
+                    CssAutoConfirm_SetSeamHold(false);
+                }
                 // [NATCSS] every 10th pop until the mechanism that
                 // advances a mirrored CSS to battle is identified --
                 // logs the state machine's inputs and progression.
-                static uint32_t s_natcss_pop = 0;
                 if ((s_natcss_pop++ % 10u) == 0) {
                     const int* p1c = (const int*)0x424E50;
                     const int* p2c = (const int*)0x424E58;
