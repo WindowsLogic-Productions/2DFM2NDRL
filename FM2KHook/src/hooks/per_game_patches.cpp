@@ -1143,9 +1143,18 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
                 }
                 const uint64_t now = GetTickCount64();
                 if (now - start >= 8000) {
+                    // Natural boot is the DEFAULT; /F is the exception
+                    // that only the host's explicit "battle in progress"
+                    // answer (kind=2 ACK seeding the chars) may engage.
+                    // The old fallthrough booted /F with env-default
+                    // chars (ryu/ryu garbage) whenever the ACK was slow
+                    // or lost -- a spectator joining players at CSS must
+                    // never battle-boot.
+                    *(uint32_t*)0x424744 = 0;  // g_debug_mode: drop /F
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "PerGamePatches: /F dispatch hold timed out (8s) "
-                        "-- proceeding with env-default chars");
+                        "-- defaulting to NATURAL boot (no ACK = no "
+                        "battle authority)");
                     break;
                 }
                 if (now - last_log > 2000) {
