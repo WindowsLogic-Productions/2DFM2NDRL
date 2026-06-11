@@ -23,6 +23,8 @@
 #include <sstream>
 #include <vector>
 #include <array>
+#include <thread>
+#include <atomic>
 #include <filesystem>
 #include "vendored/imgui/imgui.h"
 #include "imgui_internal.h"
@@ -4686,25 +4688,41 @@ void LauncherUI::PollUploadQueue() {
     // among them). Rotating one game per frame keeps the per-tick cost
     // identical (still one Process() call) while guaranteeing every game's
     // queue drains regardless of selection.
+    // CRITICAL: Process() does a SYNCHRONOUS WinHTTP POST (up to a 15s
+    // timeout per upload). This runs every frame from Render(), so doing it
+    // on this (the UI/render) thread freezes the launcher for the duration
+    // of each upload -- catastrophic once a user has a backlog of stranded
+    // bundles (multi-second-to-minute unresponsive launcher, reported on
+    // 0.2.65 when the upload secret finally worked and the drain actually
+    // fired). Run the blocking drain on a detached worker thread instead, so
+    // the render loop never stalls. s_busy keeps exactly one upload in flight
+    // at a time (no thread pile-up); over successive frames it round-robins
+    // every game's queue and drains backlogs one manifest per completed run.
+    static std::atomic<bool> s_busy{false};
+    if (s_busy.exchange(true)) return;  // an upload is already running
+
     static size_t s_rr = 0;
     if (s_rr >= games_.size()) s_rr = 0;
     const FM2K::FM2KGameInfo& game = games_[s_rr++];
 
-    // Convert wide path to UTF-8 for the upload-queue API. fs::path
-    // already supports that natively via .u8string() but the return
-    // type changed in C++20; use string() and accept the system-
-    // codepage round-trip for the launcher (game dirs are ASCII in
-    // practice for FM2K installs).
+    // Snapshot the game dir on THIS thread (we own games_); pass by value to
+    // the worker so it never touches launcher state. fs::path .string() does
+    // the wide->UTF-8 round-trip; game dirs are ASCII in practice.
     std::filesystem::path exe = fm2k::utf8path::Utf8ToWide(game.exe_path);
-    std::filesystem::path game_dir = exe.parent_path();
+    std::string game_dir = exe.parent_path().string();
 
-    fm2k::upload_queue::ProcessorConfig cfg;
-    cfg.game_dir   = game_dir.string();
-    cfg.upload_url = fm2k::kLogUploadUrl;
-    cfg.secret     = fm2k::kLogUploadSecret;
-    cfg.enabled    = true;
-
-    fm2k::upload_queue::Process(cfg);
+    std::thread([game_dir]() {
+        fm2k::upload_queue::ProcessorConfig cfg;
+        cfg.game_dir   = game_dir;
+        cfg.upload_url = fm2k::kLogUploadUrl;   // global constexpr -- thread-safe
+        cfg.secret     = fm2k::kLogUploadSecret;
+        cfg.enabled    = true;
+        // Drain everything queued for this dir in one run, then release the
+        // slot. Process() returns false when nothing's left or on a transient
+        // failure (manifest stays for the next pass), so this terminates.
+        while (fm2k::upload_queue::Process(cfg)) {}
+        s_busy.store(false);
+    }).detach();
 }
 
 void LauncherUI::PollMatchOutcome() {
