@@ -688,8 +688,7 @@ uint16_t Hook_ComputeAutoplayBattleInput(int player_id) {
 // Dwell anchor state for Hook_ComputeAutoplayCssInput — file scope so
 // the netplay CSS-sync path can reset it deterministically (the
 // in-function gap heuristic only covers the offline path).
-static bool     g_css_autoplay_in_css    = false;
-static uint32_t g_css_autoplay_entry_buf = 0;
+static bool g_css_autoplay_in_css = false;
 void Hook_AutoplayCssResetDwell() {
     g_css_autoplay_in_css = false;
 }
@@ -722,65 +721,75 @@ uint16_t Hook_ComputeAutoplayCssInput(int player_id) {
         g_css_autoplay_in_css = false;
         return 0;
     }
+    // g_input_buffer_index is an index into the 1024-frame input ring --
+    // it WRAPS (975 -> 39 observed mid-CSS, 2026-06-11 16:11), so it can
+    // never be used as an elapsed-time anchor: the old `buf - anchor`
+    // dwell wrapped to ~4e9 at the ring boundary and the function fell
+    // into the confirm phase by accident (that wrap, not the dwell, is
+    // what had been locking chars all along). Instead keep our own
+    // monotonic per-CSS tick counter, incremented whenever the ring
+    // index moves.
     const uint32_t buf_idx = *(uint32_t*)0x447EE0;
-    // Re-entry detection: in the netplay path this function is only
-    // called while ProcessCSS drives a live CSS session, so it never
-    // sees the mode leave 2000 during a battle -- the dwell anchor from
-    // match 1 went stale and CSS-2 computed in_css ~8000, skipping the
-    // dwell entirely (instant confirm pulses, 2026-06-11 15:50). A big
-    // FORWARD buf_idx gap between calls means a battle ran in between:
-    // re-anchor. Backward jumps are excluded (gap < 0x80000000): the
-    // snapshot-render path restores state after rendering, so buf_idx
-    // can step backward between calls -- the unsigned wrap read as a
-    // huge gap and re-anchored the dwell EVERY frame (CSS never left
-    // the wander phase, nobody ever confirmed, 2026-06-11 16:03).
-    // Netplay additionally resets explicitly at CSS SYNCED
-    // (Hook_AutoplayCssResetDwell), which is the authoritative signal.
-    static uint32_t s_last_call_buf = 0;
-    {
-        const uint32_t gap = buf_idx - s_last_call_buf;
-        if (g_css_autoplay_in_css && gap > 120u && gap < 0x80000000u) {
-            g_css_autoplay_in_css = false;
-        }
-    }
-    s_last_call_buf = buf_idx;
+    static uint32_t s_prev_buf = 0;
+    static uint32_t s_ticks = 0;
+    static uint32_t s_session_salt = 0;
     if (!g_css_autoplay_in_css) {
+        // Fresh CSS phase: reset elapsed time, bump the salt so the
+        // browse path and confirm buttons differ between matches.
         g_css_autoplay_in_css = true;
-        g_css_autoplay_entry_buf = buf_idx;
+        s_prev_buf = buf_idx;
+        s_ticks = 0;
+        ++s_session_salt;
+    } else if (buf_idx != s_prev_buf) {
+        ++s_ticks;
+        s_prev_buf = buf_idx;
     }
-    const uint32_t in_css = buf_idx - g_css_autoplay_entry_buf;
-    // 1Hz diag: which phase is the autoplay in, and is the anchor sane?
+    const uint32_t in_css = s_ticks;
+    const uint32_t salt = s_session_salt * 0x68E31DA4u;
+    // 1Hz diag: which phase is the autoplay in, and is the clock sane?
     {
         static uint32_t s_diag_last_ms = 0;
         const uint32_t now_ms = GetTickCount();
         if (now_ms - s_diag_last_ms >= 1000) {
             s_diag_last_ms = now_ms;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "[CSSAP] buf=%u anchor=%u in_css=%u dwell=%d phase=%s",
-                buf_idx, g_css_autoplay_entry_buf, in_css, s_dwell,
+                "[CSSAP] buf=%u ticks=%u salt=%u dwell=%d phase=%s",
+                buf_idx, in_css, s_session_salt, s_dwell,
                 (s_dwell > 0 && in_css < (uint32_t)s_dwell) ? "wander"
                                                             : "confirm");
         }
     }
     if (s_dwell > 0 && in_css < (uint32_t)s_dwell) {
         // Wander: direction (or idle) stable for ~20-frame steps. Per-player
-        // offset gives P1/P2 independent browsing.
+        // offset + per-match salt give independent, varied browsing.
         const uint32_t step = in_css / 20u;
-        uint32_t h = (step + 1u) * 0x9E3779B9u ^ ((uint32_t)player_id << 16);
+        uint32_t h = (step + 1u) * 0x9E3779B9u ^ ((uint32_t)player_id << 16)
+                   ^ salt;
         h = (h ^ (h >> 16)) * 0x7feb352du;
         h ^= h >> 15;
         return (h & 1u) ? (uint16_t)(1u << ((h >> 1) & 3u)) : (uint16_t)0u;
     }
-    if ((in_css % 30u) == 0u) {
-        if (s_dwell > 0) {
-            // Post-dwell confirm: button derived from the dwell hash ->
-            // colors 0..3 vary per player/match.
-            uint32_t h = (buf_idx / 64u + 1u) * 0x85EBCA6Bu
-                       ^ ((uint32_t)player_id << 8);
-            h = (h ^ (h >> 13)) * 0xC2B2AE35u;
-            return (uint16_t)(1u << (4 + (h & 3u)));
-        }
-        return 0x010u;  // legacy instant-confirm pulse
+    if (s_dwell == 0) {
+        return ((in_css % 30u) == 0u) ? (uint16_t)0x010u : (uint16_t)0u;
+    }
+    // Post-dwell lock-in walk: confirm pulse every 30 ticks; if the
+    // cursor parked on an empty grid cell (sel=-1, confirm is a no-op)
+    // the offset direction nudge steps it to a neighbor before the next
+    // pulse. Once the engine latches the confirm (action state set) it
+    // stops reading this player's input, so the nudges are inert after
+    // lock-in.
+    const uint32_t k = in_css % 30u;
+    if (k == 0u) {
+        uint32_t h = (in_css / 64u + 1u) * 0x85EBCA6Bu
+                   ^ ((uint32_t)player_id << 8) ^ salt;
+        h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+        return (uint16_t)(1u << (4 + (h & 3u)));
+    }
+    if (k == 15u) {
+        uint32_t h = (in_css / 30u + 1u) * 0x9E3779B9u
+                   ^ ((uint32_t)player_id << 16) ^ salt;
+        h = (h ^ (h >> 16)) * 0x7feb352du;
+        return (uint16_t)(1u << (h & 3u));
     }
     return 0;
 }
