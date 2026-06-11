@@ -1319,6 +1319,15 @@ bool SaveState_Load(int frame) {
             uint8_t* dst = dst_base + i * OBJ_SZ;
             if (src[0] != 0) {
                 if (!is_spec_apply) {
+                    // NOTE(task #34, 2026-06-11): object slot byte 299 (a
+                    // render-written anim timer on stage BG objects) drifts
+                    // record-vs-replay under forced rollbacks, but a
+                    // skip-restore experiment on it changed NOTHING about
+                    // the k=774 divergence -- it is sim-inert (red
+                    // herring). The actual #34 mechanism is a one-slot
+                    // input-history ring shift introduced at the first
+                    // rollback (see CAM_DIAG findings in csm_diag.cpp);
+                    // motion-command history reads then diverge.
                     memcpy(dst, src, OVERRIDE_OFFSET);
                     memcpy(dst + OVERRIDE_END, src + OVERRIDE_END,
                            OBJ_SZ - OVERRIDE_END);

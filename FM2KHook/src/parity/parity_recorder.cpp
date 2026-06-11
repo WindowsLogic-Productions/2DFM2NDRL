@@ -296,6 +296,80 @@ void Capture() {
         }
     }
 
+    // [CAMTRACE] Frame-windowed object-pool divergence tracer for the
+    // forced-rollback drift (task #34). FM2K_CAMTRACE=lo-hi (capture-seq
+    // window, e.g. "740-800") logs g_screen_x/y plus one line per active
+    // object slot: full-slot Fletcher32 + the fields the camera/BG handler
+    // (0x40AF30) uses as live sim state -- including dword offsets 68/72/76
+    // which sit INSIDE the savestate restore's color-override carve-out.
+    // Diff record-side (FM2K_P1_Debug.log) vs replay-side
+    // (FM2K_P3_Debug.log) [CAMTRACE] lines to find which slot/field
+    // diverges first.
+    {
+        static int s_ct_lo = -1, s_ct_hi = -2;
+        static bool s_ct_parsed = false;
+        if (!s_ct_parsed) {
+            s_ct_parsed = true;
+            if (const char* v = std::getenv("FM2K_CAMTRACE"); v && v[0]) {
+                int lo = 0, hi = 0;
+                if (std::sscanf(v, "%d-%d", &lo, &hi) == 2) {
+                    s_ct_lo = lo;
+                    s_ct_hi = hi;
+                }
+            }
+        }
+        const int seq = (int)g_active_recorder->frames_written;
+        if (seq >= s_ct_lo && seq <= s_ct_hi) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[CAMTRACE] seq=%d screen=(%d,%d)",
+                seq, Read32S(ADDR_CAMERA_X), Read32S(ADDR_CAMERA_Y));
+            constexpr uintptr_t POOL_BASE = 0x4701E0;  // g_object_pool
+            constexpr size_t POOL_STRIDE  = 382;
+            constexpr size_t POOL_COUNT   = 1024;
+            for (size_t i = 0; i < POOL_COUNT; i++) {
+                const uint8_t* obj = (const uint8_t*)(POOL_BASE + i * POOL_STRIDE);
+                if (obj[0] == 0) continue;
+                uint32_t s1 = 0xFFFF, s2 = 0xFFFF;
+                for (size_t b = 0; b < POOL_STRIDE; b++) {
+                    s1 = (s1 + obj[b]) % 65535;
+                    s2 = (s2 + s1)     % 65535;
+                }
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[CAMTRACE]   slot=%03u id=0x%08X crc=0x%08X o8=%d o12=%d "
+                    "st338=%u a342=%d o68=%d o72=%d o76=%d",
+                    (unsigned)i,
+                    *(const uint32_t*)obj,
+                    (s2 << 16) | s1,
+                    *(const int32_t*)(obj + 8),  *(const int32_t*)(obj + 12),
+                    *(const uint32_t*)(obj + 338), *(const int32_t*)(obj + 342),
+                    *(const int32_t*)(obj + 68), *(const int32_t*)(obj + 72),
+                    *(const int32_t*)(obj + 76));
+                // FM2K_CAMTRACE_HEX=1: full 382-byte hex dump per active
+                // slot (4 chunked lines) so an offline diff can pin the
+                // exact divergent byte offsets. Keep the seq window tiny
+                // (2-3 frames) when using this -- it's ~80 lines/frame.
+                static int s_ct_hex = -1;
+                if (s_ct_hex < 0) {
+                    const char* h = std::getenv("FM2K_CAMTRACE_HEX");
+                    s_ct_hex = (h && h[0] && h[0] != '0') ? 1 : 0;
+                }
+                if (s_ct_hex == 1) {
+                    char hexbuf[2 * 96 + 1];
+                    for (size_t base = 0; base < POOL_STRIDE; base += 96) {
+                        const size_t nb = (POOL_STRIDE - base) < 96
+                                        ? (POOL_STRIDE - base) : 96;
+                        for (size_t j = 0; j < nb; j++) {
+                            std::snprintf(hexbuf + 2 * j, 3, "%02X", obj[base + j]);
+                        }
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "[CAMTRACE-HEX] slot=%03u off=%03u %s",
+                            (unsigned)i, (unsigned)base, hexbuf);
+                    }
+                }
+            }
+        }
+    }
+
     /* Patch initial_seed into the header on the first frame where FM2K
      * is in battle phase (g_game_mode == 3000). srand(time(NULL)) runs
      * during the title-to-CSS transition, well before battle. Capturing

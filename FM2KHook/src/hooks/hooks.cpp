@@ -3093,6 +3093,12 @@ bool InitializeHooks() {
     extern void Hook_InstallCsmDiag();
     Hook_InstallCsmDiag();
 
+    // Camera-operand diagnostic (task #34). FM2K_CAM_DIAG=1 installs a
+    // MidHook at camera_manager's battle path logging the camera formula's
+    // exact inputs per tick (record-vs-replay diff localizes the drift).
+    extern void Hook_InstallCamDiag();
+    Hook_InstallCamDiag();
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Hooks: All hooks installed successfully");
     return true;
 }

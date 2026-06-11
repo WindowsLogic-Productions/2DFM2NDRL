@@ -155,7 +155,85 @@ void OnCsmDispatchEntry(SafetyHookContext& ctx) {
     }
 }
 
+// --------------------------------------------------------------------------
+// Camera-input diagnostic (task #34 forced-rollback drift). MidHook at
+// 0x40B022 -- the start of camera_manager's two-player battle path (case 13,
+// g_game_mode_flag 1..2) right before it reads g_charslot0/1_pos and
+// g_screen_x/y to compute the new camera. Logs the exact operands per tick
+// so record-vs-replay diffs show WHICH input to the camera formula differs
+// at the divergent frame (parity post-frame snapshots all matched, so the
+// difference must be mid-frame / camera-object-internal).
+// Activated by env FM2K_CAM_DIAG=1; writes logs/FM2K_cam_diag.log.
+constexpr uintptr_t CAM_CASE13_SITE = 0x40B022;
+SafetyHookMid g_cam_diag_hook{};
+FILE* g_cam_diag_fp = nullptr;
+
+void OnCamCase13(SafetyHookContext& ctx) {
+    if (!g_cam_diag_fp) return;
+    const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+    const int32_t c0x = *(int32_t*)0x4DFCC1;
+    const int32_t c0y = *(int32_t*)0x4DFCC5;
+    const int32_t c1x = *(int32_t*)0x4EDD00;
+    const int32_t c1y = *(int32_t*)0x4EDD04;
+    const int32_t sx  = *(int32_t*)0x447F2C;
+    const int32_t sy  = *(int32_t*)0x447F30;
+    // esi = camera object ptr; log its slot idx + state fields so we can
+    // tell if the camera OBJECT's internal state diverged.
+    const uint8_t* obj = (const uint8_t*)ctx.esi;
+    const int slot = (int)(((uintptr_t)obj - 0x4701E0u) / 382u);
+    const int32_t o8  = *(const int32_t*)(obj + 8);
+    const int32_t o12 = *(const int32_t*)(obj + 12);
+    const int32_t a342 = *(const int32_t*)(obj + 0x156);
+    // Inputs the sim consumed THIS frame: history ring at the current
+    // buf_idx (PGI wrote them before UG; camera ticks inside UG). The
+    // parity recorder's input fields read post-update buf_idx and are a
+    // known display artifact -- these are the authoritative values.
+    const uint32_t in_p1 = *(const uint32_t*)(0x4280E0u + (buf_idx & 0x3FFu) * 4u);
+    const uint32_t in_p2 = *(const uint32_t*)(0x4290E0u + (buf_idx & 0x3FFu) * 4u);
+    std::fprintf(g_cam_diag_fp,
+        "[CAM] buf=%u scr=(%d,%d) c0=(%d,%d) c1=(%d,%d) slot=%d o8=%d o12=%d a342=%d in1=0x%03X in2=0x%03X\n",
+        buf_idx, sx, sy, c0x, c0y, c1x, c1y, slot, o8, o12, a342, in_p1, in_p2);
+    static uint32_t cam_lines_since_flush = 0;
+    if (++cam_lines_since_flush >= 100) {
+        std::fflush(g_cam_diag_fp);
+        cam_lines_since_flush = 0;
+    }
+}
+
 }  // namespace
+
+void Hook_InstallCamDiag() {
+    const char* env = std::getenv("FM2K_CAM_DIAG");
+    if (!(env && env[0] == '1')) return;
+    // pid-suffixed so the record and replay phases (same game dir, run
+    // back-to-back) don't clobber each other's log.
+    char base[64];
+    std::snprintf(base, sizeof(base), "FM2K_cam_diag_pid%lu.log",
+                  (unsigned long)GetCurrentProcessId());
+    char path[MAX_PATH] = {};
+    if (Fm2k_BuildLogPath(path, sizeof(path), base) == 0) {
+        std::snprintf(path, sizeof(path), "%s", base);
+    }
+    g_cam_diag_fp = std::fopen(path, "w");
+    if (!g_cam_diag_fp) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "CamDiag: failed to open %s for write", path);
+        return;
+    }
+    std::setvbuf(g_cam_diag_fp, nullptr, _IOFBF, 1 << 16);
+    g_cam_diag_hook = safetyhook::create_mid((void*)CAM_CASE13_SITE, OnCamCase13);
+    if (!g_cam_diag_hook) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "CamDiag: safetyhook::create_mid @ 0x%X failed",
+            (unsigned)CAM_CASE13_SITE);
+        std::fclose(g_cam_diag_fp);
+        g_cam_diag_fp = nullptr;
+        return;
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "CamDiag: MidHook installed @ 0x%X -- log: %s",
+        (unsigned)CAM_CASE13_SITE, path);
+}
 
 void Hook_InstallCsmDiag() {
     const char* env = std::getenv("FM2K_CSM_DIAG");
