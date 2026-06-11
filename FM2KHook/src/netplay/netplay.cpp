@@ -340,6 +340,23 @@ static bool g_session_delay_cache_valid  = false;
 // monotonic forward crossing is "the" confirmed advance.
 static uint32_t g_highest_recorded_frame = 0;
 
+// Confirmed-input recording ring (netplay battle sessions only). EVERY
+// non-runahead advance -- speculative first pass AND rolling_back
+// correction -- writes (frame, post-SOCD inputs) here, corrections
+// overwriting predictions. The flush after the event loop emits entries
+// to SpectatorNode_OnFrameConfirmed only once gekko_confirmed_frame()
+// says ALL players' real inputs arrived for that frame. Without this,
+// a predicting peer recorded speculative inputs into .fm2krep and the
+// live spectator stream (cross-peer fork hunt, 2026-06-11).
+struct PendingConfirmInput { uint32_t frame; uint16_t p1, p2; };
+static constexpr uint32_t PENDING_CONFIRM_RING = 128;
+static PendingConfirmInput g_pending_confirm[PENDING_CONFIRM_RING];
+static uint32_t g_next_confirm_flush = 0;
+static void ResetConfirmRing() {
+    for (auto& pc : g_pending_confirm) pc.frame = 0xFFFFFFFFu;
+    g_next_confirm_flush = 0;
+}
+
 // Battle entry sync barrier - ensures both clients enter battle at same time.
 // Also carries swap_frame negotiation for the CSS-session->battle-session swap:
 // both peers propose g_css_frame + SWAP_FRAME_BUFFER on detection, exchange via
@@ -2317,6 +2334,7 @@ bool Netplay_StartBattle() {
     g_session_ready = false;
     g_netplay_frame = 0;
     g_highest_recorded_frame = 0;  // monotonic dedup gate, reset per battle
+    ResetConfirmRing();
     g_rollback_count = 0;
     g_last_rollback_frame = 0;
     g_desync_count = 0;
@@ -2453,6 +2471,7 @@ bool Netplay_StartStressBattle() {
     g_session_ready = true;   // no handshake needed for stress
     g_netplay_frame = 0;
     g_highest_recorded_frame = 0;
+    ResetConfirmRing();
     g_rollback_count = 0;
     g_last_rollback_frame = 0;
     g_desync_count = 0;
@@ -2745,7 +2764,21 @@ bool Netplay_ProcessBattleInputPhase() {
         if (s_np_autoplay_battle == 1) {
             local_input = Hook_ComputeAutoplayBattleInput(g_player_index);
         }
-        gekko_add_local_input(g_session, g_player_index, &local_input);
+        // Only feed inputs into a STARTED session. The peer that enters
+        // battle first ticks this loop while gekko is still syncing;
+        // AddLocalInput stamps those adds with the pre-start frame
+        // counter and the input buffer's sequential gate drops/misplaces
+        // them -- net effect (cross-peer fork hunt, 2026-06-11): the two
+        // peers permanently disagreed about THIS player's input timeline
+        // by ~11 frames (= the leader's pre-sync tick count). States
+        // matched through the round intro (inputs ignored there), then
+        // forked at the first actionable frame (k=71, p1.script_idx 982
+        // vs 986) -- the live "transient desync" class users hit.
+        // GekkoNet's examples only add inputs in lockstep with a started
+        // session.
+        if (g_session_ready) {
+            gekko_add_local_input(g_session, g_player_index, &local_input);
+        }
     }
 
     int event_count = 0;
@@ -2822,15 +2855,19 @@ bool Netplay_ProcessBattleInputPhase() {
     // the same batch from HandleRollback. The first LoadEvent of every
     // batch is therefore the runahead rewind; only the 2nd+ should be
     // counted as user-visible rollbacks.
-    // [RING] trace gate (task #34): cached FM2K_RING_TRACE env check.
-    static auto RingTraceOn = []() {
-        static int c = -1;
-        if (c < 0) {
+    // [RING] trace gate (task #34 + cross-peer fork hunt): cached
+    // FM2K_RING_TRACE env check. Value 1 = legacy 40-frame window;
+    // value N>1 = trace confirmed frames 0..N.
+    static auto RingTraceMax = []() {
+        static int c = -2;
+        if (c == -2) {
             const char* v = std::getenv("FM2K_RING_TRACE");
-            c = (v && v[0] && v[0] != '0') ? 1 : 0;
+            c = (v && v[0] && v[0] != '0') ? std::atoi(v) : 0;
+            if (c == 1) c = 40;
         }
-        return c == 1;
+        return c;
     };
+    static auto RingTraceOn = []() { return RingTraceMax() > 0; };
     int load_events_in_batch = 0;
     for (int i = 0; i < update_count; i++) {
         auto update = updates[i];
@@ -2857,7 +2894,7 @@ bool Netplay_ProcessBattleInputPhase() {
                 // ring slots at every Save/Load/Advance so the one-slot
                 // input-history shift (task #34) can be watched being born
                 // at the first rollback.
-                if (RingTraceOn() && frame <= 40) {
+                if (RingTraceOn() && frame <= RingTraceMax()) {
                     const uint32_t b = *(uint32_t*)0x447EE0;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "[RING] SAVE f=%d buf=%u h1[b]=%03X h1[b-1]=%03X",
@@ -2936,7 +2973,7 @@ bool Netplay_ProcessBattleInputPhase() {
                     }
                 }
                 { PerfScope _pl(&g_perf_load); SaveState_Load(frame); }  // profile load cost (#62)
-                if (RingTraceOn() && frame <= 40) {
+                if (RingTraceOn() && frame <= RingTraceMax()) {
                     const uint32_t b = *(uint32_t*)0x447EE0;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "[RING] LOAD f=%d buf=%u h1[b]=%03X h1[b-1]=%03X",
@@ -3154,7 +3191,7 @@ bool Netplay_ProcessBattleInputPhase() {
                         post_sim_rng - pre_sim_rng);
                 }
 
-                if (RingTraceOn() && g_netplay_frame <= 40) {
+                if (RingTraceOn() && g_netplay_frame <= (uint32_t)RingTraceMax()) {
                     const uint32_t b = *(uint32_t*)0x447EE0;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "[RING] ADV  f=%u rb=%d ra=%d buf=%u h1[b]=%03X in1=%03X in2=%03X h2[b]=%03X",
@@ -3163,6 +3200,18 @@ bool Netplay_ProcessBattleInputPhase() {
                         *(uint32_t*)(0x4280E0 + (b & 0x3FF) * 4),
                         g_p1_input, g_p2_input,
                         *(uint32_t*)(0x4290E0 + (b & 0x3FF) * 4));
+                }
+
+                // Confirmed-input ring: every non-runahead advance writes
+                // its frame's inputs; rolling_back corrections OVERWRITE
+                // the speculative first pass, so by the time the flush
+                // below reaches a frame its values are final.
+                if (!g_stress_mode && !update->data.adv.running_ahead) {
+                    const uint32_t f = (uint32_t)update->data.adv.frame;
+                    auto& slot = g_pending_confirm[f % PENDING_CONFIRM_RING];
+                    slot.frame = f;
+                    slot.p1 = Hook_ApplySOCD_Public(g_p1_input);
+                    slot.p2 = Hook_ApplySOCD_Public(g_p2_input);
                 }
 
                 g_is_rolling_back = false;
@@ -3389,7 +3438,23 @@ bool Netplay_ProcessBattleInputPhase() {
                     // post-SOCD inputs to both engines).
                     const uint16_t p1_for_spec = Hook_ApplySOCD_Public(g_p1_input);
                     const uint16_t p2_for_spec = Hook_ApplySOCD_Public(g_p2_input);
-                    SpectatorNode_OnFrameConfirmed(p1_for_spec, p2_for_spec);
+                    // STRESS: record immediately -- no remotes, no
+                    // predictions, every advance is confirmed truth.
+                    //
+                    // NETPLAY: do NOT record here. Under input prediction
+                    // (window 16) this rb=0 advance may be SPECULATIVE --
+                    // gekko advances with predicted remote inputs and the
+                    // correction arrives later as a rolling_back re-advance
+                    // (which this gate skips, and the monotonic gate blocks
+                    // re-recording). Result: .fm2krep + live spectator
+                    // stream recorded mispredicted inputs on any predicting
+                    // peer -- on real internet BOTH peers predict, so real
+                    // matches shipped corrupted replays/spec streams. The
+                    // netplay path records via the pending ring + confirmed
+                    // -horizon flush after the event loop instead.
+                    if (g_stress_mode) {
+                        SpectatorNode_OnFrameConfirmed(p1_for_spec, p2_for_spec);
+                    }
 
                     // Per-frame state fingerprint for spectator-desync
                     // diagnosis — pairs with [SPEC-FP] log in
@@ -3528,6 +3593,22 @@ bool Netplay_ProcessBattleInputPhase() {
     // the rollback-window filter that prevents erased/re-triggered sounds.
     if (has_advance && earliest_advance != UINT32_MAX) {
         latest_advance = g_netplay_frame;
+        // Flush CONFIRMED inputs to the recorder/spectator stream. A frame
+        // is safe once gekko has REAL inputs from all players for it --
+        // predictions can no longer change it. Entries flush in strict
+        // frame order; the pi.frame guard stops at frames not yet
+        // advanced locally (confirmed horizon can lead our sim).
+        if (!g_stress_mode && g_session && g_session_kind == SessionKind::BATTLE) {
+            const int confirmed = gekko_confirmed_frame(g_session);
+            while ((int)g_next_confirm_flush <= confirmed) {
+                const PendingConfirmInput& pi =
+                    g_pending_confirm[g_next_confirm_flush % PENDING_CONFIRM_RING];
+                if (pi.frame != g_next_confirm_flush) break;
+                SpectatorNode_OnFrameConfirmed(pi.p1, pi.p2);
+                g_next_confirm_flush++;
+            }
+        }
+
         SoundRollback::SyncAfterAdvance(earliest_advance, latest_advance);
     }
 

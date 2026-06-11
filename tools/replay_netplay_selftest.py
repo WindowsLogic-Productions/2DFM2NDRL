@@ -128,7 +128,8 @@ def main():
     # by default. FM2K_LOCAL_DELAY=0 forces real prediction misses (even
     # 0ms-ping scheduling jitter makes remote inputs late) -> genuine
     # rollbacks through the genuine path.
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_RUNAHEAD"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD",
+              "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 

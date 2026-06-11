@@ -180,7 +180,7 @@ def main():
         "FM2K_AUTO_TERMINATE_AT_FRAME": str(args.frames),
         "FM2K_TEST_AUTO_CSS": "0,0,0,0,0",
     }
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_RUNAHEAD"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
