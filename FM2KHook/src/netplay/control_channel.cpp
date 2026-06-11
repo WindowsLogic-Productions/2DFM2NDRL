@@ -517,6 +517,16 @@ static void RawReceive() {
             // Defined in nat_traversal.h. Returning here keeps the byte
             // out of GekkoNet's queue and the spectator path.
             ::fm2k::nat::HandleDatagram(eff_data, eff_len, from_addr);
+        } else if (eff_len >= 1 && first == 0xCE) {
+            // Spectator UDP input accelerator (Phase F). Narrow handler:
+            // accepts ONLY UDP_INPUT_BATCH from the current upstream;
+            // everything else is dropped there. Keeps the datagram out of
+            // GekkoNet's queue (old builds without this branch fed 0xCE
+            // to gekko, which discards on bad magic -- harmless but noisy).
+            extern void SpectatorNode_HandleUdpInputDatagram(
+                const uint8_t* buf, size_t len, const sockaddr_in& from);
+            SpectatorNode_HandleUdpInputDatagram(
+                reinterpret_cast<const uint8_t*>(eff_data), eff_len, from_addr);
         } else {
             // GekkoNet packet - queue for adapter
             std::vector<char> pkt_data(
@@ -668,6 +678,14 @@ void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest) {
     pkt.header.player_id = g_local_player_id;
 
     sendto(g_socket, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
+           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+}
+
+void ControlChannel_SendRawTo(const void* buf, size_t len, const sockaddr_in& dest) {
+    if (!g_socket_initialized) return;
+    if (g_socket == INVALID_SOCKET) return;
+    if (dest.sin_port == 0) return;
+    sendto(g_socket, reinterpret_cast<const char*>(buf), (int)len, 0,
            reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
 }
 

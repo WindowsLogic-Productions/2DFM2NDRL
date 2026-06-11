@@ -590,8 +590,11 @@ void SpectatorNode_ClearGekkoSpectatorTracking();
 // SpecJoinMode value the joining peer declared in its SPEC_JOIN_REQ
 // payload (zero / FULL_SESSION when sent by older builds that don't
 // know about the field — the back-compat path).
+// `caps` is the JOIN_REQ's reserved[0] capability byte (SPEC_JOIN_* bits;
+// zeros from older builds).
 void SpectatorNode_HandleJoinReq(const sockaddr_in& from,
-                                 SpecJoinMode mode = SpecJoinMode::FULL_SESSION);
+                                 SpecJoinMode mode = SpecJoinMode::FULL_SESSION,
+                                 uint8_t caps = 0);
 
 // Handle SPEC_LEAVE — remove subscriber from list.
 void SpectatorNode_HandleLeave(const sockaddr_in& from);
@@ -671,6 +674,19 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
 // demux before the GekkoNet queue.
 void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
                                           const sockaddr_in& from);
+
+// Upstream TCP stream died (read error / corrupt stream / unknown type).
+// Drops the subscription + UDP admission epoch so TickHealth's reconnect
+// path re-JOINs immediately, instead of waiting on a silence failover that
+// the UDP accelerator suppresses forever (queue never idles while
+// datagrams flow, but ops are TCP-only -- the q:7 boundary zombie).
+void SpectatorNode_OnUpstreamTcpDead();
+
+// Playback-pacing queries for the trampoline's jitter floor (Phase F):
+// the q<floor freeze must not strand a queued boundary op (MATCH_END
+// behind tail inputs) or an active SEAM/PINNING walk.
+bool SpectatorNode_InBoundary();
+bool SpectatorNode_QueueHasPendingOp();
 
 // Are we currently subscribed upstream (receiving a live match stream)?
 bool SpectatorNode_IsSubscribedUpstream();

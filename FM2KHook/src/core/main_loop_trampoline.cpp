@@ -1012,13 +1012,27 @@ static void RunSpectatorTick() {
     // stream — so the last ≤8 events (typically post-match INPUTs +
     // MATCH_END) would be stranded under the LIVE floor. Drain to zero
     // instead, which lets MATCH_END apply and the playback finishes cleanly.
-    if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active) {
+    //
+    // Boundary bypass (Phase F): the floor must not strand a queued
+    // boundary op or freeze an active SEAM/PINNING walk. With the UDP
+    // accelerator the spec rides AT the live edge, so the stream pause at
+    // a match seam arrives with q < floor — the old unconditional freeze
+    // trapped MATCH_END behind the last tail inputs forever (q:7 zombie,
+    // 2026-06-11). If any non-INPUT op is queued, drain toward it; if a
+    // boundary is active, the synthetic feed must keep ticking even at
+    // q == 0 (it consumes nothing while walking results/CSS).
+    const bool boundary_bypass =
+        SpectatorNode_InBoundary() ||
+        (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
+         SpectatorNode_QueueHasPendingOp());
+    if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active &&
+        !boundary_bypass) {
         // Queue starved — hold the current rendered frame. Don't tick sim,
         // don't read inputs, don't run process_game_inputs/update_game.
         RenderFrameWithSnapshot();
         return;
     }
-    if (qd == 0) {
+    if (qd == 0 && !boundary_bypass) {
         // Truly empty — even offline replay has nothing left to do.
         //
         // For offline replay (FM2K_REPLAY_FILE set): the entire file was

@@ -65,6 +65,13 @@ void ControlChannel_Send(const CtrlPacket& packet);
 // route the ACK to the wrong client and put it in an unintended state.
 void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest);
 
+// Send a raw datagram (no CtrlPacket header) on the shared control socket.
+// Used by the Phase F spectator UDP input accelerator (0xCE
+// UDP_INPUT_BATCH datagrams to subscriber addresses). The receiver's
+// RawReceive demux routes by first byte, so the payload must begin with
+// its own magic.
+void ControlChannel_SendRawTo(const void* buf, size_t len, const sockaddr_in& dest);
+
 // Check if control channel is connected (received HELLO_ACK)
 bool ControlChannel_IsConnected();
 

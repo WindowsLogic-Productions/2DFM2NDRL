@@ -792,7 +792,8 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                     (mode_byte == static_cast<uint8_t>(SpecJoinMode::CURRENT_MATCH))
                         ? SpecJoinMode::CURRENT_MATCH
                         : SpecJoinMode::FULL_SESSION;
-                SpectatorNode_HandleJoinReq(from, mode);
+                SpectatorNode_HandleJoinReq(from, mode,
+                    packet->data.spec_join_req.reserved[0]);
             }
             break;
 

@@ -306,6 +306,17 @@ def main():
     kill_strays()
     print(f"[harness] rcs: P1={rcs[0]} P2={rcs[1]} SPEC={rcs[2]}")
 
+    # Preserve the live-phase debug logs IMMEDIATELY -- before any
+    # assertion can bail (a coverage FAIL used to skip preservation and
+    # the replay phase of the NEXT run overwrote the evidence).
+    for lf in ("FM2K_P1_Debug.log", "FM2K_P2_Debug.log", "FM2K_P3_Debug.log"):
+        src = game_dir / "logs" / lf
+        if src.exists():
+            try:
+                shutil.copy2(src, OUT_DIR / f"live_{lf}")
+            except OSError as e:
+                print(f"[harness] (warn) could not preserve {lf}: {e}")
+
     if not p1_pty.exists():
         print("[harness] FAIL: host parity missing")
         return 1
@@ -355,18 +366,6 @@ def main():
           "(unreliable under packet loss -- host captures speculative states)")
     subprocess.call([sys.executable, str(PARITY_DIFF),
                      str(p1_pty), str(spec_pty)])
-
-    # Preserve the live-phase debug logs BEFORE the replay phase launches --
-    # the replay instance reuses the P3 log slot and overwrites the
-    # spectator's evidence (lost the CSS-2 wrong-characters trail on the
-    # 2026-06-11 A4 run).
-    for lf in ("FM2K_P1_Debug.log", "FM2K_P2_Debug.log", "FM2K_P3_Debug.log"):
-        src = game_dir / "logs" / lf
-        if src.exists():
-            try:
-                shutil.copy2(src, OUT_DIR / f"live_{lf}")
-            except OSError as e:
-                print(f"[harness] (warn) could not preserve {lf}: {e}")
 
     # THE GATE: spec-vs-replay, confirmed-vs-confirmed. Both the spectator
     # stream and --replay playback are driven by the host's CONFIRMED input

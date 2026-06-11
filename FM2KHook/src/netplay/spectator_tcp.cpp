@@ -25,6 +25,7 @@
 // Forward declaration — defined in spectator_node.cpp. The `from` field is
 // unused for TCP-sourced frames (dispatch logic doesn't depend on it for
 // upstream-INPUT_BATCH/INITIAL_MATCH/MATCH_END), so we pass a zeroed sockaddr.
+extern void SpectatorNode_OnUpstreamTcpDead();
 extern void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                                          const sockaddr_in& from);
 
@@ -152,6 +153,14 @@ size_t PayloadLenForType(const SpecDataHeader& hdr) {
         case SpecDataType::SNAPSHOT_BEGIN:
         case SpecDataType::SNAPSHOT_CHUNK:
         case SpecDataType::SNAPSHOT_END:
+            return static_cast<size_t>(hdr.flags);
+
+        // Phase F: OP_BASELINE is TCP-borne (u32 payload, byte count in
+        // flags). UDP_INPUT_BATCH deliberately has NO case here -- it is
+        // datagram-only, and a host bug that ever frames it onto the TCP
+        // stream should fail loudly (SIZE_MAX -> connection drop) instead
+        // of silently desyncing the framer.
+        case SpecDataType::OP_BASELINE:
             return static_cast<size_t>(hdr.flags);
     }
     return SIZE_MAX;  // unknown tag
@@ -594,6 +603,14 @@ void PollUpstream() {
             NET_DestroyStreamSocket(g_upstream_sock);
             g_upstream_sock = nullptr;
             g_upstream_read_buf.clear();
+            // Tell the node the authoritative stream is gone so it can
+            // re-JOIN immediately. Waiting on the silence failover is a
+            // trap with the UDP accelerator: datagrams keep the queue
+            // non-empty (suppressing failover) while every op stays
+            // undeliverable -- observed as the q:7 boundary zombie on
+            // the 2026-06-11 multi-match run (RST mid-battle, UDP masked
+            // it for 15s, deadlock at MATCH_END).
+            SpectatorNode_OnUpstreamTcpDead();
             return;
         }
         if (n == 0) break;
@@ -617,6 +634,7 @@ void PollUpstream() {
             NET_DestroyStreamSocket(g_upstream_sock);
             g_upstream_sock = nullptr;
             g_upstream_read_buf.clear();
+            SpectatorNode_OnUpstreamTcpDead();
             return;
         }
         const size_t payload_len = PayloadLenForType(hdr);
@@ -628,6 +646,7 @@ void PollUpstream() {
             NET_DestroyStreamSocket(g_upstream_sock);
             g_upstream_sock = nullptr;
             g_upstream_read_buf.clear();
+            SpectatorNode_OnUpstreamTcpDead();
             return;
         }
         const size_t total = sizeof(SpecDataHeader) + payload_len;

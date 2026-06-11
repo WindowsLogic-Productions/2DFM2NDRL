@@ -343,6 +343,14 @@ struct State {
     //              consumes host battle frame 0's input.
     enum class PbBoundary : uint8_t { NONE, SEAM, PINNING };
     PbBoundary                pb_boundary          = PbBoundary::NONE;
+    // PINNING release requires a mode EDGE, not a level: the local game
+    // must first LEAVE battle (results screen is still mode 3000 -- with
+    // the UDP accelerator MATCH_START arrives ~2s after MATCH_END, long
+    // before the local game walks off the old match's results screen) and
+    // only then re-enter >= 3000. Releasing on the stale 3000 fed the new
+    // match's inputs into the old results screen and let CssAutoConfirm
+    // disengage before CSS even opened (wrong characters at UDP speed).
+    bool                      pb_boundary_left_battle = false;
 };
 
 State g_state;
@@ -632,6 +640,76 @@ void FlushBatch() {
     OutboundBroadcast(buf.data(), buf.size());
 }
 
+// ─── Phase F: UDP input accelerator (host side) ──────────────────────────
+
+// Kill switch: FM2K_SPEC_UDP=0 disables both the host sender and the
+// viewer admission. Default ON.
+bool SpecUdpEnabled() {
+    static int s_state = -1;
+    if (s_state < 0) {
+        const char* v = std::getenv("FM2K_SPEC_UDP");
+        s_state = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return s_state != 0;
+}
+
+// Broadcast the last-K-confirmed-inputs window as a raw datagram to every
+// direct subscriber that advertised SPEC_JOIN_UDP_OK. Pure accelerator:
+// the same inputs also flow via the TCP EVENT_BATCH stream; the viewer's
+// positional dedup makes double delivery free. See spectator_node.h
+// (UDP_INPUT_BATCH) for the wire layout and admission invariant.
+void SendUdpInputBatches() {
+    if (!SpecUdpEnabled()) return;
+    if (g_state.spec_transport_relay) return;   // no direct UDP addressing
+    if (g_state.subscribers.empty()) return;
+    const uint32_t total = g_state.total_input_count;
+    if (total == 0) return;
+
+    const uint32_t window = (uint32_t)std::min<uint64_t>(SPEC_UDP_WINDOW, total);
+    const uint32_t start  = total - window;
+
+    uint8_t buf[sizeof(SpecDataHeader) + 4 + SPEC_UDP_WINDOW * 4];
+    SpecDataHeader hdr = {};
+    hdr.magic       = SPEC_DATA_MAGIC;
+    hdr.type        = SpecDataType::UDP_INPUT_BATCH;
+    hdr.start_frame = start;
+    hdr.frame_count = (uint16_t)window;
+    hdr.flags       = (uint16_t)(4 + window * 4);
+    std::memcpy(buf, &hdr, sizeof(hdr));
+    const uint32_t op_seq = g_state.total_op_count;
+    std::memcpy(buf + sizeof(hdr), &op_seq, 4);
+    uint8_t* w = buf + sizeof(hdr) + 4;
+    for (uint32_t f = start; f < total; ++f) {
+        const size_t slot = f % SPEC_UDP_WINDOW;
+        std::memcpy(w, &g_state.udp_ring_p1[slot], 2); w += 2;
+        std::memcpy(w, &g_state.udp_ring_p2[slot], 2); w += 2;
+    }
+    const size_t len = sizeof(SpecDataHeader) + 4 + (size_t)window * 4;
+
+    size_t fanned = 0;
+    for (const auto& sub : g_state.subscribers) {
+        if (!sub.udp_ok || !sub.tcp_bound) continue;
+        ControlChannel_SendRawTo(buf, len, sub.addr);
+        if (++fanned >= SPEC_UDP_MAX_FANOUT) break;
+    }
+}
+
+// TCP-borne op-count baseline for a freshly-bound subscriber. Must ship
+// BEFORE the snapshot/backfill on the same connection so the viewer's
+// ops_seen starts exact for the events this connection will deliver.
+void SendOpBaselineTo(const sockaddr_in& to, uint32_t baseline) {
+    uint8_t buf[sizeof(SpecDataHeader) + 4];
+    SpecDataHeader hdr = {};
+    hdr.magic       = SPEC_DATA_MAGIC;
+    hdr.type        = SpecDataType::OP_BASELINE;
+    hdr.start_frame = 0;
+    hdr.frame_count = 0;
+    hdr.flags       = 4;
+    std::memcpy(buf, &hdr, sizeof(hdr));
+    std::memcpy(buf + sizeof(hdr), &baseline, 4);
+    OutboundSendTo(to, buf, sizeof(buf));
+}
+
 // Legacy SendInitialMatchTo / INITIAL_MATCH packet path removed in C12.
 // MATCH_START flows as a SessionEvent op interleaved with INPUTs in the
 // EVENT_BATCH stream; late joiners get it via SendSessionBackfillTo.
@@ -822,13 +900,14 @@ void SendSessionBackfillTo(const sockaddr_in& to) {
 // follows them" so we keep them grouped. We therefore find the FIRST
 // INPUT >= anchor and back up to include any preceding non-INPUT ops in
 // the same group.
-void SendSessionBackfillFromFrame(const sockaddr_in& to,
-                                  uint32_t anchor_input_frame) {
+// Hoisted index computation: the first session_events index a backfill
+// anchored at `anchor_input_frame` would ship (the first INPUT at-or-after
+// the anchor, backed up over its preceding non-INPUT op group). Returns
+// session_events.size() when nothing is at-or-after the anchor. Shared by
+// SendSessionBackfillFromFrame and the OP_BASELINE computation in the bind
+// path so both always agree on where the connection's delivery starts.
+size_t BackfillFirstIdxForFrame(uint32_t anchor_input_frame) {
     const size_t total = g_state.session_events.size();
-    if (total == 0) return;
-
-    // Walk session_events tracking the running input-frame cursor; find
-    // the first INPUT event whose cursor value == anchor_input_frame.
     uint32_t cursor = g_state.session_start_frame;
     size_t   first_idx = total;   // sentinel: nothing matched
     for (size_t i = 0; i < total; ++i) {
@@ -841,14 +920,7 @@ void SendSessionBackfillFromFrame(const sockaddr_in& to,
             ++cursor;
         }
     }
-
-    if (first_idx >= total) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "SpectatorNode: no events at-or-after INPUT-frame=%u "
-            "(total INPUTs=%u, snapshot is at the live edge)",
-            anchor_input_frame, g_state.total_input_count);
-        return;
-    }
+    if (first_idx >= total) return total;
 
     // Back up over any non-INPUT ops immediately preceding first_idx
     // so they belong to the SAME chunk as their following INPUT (the
@@ -859,6 +931,22 @@ void SendSessionBackfillFromFrame(const sockaddr_in& to,
     while (first_idx > 0 &&
            g_state.session_events[first_idx - 1].type != SessionEventType::INPUT) {
         --first_idx;
+    }
+    return first_idx;
+}
+
+void SendSessionBackfillFromFrame(const sockaddr_in& to,
+                                  uint32_t anchor_input_frame) {
+    const size_t total = g_state.session_events.size();
+    if (total == 0) return;
+
+    const size_t first_idx = BackfillFirstIdxForFrame(anchor_input_frame);
+    if (first_idx >= total) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: no events at-or-after INPUT-frame=%u "
+            "(total INPUTs=%u, snapshot is at the live edge)",
+            anchor_input_frame, g_state.total_input_count);
+        return;
     }
 
     SendSessionEventsTo(to, first_idx, anchor_input_frame);
@@ -1362,6 +1450,12 @@ void SpectatorNode_Shutdown() {
     g_state.last_flushed_event_idx = 0;
     g_state.flushed_input_count    = 0;
     g_state.total_input_count      = 0;
+    g_state.total_op_count         = 0;
+    g_state.ops_seen               = 0;
+    g_state.udp_epoch_armed        = false;
+    g_state.udp_admitted_total     = 0;
+    g_state.udp_paused_on_gate     = 0;
+    g_state.udp_dropped_on_gap     = 0;
     g_state.broadcasting = false;
     g_state.subscribed_upstream = false;
     g_state.playing_back = false;
@@ -1468,6 +1562,10 @@ void SpectatorNode_OnFrameConfirmed(uint16_t p1_input, uint16_t p2_input) {
     ev.u.input.p1 = p1_input;
     ev.u.input.p2 = p2_input;
     g_state.session_events.push_back(ev);
+    // Phase F: mirror into the UDP accelerator ring, keyed by this input's
+    // session-relative frame index (= total_input_count pre-increment).
+    g_state.udp_ring_p1[g_state.total_input_count % SPEC_UDP_WINDOW] = p1_input;
+    g_state.udp_ring_p2[g_state.total_input_count % SPEC_UDP_WINDOW] = p2_input;
     ++g_state.total_input_count;
 
     // Live broadcast batching window — only fan out to existing subscribers.
@@ -1476,6 +1574,12 @@ void SpectatorNode_OnFrameConfirmed(uint16_t p1_input, uint16_t p2_input) {
         g_state.total_input_count - g_state.flushed_input_count;
     if (pending_inputs >= BROADCAST_BATCH_FRAMES) {
         FlushBatch();
+    }
+
+    // Phase F: redundant UDP window every SPEC_UDP_SEND_INTERVAL confirmed
+    // frames. Internally no-ops when disabled / relay-mode / no udp_ok subs.
+    if ((g_state.total_input_count % SPEC_UDP_SEND_INTERVAL) == 0) {
+        SendUdpInputBatches();
     }
 }
 
@@ -1509,6 +1613,10 @@ void SpectatorNode_OnMatchEnd(const MatchEndPayload& p) {
 namespace {
 
 void AppendOpAndFlush(const SessionEvent& ev) {
+    // Phase F: single choke point for non-INPUT appends -- the running op
+    // count ships as op_seq in UDP_INPUT_BATCH so viewers can order
+    // inputs after ops (see admission invariant in spectator_node.h).
+    ++g_state.total_op_count;
     g_state.session_events.push_back(ev);
     // Flush eagerly when subscribers exist (host with live spectators OR
     // relay node with sub-spectators). When the subscriber list is empty,
@@ -1898,6 +2006,33 @@ void SpectatorNode_ApplyPendingSnapshot() {
     const uint32_t captured  = inbox.meta.captured_game_mode;
     const uint32_t apply_gate = (captured == 0u) ? 3000u : captured;
     if (game_mode < apply_gate) return;
+
+    // Re-join guard (Phase F): a TCP-death re-JOIN makes the host re-ship
+    // its cached snapshot. If our sim has already CONSUMED past the
+    // snapshot's anchor, loading it would rewind the engine to the anchor
+    // while the queue/cursor stay at the live edge -- corrupted playback.
+    // Consumption position = receipt cursor minus the INPUTs still queued
+    // (highest_consumed_frame is vestigial -- never updated). Strict >
+    // so a fresh join (consumed == anchor, nothing popped yet) applies,
+    // and a forward jump (anchor ahead of us, e.g. re-join landing in the
+    // NEXT match) also applies.
+    if (g_state.have_frame_baseline) {
+        uint32_t queued_inputs = 0;
+        for (const auto& ev : g_state.pb_queue) {
+            if (ev.type == SessionEventType::INPUT) ++queued_inputs;
+        }
+        const uint32_t consumed_pos =
+            (g_state.next_expected_frame > queued_inputs)
+                ? g_state.next_expected_frame - queued_inputs : 0;
+        if (consumed_pos > inbox.anchor_frame) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: discarding re-join snapshot (anchor=%u "
+                "behind consumed=%u) -- already playing past it",
+                inbox.anchor_frame, consumed_pos);
+            inbox = State::SnapshotInbox{};
+            return;
+        }
+    }
 
     if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -2586,7 +2721,24 @@ void ApplySessionEvent(const SessionEvent& ev) {
             // structurally misaligned with the spec's own seam timing.
             // PopFrameInputs discards them and feeds synthetic inputs; the
             // next MATCH_START re-arms character pinning (see PbBoundary).
-            g_state.pb_boundary = State::PbBoundary::SEAM;
+            //
+            // Offline replay keeps the legacy path: single-match .fm2krep
+            // files have no following MATCH_START, so a SEAM would feed
+            // synthetic inputs forever and block the queue-drained
+            // ExitProcess (observed: replay-phase instance stuck at its
+            // results screen after the Phase F boundary rework).
+            {
+                static int s_offline_replay_cached2 = -1;
+                if (s_offline_replay_cached2 < 0) {
+                    const char* v = std::getenv("FM2K_REPLAY_FILE");
+                    s_offline_replay_cached2 = (v && v[0]) ? 1 : 0;
+                }
+                if (s_offline_replay_cached2 == 0) {
+                    g_state.pb_boundary = State::PbBoundary::SEAM;
+                    const uint32_t cur_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+                    g_state.pb_boundary_left_battle = (cur_mode < 3000u);
+                }
+            }
             const auto& p = ev.u.match_end;
             const char* who = (p.winner_idx == 0) ? "P1"
                             : (p.winner_idx == 1) ? "P2" : "DRAW";
@@ -2661,7 +2813,9 @@ void ApplySessionEvent(const SessionEvent& ev) {
 // JOIN / REDIRECT
 // -----------------------------------------------------------------------------
 
-void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
+void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
+                                 uint8_t caps) {
+    const bool udp_ok = SpecUdpEnabled() && (caps & SPEC_JOIN_UDP_OK) != 0;
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
@@ -2772,6 +2926,7 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
             sub.tcp_bound    = false;
             sub.ack_frame    = 0;
             sub.join_mode    = mode;
+            sub.udp_ok       = udp_ok;
             sub.last_seen_ms = GetTickCount64();
             // Drop the old TCP conn + any stale pending clients from this
             // IP so the bind path pairs the spectator's FRESH dial instead
@@ -2808,6 +2963,7 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
         sub.ack_frame    = 0;
         sub.tcp_bound    = false;
         sub.join_mode    = mode;
+        sub.udp_ok       = udp_ok;
         // Phase 2c: pop the cached spec_user_id (if any) for this addr.
         // Punch-target poll wrote it earlier when the hub's
         // spec_incoming forwarded the sub's user_id. Used by relay-mode
@@ -2969,7 +3125,11 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
     CtrlPacket req = {};
     req.header.type            = CtrlMsg::SPEC_JOIN_REQ;
     req.data.spec_join_req.mode = static_cast<uint8_t>(mode);
-    // reserved bytes are zero from the {} init above.
+    // Phase F capability advertisement (remaining reserved bytes stay
+    // zero from the {} init above). Old hosts ignore reserved bits.
+    if (SpecUdpEnabled()) {
+        req.data.spec_join_req.reserved[0] |= SPEC_JOIN_UDP_OK;
+    }
     ControlChannel_SendTo(req, upstream);
     return true;
 }
@@ -3021,12 +3181,26 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     g_state.upstream_addr         = from;
     g_state.subscribed_upstream   = true;
 
+    // Phase F: every (re)subscribe starts a fresh UDP admission epoch.
+    // The host's OP_BASELINE on the new connection re-arms it with an
+    // exact count; until then incoming datagrams are dropped. Without
+    // this, ops re-delivered by the new connection's backfill would
+    // double-count into ops_seen and over-permit admission.
+    g_state.udp_epoch_armed = false;
+
     // RNG sync + queue clear: ONLY apply on FIRST-TIME subscribe (spectator
     // is still at title/pre-CSS, no game state to lose). On reconnect-after-
     // silence-failover or on re-broadcast ACK, spectator's local sim is
     // mid-match — clobbering RNG / wiping the queue would erase in-progress
     // state. Gate both on first-time only.
-    if (first_time) {
+    //
+    // have_frame_baseline sub-gate (review hole 9): RequestJoin sets
+    // join_req_pending on EVERY reconnect attempt, so first_time is true
+    // for genuine reconnects too. If a baseline already exists, the queue
+    // holds received-but-unplayed frames the dedup cursor has already
+    // counted -- clearing them would skip those frames forever. Only a
+    // truly fresh viewer (no baseline yet) gets the clear + RNG pin.
+    if (first_time && !g_state.have_frame_baseline) {
         *(uint32_t*)0x41FB1C = 0x12345678;
         g_state.pb_queue.clear();
         g_state.pb_current_p1 = 0;
@@ -3380,6 +3554,27 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 local_checksum, inbox.anchor_frame);
             break;
         }
+        case SpecDataType::OP_BASELINE: {
+            // Phase F: op-count baseline for this connection. Seeds
+            // ops_seen with the count of non-INPUT events appended before
+            // this connection's backfill start (which we will never
+            // receive), and (re-)arms the UDP admission epoch. Sent by the
+            // host's bind path BEFORE snapshot/backfill, so by TCP
+            // ordering it always precedes the first EVENT_BATCH of the
+            // fresh connection.
+            if (!g_state.subscribed_upstream) return;
+            if (payload_len >= 4) {
+                uint32_t baseline = 0;
+                std::memcpy(&baseline, payload, 4);
+                g_state.ops_seen        = baseline;
+                g_state.udp_epoch_armed = SpecUdpEnabled();
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: OP_BASELINE=%u received -- UDP "
+                    "admission %s", baseline,
+                    g_state.udp_epoch_armed ? "armed" : "disabled by env");
+            }
+            break;
+        }
         case SpecDataType::EVENT_BATCH: {
             // Primary C2+ ingest. Payload is a packed SessionEvent[] stream
             // (1-byte tag + variant payload per event). Walk the stream
@@ -3451,6 +3646,14 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                     }
                     ++cursor_input;
                 } else {
+                    // Phase F: exact op count for the UDP admission gate.
+                    // Counted for EVERY decoded non-INPUT event on this
+                    // connection (pushed or stale) -- TCP delivers each op
+                    // exactly once per connection, and OP_BASELINE seeded
+                    // the count for ops from before this connection's
+                    // backfill start.
+                    ++g_state.ops_seen;
+
                     // Non-INPUT event. Apply when its position (= cursor_input,
                     // i.e. the index of the next INPUT) is at or after the
                     // current dedup cursor — meaning the INPUT it logically
@@ -3548,6 +3751,113 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
     }
 }
 
+void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
+                                          const sockaddr_in& from) {
+    // Narrow by design: only UDP_INPUT_BATCH, only from the current
+    // upstream, only while the per-connection admission epoch is armed.
+    // Never runs the full HandleSpecData parser -- its dedup/ordering
+    // assumptions are TCP-shaped.
+    if (!SpecUdpEnabled()) return;
+    if (len < sizeof(SpecDataHeader) + 4) return;
+    SpecDataHeader hdr;
+    std::memcpy(&hdr, buf, sizeof(hdr));
+    if (hdr.magic != SPEC_DATA_MAGIC) return;
+    if (hdr.type != SpecDataType::UDP_INPUT_BATCH) return;
+    if (!g_state.subscribed_upstream) return;
+    if (!g_state.have_frame_baseline) return;
+    if (!g_state.udp_epoch_armed) return;
+    if (!AddrEqual(from, g_state.upstream_addr)) return;  // spoof / stale upstream
+
+    uint32_t op_seq = 0;
+    std::memcpy(&op_seq, buf + sizeof(SpecDataHeader), 4);
+    const size_t frames = (len - sizeof(SpecDataHeader) - 4) / 4;
+    if (frames == 0 || frames != hdr.frame_count) return;  // malformed
+
+    // [SPEC-UDP] 1Hz heartbeat BEFORE the gates -- pause periods are
+    // exactly when this diagnostic matters (the original tail placement
+    // went silent the moment the op gate engaged).
+    {
+        static uint64_t s_last_log_ms = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - s_last_log_ms >= 1000) {
+            s_last_log_ms = now;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[SPEC-UDP] admitted=%u paused_on_gate=%u dropped_on_gap=%u "
+                "op_seq=%u ops_seen=%u q=%zu",
+                g_state.udp_admitted_total, g_state.udp_paused_on_gate,
+                g_state.udp_dropped_on_gap, op_seq, g_state.ops_seen,
+                g_state.pb_queue.size());
+        }
+    }
+
+    // Admission gate: every op the host appended before these inputs must
+    // already be TCP-decoded locally (see invariant in spectator_node.h).
+    // Boundary ops in flight (MATCH_END .. MATCH_START) pause admission;
+    // the TCP burst that delivers them also jumps the cursor, after which
+    // UDP re-engages. Self-healing by redundancy -- nothing is lost.
+    if (op_seq > g_state.ops_seen) {
+        ++g_state.udp_paused_on_gate;
+        return;
+    }
+    // Window entirely ahead of the cursor (loss burst exceeded the
+    // redundancy window): drop whole datagram; TCP fills the hole.
+    if (hdr.start_frame > g_state.next_expected_frame) {
+        ++g_state.udp_dropped_on_gap;
+        return;
+    }
+
+    uint32_t cursor   = hdr.start_frame;
+    uint32_t admitted = 0;
+    const uint8_t* p = buf + sizeof(SpecDataHeader) + 4;
+    for (size_t i = 0; i < frames; ++i, ++cursor) {
+        if (cursor != g_state.next_expected_frame) continue;  // already queued
+        uint16_t p1 = 0, p2 = 0;
+        std::memcpy(&p1, p + i * 4,     2);
+        std::memcpy(&p2, p + i * 4 + 2, 2);
+        SessionEvent ev{};
+        ev.type       = SessionEventType::INPUT;
+        ev.u.input.p1 = p1;
+        ev.u.input.p2 = p2;
+        g_state.pb_queue.push_back(ev);
+        g_state.next_expected_frame = cursor + 1;
+        ++admitted;
+        // Hop-1 relay parity with the TCP path (line ~3318): the late TCP
+        // copy of these frames is positionally skipped there, so without
+        // this append a relay node's downstream stream would lose them.
+        SpectatorNode_OnFrameConfirmed(p1, p2);
+    }
+    g_state.udp_admitted_total += admitted;
+}
+
+void SpectatorNode_OnUpstreamTcpDead() {
+    if (!g_state.subscribed_upstream) return;
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+        "SpectatorNode: upstream TCP died -- dropping subscription for "
+        "immediate re-JOIN (q=%zu, ops_seen=%u, boundary=%d)",
+        g_state.pb_queue.size(), g_state.ops_seen,
+        (int)g_state.pb_boundary);
+    g_state.subscribed_upstream = false;
+    g_state.live_established    = false;
+    g_state.udp_epoch_armed     = false;   // stale-stream datagrams rejected
+    // Queue + frame baseline + boundary state are KEPT (F4 semantics):
+    // received-but-unplayed frames stay playable; the re-JOIN's
+    // OP_BASELINE re-seeds ops_seen exactly for the new connection, and
+    // its backfill dedups against next_expected_frame.
+    // TickHealth's reconnect branch (subscribed=false + root_addr) fires
+    // RequestJoin on its 2s backoff.
+}
+
+bool SpectatorNode_InBoundary() {
+    return g_state.pb_boundary != State::PbBoundary::NONE;
+}
+
+bool SpectatorNode_QueueHasPendingOp() {
+    for (const auto& ev : g_state.pb_queue) {
+        if (ev.type != SessionEventType::INPUT) return true;
+    }
+    return false;
+}
+
 bool SpectatorNode_IsSubscribedUpstream() { return g_state.subscribed_upstream; }
 
 // -----------------------------------------------------------------------------
@@ -3613,12 +3923,20 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     // Boundary synthetic feed. SEAM: queue may be empty or waiting on the
     // wire for the boundary ops — keep the local sim moving. PINNING:
     // battle INPUTs are parked at the head while CssAutoConfirm walks the
-    // local CSS to the announced picks; resume exact pops at mode 3000 so
-    // spec battle frame 0 consumes host battle frame 0's input.
+    // local CSS to the announced picks; resume exact pops when the local
+    // game re-enters battle.
+    //
+    // Release is EDGE-triggered: the local mode must first drop below
+    // 3000 (leave the old match's results screen) before a value >= 3000
+    // counts as "the new battle". The old level check released instantly
+    // when MATCH_START arrived while results were still on screen (UDP
+    // live edge), feeding the new match's inputs into the old screen and
+    // letting CssAutoConfirm disengage before CSS opened.
     if (g_state.pb_boundary != State::PbBoundary::NONE) {
         const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (mode < 3000u) g_state.pb_boundary_left_battle = true;
         if (g_state.pb_boundary == State::PbBoundary::PINNING &&
-            mode >= 3000u) {
+            g_state.pb_boundary_left_battle && mode >= 3000u) {
             g_state.pb_boundary = State::PbBoundary::NONE;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: boundary PINNING -> NONE (battle entered, "
@@ -4069,6 +4387,34 @@ void SpectatorNode_TickHostMaintenance() {
             const bool use_snapshot =
                 sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
                 g_state.current_snapshot.valid;
+
+            // Phase F: op-count baseline FIRST on the fresh connection --
+            // before snapshot/backfill -- so the viewer's ops_seen starts
+            // exact for everything this connection delivers. The
+            // connection ships ops from min(backfill_first_idx,
+            // live-flush cursor) onward; the baseline counts the ops
+            // BELOW that point (which a mid-session joiner never sees).
+            // Gated on udp_ok: an old build's TCP framer drops the
+            // connection on an unknown SpecDataType.
+            if (sub.udp_ok && SpecUdpEnabled() &&
+                !g_state.spec_transport_relay) {
+                const size_t first_idx = use_snapshot
+                    ? BackfillFirstIdxForFrame(g_state.current_snapshot.input_frame)
+                    : 0;
+                const size_t clamp = std::min(g_state.last_flushed_event_idx,
+                                              g_state.session_events.size());
+                const size_t effective_start = std::min(first_idx, clamp);
+                uint32_t baseline = 0;
+                for (size_t i = 0; i < effective_start; ++i) {
+                    if (g_state.session_events[i].type != SessionEventType::INPUT)
+                        ++baseline;
+                }
+                SendOpBaselineTo(sub.addr, baseline);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: OP_BASELINE=%u sent (first_idx=%zu, "
+                    "clamp=%zu, total_ops=%u)",
+                    baseline, first_idx, clamp, g_state.total_op_count);
+            }
 
             const char* xport = g_state.spec_transport_relay ? "RELAY" : "TCP";
             if (use_snapshot) {
