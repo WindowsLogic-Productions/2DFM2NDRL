@@ -4345,6 +4345,12 @@ uint32_t SpectatorNode_MsSinceLastAdmit() {
 
 bool SpectatorNode_IsSubscribedUpstream() { return g_state.subscribed_upstream; }
 
+// True while the upstream TCP died but the subscription is riding on UDP
+// with a background re-JOIN in flight. Surfaced in the window title as
+// "Resyncing..." -- distinct from a cold "Connecting..." (no
+// subscription at all) and from a healthy "Subscribed".
+bool SpectatorNode_IsTcpRejoinPending() { return g_state.tcp_rejoin_pending; }
+
 // Natural-boot title/menu walk in progress: the synthetic title presses
 // live inside PopFrameInputs, so the jitter floor must not gate the tick
 // on queue depth while the local game is still pre-CSS (q=0 at boot is

@@ -2305,11 +2305,19 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                         "%s | Replay (%s) | %dfps | q:%zu",
                         s_game_prefix, phase, g_current_fps, qd);
                 } else {
-                    bool sub = SpectatorNode_IsSubscribedUpstream();
+                    // Three-state: a TCP heal while the subscription rides
+                    // on UDP is "Resyncing..." -- NOT a cold "Connecting..."
+                    // (the old binary label flapped to Connecting during
+                    // transport churn even though playback never stopped,
+                    // which read as a full drop to the user).
+                    const bool sub = SpectatorNode_IsSubscribedUpstream();
+                    const char* status =
+                        !sub                                   ? "Connecting..."
+                        : SpectatorNode_IsTcpRejoinPending()   ? "Resyncing..."
+                                                               : "Subscribed";
                     snprintf(title, sizeof(title),
                         "%s | %s %s | %dfps | q:%zu",
-                        s_game_prefix, role,
-                        sub ? "Subscribed" : "Connecting...",
+                        s_game_prefix, role, status,
                         g_current_fps, qd);
                 }
             } else if (active) {

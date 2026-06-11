@@ -732,6 +732,10 @@ void SpectatorNode_KickJoin();
 // Are we currently subscribed upstream (receiving a live match stream)?
 bool SpectatorNode_IsSubscribedUpstream();
 
+// Upstream TCP died but the subscription is riding on UDP with a
+// background re-JOIN in flight (window title shows "Resyncing...").
+bool SpectatorNode_IsTcpRejoinPending();
+
 // Periodic health tick. Called from the trampoline once per iteration
 // (cheap — internally rate-limited). Drives:
 //   * heartbeat send to upstream every HEARTBEAT_INTERVAL_MS

@@ -239,10 +239,28 @@ static char __cdecl Hook_vs_round_function() {
         return ret;
     }
 
-    // ROUND_START — fires at RSS_FIGHT_LATCH → RSS_ACTIVE (the "FIGHT!" →
-    // battle becomes interactive moment). HP_max is populated by then (see
-    // constexpr block above for the rationale).
-    if (pre == RSS_FIGHT_LATCH && post == RSS_ACTIVE &&
+    // [RND-EDGE] substate transition trace (host, non-rollback only) —
+    // a handful of lines per round, permanently cheap, and the ground
+    // truth for edge-condition bugs like the one below.
+    if (pre != post) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[RND-EDGE] %d -> %d", pre, post);
+    }
+
+    // ROUND_START — fires on ANY entry into RSS_ACTIVE (the moment the
+    // battle becomes interactive), mirroring the END edge's shape. The
+    // old exact (RSS_FIGHT_LATCH=112 -> 200) pair silently never matched:
+    // per the 0x4086A0 decompile, the announce chain 110->111->112->113
+    // ->200 advances on per-state countdowns that all live in the SAME
+    // dispatcher call when a counter starts expired, so several states
+    // collapse into one call and the observable pre can be 110/111/112
+    // depending on sprite timing. Result: zero [ROUND-START]s, round=0
+    // in every END, and the alternation guard then ate every second
+    // round's END too. Any-entry matches all collapse shapes; the
+    // alternation guard + g_is_rolling_back gate dedup re-traversals
+    // exactly as they do for the END edge. HP_max is populated by the
+    // ACTIVE entry (see constexpr block above for the rationale).
+    if (pre != RSS_ACTIVE && post == RSS_ACTIVE &&
         s_last_emit != LastEmit::ROUND_START) {
         ++s_round_idx_counter;
         s_last_emit = LastEmit::ROUND_START;
