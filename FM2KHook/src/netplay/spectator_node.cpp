@@ -333,6 +333,10 @@ struct State {
     // to restore the TCP side. Cleared when the new connection's
     // OP_BASELINE lands.
     bool                      tcp_rejoin_pending    = false;
+    // Last validated UDP datagram from the upstream -- the PRIMARY
+    // liveness signal. With inputs and ops riding UDP, a quiet TCP
+    // means nothing while datagrams flow.
+    uint64_t                  last_udp_recv_ms      = 0;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -3985,6 +3989,7 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
     if (!g_state.have_frame_baseline) return;
     if (!g_state.udp_epoch_armed) return;
     if (!AddrEqual(from, g_state.upstream_addr)) return;  // spoof / stale upstream
+    g_state.last_udp_recv_ms = GetTickCount64();
 
     uint32_t op_seq = 0;
     std::memcpy(&op_seq, buf + sizeof(SpecDataHeader), 4);
@@ -4695,8 +4700,20 @@ void SpectatorNode_TickHealth() {
             (snapshot_in_flight || !g_state.live_established)
                 ? (uint64_t)30000
                 : (uint64_t)SPECTATOR_SILENCE_FAILOVER_MS;
+        // UDP is the primary liveness signal now: inputs + ops ride
+        // datagrams, so TCP being quiet is NORMAL (retransmit storms
+        // under loss, host swap stalls, nothing bulk to send). The old
+        // TCP-only condition fired at every battle->CSS return under
+        // clumsy -- queue drained (host stalled production), TCP quiet
+        // past budget -> the viewer sent SPEC_LEAVE, unsubscribed
+        // ITSELF, killed its own UDP fan-out, and span through a full
+        // reconnect against a host mid-swap. Fail over only when BOTH
+        // transports are silent.
+        const bool udp_alive = g_state.last_udp_recv_ms > 0 &&
+            now - g_state.last_udp_recv_ms < 2000;
         if (!g_spectator_catchup &&
             queue_idle &&
+            !udp_alive &&
             recv_ms > 0 &&
             now - recv_ms >= silence_budget_ms)
         {
