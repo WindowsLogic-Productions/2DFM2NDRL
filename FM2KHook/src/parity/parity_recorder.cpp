@@ -119,6 +119,27 @@ constexpr size_t SLOT_TASK_VARS_OFFSET  = 0x131u;
 constexpr int    BOX_SLOT_COUNT         = 20;
 constexpr int    TASK_VAR_COUNT         = 16;
 
+/* Locate player_idx's CHARACTER object in the pool. The old code
+ * hardcoded pool slots 0/1, but P2's char object does NOT live in slot 1
+ * (verified 2026-06-11: stress-mode players[1] captured a static system
+ * object -- pos=(320,150), script=0/0 -- so every P2-side divergence was
+ * invisible to parity_diff). Match the engine's own player scans
+ * (camera_manager @ 0x40AF30, hit_detection_system @ 0x40F010): object
+ * type dword == 4 AND char index at +0x156 == player_idx. Ascending scan
+ * returns the first match; char objects are created at battle init in
+ * low slots, well below the BG-handler objects whose +0x156 accumulators
+ * could transiently equal 0/1. */
+int FindPlayerObjectSlot(int player_idx) {
+    for (int i = 0; i < 1024; ++i) {
+        const uintptr_t a = ADDR_OBJECT_POOL_BASE +
+                            static_cast<uintptr_t>(i) * OBJECT_SLOT_SIZE;
+        if (Read32(a) != 4u) continue;
+        if (Read32S(a + 0x156) != player_idx) continue;
+        return i;
+    }
+    return -1;
+}
+
 void FillPlayerSnapshot(KgtParityPlayer& dst, int slot_idx) {
     if (slot_idx < 0 || slot_idx >= 1024) {
         std::memset(&dst, 0, sizeof(dst));
@@ -182,10 +203,15 @@ void FillPlayerSnapshot(KgtParityPlayer& dst, int slot_idx) {
         dst.super_meter = 0;
     }
 
-    /* Per-player HP override: FM2K maintains a separate HP table. */
-    if (slot_idx == 0) dst.hp = static_cast<int32_t>(Read32(ADDR_P1_HP));
-    else if (slot_idx == 1) dst.hp = static_cast<int32_t>(Read32(ADDR_P2_HP));
-    else dst.hp = 0;
+    /* Per-player HP override: FM2K maintains a separate HP table, keyed
+     * by the object's char index (+0x156), NOT the pool slot index --
+     * P2's char object is not in pool slot 1 (see FindPlayerObjectSlot). */
+    if (char_idx >= 0 && char_idx < 8) {
+        dst.hp = static_cast<int32_t>(
+            Read32(ADDR_P1_HP + static_cast<uintptr_t>(char_idx) * CHAR_DATA_STRIDE));
+    } else {
+        dst.hp = 0;
+    }
 
     /* v2: hit/hurt slot popcounts — cross-process comparable summary
      * of the 20 + 20 box-pointer arrays. The slot_idx for [C] cancel
@@ -428,9 +454,13 @@ void Capture() {
     snap.camera_x    = ADDR_CAMERA_X    ? Read32S(ADDR_CAMERA_X)    : 0;
     snap.camera_y    = ADDR_CAMERA_Y    ? Read32S(ADDR_CAMERA_Y)    : 0;
 
-    /* Slots 0 & 1 are the main fighters (FM2K convention). */
-    FillPlayerSnapshot(snap.players[0], 0);
-    FillPlayerSnapshot(snap.players[1], 1);
+    /* Resolve each player's char object by id -- the "slots 0 & 1 are
+     * the fighters" convention is FALSE for P2 (its char object lives in
+     * a different slot; pool slot 1 holds a system object). Not-found
+     * (-1, pre-battle) produces the same zeroed/script=-1 block the old
+     * empty-slot path did, so parity_diff alignment is unchanged. */
+    FillPlayerSnapshot(snap.players[0], FindPlayerObjectSlot(0));
+    FillPlayerSnapshot(snap.players[1], FindPlayerObjectSlot(1));
 
     /* v2 match-level fields. rng_after_frame mirrors rng (we capture
      * post-update so they're identical). system_vars maps to FM2K's
