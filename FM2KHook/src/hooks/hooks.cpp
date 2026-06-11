@@ -2284,6 +2284,25 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
 
             if (g_spectator_mode) {
                 size_t qd = SpectatorNode_PendingFrameCount();
+                // Real playback rate (popped sim frames per second), NOT
+                // the trampoline loop rate: during a q:0 hold the loop
+                // keeps spinning at 100/s re-rendering the same frame,
+                // so g_current_fps read "100fps" while playback was
+                // visibly frozen (user report 2026-06-11 18:1x). pops/s
+                // is the truth the viewer cares about.
+                extern uint32_t g_spec_pop_total;
+                static uint32_t s_pop_prev    = 0;
+                static DWORD    s_pop_prev_ms = 0;
+                uint32_t play_fps = 0;
+                {
+                    const DWORD nowp = GetTickCount();
+                    if (s_pop_prev_ms != 0 && nowp > s_pop_prev_ms) {
+                        play_fps = (g_spec_pop_total - s_pop_prev) * 1000u /
+                                   (nowp - s_pop_prev_ms);
+                    }
+                    s_pop_prev    = g_spec_pop_total;
+                    s_pop_prev_ms = nowp;
+                }
                 // Differentiate offline-replay (file-driven, no peer) from
                 // live-spec (subscribed to a host's stream). Replay mode
                 // never has an upstream so "Connecting..." would be a lie
@@ -2302,8 +2321,8 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                         (mode >= 3000 && mode < 4000)        ? "BATTLE" :
                                                                "POST";
                     snprintf(title, sizeof(title),
-                        "%s | Replay (%s) | %dfps | q:%zu",
-                        s_game_prefix, phase, g_current_fps, qd);
+                        "%s | Replay (%s) | %ufps | q:%zu",
+                        s_game_prefix, phase, play_fps, qd);
                 } else {
                     // Three-state: a TCP heal while the subscription rides
                     // on UDP is "Resyncing..." -- NOT a cold "Connecting..."
@@ -2316,9 +2335,9 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                         : SpectatorNode_IsTcpRejoinPending()   ? "Resyncing..."
                                                                : "Subscribed";
                     snprintf(title, sizeof(title),
-                        "%s | %s %s | %dfps | q:%zu",
+                        "%s | %s %s | %ufps | q:%zu",
                         s_game_prefix, role, status,
-                        g_current_fps, qd);
+                        play_fps, qd);
                 }
             } else if (active) {
                 GekkoNetworkStats stats = Netplay_GetNetworkStats();

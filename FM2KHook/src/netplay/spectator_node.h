@@ -719,6 +719,9 @@ bool SpectatorNode_QueueHasPendingOp();
 // genuine starvation and play out its held frames instead of freezing.
 uint32_t SpectatorNode_MsSinceLastAdmit();
 void SpectatorNode_StampInputAdmit();
+// UDP-datagram INPUT admissions only (subset of the above). Feeds the
+// adaptive bank's TCP-only floor pre-arm.
+void SpectatorNode_StampUdpInputAdmit();
 
 // Broadcast delay-bank target in frames (Phase G adaptive): the larger
 // of the FM2K_SPEC_DELAY floor (default 300) and the rolling-30-60s max

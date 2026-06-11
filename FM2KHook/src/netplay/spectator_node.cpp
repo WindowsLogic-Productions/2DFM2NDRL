@@ -4263,6 +4263,8 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
         ev.u.input.p2 = p2;
         g_state.pb_queue.push_back(ev);
         SpectatorNode_StampInputAdmit();
+        SpectatorNode_StampUdpInputAdmit();  // UDP-borne: feeds the
+                                             // TCP-only floor pre-arm
         g_state.next_expected_frame = cursor + 1;
         ++admitted;
         accept_eligible();  // an op positioned right after this input
@@ -4342,12 +4344,27 @@ static uint32_t g_admit_gap_bucket_cur   = 0;   // max gap (ms), current 30s buc
 static uint32_t g_admit_gap_bucket_prev  = 0;
 static uint64_t g_admit_gap_bucket_start = 0;
 static size_t   g_adaptive_bank_frames   = 0;   // grow-only published target
+static uint64_t g_first_input_admit_ms   = 0;   // session's first admission
+// Last INPUT admitted via a UDP datagram specifically (heartbeats and
+// control traffic don't count). Drives the TCP-only floor pre-arm.
+static uint64_t g_last_udp_input_admit_ms = 0;
+void SpectatorNode_StampUdpInputAdmit() {
+    g_last_udp_input_admit_ms = GetTickCount64();
+}
 
 void SpectatorNode_StampInputAdmit() {
     const uint64_t now = GetTickCount64();
+    if (g_first_input_admit_ms == 0) g_first_input_admit_ms = now;
     if (g_last_input_admit_ms != 0) {
         const uint64_t gap = now - g_last_input_admit_ms;
-        if (gap <= 5000) {
+        // 10s ceiling: longer silences are outages (TCP death, frozen
+        // host) owned by the failover machinery. Everything under it is
+        // jitter the bank must absorb -- the first UDP-off control run
+        // showed 8.8s TCP retransmit bursts under clumsy that a 5s
+        // ceiling wrongly discarded, so the bank stayed at 705 frames
+        // while the link needed ~1300 and mid-battle q:0 stalls kept
+        // happening (2026-06-11 18:15).
+        if (gap <= 10000) {
             if (g_admit_gap_bucket_start == 0) g_admit_gap_bucket_start = now;
             if (now - g_admit_gap_bucket_start >= 30000) {
                 g_admit_gap_bucket_prev  = g_admit_gap_bucket_cur;
@@ -4376,6 +4393,21 @@ size_t SpectatorNode_TargetDelayFrames() {
         const char* v = std::getenv("FM2K_SPEC_ADAPTIVE");
         s_adaptive = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
     }
+    size_t floor_eff = s_floor;
+    // TCP-only pre-arm: with the UDP accelerator dead (firewalled, or
+    // FM2K_SPEC_UDP=0), arrivals come in TCP retransmit bursts that
+    // routinely exceed the 3s default under loss -- don't wait for the
+    // first stall to teach the adaptive growth; start from a 6s floor.
+    // Engages only after 10s of admissions with no UDP-borne INPUT.
+    if (s_adaptive == 1 && floor_eff < 600 &&
+        g_state.subscribed_upstream && g_first_input_admit_ms != 0) {
+        const uint64_t now = GetTickCount64();
+        const bool udp_quiet =
+            (g_last_udp_input_admit_ms == 0)
+                ? (now - g_first_input_admit_ms > 10000)
+                : (now - g_last_udp_input_admit_ms > 10000);
+        if (udp_quiet) floor_eff = 600;
+    }
     if (s_adaptive == 1) {
         const uint32_t max_gap_ms =
             (g_admit_gap_bucket_cur > g_admit_gap_bucket_prev)
@@ -4384,7 +4416,7 @@ size_t SpectatorNode_TargetDelayFrames() {
         if (want > 2000) want = 2000;
         if (want > g_adaptive_bank_frames) {
             g_adaptive_bank_frames = want;
-            if (g_adaptive_bank_frames > s_floor) {
+            if (g_adaptive_bank_frames > floor_eff) {
                 static uint64_t s_grow_log_ms = 0;
                 const uint64_t now = GetTickCount64();
                 if (now - s_grow_log_ms >= 1000) {
@@ -4397,8 +4429,8 @@ size_t SpectatorNode_TargetDelayFrames() {
             }
         }
     }
-    return (g_adaptive_bank_frames > s_floor) ? g_adaptive_bank_frames
-                                              : s_floor;
+    return (g_adaptive_bank_frames > floor_eff) ? g_adaptive_bank_frames
+                                                : floor_eff;
 }
 
 static size_t SpecDelayBankFrames() {
