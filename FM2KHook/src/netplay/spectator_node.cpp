@@ -3123,6 +3123,21 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
     // doesn't cull this slot mid-rebind.
     for (auto& sub : g_state.subscribers) {
         if (AddrEqual(sub.addr, from)) {
+            if (sub.tcp_bound && !g_state.spec_transport_relay &&
+                SpectatorTCP::HasLiveConnFor(sub.addr)) {
+                // Live stream already flowing: this JOIN_REQ is a dup or
+                // an over-eager retry. Re-ACK and change NOTHING -- the
+                // old reset dropped the conn the previous JOIN opened,
+                // and the viewer's heal retried 500ms later: an infinite
+                // join storm that DoS'ed this host's main loop and
+                // starved its own netplay sends (one-directional 30s
+                // blackout -> P1/P2 barrier wedge).
+                sub.last_seen_ms = GetTickCount64();
+                sub.udp_ok       = udp_ok;
+                CtrlPacket ack = BuildJoinAckPacket();
+                ControlChannel_SendTo(ack, sub.addr);
+                return;
+            }
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: JOIN_REQ from existing subscriber %s — "
                         "resetting bind state for fresh backfill (mode=%s)",

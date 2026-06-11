@@ -320,6 +320,15 @@ void SendTo(const sockaddr_in& sub_addr, const void* buf, size_t len) {
     }
 }
 
+bool HasLiveConnFor(const sockaddr_in& sub_addr) {
+    for (auto& sc : g_subs) {
+        if (AddrEquals(sc.addr, sub_addr)) {
+            return sc.sock != nullptr && sc.backfill_done;
+        }
+    }
+    return false;
+}
+
 void DisconnectSubscriber(const sockaddr_in& sub_addr) {
     for (size_t i = 0; i < g_subs.size(); ++i) {
         if (AddrEquals(g_subs[i].addr, sub_addr)) {

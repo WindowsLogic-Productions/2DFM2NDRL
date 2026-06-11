@@ -113,6 +113,13 @@ void DisconnectSubscriber(const sockaddr_in& sub_addr);
 // IP (stale corpses from abandoned dials). Used on re-JOIN bind reset.
 void DropConnectionsFromAddr(const sockaddr_in& sub_addr);
 
+// True when this subscriber has a live, backfill-complete stream socket.
+// A JOIN_REQ from such a subscriber is a duplicate/keepalive and must be
+// ACK'd idempotently -- resetting bind state would drop the very conn the
+// previous JOIN opened (the 500ms join storm that DoS'ed the host's main
+// loop and starved its own netplay sends, 2026-06-11 14:33-14:42).
+bool HasLiveConnFor(const sockaddr_in& sub_addr);
+
 // =============================================================================
 // SPECTATOR-SIDE
 // =============================================================================
