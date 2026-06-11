@@ -202,6 +202,22 @@ void ApplyDefaults(int player) {
 // ---------------------------------------------------------------------------
 
 void RefreshGamepadList() {
+    // Reentrancy guard. SDL_PumpEvents below dispatches Win32 messages
+    // into the wndproc subclass (modal pump), which can tick code that
+    // calls RefreshGamepads() again -- the reentrant call mutates
+    // g_gamepad_handles / g_non_gamepad_ids while THIS frame iterates
+    // them, invalidating iterators: AV inside unordered_map internals
+    // (hash<unsigned> _M_cget), observed twice on spectator instances
+    // under 20% loss (2026-06-11, FM2KHook+0x38d944). Skipping the
+    // nested refresh is always safe -- the outer one finishes the scan.
+    static bool s_refresh_in_progress = false;
+    if (s_refresh_in_progress) return;
+    s_refresh_in_progress = true;
+    struct RefreshGuard {
+        bool* flag;
+        ~RefreshGuard() { *flag = false; }
+    } guard{&s_refresh_in_progress};
+
     g_gamepad_ids.clear();
     // Pump events first — a freshly-plugged stick may not show up in
     // SDL_GetGamepads / SDL_GetJoysticks until SDL has processed its
