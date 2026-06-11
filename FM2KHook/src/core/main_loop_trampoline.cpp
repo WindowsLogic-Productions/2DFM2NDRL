@@ -1034,6 +1034,7 @@ static void RunSpectatorTick() {
     // admitted for >250ms, play out what we hold at 1:1.
     const bool boundary_bypass =
         SpectatorNode_InBoundary() ||
+        SpectatorNode_InNaturalBootWalk() ||
         (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
          SpectatorNode_QueueHasPendingOp());
     if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active &&

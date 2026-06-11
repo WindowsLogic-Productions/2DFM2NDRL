@@ -716,6 +716,10 @@ bool SpectatorNode_QueueHasPendingOp();
 uint32_t SpectatorNode_MsSinceLastAdmit();
 void SpectatorNode_StampInputAdmit();
 
+// Natural-boot viewer still walking title/menu (pre-CSS) -- the jitter
+// floor must not hold the tick on queue depth during this phase.
+bool SpectatorNode_InNaturalBootWalk();
+
 // Re-request the upstream JOIN if none is in flight (1Hz throttle).
 // Used by the /F dispatch hold, which can run before the DLL-init path
 // has sent the original JOIN_REQ.

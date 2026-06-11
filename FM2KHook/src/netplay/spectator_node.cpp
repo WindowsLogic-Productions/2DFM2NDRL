@@ -337,6 +337,12 @@ struct State {
     // liveness signal. With inputs and ops riding UDP, a quiet TCP
     // means nothing while datagrams flow.
     uint64_t                  last_udp_recv_ms      = 0;
+    // Viewer chose natural boot (pre-battle JOIN_ACK aborted /F): it
+    // replays the session from frame 0 and can NEVER accept a snapshot
+    // (battle-captured state into a title/CSS engine = phase-wait
+    // deadlock: pending_apply blocks pops, pops are the only road to
+    // the apply gate).
+    bool                      natural_boot          = false;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -2152,7 +2158,8 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // so a fresh join (consumed == anchor, nothing popped yet) applies,
     // and a forward jump (anchor ahead of us, e.g. re-join landing in the
     // NEXT match) also applies.
-    if (g_state.pb_snapshot_applied_once || g_state.pb_started) {
+    if (g_state.pb_snapshot_applied_once || g_state.pb_started ||
+        g_state.natural_boot) {
         // Re-join snapshots NEVER re-apply. Backward anchors would rewind
         // the sim under a live-edge queue; forward anchors (re-join lands
         // in a LATER match) would overwrite the char slots with the new
@@ -3343,6 +3350,19 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
         // title->CSS naturally and replays the from-frame-0 stream,
         // watching the lock-ins live.
         PerGamePatches_AbortBtbNaturalBoot();
+        g_state.natural_boot = true;
+        // Lock the choice in protocol-side: the host's BIND runs later
+        // and decides from ITS state at that moment -- if its battle
+        // started in between, a CURRENT_MATCH sub gets the snapshot
+        // path (binds 15s late, ships battle-captured state to a
+        // title-screen engine = deadlock; observed 12:40 2026-06-11).
+        // FULL_SESSION pins the host to the from-frame-0 stream no
+        // matter when the bind fires.
+        if (g_state.last_requested_mode != SpecJoinMode::FULL_SESSION) {
+            g_state.last_requested_mode = SpecJoinMode::FULL_SESSION;
+            SpectatorNode_RequestJoin(g_state.root_addr,
+                                      SpecJoinMode::FULL_SESSION);
+        }
     }
     if (host_session_kind == 2 /* BATTLE */) {
         PerGamePatches_SetRuntimeBtbOverrides(host_p1_char,
@@ -4235,6 +4255,15 @@ uint32_t SpectatorNode_MsSinceLastAdmit() {
 }
 
 bool SpectatorNode_IsSubscribedUpstream() { return g_state.subscribed_upstream; }
+
+// Natural-boot title/menu walk in progress: the synthetic title presses
+// live inside PopFrameInputs, so the jitter floor must not gate the tick
+// on queue depth while the local game is still pre-CSS (q=0 at boot is
+// normal -- the title walk is what gets us to where the stream starts).
+bool SpectatorNode_InNaturalBootWalk() {
+    if (!g_state.natural_boot) return false;
+    return *(uint32_t*)FM2K::ADDR_GAME_MODE < 2000u;
+}
 
 // -----------------------------------------------------------------------------
 // PLAYBACK DRIVER API (called from main_loop_trampoline + Hook_GetPlayerInput)
