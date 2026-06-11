@@ -356,6 +356,16 @@ struct State {
     // whole mirrored dance then ran offset = wrong chars AND colors at
     // the rematch, 2026-06-11 15:09).
     bool                      pb_awaiting_match_end = false;
+    // True once the LOCAL game has been in battle mode (>=3000) since the
+    // last MATCH_START apply. Distinguishes the rematch boundary (local
+    // played the battle, returned to CSS early -> queued inputs are the
+    // results tail, discard) from match ENTRY (local still at CSS while
+    // the stream just started the battle -> queued inputs ARE the battle,
+    // keep). Without it the results-tail guard ate the entire offline
+    // replay at boot: .fm2krep starts with MATCH_START, the pin walk
+    // reaches mode 2000, and all 3616 battle INPUTs were discarded as a
+    // "results tail" (2026-06-11 16:24, replay parity 0 rows).
+    bool                      pb_local_battle_seen  = false;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -2828,6 +2838,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
             break;
         case SessionEventType::MATCH_START: {
             g_state.pb_awaiting_match_end = true;
+            g_state.pb_local_battle_seen  = false;
             // Look up the cached 96-byte header by side-table index.
             // Header layout matches Replay::ReplayHeader on-disk; pull
             // seed/state-hash/char/color and re-publish into the playback
@@ -4497,8 +4508,19 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     // offset (wrong chars + colors at the rematch, 2026-06-11 15:09).
     // Discard them while applying ops; the MATCH_END op flips
     // pb_awaiting_match_end and engages the SEAM, whose machinery takes
-    // over on the next call. Hold neutral throughout.
+    // over on the next call. Hold neutral throughout. Gated on
+    // pb_local_battle_seen: only a sim that ALREADY played this match's
+    // battle can be in its results tail -- at match entry (and offline
+    // replay boot) mode 2000 + awaiting means the battle hasn't started
+    // locally yet and the queued INPUTs are the battle itself.
+    {
+        const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (mode_now >= 3000u && mode_now < 4000u) {
+            g_state.pb_local_battle_seen = true;
+        }
+    }
     if (g_state.pb_awaiting_match_end &&
+        g_state.pb_local_battle_seen &&
         g_state.pb_boundary == State::PbBoundary::NONE &&
         *(uint32_t*)FM2K::ADDR_GAME_MODE == 2000u) {
         while (!g_state.pb_queue.empty() && g_state.pb_awaiting_match_end) {
