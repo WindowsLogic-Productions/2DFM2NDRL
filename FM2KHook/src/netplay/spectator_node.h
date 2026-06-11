@@ -577,7 +577,11 @@ constexpr size_t SPECTATOR_DEFAULT_CAPACITY = 32;
 
 // Failover timing.
 constexpr uint64_t SPECTATOR_HEARTBEAT_INTERVAL_MS = 1000;   // 1 s outbound
-constexpr uint64_t SPECTATOR_SILENCE_FAILOVER_MS   = 5000;   // 5 s with no
+// 15s: with UDP datagrams + heartbeat echoes as the liveness clock,
+// silence this long means the host is GONE or frozen solid -- and a
+// re-join against a frozen host only churns (the 5s budget flipped the
+// overlay to "connecting" during the players' own rollback stalls).
+constexpr uint64_t SPECTATOR_SILENCE_FAILOVER_MS   = 15000;  // 15 s with no
                                                              // inbound from
                                                              // current
                                                              // upstream → fall

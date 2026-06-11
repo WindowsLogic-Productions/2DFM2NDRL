@@ -1055,14 +1055,15 @@ static void RunSpectatorTick() {
         SpectatorNode_InNaturalBootWalk() ||
         (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
          SpectatorNode_QueueHasPendingOp());
-    if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active &&
-        !boundary_bypass) {
-        // Below the cushion: half-speed glide instead of a hard hold.
-        // The old hold->drain->hold cycle (starvation bypass draining
-        // the cushion at 1:1, floor freezing to rebuild it) oscillated
-        // visibly under loss+latency (clumsy 20%/140ms). Playing every
-        // other tick keeps motion continuous at 50fps while arrivals
-        // outpace consumption 2:1 and the cushion refills itself.
+    if (qd < SpectatorTargetDelayFrames() / 2 &&
+        !s_offline_replay_env_active && !boundary_bypass) {
+        // BANK MAINTENANCE: below half the delay bank, glide at half
+        // speed until arrivals restore it. The bank previously only
+        // existed at mirror start -- any host slow-period bled it at
+        // 1:1 playback and the next production stall hit q=0 (the
+        // mid-battle freeze, 2026-06-11 14:54). Half-speed playback
+        // during host slowdowns is a brief slow-mo the eye barely
+        // notices; a hard stall is not.
         static bool s_glide_toggle = false;
         s_glide_toggle = !s_glide_toggle;
         if (qd == 0 || !s_glide_toggle) {
