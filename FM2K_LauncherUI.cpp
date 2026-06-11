@@ -17,6 +17,7 @@
 #include <ws2tcpip.h>
 #include <wininet.h>
 #include <shellapi.h>  // Shell_NotifyIcon for challenge toast
+#include <shobjidl.h>  // IFileOpenDialog (modern native folder picker)
 #include <iostream>
 #include <algorithm>
 #include <fstream>
@@ -1488,61 +1489,91 @@ void LauncherUI::RenderSettingsWindow() {
     ImGui::End();
 }
 
+// Modern native folder picker via Win32 IFileOpenDialog (the Common Item
+// Dialog) -- NOT SDL_ShowOpenFolderDialog, whose Windows backend uses the
+// legacy SHBrowseForFolder tree dialog (the dated one). FOS_ALLOWMULTISELECT
+// lets the user add several folders in one go. Synchronous + modal to the
+// launcher window, the standard behavior for a native file dialog. Returns
+// the chosen folders as UTF-8; empty on cancel or error.
+static std::vector<std::string> PickGamesFoldersNative(SDL_Window* parent) {
+    HWND hwnd = nullptr;
+    if (parent) {
+        hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+            SDL_GetWindowProperties(parent),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    }
+
+    std::vector<std::string> out;
+    // Run on a dedicated STA thread: the Common Item Dialog requires an
+    // apartment-threaded COM context, but SDL may have already put the main
+    // thread in MTA (CoInitializeEx would then fail). Joining keeps the call
+    // synchronous; the main thread blocks (UI frozen behind the modal dialog,
+    // which is the expected native-dialog behavior).
+    std::thread worker([hwnd, &out]() {
+        if (FAILED(CoInitializeEx(nullptr,
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+            return;
+        }
+        IFileOpenDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                       CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
+                                       reinterpret_cast<void**>(&dlg))) && dlg) {
+            DWORD opts = 0;
+            dlg->GetOptions(&opts);
+            dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT |
+                            FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+            if (SUCCEEDED(dlg->Show(hwnd))) {
+                IShellItemArray* items = nullptr;
+                if (SUCCEEDED(dlg->GetResults(&items)) && items) {
+                    DWORD count = 0;
+                    items->GetCount(&count);
+                    for (DWORD i = 0; i < count; ++i) {
+                        IShellItem* item = nullptr;
+                        if (SUCCEEDED(items->GetItemAt(i, &item)) && item) {
+                            PWSTR wpath = nullptr;
+                            if (SUCCEEDED(item->GetDisplayName(
+                                    SIGDN_FILESYSPATH, &wpath)) && wpath) {
+                                int n = WideCharToMultiByte(CP_UTF8, 0, wpath,
+                                            -1, nullptr, 0, nullptr, nullptr);
+                                if (n > 1) {
+                                    std::string s(static_cast<size_t>(n - 1), '\0');
+                                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                                            s.data(), n, nullptr, nullptr);
+                                    out.push_back(std::move(s));
+                                }
+                                CoTaskMemFree(wpath);
+                            }
+                            item->Release();
+                        }
+                    }
+                    items->Release();
+                }
+            }
+            dlg->Release();
+        }
+        CoUninitialize();
+    });
+    worker.join();
+    return out;
+}
+
 // Settings → Games Folders… window. Multi-root editor for the launcher's
 // games-discovery roots. Lives behind a Settings menu entry so the main
 // panel stays focused on the games list itself; casual users with a
 // single folder almost never need this UI after first-run setup.
-// Native folder-picker result marshaling. SDL fires the dialog callback
-// from its own thread (or during event pump), so it can't touch UI state
-// directly -- it stashes the chosen path here and the render thread applies
-// it on the next RenderGamesFoldersBody().
-namespace {
-std::mutex              g_games_folder_pick_mtx;
-std::string             g_games_folder_pick;
-std::atomic<bool>       g_games_folder_picked{false};
-
-void SDLCALL GamesFolderPickCallback(void* /*userdata*/,
-                                     const char* const* filelist,
-                                     int /*filter*/) {
-    // filelist == NULL on error; filelist[0] == NULL on cancel.
-    if (filelist && filelist[0]) {
-        std::lock_guard<std::mutex> lk(g_games_folder_pick_mtx);
-        g_games_folder_pick = filelist[0];
-        g_games_folder_picked.store(true, std::memory_order_release);
-    }
-}
-}  // namespace
-
 void LauncherUI::RenderGamesFoldersBody() {
     auto commit = [&](std::vector<std::string> paths) {
         games_root_paths_ = paths;
         if (on_games_folders_set) on_games_folders_set(std::move(paths));
     };
 
-    // Apply a folder chosen via the native picker (callback runs off the UI
-    // thread; this drains it on the render thread). De-dupe so picking the
-    // same folder twice is a no-op.
-    if (g_games_folder_picked.exchange(false, std::memory_order_acq_rel)) {
-        std::string picked;
-        {
-            std::lock_guard<std::mutex> lk(g_games_folder_pick_mtx);
-            picked.swap(g_games_folder_pick);
-        }
-        if (!picked.empty() &&
-            std::find(games_root_paths_.begin(), games_root_paths_.end(),
-                      picked) == games_root_paths_.end()) {
-            std::vector<std::string> paths = games_root_paths_;
-            paths.push_back(std::move(picked));
-            commit(std::move(paths));
-        }
-    }
-
     ImGui::TextWrapped("%s", T("hint_games_folders_window"));
     ImGui::Separator();
 
     ImGui::PushID("GamesFoldersWindow");
-    // Read-only rows: each configured folder + a Remove button. No manual
-    // text entry -- folders are added via the native Browse picker below.
+    // Each configured root: a Remove button + the path. Folders are ADDED via
+    // the native Browse picker below (multi-select supported) -- the list
+    // holds as many roots as you want.
     int remove_index = -1;
     for (size_t i = 0; i < games_root_paths_.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
@@ -1561,10 +1592,16 @@ void LauncherUI::RenderGamesFoldersBody() {
 
     ImGui::Separator();
     if (ImGui::Button(T("btn_browse_folder"))) {
-        // Native OS folder picker. Single selection; result applied above on
-        // the next frame. window_ parents the dialog to the launcher.
-        SDL_ShowOpenFolderDialog(GamesFolderPickCallback, nullptr,
-                                 window_, nullptr, false);
+        // Modern native folder picker; appends every chosen folder (de-duped).
+        std::vector<std::string> picked = PickGamesFoldersNative(window_);
+        if (!picked.empty()) {
+            std::vector<std::string> paths = games_root_paths_;
+            for (auto& p : picked) {
+                if (std::find(paths.begin(), paths.end(), p) == paths.end())
+                    paths.push_back(std::move(p));
+            }
+            commit(std::move(paths));
+        }
     }
     ImGui::PopID();
 }

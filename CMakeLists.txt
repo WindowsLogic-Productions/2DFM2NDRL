@@ -439,6 +439,7 @@ target_link_libraries(FM2K_RollbackLauncher PRIVATE
     user32
     shell32
     ole32
+    uuid          # CLSID_FileOpenDialog / IID_IFileOpenDialog GUIDs (native folder picker)
     setupapi
     version
     imm32
