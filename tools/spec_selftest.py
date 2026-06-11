@@ -32,7 +32,7 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, os, subprocess, sys, threading, time
+import argparse, os, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 LAUNCHER = Path("/mnt/c/games/FM2K_RollbackLauncher.exe")
@@ -149,6 +149,14 @@ def trim_first_battle_segment(src: Path, dst: Path) -> int:
                 rows.append(body[off:off + 260])
         else:
             if phase != 3000:
+                break
+            # Teardown rows: at match end the player objects despawn while
+            # phase is still 3000 for a few capture ticks -- script_idx
+            # reads -1 and every other field zeros. The replay instance
+            # tends to capture one of these as its final row (the A4
+            # k=6534 "divergence" was spec-real-row vs replay-empty-row).
+            # They carry no engine state; end the segment there.
+            if p1s == -1 and p2s == -1:
                 break
             rows.append(body[off:off + 260])
     dst.write_bytes(hdr + b"".join(rows))
@@ -347,6 +355,18 @@ def main():
           "(unreliable under packet loss -- host captures speculative states)")
     subprocess.call([sys.executable, str(PARITY_DIFF),
                      str(p1_pty), str(spec_pty)])
+
+    # Preserve the live-phase debug logs BEFORE the replay phase launches --
+    # the replay instance reuses the P3 log slot and overwrites the
+    # spectator's evidence (lost the CSS-2 wrong-characters trail on the
+    # 2026-06-11 A4 run).
+    for lf in ("FM2K_P1_Debug.log", "FM2K_P2_Debug.log", "FM2K_P3_Debug.log"):
+        src = game_dir / "logs" / lf
+        if src.exists():
+            try:
+                shutil.copy2(src, OUT_DIR / f"live_{lf}")
+            except OSError as e:
+                print(f"[harness] (warn) could not preserve {lf}: {e}")
 
     # THE GATE: spec-vs-replay, confirmed-vs-confirmed. Both the spectator
     # stream and --replay playback are driven by the host's CONFIRMED input

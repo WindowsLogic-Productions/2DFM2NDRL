@@ -66,6 +66,11 @@ struct Subscriber {
     // uses `addr` instead. Phase 2b just declares the field so the
     // Subscriber shape is forward-compatible.
     std::string  spec_user_id;
+    // Phase F: viewer advertised SPEC_JOIN_UDP_OK in its JOIN_REQ
+    // reserved bits. Gates BOTH UDP_INPUT_BATCH datagrams and the
+    // TCP-borne OP_BASELINE (an old build's framer drops the connection
+    // on an unknown SpecDataType).
+    bool         udp_ok = false;
 };
 
 // Cached initial-match metadata so new joiners get a consistent handoff.
@@ -129,6 +134,18 @@ struct State {
     // emits as one EVENT_BATCH datagram, advances the cursor.
     size_t                    last_flushed_event_idx = 0;
     uint32_t                  flushed_input_count    = 0;  // INPUT events flushed so far
+
+    // ─── HOST SIDE: UDP input accelerator (Phase F) ─────────────────────
+    // Ring of the most recent confirmed (p1,p2) pairs, indexed by
+    // session-relative INPUT-frame % SPEC_UDP_WINDOW. Maintained by
+    // OnFrameConfirmed; read by SendUdpInputBatches every
+    // SPEC_UDP_SEND_INTERVAL confirmed frames. total_op_count is the
+    // running count of non-INPUT events appended (AppendOpAndFlush is
+    // the single op choke point) -- shipped as op_seq in every datagram
+    // so the spectator's admission gate can order inputs after ops.
+    uint16_t                  udp_ring_p1[SPEC_UDP_WINDOW] = {};
+    uint16_t                  udp_ring_p2[SPEC_UDP_WINDOW] = {};
+    uint32_t                  total_op_count         = 0;
 
     // Index of the most recent MATCH_START event in session_events. Used by
     // SpectatorNode_WriteCurrentBattleFile to slice the per-battle segment.
@@ -267,6 +284,31 @@ struct State {
     // it to engine RNG when game_mode flips to 3000.
     uint32_t                  pending_pin_rng_seed  = 0;
     bool                      pending_pin_rng_valid = false;
+    // RESET_INPUT_STATE / SOUND_INIT deferred the same way, but only when
+    // they arrive during a match-boundary seam (pb_boundary != NONE). In
+    // lockstep replay (FULL_SESSION from frame 0) the immediate apply is
+    // correct -- the spec consumes the same frames the host did. During a
+    // seam the spec runs EXTRA local frames (results screens + CSS pin
+    // walk) between the op's queue position and its own battle entry;
+    // applying RESET early would let those frames write back into the
+    // freshly-zeroed input history ring, leaving garbage at slots the
+    // host has as zeros (the task-#34 ring-shift failure class).
+    bool                      pending_reset_input   = false;
+    bool                      pending_sound_init    = false;
+
+    // ─── VIEWER SIDE: UDP input accelerator (Phase F) ───────────────────
+    // ops_seen mirrors the host's total_op_count: incremented for EVERY
+    // non-INPUT event decoded from the current TCP connection (exactness
+    // is what matters -- the gate compares it against op_seq in incoming
+    // datagrams). udp_epoch_armed gates admission per-connection: cleared
+    // on every (re)join so a stale stream can't poison the count, re-armed
+    // when the host's OP_BASELINE for the new connection arrives.
+    uint32_t                  ops_seen              = 0;
+    bool                      udp_epoch_armed       = false;
+    // [SPEC-UDP] diagnostics (rate-limited 1Hz log).
+    uint32_t                  udp_admitted_total    = 0;
+    uint32_t                  udp_paused_on_gate    = 0;
+    uint32_t                  udp_dropped_on_gap    = 0;
 
     // C7 — host's session_id for this peer connection. Generated lazily
     // (first AppendSessionId call) and stays stable until the SpectatorNode
@@ -276,6 +318,31 @@ struct State {
     // a spectator's own .fm2kset/.fm2krep recordings carry the same id
     // as the upstream's.
     uint64_t                  session_id           = 0;
+
+    // Match-boundary playback state (A4 wrong-characters fix). Raw replay
+    // of the host's seam frames (results screens + CSS traversal) cannot
+    // align on the spectator: the spec's own 3000->2000 transition timing
+    // is driven by ITS local result-screen processing, and a CURRENT_MATCH
+    // joiner's CSS init state never matched the host's to begin with. So
+    // a spectator that replayed CSS inputs raw locked whatever its
+    // diverged cursor walk landed on -- match 2 started with the wrong
+    // characters (observed 2026-06-11, A4 multi-match run). The robust
+    // pattern is the one offline replay already uses: characters come
+    // from MATCH_START + CssAutoConfirm, never from CSS input replay.
+    //   NONE    -- normal battle playback; INPUT pops feed the sim 1:1.
+    //   SEAM    -- between MATCH_END apply and MATCH_START apply: INPUT
+    //              events at the queue head are consumed-and-DISCARDED
+    //              (host seam frames are presentation-only), ops apply
+    //              as they reach head, and the local sim runs on
+    //              synthetic inputs (confirm-edge to leave the results
+    //              screen, neutral at CSS).
+    //   PINNING -- MATCH_START applied (CssAutoConfirm armed with the
+    //              new picks): battle INPUTs stay AT the head while the
+    //              local game walks CSS under the pin; pops resume the
+    //              moment game_mode crosses 3000 so spec battle frame 0
+    //              consumes host battle frame 0's input.
+    enum class PbBoundary : uint8_t { NONE, SEAM, PINNING };
+    PbBoundary                pb_boundary          = PbBoundary::NONE;
 };
 
 State g_state;
@@ -1298,6 +1365,9 @@ void SpectatorNode_Shutdown() {
     g_state.broadcasting = false;
     g_state.subscribed_upstream = false;
     g_state.playing_back = false;
+    g_state.pb_boundary         = State::PbBoundary::NONE;
+    g_state.pending_reset_input = false;
+    g_state.pending_sound_init  = false;
     SpectatorTCP::Shutdown();
     // Tear down both relay rings if we created them. Close handles
     // nullptr. Kernel mapping refcount keeps the object alive while
@@ -1772,7 +1842,25 @@ bool SpectatorNode_HasSnapshot() {
     return g_state.current_snapshot.valid;
 }
 
+namespace { void ApplyResetInputState(); }  // defined with ApplySessionEvent below
+
 void SpectatorNode_ApplyPendingPinRng() {
+    // Seam-deferred battle-init ops first (match-boundary path only; see
+    // pending_reset_input). Order mirrors the host's StartBattle: input
+    // state reset + sound layer init, then the RNG pin last so nothing
+    // can disturb the seed before frame 0's PGI.
+    if (g_state.pending_reset_input) {
+        ApplyResetInputState();
+        g_state.pending_reset_input = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: applied deferred RESET_INPUT_STATE at battle entry");
+    }
+    if (g_state.pending_sound_init) {
+        SoundRollback::Init();
+        g_state.pending_sound_init = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: applied deferred SOUND_INIT at battle entry");
+    }
     if (!g_state.pending_pin_rng_valid) return;
     *(uint32_t*)0x41FB1C = g_state.pending_pin_rng_seed;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1850,6 +1938,11 @@ void SpectatorNode_ApplyPendingSnapshot() {
     g_state.have_frame_baseline    = true;
     g_state.highest_consumed_frame = 0;
     g_state.playing_back           = true;
+    // Snapshot supersedes any in-flight boundary state (e.g. a stale SEAM
+    // from a renegotiated join) -- the restored state IS the new baseline.
+    g_state.pb_boundary         = State::PbBoundary::NONE;
+    g_state.pending_reset_input = false;
+    g_state.pending_sound_init  = false;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "SpectatorNode: SNAPSHOT applied (match=%u, %zu bytes) — "
@@ -2269,6 +2362,9 @@ bool SpectatorNode_LoadSessionFile(const char* path, const SeekTarget& seek) {
     g_state.have_frame_baseline = false;
     g_state.next_expected_frame = 0;
     g_state.playing_back = true;
+    g_state.pb_boundary         = State::PbBoundary::NONE;
+    g_state.pending_reset_input = false;
+    g_state.pending_sound_init  = false;
     if (loaded_session_id != 0) g_state.session_id = loaded_session_id;
 
     auto push_event = [&](SessionEvent& ev, const uint8_t* hdr_buf) {
@@ -2393,14 +2489,29 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 ev.u.pin_rng_seed);
             break;
         case SessionEventType::RESET_INPUT_STATE:
-            ApplyResetInputState();
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: applied RESET_INPUT_STATE");
+            if (g_state.pb_boundary != State::PbBoundary::NONE) {
+                // Seam: defer to battle entry (see pending_reset_input).
+                g_state.pending_reset_input = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: queued RESET_INPUT_STATE (seam -- will "
+                    "apply at battle entry)");
+            } else {
+                ApplyResetInputState();
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: applied RESET_INPUT_STATE");
+            }
             break;
         case SessionEventType::SOUND_INIT:
-            SoundRollback::Init();
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: applied SOUND_INIT");
+            if (g_state.pb_boundary != State::PbBoundary::NONE) {
+                g_state.pending_sound_init = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: queued SOUND_INIT (seam -- will apply "
+                    "at battle entry)");
+            } else {
+                SoundRollback::Init();
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: applied SOUND_INIT");
+            }
             break;
         case SessionEventType::MATCH_START: {
             // Look up the cached 96-byte header by side-table index.
@@ -2432,22 +2543,35 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 g_state.pb_p1_char, g_state.pb_p1_color,
                 g_state.pb_p2_char, g_state.pb_p2_color,
                 g_state.pb_stage_id);
-            // For offline replay (FM2K_REPLAY_FILE set), arm the CSS auto-
-            // lock-and-confirm hook so the local game pins to the recorded
-            // chars/stage when CSS opens. Live-spec (host stream) walks CSS
-            // via the upstream input log and doesn't need this. Cached
-            // once — getenv hits an env block walk every call otherwise.
+            // Arm the CSS auto-lock-and-confirm hook so the local game pins
+            // to the announced chars/stage when CSS opens.
+            //   - Offline replay (FM2K_REPLAY_FILE): always -- the file's
+            //     INPUTs are battle-phase only, CSS must be driven by pins.
+            //   - Live spectator at a match boundary (pb_boundary==SEAM):
+            //     same reasoning. The old assumption ("live-spec walks CSS
+            //     via the upstream input log") only holds for FULL_SESSION
+            //     specs on their FIRST CSS, where the fresh boot matches
+            //     the host's initial CSS state. At match 2+ the seam can't
+            //     align (see PbBoundary), so picks must come from this
+            //     header -- raw CSS replay locked the wrong characters.
             {
                 static int s_offline_replay_cached = -1;
                 if (s_offline_replay_cached < 0) {
                     const char* v = std::getenv("FM2K_REPLAY_FILE");
                     s_offline_replay_cached = (v && v[0]) ? 1 : 0;
                 }
-                if (s_offline_replay_cached == 1) {
+                if (s_offline_replay_cached == 1 ||
+                    g_state.pb_boundary == State::PbBoundary::SEAM) {
                     CssAutoConfirm_OnReplayMatchStart(
                         g_state.pb_p1_char, g_state.pb_p1_color,
                         g_state.pb_p2_char, g_state.pb_p2_color,
                         g_state.pb_stage_id);
+                }
+                if (g_state.pb_boundary == State::PbBoundary::SEAM) {
+                    g_state.pb_boundary = State::PbBoundary::PINNING;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: boundary SEAM -> PINNING (holding "
+                        "battle inputs until local game_mode reaches 3000)");
                 }
             }
             break;
@@ -2457,12 +2581,18 @@ void ApplySessionEvent(const SessionEvent& ev) {
             // (they render the final battle frames). The next MATCH_START
             // resets metadata and flips playing_back back on.
             g_state.playing_back = false;
+            // Enter the seam: from here until the next MATCH_START, INPUT
+            // events are host results/CSS frames -- presentation-only and
+            // structurally misaligned with the spec's own seam timing.
+            // PopFrameInputs discards them and feeds synthetic inputs; the
+            // next MATCH_START re-arms character pinning (see PbBoundary).
+            g_state.pb_boundary = State::PbBoundary::SEAM;
             const auto& p = ev.u.match_end;
             const char* who = (p.winner_idx == 0) ? "P1"
                             : (p.winner_idx == 1) ? "P2" : "DRAW";
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: applied MATCH_END winner=%s rounds=%u-%u "
-                "frames=%u (queued=%zu)",
+                "frames=%u (queued=%zu) -- boundary SEAM entered",
                 who, p.rounds_won_p1, p.rounds_won_p2, p.frames_total,
                 g_state.pb_queue.size());
             break;
@@ -2901,6 +3031,9 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
         g_state.pb_queue.clear();
         g_state.pb_current_p1 = 0;
         g_state.pb_current_p2 = 0;
+        g_state.pb_boundary         = State::PbBoundary::NONE;
+        g_state.pending_reset_input = false;
+        g_state.pending_sound_init  = false;
     }
     g_state.playing_back = true;
 
@@ -3275,18 +3408,17 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 g_state.next_expected_frame = hdr.start_frame;
             }
 
-            // If the batch's first INPUT is already behind the cursor, the
-            // whole batch is a redundant retransmit (e.g. backfill arriving
-            // after live frames during the C5 race) — skip it.
-            const bool batch_already_consumed =
-                hdr.start_frame + hdr.frame_count <= g_state.next_expected_frame;
-            if (batch_already_consumed) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "SpectatorNode: skipping fully-consumed EVENT_BATCH "
-                    "(start=%u count=%u, expected=%u)",
-                    hdr.start_frame, hdr.frame_count, expected_at_entry);
-                break;
-            }
+            // NOTE: there is deliberately NO "fully-consumed batch" early
+            // skip here. AppendOpAndFlush emits op-only batches with
+            // frame_count=0 at the live edge (MATCH_END / MATCH_START use
+            // the flush-then-append pattern, so the boundary ops always
+            // ride such a batch). For a caught-up spectator,
+            // start_frame + 0 <= next_expected_frame held, and the old
+            // skip silently dropped MATCH_END and the next MATCH_START --
+            // the spectator never followed into match 2. The per-event
+            // walk below already dedups INPUTs positionally and gates ops
+            // on cursor_input >= next_expected_frame, so redundant batches
+            // cost ~8 decodes and nothing else.
 
             size_t off = 0;
             uint32_t  cursor_input  = hdr.start_frame;  // next INPUT in this batch
@@ -3443,11 +3575,73 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
     // the moment the spectator's local sim is about to consume the next
     // INPUT, which is the same logical-frame moment the host's pin
     // happened. Eliminates the game_mode-driven mirror race.
-    while (!g_state.pb_queue.empty() &&
-           g_state.pb_queue.front().type != SessionEventType::INPUT) {
-        ApplySessionEvent(g_state.pb_queue.front());
-        g_state.pb_queue.erase(g_state.pb_queue.begin());
+    //
+    // SEAM extension: between MATCH_END and MATCH_START applies, INPUT
+    // events at the head are consumed-and-discarded instead of breaking
+    // the drain — they are the host's results/CSS frames and must not
+    // drive the spectator's local sim (see PbBoundary). The drain
+    // naturally reaches the boundary init ops + MATCH_START, whose apply
+    // flips the state to PINNING and stops the discard.
+    {
+        uint32_t seam_discarded = 0;
+        while (!g_state.pb_queue.empty()) {
+            const SessionEvent& head = g_state.pb_queue.front();
+            if (head.type != SessionEventType::INPUT) {
+                ApplySessionEvent(head);
+                g_state.pb_queue.erase(g_state.pb_queue.begin());
+                continue;
+            }
+            if (g_state.pb_boundary == State::PbBoundary::SEAM) {
+                g_state.pb_queue.erase(g_state.pb_queue.begin());
+                ++seam_discarded;
+                continue;
+            }
+            break;
+        }
+        if (seam_discarded > 0) {
+            static uint64_t s_last_seam_log_ms = 0;
+            const uint64_t now = GetTickCount64();
+            if (now - s_last_seam_log_ms > 1000) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: seam discarded %u host seam INPUT(s) "
+                    "(q=%zu)", seam_discarded, g_state.pb_queue.size());
+                s_last_seam_log_ms = now;
+            }
+        }
     }
+
+    // Boundary synthetic feed. SEAM: queue may be empty or waiting on the
+    // wire for the boundary ops — keep the local sim moving. PINNING:
+    // battle INPUTs are parked at the head while CssAutoConfirm walks the
+    // local CSS to the announced picks; resume exact pops at mode 3000 so
+    // spec battle frame 0 consumes host battle frame 0's input.
+    if (g_state.pb_boundary != State::PbBoundary::NONE) {
+        const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (g_state.pb_boundary == State::PbBoundary::PINNING &&
+            mode >= 3000u) {
+            g_state.pb_boundary = State::PbBoundary::NONE;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: boundary PINNING -> NONE (battle entered, "
+                "resuming exact input pops, q=%zu)", g_state.pb_queue.size());
+            // fall through to the normal pop below
+        } else {
+            // Results screens / title need a confirm-button edge to
+            // advance; CSS gets neutral (CssAutoConfirm pins cursor +
+            // confirm bits directly once armed, and before arming a
+            // neutral CSS must not lock anything).
+            uint16_t synthetic = 0;
+            if (mode != 2000u) {
+                static uint32_t s_seam_tick = 0;
+                synthetic = (s_seam_tick++ & 1u) ? 0x010u : 0u;
+            }
+            g_state.pb_current_p1 = synthetic;
+            g_state.pb_current_p2 = synthetic;
+            if (p1_input) *p1_input = synthetic;
+            if (p2_input) *p2_input = synthetic;
+            return true;
+        }
+    }
+
     if (g_state.pb_queue.empty()) return false;
     if (g_state.pb_queue.front().type != SessionEventType::INPUT) return false;
 

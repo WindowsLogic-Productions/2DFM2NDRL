@@ -1482,6 +1482,37 @@ bool SaveState_Load(int frame) {
                   "EFFECT_SYS1 must end before shake region");
     static_assert(SHAKE_END_IN_AI <= G_LAST_FRAME_TIME_OFFSET,
                   "shake region must end before g_last_frame_time");
+    // CROSS-PROCESS SPEC CARVE-OUT: this region is a raw data-segment slice
+    // that CONTAINS the tail of the stage data block (g_special_object_
+    // character_data_base @ 0x445740). Its sound-resource bookkeeping lands
+    // at 0x44795C..0x447970 (= AI offset 0x2C): GlobalAlloc'd sound-entry
+    // array ptr, bank index, loaded flag, entry counts. Copying the host's
+    // heap pointer verbatim crashes the spectator at the NEXT CSS entry:
+    // ClearStageData -> resource_cleanup_manager walks *(0x44795C) entry by
+    // entry (stride 0x2A) freeing each -- AV read of host heap addr at game
+    // EXE 0x40356F (observed 2026-06-11 on the A4 multi-match run, match-1
+    // -> CSS boundary). Same scan/memcpy/conditional-restore treatment as
+    // char_dynamic above. At a BTB join the live pool is near-empty (few
+    // false candidates); static .data pointers sit below HEAP_PTR_FLOOR so
+    // only genuine heap pointers are preserved. Restores in the carved-out
+    // slices are identity writes (live value == preserved value there).
+    struct AiPtrPreserve { uint32_t didx; uint32_t value; };
+    constexpr size_t MAX_PRESERVED_AI = 16384;
+    static AiPtrPreserve s_ai_preserved[MAX_PRESERVED_AI];
+    size_t ai_pcount = 0;
+    size_t ai_candidates = 0;
+    if (is_spec_apply) {
+        const uint32_t* live_r = (const uint32_t*)WaveCAddrs::AFTERIMAGE_POOL;
+        const size_t dword_count = WaveCAddrs::AFTERIMAGE_POOL_SZ / sizeof(uint32_t);
+        for (size_t o = 0; o < dword_count; ++o) {
+            if (live_r[o] >= HEAP_PTR_FLOOR) {
+                ++ai_candidates;
+                if (ai_pcount < MAX_PRESERVED_AI) {
+                    s_ai_preserved[ai_pcount++] = { (uint32_t)o, live_r[o] };
+                }
+            }
+        }
+    }
     memcpy((void*)WaveCAddrs::AFTERIMAGE_POOL,
            state->afterimage_pool,
            PFLASH1_OFFSET_IN_AI);
@@ -1494,6 +1525,28 @@ bool SaveState_Load(int frame) {
     memcpy((void*)(WaveCAddrs::AFTERIMAGE_POOL + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE),
            state->afterimage_pool + G_LAST_FRAME_TIME_OFFSET + G_LAST_FRAME_TIME_SIZE,
            WaveCAddrs::AFTERIMAGE_POOL_SZ - G_LAST_FRAME_TIME_OFFSET - G_LAST_FRAME_TIME_SIZE);
+    if (is_spec_apply) {
+        uint32_t* live_w = (uint32_t*)WaveCAddrs::AFTERIMAGE_POOL;
+        size_t restored = 0;
+        for (size_t k = 0; k < ai_pcount; ++k) {
+            if (live_w[s_ai_preserved[k].didx] >= HEAP_PTR_FLOOR) {
+                live_w[s_ai_preserved[k].didx] = s_ai_preserved[k].value;
+                ++restored;
+            }
+        }
+        if (ai_candidates > 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SaveState: spec afterimage_pool: candidates=%zu preserved=%zu "
+                "restored=%zu (cap=%zu)",
+                ai_candidates, ai_pcount, restored, MAX_PRESERVED_AI);
+            if (ai_candidates > MAX_PRESERVED_AI) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SaveState: spec afterimage_pool pointer-preserve TRUNCATED "
+                    "(%zu > cap %zu) -- bump MAX_PRESERVED_AI",
+                    ai_candidates, MAX_PRESERVED_AI);
+            }
+        }
+    }
     *(uint32_t*)WaveCAddrs::CURRENT_OBJECT_PTR    = state->current_object_ptr;
     memcpy((void*)WaveCAddrs::OBJECT_LIST_HEADS,    state->object_list_heads_tails, WaveCAddrs::OBJECT_LIST_HEADS_SZ);
     memcpy((void*)WaveCAddrs::OBJECT_NODE_POOL,     state->object_node_pool,        WaveCAddrs::OBJECT_NODE_POOL_SZ);

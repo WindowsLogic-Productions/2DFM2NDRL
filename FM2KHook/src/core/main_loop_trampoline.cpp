@@ -836,11 +836,14 @@ constexpr size_t SPECTATOR_LIVE_LAG_FRAMES = 100;
 // the queue couldn't supply an INPUT (head non-INPUTs were drained but no
 // INPUT followed them), true if a frame was simulated. Render is the
 // caller's responsibility.
+uint32_t g_spec_pop_total = 0;
+
 static bool SpectatorSimOneFrame() {
     uint16_t p1 = 0, p2 = 0;
     if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
         return false;
     }
+    ++g_spec_pop_total;
 
     // PER-FRAME alignment-trace log: capture RNG before PGI runs so we can
     // pair with [HOST-TRACE] on the host. If host's bf=N rng_pre matches
@@ -982,6 +985,28 @@ static void RunSpectatorTick() {
     const bool s_offline_replay_env_active = (s_offline_replay_cached == 1);
 
     const size_t qd = SpectatorNode_PendingFrameCount();
+
+    // [SPEC-Q] 1Hz heartbeat: phase + queue depth + pop counters. The
+    // [SPEC-FP] trace only logs in battle (mode>=3000), leaving the
+    // match-boundary CSS walk a blind spot -- the multi-match journey
+    // stalls there and nothing said why.
+    {
+        static uint64_t s_last_q_log = 0;
+        static uint32_t s_pops_window = 0;
+        extern uint32_t g_spec_pop_total;
+        static uint32_t s_pop_last = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - s_last_q_log >= 1000) {
+            const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+            s_pops_window = g_spec_pop_total - s_pop_last;
+            s_pop_last = g_spec_pop_total;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[SPEC-Q] mode=%u q=%zu pops/s=%u total=%u catchup=%d",
+                mode, qd, s_pops_window, g_spec_pop_total,
+                (int)g_spectator_catchup);
+            s_last_q_log = now;
+        }
+    }
     // Jitter-buffer floor only applies to LIVE spec (waiting on host's next
     // batch). Offline replay has no upstream — the file is the entire input
     // stream — so the last ≤8 events (typically post-match INPUTs +

@@ -79,7 +79,59 @@ enum class SpecDataType : uint8_t {
     SNAPSHOT_BEGIN = 6,
     SNAPSHOT_CHUNK = 7,
     SNAPSHOT_END   = 8,
+
+    // ----- UDP input accelerator (Phase F) -----
+    //
+    // UDP_INPUT_BATCH is a raw datagram on the shared control UDP socket
+    // (NEVER framed over TCP -- PayloadLenForType deliberately has no case
+    // for it, so a host bug that puts it on the stream fails loudly).
+    // TCP stays the single authority for ops, history, backfill and
+    // snapshots; this datagram is a pure positional INPUT accelerator so
+    // a TCP retransmit stall (multi-second at real loss rates) can't
+    // starve the playback queue mid-battle.
+    //
+    //   UDP_INPUT_BATCH:
+    //     start_frame = session-relative INPUT-frame index of first frame
+    //                   in the window
+    //     frame_count = frames in window (<= SPEC_UDP_WINDOW)
+    //     flags       = payload byte count (4 + frame_count*4)
+    //     payload     = u32 op_seq (host's total non-INPUT event count at
+    //                   send time, little-endian)
+    //                 + frame_count x { u16 p1, u16 p2 }
+    //
+    // Admission invariant (spectator side): a window is admitted only when
+    // ops_seen >= op_seq, i.e. every non-INPUT event the host appended
+    // before these inputs has already been TCP-decoded locally. Positional
+    // guarantee: an op always precedes the inputs appended after it, and a
+    // datagram only carries already-appended inputs -- so no input can
+    // ever be admitted past an unseen sim-critical op, on the playback
+    // queue, the hop-1 relay log, or recordings.
+    //
+    //   OP_BASELINE (TCP-borne, sent at bind BEFORE snapshot/backfill):
+    //     start_frame = unused (0)
+    //     frame_count = unused (0)
+    //     flags       = 4 (payload byte count)
+    //     payload     = u32 count of non-INPUT events in
+    //                   session_events[0 .. backfill start) -- the ops a
+    //                   mid-session joiner will never receive. Initializes
+    //                   ops_seen and (re-)arms the UDP admission epoch for
+    //                   the new connection; sent only to subscribers that
+    //                   advertised SPEC_JOIN_UDP_OK (old framers would
+    //                   drop the connection on an unknown type).
+    UDP_INPUT_BATCH = 9,
+    OP_BASELINE     = 10,
 };
+
+// UDP accelerator tuning. Window 64 + send-every-2-confirmed-frames means
+// a frame is re-shipped in ~32 consecutive datagrams: at 20% loss the
+// probability that ALL of them drop is ~0.2^32. ~270 B per datagram at
+// 50/s = ~13.5 KB/s per subscriber.
+constexpr size_t   SPEC_UDP_WINDOW        = 64;
+constexpr uint32_t SPEC_UDP_SEND_INTERVAL = 2;   // confirmed frames per send
+constexpr size_t   SPEC_UDP_MAX_FANOUT    = 8;   // cap UDP sends per tick
+
+// SPEC_JOIN_REQ reserved[0] capability bits (old builds send zeros).
+constexpr uint8_t SPEC_JOIN_UDP_OK = 0x01;  // viewer accepts UDP_INPUT_BATCH + OP_BASELINE
 
 // Spectator's preferred backfill mode, declared in SPEC_JOIN_REQ payload.
 // Default at the wire level (zero-init) is FULL_SESSION so an older host
@@ -610,6 +662,15 @@ void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,
 // it sees SPEC_DATA_MAGIC.
 void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                                   const sockaddr_in& from);
+
+// Narrow handler for raw 0xCE datagrams arriving on the shared control
+// UDP socket (Phase F accelerator). Accepts ONLY UDP_INPUT_BATCH, and only
+// from the current upstream while the admission epoch is armed -- never
+// runs the full HandleSpecData parser (TCP ordering assumptions don't
+// hold for raw datagrams). Called from control_channel.cpp's RawReceive
+// demux before the GekkoNet queue.
+void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
+                                          const sockaddr_in& from);
 
 // Are we currently subscribed upstream (receiving a live match stream)?
 bool SpectatorNode_IsSubscribedUpstream();
