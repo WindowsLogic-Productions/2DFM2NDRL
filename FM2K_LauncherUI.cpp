@@ -4678,6 +4678,20 @@ void LauncherUI::PollUploadQueue() {
 
     if (games_.empty()) return;
 
+    // Pause uploads while a match is live. Even off the UI thread, draining a
+    // backlog of fat rngtrace.csv bundles saturates the user's UPSTREAM
+    // bandwidth and competes with the game's live netplay UDP -> ping spikes
+    // (Melancholy's 800ms persisted after the thread fix). Telemetry isn't
+    // urgent: only drain at the menu, never while Connecting or InGame.
+    if (launcher_state_ == LauncherState::Connecting ||
+        launcher_state_ == LauncherState::InGame) return;
+
+    // Trickle: at most one upload every ~1.5s so even a large backlog drains
+    // gently instead of flooding the connection in a single burst.
+    static uint64_t s_next_ms = 0;
+    const uint64_t now_ms = (uint64_t)GetTickCount64();
+    if (now_ms < s_next_ms) return;
+
     // Round-robin through ALL installed games, one game per tick, instead
     // of only the UI-selected one. The old code scanned
     // games_[selected_game_index_] only, which meant a crash/desync bundle
@@ -4700,6 +4714,7 @@ void LauncherUI::PollUploadQueue() {
     // every game's queue and drains backlogs one manifest per completed run.
     static std::atomic<bool> s_busy{false};
     if (s_busy.exchange(true)) return;  // an upload is already running
+    s_next_ms = now_ms + 1500;          // >= 1.5s before the next upload starts
 
     static size_t s_rr = 0;
     if (s_rr >= games_.size()) s_rr = 0;
@@ -4717,10 +4732,11 @@ void LauncherUI::PollUploadQueue() {
         cfg.upload_url = fm2k::kLogUploadUrl;   // global constexpr -- thread-safe
         cfg.secret     = fm2k::kLogUploadSecret;
         cfg.enabled    = true;
-        // Drain everything queued for this dir in one run, then release the
-        // slot. Process() returns false when nothing's left or on a transient
-        // failure (manifest stays for the next pass), so this terminates.
-        while (fm2k::upload_queue::Process(cfg)) {}
+        // Upload ONE manifest per run, then release the slot. The 1.5s
+        // throttle + round-robin in PollUploadQueue pace the rest, so a
+        // backlog trickles out over time instead of flooding the connection
+        // in one burst (which is what spiked netplay ping even off-thread).
+        fm2k::upload_queue::Process(cfg);
         s_busy.store(false);
     }).detach();
 }
