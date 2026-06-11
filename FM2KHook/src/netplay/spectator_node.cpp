@@ -1462,6 +1462,7 @@ void SpectatorNode_Shutdown() {
     g_state.pb_boundary         = State::PbBoundary::NONE;
     g_state.pending_reset_input = false;
     g_state.pending_sound_init  = false;
+    CssAutoConfirm_SetSeamHold(false);
     SpectatorTCP::Shutdown();
     // Tear down both relay rings if we created them. Close handles
     // nullptr. Kernel mapping refcount keeps the object alive while
@@ -2078,6 +2079,7 @@ void SpectatorNode_ApplyPendingSnapshot() {
     g_state.pb_boundary         = State::PbBoundary::NONE;
     g_state.pending_reset_input = false;
     g_state.pending_sound_init  = false;
+    CssAutoConfirm_SetSeamHold(false);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "SpectatorNode: SNAPSHOT applied (match=%u, %zu bytes) — "
@@ -2500,6 +2502,7 @@ bool SpectatorNode_LoadSessionFile(const char* path, const SeekTarget& seek) {
     g_state.pb_boundary         = State::PbBoundary::NONE;
     g_state.pending_reset_input = false;
     g_state.pending_sound_init  = false;
+    CssAutoConfirm_SetSeamHold(false);
     if (loaded_session_id != 0) g_state.session_id = loaded_session_id;
 
     auto push_event = [&](SessionEvent& ev, const uint8_t* hdr_buf) {
@@ -2737,6 +2740,11 @@ void ApplySessionEvent(const SessionEvent& ev) {
                     g_state.pb_boundary = State::PbBoundary::SEAM;
                     const uint32_t cur_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
                     g_state.pb_boundary_left_battle = (cur_mode < 3000u);
+                    // Hold the local CSS unadvanceable until MATCH_START
+                    // pins -- the VS-rematch CSS auto-advances on neutral
+                    // inputs (carried locks) and raced into battle-2
+                    // BEFORE the pin targets arrived.
+                    CssAutoConfirm_SetSeamHold(true);
                 }
             }
             const auto& p = ev.u.match_end;
@@ -3208,6 +3216,7 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
         g_state.pb_boundary         = State::PbBoundary::NONE;
         g_state.pending_reset_input = false;
         g_state.pending_sound_init  = false;
+        CssAutoConfirm_SetSeamHold(false);
     }
     g_state.playing_back = true;
 
@@ -3938,6 +3947,7 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
         if (g_state.pb_boundary == State::PbBoundary::PINNING &&
             g_state.pb_boundary_left_battle && mode >= 3000u) {
             g_state.pb_boundary = State::PbBoundary::NONE;
+            CssAutoConfirm_SetSeamHold(false);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: boundary PINNING -> NONE (battle entered, "
                 "resuming exact input pops, q=%zu)", g_state.pb_queue.size());

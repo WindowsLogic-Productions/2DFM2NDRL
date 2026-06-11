@@ -418,6 +418,24 @@ def main():
         if segs < 2:
             print("[harness] FAIL: spectator did not follow into match 2")
             return 1
+        # Every boundary crossing must apply the deferred battle-init ops
+        # (PIN_RNG at minimum) at the spec's battle entry. A local early
+        # battle entry (the 2026-06-11 rematch-CSS auto-advance bug)
+        # consumed the once-per-battle init edge before the ops arrived --
+        # match 2 ran with an unpinned RNG and nothing failed loudly
+        # because the parity gate only covers match 1.
+        spec_log = OUT_DIR / "live_FM2K_P3_Debug.log"
+        if spec_log.exists():
+            txt = spec_log.read_text(errors="replace")
+            pins = txt.count("applied deferred PIN_RNG at battle entry")
+            needed = segs - 1  # first battle is snapshot-anchored
+            print(f"[harness] deferred PIN_RNG applies: {pins} "
+                  f"(boundary crossings: {needed})")
+            if pins < needed:
+                print("[harness] FAIL: a boundary crossing entered battle "
+                      "without applying the deferred init ops (early local "
+                      "battle entry -- match desync)")
+                return 1
     else:
         p0_rep = None
         deadline = time.time() + 10.0

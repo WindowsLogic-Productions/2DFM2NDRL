@@ -49,3 +49,16 @@ void CssAutoConfirm_Disengage();
 // auto-confirm path. Read from the FM2K_TEAM_CSS_DUPE_LOCK env var at
 // hook init; toggled per-game via the launcher's host config panel.
 void CssAutoConfirm_SetTeamDupeLock(bool enabled);
+
+// Spectator match-boundary seam hold (Phase F). While enabled and the
+// auto-confirm pin is NOT armed, the hook keeps the local CSS from
+// advancing: both action_states forced to 0 and confirm bits masked each
+// frame. FM2K's VS-rematch CSS auto-advances even on neutral inputs (the
+// previous match's locks persist), which let the spectator race into the
+// next battle BEFORE the host's MATCH_START arrived -- early battle entry
+// consumed the once-per-battle init edge before the deferred PIN_RNG /
+// RESET_INPUT_STATE were even queued (battle-2 desync), and the screen ran
+// ahead of the source clients. Set on SEAM entry; the pin arming
+// (OnReplayMatchStart) takes precedence via the !armed gate; cleared at
+// boundary teardown.
+void CssAutoConfirm_SetSeamHold(bool enabled);

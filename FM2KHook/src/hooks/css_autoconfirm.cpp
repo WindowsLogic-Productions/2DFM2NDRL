@@ -92,6 +92,10 @@ std::atomic<uint32_t> g_pin_tick{0};
 // hook init; flipped per-game via the launcher's host config panel.
 std::atomic<bool> g_team_dupe_lock{false};
 
+// Spectator seam hold (Phase F) -- see header. Holds CSS unadvanceable
+// while the spectator waits for the next MATCH_START's pin targets.
+std::atomic<bool> g_seam_hold{false};
+
 // Apply team-mode dupe-lock: in team mode CSS, mask each player's confirm
 // bits if their cursor would land on a character already locked into one
 // of their earlier team slots. Engine writes the cursor's selected char
@@ -158,6 +162,23 @@ char __cdecl Hook_GameStateManager() {
                 *(uint32_t*)0x00430128 = (uint32_t)override;
                 VirtualProtect((void*)0x00430128, 4, old_protect, &old_protect);
             }
+        }
+    }
+
+    // Seam hold: while waiting for the next MATCH_START, keep the CSS
+    // unadvanceable -- zero both action_states (the rematch flow carries
+    // the previous match's locks, which auto-advance to battle on neutral
+    // inputs) and mask all confirm bits. The pin (g_active) takes
+    // precedence: once armed it drives the natural confirm flow itself.
+    if (g_seam_hold.load(std::memory_order_relaxed) &&
+        !g_active.load(std::memory_order_relaxed)) {
+        const uint32_t game_mode = *(uint32_t*)ADDR_GAME_MODE;
+        if (game_mode == 2000u) {
+            *(uint32_t*)ADDR_P1_ACTION_STATE = 0;
+            *(uint32_t*)ADDR_P2_ACTION_STATE = 0;
+            uint32_t* in_changes = (uint32_t*)ADDR_INPUT_CHANGES;
+            in_changes[0] &= ~0x3F0u;
+            in_changes[1] &= ~0x3F0u;
         }
     }
 
@@ -327,6 +348,14 @@ void CssAutoConfirm_SetTeamDupeLock(bool enabled) {
         enabled ? "ENABLED" : "disabled");
 }
 
+void CssAutoConfirm_SetSeamHold(bool enabled) {
+    const bool was = g_seam_hold.exchange(enabled, std::memory_order_acq_rel);
+    if (was != enabled) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "CssAutoConfirm: seam hold %s", enabled ? "ENGAGED" : "released");
+    }
+}
+
 #else  // ENGINE_FM95 — separate state machine, separate hand-off
 
 #include "css_autoconfirm.h"
@@ -335,5 +364,6 @@ bool CssAutoConfirm_Install()                              { return true; }
 void CssAutoConfirm_OnReplayMatchStart(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
 void CssAutoConfirm_Disengage()                            {}
 void CssAutoConfirm_SetTeamDupeLock(bool)                  {}
+void CssAutoConfirm_SetSeamHold(bool)                      {}
 
 #endif
