@@ -4132,8 +4132,7 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 // the boundary over to pure replay.
                 g_state.pb_boundary = State::PbBoundary::NONE;
                 g_state.pb_post_css_mask_pops = 10;
-                CssAutoConfirm_SetSeamHold(true,
-                    g_state.pb_p1_color, g_state.pb_p2_color);
+                CssAutoConfirm_SetSeamHold(true, 0xFF, 0xFF);  // mask only
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: lean seam -> mirror (CSS aligned at "
                     "host frame 0, confirm mask 10 pops, q=%zu)",
@@ -4207,7 +4206,7 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 // masking hold for the first 60 CSS frames to eat the
                 // stray edge; released in the post-release guard below.
                 if (mode_now == 2000u) {
-                    CssAutoConfirm_SetSeamHold(true, 0, 0);
+                    CssAutoConfirm_SetSeamHold(true, 0xFF, 0xFF);  // mask only
                 }
             }
             if (!s_css_reached) {

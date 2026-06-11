@@ -190,13 +190,21 @@ char __cdecl Hook_GameStateManager() {
             uint32_t* in_changes = (uint32_t*)ADDR_INPUT_CHANGES;
             in_changes[0] &= ~0x3F0u;
             in_changes[1] &= ~0x3F0u;
-            // Keep the held portraits in the colors from the match the
-            // viewer just watched (confirm-time color assignment never
-            // runs while held).
-            *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 0 * CHARSLOT_STRIDE_BYTES) =
-                g_seam_hold_p1_color.load(std::memory_order_relaxed);
-            *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 1 * CHARSLOT_STRIDE_BYTES) =
-                g_seam_hold_p2_color.load(std::memory_order_relaxed);
+            // OPTIONAL carry-color stamping (0xFF = don't touch). Only
+            // the legacy long-hold display path uses it. The lean
+            // 10-frame masks must NOT write these: AssignPlayerColor's
+            // collision scan reads the slot color fields, so stamped
+            // values diverge the bump logic from the host's and the
+            // mirrored confirms land on different palettes (rematch
+            // wrong-colors-on-both, 2026-06-11).
+            const uint8_t hc1 = g_seam_hold_p1_color.load(std::memory_order_relaxed);
+            const uint8_t hc2 = g_seam_hold_p2_color.load(std::memory_order_relaxed);
+            if (hc1 < 8) {
+                *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 0 * CHARSLOT_STRIDE_BYTES) = hc1;
+            }
+            if (hc2 < 8) {
+                *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 1 * CHARSLOT_STRIDE_BYTES) = hc2;
+            }
 
             // [SEAM-CSS] 1Hz: is the mirror actually moving this CSS?
             // Pairs with [HOST-CSS] below for a side-by-side diff.
