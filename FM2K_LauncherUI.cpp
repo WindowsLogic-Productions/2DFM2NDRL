@@ -25,6 +25,7 @@
 #include <array>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <filesystem>
 #include "vendored/imgui/imgui.h"
 #include "imgui_internal.h"
@@ -1491,82 +1492,79 @@ void LauncherUI::RenderSettingsWindow() {
 // games-discovery roots. Lives behind a Settings menu entry so the main
 // panel stays focused on the games list itself; casual users with a
 // single folder almost never need this UI after first-run setup.
+// Native folder-picker result marshaling. SDL fires the dialog callback
+// from its own thread (or during event pump), so it can't touch UI state
+// directly -- it stashes the chosen path here and the render thread applies
+// it on the next RenderGamesFoldersBody().
+namespace {
+std::mutex              g_games_folder_pick_mtx;
+std::string             g_games_folder_pick;
+std::atomic<bool>       g_games_folder_picked{false};
+
+void SDLCALL GamesFolderPickCallback(void* /*userdata*/,
+                                     const char* const* filelist,
+                                     int /*filter*/) {
+    // filelist == NULL on error; filelist[0] == NULL on cancel.
+    if (filelist && filelist[0]) {
+        std::lock_guard<std::mutex> lk(g_games_folder_pick_mtx);
+        g_games_folder_pick = filelist[0];
+        g_games_folder_picked.store(true, std::memory_order_release);
+    }
+}
+}  // namespace
+
 void LauncherUI::RenderGamesFoldersBody() {
-    // Per-row edit buffers persist across frames so users can keep
-    // typing without ImGui resetting their input. Sized to match the
-    // typical launcher.cfg line length; long absolute paths fit fine.
-    static std::vector<std::array<char, 512>> row_bufs;
-    static std::vector<std::string> last_seen;
-    static std::array<char, 512> add_buf{};
-    static bool add_buf_initialized = false;
-
-    auto sync_rows_from_paths = [&]() {
-        row_bufs.assign(games_root_paths_.size(), {});
-        for (size_t i = 0; i < games_root_paths_.size(); ++i) {
-            SDL_strlcpy(row_bufs[i].data(),
-                        games_root_paths_[i].c_str(), row_bufs[i].size());
-        }
-        last_seen = games_root_paths_;
-    };
-
-    if (last_seen != games_root_paths_) sync_rows_from_paths();
-    if (!add_buf_initialized) { add_buf_initialized = true; add_buf[0] = '\0'; }
-
-    auto current_paths = [&]() -> std::vector<std::string> {
-        std::vector<std::string> out;
-        out.reserve(row_bufs.size());
-        for (auto& buf : row_bufs) {
-            if (buf[0] != '\0') out.emplace_back(buf.data());
-        }
-        return out;
-    };
     auto commit = [&](std::vector<std::string> paths) {
         games_root_paths_ = paths;
-        last_seen = paths;
         if (on_games_folders_set) on_games_folders_set(std::move(paths));
     };
+
+    // Apply a folder chosen via the native picker (callback runs off the UI
+    // thread; this drains it on the render thread). De-dupe so picking the
+    // same folder twice is a no-op.
+    if (g_games_folder_picked.exchange(false, std::memory_order_acq_rel)) {
+        std::string picked;
+        {
+            std::lock_guard<std::mutex> lk(g_games_folder_pick_mtx);
+            picked.swap(g_games_folder_pick);
+        }
+        if (!picked.empty() &&
+            std::find(games_root_paths_.begin(), games_root_paths_.end(),
+                      picked) == games_root_paths_.end()) {
+            std::vector<std::string> paths = games_root_paths_;
+            paths.push_back(std::move(picked));
+            commit(std::move(paths));
+        }
+    }
 
     ImGui::TextWrapped("%s", T("hint_games_folders_window"));
     ImGui::Separator();
 
     ImGui::PushID("GamesFoldersWindow");
+    // Read-only rows: each configured folder + a Remove button. No manual
+    // text entry -- folders are added via the native Browse picker below.
     int remove_index = -1;
-    for (size_t i = 0; i < row_bufs.size(); ++i) {
+    for (size_t i = 0; i < games_root_paths_.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
-        ImGui::SetNextItemWidth(380);
-        bool changed = ImGui::InputText("##path", row_bufs[i].data(),
-                                        row_bufs[i].size());
-        ImGui::SameLine();
-        if (ImGui::Button(T("btn_set")) ||
-            (changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-            commit(current_paths());
-        }
-        ImGui::SameLine();
         if (ImGui::Button(T("btn_remove"))) {
             remove_index = static_cast<int>(i);
         }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(games_root_paths_[i].c_str());
         ImGui::PopID();
     }
-    if (remove_index >= 0 && remove_index < (int)row_bufs.size()) {
-        row_bufs.erase(row_bufs.begin() + remove_index);
-        commit(current_paths());
+    if (remove_index >= 0 && remove_index < (int)games_root_paths_.size()) {
+        std::vector<std::string> paths = games_root_paths_;
+        paths.erase(paths.begin() + remove_index);
+        commit(std::move(paths));
     }
 
     ImGui::Separator();
-    ImGui::SetNextItemWidth(380);
-    bool add_changed = ImGui::InputTextWithHint(
-        "##add_path", T("hint_add_games_folder"),
-        add_buf.data(), add_buf.size());
-    ImGui::SameLine();
-    if (ImGui::Button(T("btn_add")) ||
-        (add_changed && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-        if (add_buf[0] != '\0') {
-            std::array<char, 512> nb{};
-            SDL_strlcpy(nb.data(), add_buf.data(), nb.size());
-            row_bufs.push_back(nb);
-            add_buf[0] = '\0';
-            commit(current_paths());
-        }
+    if (ImGui::Button(T("btn_browse_folder"))) {
+        // Native OS folder picker. Single selection; result applied above on
+        // the next frame. window_ parents the dialog to the launcher.
+        SDL_ShowOpenFolderDialog(GamesFolderPickCallback, nullptr,
+                                 window_, nullptr, false);
     }
     ImGui::PopID();
 }
