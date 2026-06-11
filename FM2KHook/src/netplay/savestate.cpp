@@ -1502,7 +1502,22 @@ bool SaveState_Load(int frame) {
     // hardware state is NOT touched — the post-advance sync decides which
     // restored desires cross into "play now" vs. "leave the channel alone"
     // based on whether the play frame falls inside the rollback window.
-    SoundRollback::RestoreDesired(state->sound_desired);
+    //
+    // CROSS-PROCESS SPEC CARVE-OUT: DesiredState.script_item_ptr is a raw
+    // pointer into the HOST's heap, stored so SyncAfterAdvance can re-invoke
+    // the original dispatcher. Restoring it on a spectator snapshot apply
+    // crashes on the first sync (AV read of host heap addr inside
+    // Hook_DispatchScriptSoundCommand reading script_item+40 -- observed
+    // 2026-06-11 on the spec_selftest CURRENT_MATCH join, FM2KHook+0x102B2).
+    // Zero desired[] for spec applies instead: in-flight sounds at join
+    // are not worth reconstructing (catchup is muted anyway) and the spec's
+    // own forward sim re-records fresh entries with LOCAL pointers.
+    if (!is_spec_apply) {
+        SoundRollback::RestoreDesired(state->sound_desired);
+    } else {
+        static const SoundRollback::DesiredState s_zero_desired[SoundRollback::MAX_CHANNELS] = {};
+        SoundRollback::RestoreDesired(s_zero_desired);
+    }
 
     return true;
 }

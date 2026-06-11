@@ -3501,8 +3501,14 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
                 session_kind.c_str());
         }
     }
-    spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
-        "c:/games/2dfm/wanwan/parity_p3.pty");
+    // Default spectator parity path -- but respect an explicit
+    // FM2K_PARITY_RECORD_PATH from the environment (the spec_selftest
+    // harness routes the .pty into its own workspace; the unconditional
+    // override silently sent it to parity_p3.pty instead).
+    if (!std::getenv("FM2K_PARITY_RECORD_PATH")) {
+        spectator_instance_->SetEnvironmentVariable("FM2K_PARITY_RECORD_PATH",
+            "c:/games/2dfm/wanwan/parity_p3.pty");
+    }
 
     if (!spectator_instance_->Launch(game_path)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed to launch remote spectator: %s",
