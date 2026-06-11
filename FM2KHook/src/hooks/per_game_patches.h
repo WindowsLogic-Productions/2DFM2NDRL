@@ -100,7 +100,9 @@ bool PerGamePatches_InstallBootToBattleHook();
 // Pass 0xFF for any field to leave it unset (env-var fallback wins).
 void PerGamePatches_SetRuntimeBtbOverrides(uint8_t p1_char,
                                            uint8_t p2_char,
-                                           uint8_t stage);
+                                           uint8_t stage,
+                                           uint8_t p1_color = 0xFF,
+                                           uint8_t p2_color = 0xFF);
 
 // Returns the user-set team size override (2..8) or 0 if unset / out
 // of range. Called from css_autoconfirm.cpp's Hook_GameStateManager

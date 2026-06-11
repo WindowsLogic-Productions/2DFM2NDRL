@@ -10,8 +10,10 @@ Supports the FM2K family:
 - `2DKGT2K\0` (modern: Wonderful World, ReSHUFFLE, vanpri, most)
 - `2DKGT2G\0` (G-variant: AOB et al)
 
-FM95 family (`KGTGAME\0`, `2DKGT95\0`) is **gracefully skipped** —
-different fixed-offset layout, separate parser needed.
+FM95 family (`KGTGAME\0`, `2DKGT95\0`) round-trips via the opaque-blob
+fallback (`fm2nd.Fm95Opaque`) — 16B sig + 256B name + verbatim body.
+Full FM95 byte-decoding is deferred (no public spec — see
+`FM2K_KgtParser.cpp` for the slim name-extraction layout).
 
 **Verified across 146 files (809 MiB) from `C:\games\2dfm`, `C:\dev\fm95`,
 `C:\Users\teo\Downloads\_nicotine`, `D:\games\fm2k`:**
@@ -30,6 +32,9 @@ python3 kgt.py verify "path/to/game.kgt"
 
 # Full JSON
 python3 kgt.py parse "path/to/game.kgt" -o out.json
+
+# Full JSON with semantic script-item decode (Xem's 28-Block catalog)
+python3 kgt.py parse --decode-blocks "path/to/game.kgt" -o out.json
 
 # Rebuild from JSON
 python3 kgt.py pack out.json rebuilt.kgt
@@ -90,6 +95,8 @@ runtime reads. Specifically:
 | `cclFreezeTime` (RecoverTimeConfig.clashRecoverTime) | `collision_effect_type` | IDA: `g_collision_effect_type`, used by `ProcessHitboxCollisions` |
 | `unknownGapBytes[264]` ("位置数据") | `score_digit_sprites_array` (132 × u16) | IDA: `g_score_digit_sprites_array`, used by `DisplayScoreNumbers` |
 | `unknown996Bytes[996]` | split: `player_selectable_infos[50]` + `reserved_tail_946` | C++ reader names first 50; remaining 946 always-zero pad |
+| `ThrowReactionItem[200]` (010) | `common_images[200]` | Xem-confirmed: IDA insn scan finds zero references to in-memory range 0x4438AC..0x4451AC — editor-only image asset names, never read by runtime. First entry is `--Sin opciones--` (Spanish placeholder), inconsistent with hit-reaction naming. |
+| `player_selectable_infos[50]` raw byte | `player_selectable_infos_bits` (2-bit decode) | Per Xem: bit 0 = enabled_for_story_mode, bit 1 = enabled_for_vs_mode. Verified corpus-wide: across 6050 slots in 121 files, ONLY values 0/1/2/3 appear; bits 2+ never set. Old C++ "3=selectable, 1=hidden/CPU" was a guess. Reality: 3=both, 2=vs-only, 1=story-only, 0=disabled. |
 | `generalSettings` (int32) | `general_settings` + `general_settings_bits` | Added bitfield decode (ProjectBaseConfig union) |
 
 ## What's still labeled "unknown"
@@ -180,16 +187,81 @@ deltas. If a hex `_raw` blob diverges but the matching `_str` stays the
 same, that's exactly the kind of editor-corruption signature you're
 hunting.
 
-## Adding `.player` / `.demo` / `.stage` support
+## Semantic script-item decode
 
-The 010 templates exist:
-- `Unity2dfmRuntime/Docs/2dfm-player.bt` (44 lines)
-- `Unity2dfmRuntime/Docs/2dfm-stage.bt`  (45 lines)
-- `Unity2dfmRuntime/Docs/2dfm-demo.bt`   (51 lines)
+`--decode-blocks` adds a `script_items_decoded` array to the JSON
+output. Each 16-byte script item is decoded into a typed Block dict
+matching Xem85's [fm2ndparser](https://github.com/xem85/fm2ndparser)
+catalog. 25 named opcode types covered (M, DS, S, O, E, RC, SF, SG,
+SC, I, EB, GS, GL, RP, GC, R, FA, FD, PS, C, V, Rnd, Color, Com, AI)
+plus a "settings" sentinel for the first block of each skill — 26
+dispatch entries total. Verified on 124,341 blocks across 121 files:
+zero unknown opcodes, zero decode errors. The original raw payload bytes are still preserved on
+`script_items[*].payload`, so round-trip is byte-exact regardless of
+whether `--decode-blocks` is set.
 
-Factor `Script` / `ScriptItem` / `SpriteFrame` / `Palette` / `Sound` out
-of `kgt.py` — they're the shared "common resource" records. Then write
-thin wrappers for the per-file-type config tails.
+Block decoder lives in `blocks.py` and is reusable independently of
+the top-level Kgt parser.
+
+## `.player` / `.stage` / `.demo` support — `fm2nd.py`
+
+The companion `fm2nd.py` adds round-trip parsers for the other three
+FM2K project file types. Auto-dispatches by extension; same CLI shape
+as `kgt.py`.
+
+```bash
+python3 fm2nd.py verify path/to/file.player
+python3 fm2nd.py verify path/to/file.stage
+python3 fm2nd.py verify path/to/file.demo
+python3 fm2nd.py parse  --decode-blocks path/to/file.player -o out.json
+python3 fm2nd.py info   path/to/file.demo
+python3 fm2nd.py pack   out.json rebuilt.player
+```
+
+All three share the kgt common-resource section (signature, name,
+scripts, script_items, sprite_frames, palettes, sounds) — code reused
+via the `CommonHeader` dataclass. The tails:
+
+- **`.stage`**: 8B (unknown_gap + bgm_sound_id i32) + 1029B zero pad
+- **`.demo`**: 13B (unknown_gap1 + bgm_sound_id i16 + skip flag + ug2 + total_time u32) + 1024B zero pad
+- **`.player`**: opaque trailing region (~40K bytes of structured
+  character data — animations, hitboxes, AI; not currently decoded
+  because no public reference documents it. The 010 template's
+  `byte tail;` is grossly incomplete. We preserve the bytes verbatim
+  for round-trip.)
+
+`.player` decoding is a future research project — Unity's
+`PlayerFileReader.cs` only reads the common section too.
+
+### Coverage
+
+All three formats use the same `2DKGT2K\0` / `2DKGT2G\0` signatures as
+`.kgt` — detection is by extension, not magic number. FM95
+(`KGTGAME\0`, `2DKGT95\0`) is gracefully skipped.
+
+**Full-corpus verification (7252 files across `C:\games\2dfm`,
+`C:\dev\wanwan`, `D:\games\fm2k` — kgt + player + stage + demo):**
+
+| Format    | Total | OK              | FM2K | FM95 | Fail |
+|-----------|-------|-----------------|------|------|------|
+| `.player` | 2494  | **2494 (100%)** | 2470 | 24   | 0    |
+| `.stage`  | 1228  | 1227 (99.92%)   | 1227 | 0    | 1    |
+| `.demo`   | 3418  | **3418 (100%)** | 3346 | 72   | 0    |
+| `.kgt`    | 112   | **112 (100%)**  | 110  | 2    | 0    |
+| **All**   | **7252** | **7251 (99.99%)** | 7153 | 98 | 1 |
+
+The single hard failure is `Kakuhina (locked)/S02.stage` — a
+**truncated download** from MyAbandonware. The stage's last sound
+entry ("素子のテーマ", a 20,808,606-byte 44.1kHz stereo PCM WAV)
+agrees with the internal RIFF chunk header on its size, but the file
+ends 3,788,621 bytes short of that. Last bytes of the file are
+mid-stream PCM samples, not any WAV trailer. The "(locked)" tag in
+the directory name is from the archival site's metadata describing
+the game itself as locked content, *not* a kgt format flag — sibling
+stages S04 and S06 in the same directory round-trip fine. The other
+file in this same `_NODEV/` tree all parse cleanly too. Treating the
+failure as "missing input data" rather than "parser limitation":
+genuine FM2K/FM95 coverage is 7251 of 7251 = 100%.
 
 ## Adding FM95 support
 

@@ -803,7 +803,9 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                                         packet->data.spec_join_ack.host_tcp_port,
                                         packet->data.spec_join_ack.host_p1_char,
                                         packet->data.spec_join_ack.host_p2_char,
-                                        packet->data.spec_join_ack.host_stage);
+                                        packet->data.spec_join_ack.host_stage,
+                                        packet->data.spec_join_ack.host_p1_color,
+                                        packet->data.spec_join_ack.host_p2_color);
             break;
 
         case CtrlMsg::SPEC_JOIN_REDIRECT:

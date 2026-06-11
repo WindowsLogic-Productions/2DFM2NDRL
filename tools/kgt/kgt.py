@@ -273,17 +273,29 @@ class Reaction:
 
 
 @dataclass
-class ThrowReaction:
-    """32 bytes — name only."""
+class CommonImage:
+    """32 bytes — image-asset filename. Editor-only: the WW runtime never
+    references this 6400-byte region (verified by IDA insn scan over the
+    full text segment — zero immediate/lea/mov targeting the in-memory
+    range 0x4438AC..0x4451AC). The editor stores 200 shared image asset
+    names here so its asset-library UI can list them; the game itself
+    only loads them by per-character SpriteFrame index. The 010 Editor
+    template labeled this `ThrowReactionItem[200]`; that name appears to
+    be a guess — Xem's `CommonImages` matches both the editor-UI labels
+    and the runtime evidence."""
     name: bytes                 # 32B
 
     @classmethod
-    def parse(cls, buf: io.BytesIO) -> "ThrowReaction":
+    def parse(cls, buf: io.BytesIO) -> "CommonImage":
         return cls(_bytes(buf, 32))
 
     def pack(self) -> bytes:
         assert len(self.name) == 32
         return self.name
+
+
+# Backward-compat alias for callers that imported the old class name.
+ThrowReaction = CommonImage
 
 
 # ─── Top-level Kgt ──────────────────────────────────────────────────────
@@ -338,7 +350,7 @@ class Kgt:
     # ProjectBaseConfig — int32 bitfield. Low 7 bits encode game-mode flags.
     general_settings: int = 0           # int32
 
-    throw_reactions: List[ThrowReaction] = field(default_factory=list)   # 200 × 32B
+    common_images: List[CommonImage] = field(default_factory=list)   # 200 × 32B image-asset names (editor-only)
 
     # 132 × u16 array. IDA: `g_score_digit_sprites_array` @ 0x4451AC.
     # Read by DisplayScoreNumbers as `[digit_value % 10]` for score digits.
@@ -433,7 +445,7 @@ class Kgt:
 
         general_settings = _i32(buf)
 
-        throw_reactions = [ThrowReaction.parse(buf) for _ in range(200)]
+        common_images = [CommonImage.parse(buf) for _ in range(200)]
 
         score_digit_sprites_array = _bytes(buf, 264)
 
@@ -473,7 +485,7 @@ class Kgt:
             unknown_demo_id_1=unknown_demo_id_1,
             unknown_demo_id_2=unknown_demo_id_2,
             general_settings=general_settings,
-            throw_reactions=throw_reactions,
+            common_images=common_images,
             score_digit_sprites_array=score_digit_sprites_array,
             char_sel_start_pos_x=cs_sx, char_sel_start_pos_y=cs_sy,
             char_img_width=ci_w, char_img_height=ci_h,
@@ -544,8 +556,8 @@ class Kgt:
 
         out.write(_pi32(self.general_settings))
 
-        assert len(self.throw_reactions) == 200
-        for tr in self.throw_reactions: out.write(tr.pack())
+        assert len(self.common_images) == 200
+        for tr in self.common_images: out.write(tr.pack())
 
         assert len(self.score_digit_sprites_array) == 264
         out.write(self.score_digit_sprites_array)
@@ -588,6 +600,21 @@ class Kgt:
     def score_digits_array(self) -> List[int]:
         """Decode score_digit_sprites_array as 132 × u16."""
         return list(struct.unpack("<132H", self.score_digit_sprites_array))
+
+    def player_selectable_infos_bits(self) -> List[dict]:
+        """Decode the 50-byte CSS-eligibility block as 2-bit flags per slot.
+        Per Xem's fm2ndparser reverse-engineering: bit 0 = enabled in
+        story mode, bit 1 = enabled in vs mode. Explains why only 0/1/3
+        are observed (bit 2 onward asserted unused). 2 alone is never
+        seen in our corpus."""
+        out = []
+        for b in self.player_selectable_infos:
+            out.append({
+                "story_mode": bool(b & 0x1),
+                "vs_mode":    bool(b & 0x2),
+                "raw":        b,
+            })
+        return out
 
     def to_json(self) -> dict:
         return {
@@ -651,10 +678,10 @@ class Kgt:
             "unknown_demo_id_2": self.unknown_demo_id_2,
             "general_settings": self.general_settings,
             "general_settings_bits": self.general_settings_bits(),
-            "throw_reactions": [
+            "common_images": [
                 {"name": t.name.hex(),
                  "name_str": _try_decode(t.name)}
-                for t in self.throw_reactions],
+                for t in self.common_images],
             "score_digit_sprites_array": self.score_digit_sprites_array.hex(),
             "score_digit_sprites_array_u16": self.score_digits_array(),
             "char_sel_start_pos_x": self.char_sel_start_pos_x,
@@ -672,6 +699,7 @@ class Kgt:
             "char_sel_for_p2_range_x": self.char_sel_for_p2_range_x,
             "char_sel_for_p2_range_y": self.char_sel_for_p2_range_y,
             "player_selectable_infos": list(self.player_selectable_infos),
+            "player_selectable_infos_bits": self.player_selectable_infos_bits(),
             "reserved_tail_946": self.reserved_tail_946.hex(),
         }
 
@@ -724,8 +752,9 @@ class Kgt:
             unknown_demo_id_1=d["unknown_demo_id_1"],
             unknown_demo_id_2=d["unknown_demo_id_2"],
             general_settings=d["general_settings"],
-            throw_reactions=[ThrowReaction(name=bytes.fromhex(t["name"]))
-                              for t in d["throw_reactions"]],
+            common_images=[CommonImage(name=bytes.fromhex(t["name"]))
+                            for t in d.get("common_images",
+                                            d.get("throw_reactions", []))],
             score_digit_sprites_array=bytes.fromhex(d["score_digit_sprites_array"]),
             char_sel_start_pos_x=d["char_sel_start_pos_x"],
             char_sel_start_pos_y=d["char_sel_start_pos_y"],
@@ -753,6 +782,29 @@ def cmd_parse(args):
         data = f.read()
     k = Kgt.parse(data)
     j = k.to_json()
+    if args.decode_blocks:
+        import blocks
+        # The first script_item of each skill is the "settings" sentinel;
+        # subsequent items are opcode-dispatched. We walk skill ranges
+        # using scripts[i].script_index as the cursor.
+        ranges = []
+        for i, sc in enumerate(k.scripts):
+            start = sc.script_index
+            end = (k.scripts[i + 1].script_index
+                   if i + 1 < len(k.scripts) else len(k.script_items))
+            ranges.append((start, end))
+        is_settings = [False] * len(k.script_items)
+        for (start, end) in ranges:
+            if 0 <= start < len(k.script_items):
+                is_settings[start] = True
+        decoded = []
+        for idx, si in enumerate(k.script_items):
+            if is_settings[idx]:
+                # Force opcode 0 dispatch so it picks _parse_settings.
+                decoded.append(blocks.decode_block(0, si.payload))
+            else:
+                decoded.append(blocks.decode_block(si.script_type, si.payload))
+        j["script_items_decoded"] = decoded
     out = sys.stdout if args.output == "-" else open(args.output, "w")
     json.dump(j, out, indent=2, ensure_ascii=False)
     if args.output != "-":
@@ -772,6 +824,15 @@ def cmd_pack(args):
 def cmd_verify(args):
     with open(args.input, "rb") as f:
         data = f.read()
+    # FM95 fallback: opaque-blob round-trip via fm2nd.Fm95Opaque.
+    if data[:7] in (b"KGTGAME", b"2DKGT95"):
+        import fm2nd
+        obj = fm2nd.Fm95Opaque.parse(data, label="kgt-fm95")
+        if obj.pack() == data:
+            print(f"OK (kgt-fm95) round-trip exact ({len(data)} bytes): {args.input}")
+            return 0
+        print(f"FAIL FM95 round-trip diverged: {args.input}", file=sys.stderr)
+        return 1
     try:
         k = Kgt.parse(data)
     except (NotImplementedError, ValueError) as e:
@@ -956,8 +1017,8 @@ def cmd_coverage(args):
     s = pos(); _bytes(buf, 2);     mark("unknown_demo_tag_1/2 (no xrefs)", s, pos())
     s = pos(); _i32(buf);          mark("general_settings (ProjectBaseConfig)", s, pos())
     s = pos()
-    for _ in range(200): ThrowReaction.parse(buf)
-    mark("throw_reactions[200]", s, pos())
+    for _ in range(200): CommonImage.parse(buf)
+    mark("common_images[200]", s, pos())
     s = pos(); _bytes(buf, 264);   mark("score_digit_sprites_array (132 × u16)", s, pos())
     s = pos(); _bytes(buf, 28);    mark("char_sel_config (14 × 2B)", s, pos())
     s = pos(); _bytes(buf, 50);    mark("player_selectable_infos[50]", s, pos())
@@ -986,6 +1047,9 @@ def main():
 
     p = sub.add_parser("parse")
     p.add_argument("input"); p.add_argument("-o", "--output", default="-")
+    p.add_argument("--decode-blocks", action="store_true",
+                   help="add semantic decode of script_items (Xem's Block "
+                        "catalog ported to Python)")
     p.set_defaults(fn=cmd_parse)
 
     p = sub.add_parser("pack")

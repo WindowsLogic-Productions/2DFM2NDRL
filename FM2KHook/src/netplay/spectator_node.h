@@ -646,11 +646,14 @@ void SpectatorNode_SetRootAddr(const sockaddr_in& root);
 // host_session_kind == BATTLE (0xFF = unknown / not in battle); spec
 // seeds FM2K_BTB_* env vars from these so /F-boot loads the right
 // character files instead of the placeholder char 0.
-void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
+void SpectatorNode_HandleJoinAck(const sockaddr_in& from,
+                                 uint8_t host_session_kind,
                                  uint16_t host_tcp_port,
                                  uint8_t host_p1_char = 0xFF,
                                  uint8_t host_p2_char = 0xFF,
-                                 uint8_t host_stage   = 0xFF);
+                                 uint8_t host_stage = 0xFF,
+                                 uint8_t host_p1_color = 0xFF,
+                                 uint8_t host_p2_color = 0xFF);
 
 // Handle inbound SPEC_JOIN_REDIRECT — retry against redirect target.
 void SpectatorNode_HandleJoinRedirect(const sockaddr_in& from,

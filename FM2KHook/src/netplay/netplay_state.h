@@ -219,7 +219,12 @@ struct CtrlPacket {
             uint8_t  host_p1_char;   // FM2K char grid index (0..49), 0xFF=unset
             uint8_t  host_p2_char;
             uint8_t  host_stage;
-            uint8_t  reserved;
+            // Confirm-button color slots (0..7), 0xFF=unknown. The /F boot
+            // path never presses a confirm button, so without these the
+            // engine's hardcoded /F colors (P1=0, P2=1) win and spectator
+            // battles render the wrong palettes.
+            uint8_t  host_p1_color;
+            uint8_t  host_p2_color;
         } spec_join_ack;
 
         // SPEC_JOIN_REQ — viewer's mode preference.

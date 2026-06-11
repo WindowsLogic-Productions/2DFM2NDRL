@@ -2892,6 +2892,16 @@ static CtrlPacket BuildJoinAckPacket() {
         if (p1 < 50u) ack.data.spec_join_ack.host_p1_char = (uint8_t)p1;
         if (p2 < 50u) ack.data.spec_join_ack.host_p2_char = (uint8_t)p2;
         if (st < 50u) ack.data.spec_join_ack.host_stage   = (uint8_t)st;
+        // Per-slot confirm colors (slot+0xE00B, set by AssignPlayerColor
+        // from the confirm button at CSS -- the engine fact that button
+        // choice IS the color). The /F boot path on the viewer hardcodes
+        // P1=0/P2=1; these let it stamp the real palettes instead.
+        ack.data.spec_join_ack.host_p1_color = 0xFF;
+        ack.data.spec_join_ack.host_p2_color = 0xFF;
+        const int32_t c1 = *(const int32_t*)0x4DFD8Bu;
+        const int32_t c2 = *(const int32_t*)(0x4DFD8Bu + 0xE03Fu);
+        if (c1 >= 0 && c1 < 8) ack.data.spec_join_ack.host_p1_color = (uint8_t)c1;
+        if (c2 >= 0 && c2 < 8) ack.data.spec_join_ack.host_p2_color = (uint8_t)c2;
     }
     return ack;
 }
@@ -3183,7 +3193,8 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
 void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_kind,
                                  uint16_t host_tcp_port,
                                  uint8_t host_p1_char, uint8_t host_p2_char,
-                                 uint8_t host_stage) {
+                                 uint8_t host_stage,
+                                 uint8_t host_p1_color, uint8_t host_p2_color) {
     // If host advertised real chars (in-battle), forward to the BTB
     // runtime-override channel so the slot-0 /F dispatcher loads the
     // host's actual character files. We CAN'T use SetEnvironmentVariableA
@@ -3195,11 +3206,14 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     if (host_session_kind == 2 /* BATTLE */) {
         PerGamePatches_SetRuntimeBtbOverrides(host_p1_char,
                                               host_p2_char,
-                                              host_stage);
+                                              host_stage,
+                                              host_p1_color,
+                                              host_p2_color);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "SpectatorNode: seeded runtime BTB from JOIN_ACK "
-            "(p1=%u p2=%u stage=%u)",
-            (unsigned)host_p1_char, (unsigned)host_p2_char,
+            "(p1=%u/c%u p2=%u/c%u stage=%u)",
+            (unsigned)host_p1_char, (unsigned)host_p1_color,
+            (unsigned)host_p2_char, (unsigned)host_p2_color,
             (unsigned)host_stage);
     }
 

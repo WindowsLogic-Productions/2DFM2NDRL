@@ -990,16 +990,23 @@ bool WriteKgtNameToOverride() {
 static uint8_t g_runtime_btb_p1_char = 0xFF;
 static uint8_t g_runtime_btb_p2_char = 0xFF;
 static uint8_t g_runtime_btb_stage   = 0xFF;
+uint8_t g_runtime_btb_p1_color = 0xFF;
+uint8_t g_runtime_btb_p2_color = 0xFF;
 
 void PerGamePatches_SetRuntimeBtbOverrides(uint8_t p1_char,
                                            uint8_t p2_char,
-                                           uint8_t stage) {
-    g_runtime_btb_p1_char = p1_char;
-    g_runtime_btb_p2_char = p2_char;
-    g_runtime_btb_stage   = stage;
+                                           uint8_t stage,
+                                           uint8_t p1_color,
+                                           uint8_t p2_color) {
+    g_runtime_btb_p1_char  = p1_char;
+    g_runtime_btb_p2_char  = p2_char;
+    g_runtime_btb_stage    = stage;
+    g_runtime_btb_p1_color = p1_color;
+    g_runtime_btb_p2_color = p2_color;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "PerGamePatches: runtime BTB overrides set (p1=%u p2=%u stage=%u)",
-        (unsigned)p1_char, (unsigned)p2_char, (unsigned)stage);
+        "PerGamePatches: runtime BTB overrides set (p1=%u/c%u p2=%u/c%u stage=%u)",
+        (unsigned)p1_char, (unsigned)p1_color,
+        (unsigned)p2_char, (unsigned)p2_color, (unsigned)stage);
 }
 
 // Char / stage / meter overrides applied at the same hook entry point.
@@ -1137,6 +1144,26 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
     ApplyBootToBattleStateOverrides();
     int result = g_orig_init_game_from_cmd ? g_orig_init_game_from_cmd() : 0;
 
+    // Stamp the host's real confirm-button colors over the /F hardcodes
+    // (original sets slot0=0 / slot1=1 at 0x409CB7/0x409CBD; the type-14
+    // battle-init object consumes them on a later tick, and
+    // character_state_machine reads them live during battle). Button
+    // choice IS the color in this engine -- /F never presses one.
+    {
+        constexpr uintptr_t kSlotColor0 = 0x4DFD8Bu;
+        constexpr size_t    kSlotStride = 0xE03Fu;
+        if (g_runtime_btb_p1_color != 0xFF && g_runtime_btb_p1_color < 8) {
+            *(int32_t*)(kSlotColor0 + 0 * kSlotStride) = g_runtime_btb_p1_color;
+        }
+        if (g_runtime_btb_p2_color != 0xFF && g_runtime_btb_p2_color < 8) {
+            *(int32_t*)(kSlotColor0 + 1 * kSlotStride) = g_runtime_btb_p2_color;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "PerGamePatches: BTB colors stamped (p1=c%u p2=c%u)",
+                (unsigned)g_runtime_btb_p1_color,
+                (unsigned)g_runtime_btb_p2_color);
+        }
+    }
+
     // /F leaves g_debug_mode (0x424744) == 3 for the entire process
     // lifetime. The engine's LoadGameSystemFile (called from inside
     // the original we just returned from) sprintfs a "%s -テストプレイ-"
@@ -1211,6 +1238,6 @@ void PerGamePatches_OnGameStateManagerEntry()                  {}
 bool PerGamePatches_InstallBootToBattleHook()                  { return true; }
 bool PerGamePatches_InstallStoryInitHijack()                   { return true; }
 void PerGamePatches_OnBattleInitComplete()                     {}
-void PerGamePatches_SetRuntimeBtbOverrides(uint8_t, uint8_t, uint8_t) {}
+void PerGamePatches_SetRuntimeBtbOverrides(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
 
 #endif
