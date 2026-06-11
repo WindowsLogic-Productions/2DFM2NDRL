@@ -2568,6 +2568,44 @@ void Netplay_EndBattle() {
         SharedMem_PublishMatchOutcome(outcome);
     }
 
+    // Drain the confirmed-input flush BEFORE tearing the session down.
+    // Under loss the confirmed horizon trails the live sim by RTT +
+    // recovery (observed ~500 frames at 20% loss); destroying the session
+    // strands every pending-confirm ring entry past the horizon, so the
+    // recorded .fm2krep and the live spectator stream lose the MATCH TAIL
+    // -- spectators froze at the host's last flushed frame and never saw
+    // the match end (multi-match journey, 2026-06-11). Keep pumping the
+    // battle phase (full event handling: corrections land, flush runs)
+    // until the horizon catches the sim or the budget expires. Both peers
+    // linger symmetrically -- they just exited the same battle-end swap
+    // barrier.
+    if (g_session && g_session_kind == SessionKind::BATTLE && !g_stress_mode) {
+        const uint64_t drain_deadline = GetTickCount64() + 600;
+        uint32_t last_logged = 0;
+        while (GetTickCount64() < drain_deadline) {
+            const int confirmed = gekko_confirmed_frame(g_session);
+            if (g_netplay_frame == 0 ||
+                confirmed >= (int)g_netplay_frame - 1) {
+                break;  // every advanced frame is flushed
+            }
+            last_logged = (uint32_t)confirmed;
+            Netplay_ProcessBattleInputPhase();
+            Sleep(5);
+        }
+        const int final_confirmed = gekko_confirmed_frame(g_session);
+        if (g_netplay_frame > 0 && final_confirmed < (int)g_netplay_frame - 1) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: EndBattle drain timed out -- confirmed=%d < last "
+                "frame %u; stream/replay tail may be short",
+                final_confirmed, g_netplay_frame - 1);
+        } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Netplay: EndBattle drain complete (confirmed=%d, frames=%u)",
+                final_confirmed, g_netplay_frame);
+        }
+        (void)last_logged;
+    }
+
     if (g_session) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "Netplay: Ending GekkoNet session (kind=%d)", (int)g_session_kind);
