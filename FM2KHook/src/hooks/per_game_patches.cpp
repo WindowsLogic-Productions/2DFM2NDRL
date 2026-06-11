@@ -1086,9 +1086,13 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
     // ACK says kind=CSS with no chars; the battle-entry re-broadcast
     // carries the real ones). Booting early loaded default chars and the
     // later snapshot applied onto the wrong .player data (join-during-CSS
-    // = ryu/ryu garbage, 2026-06-11). Hold the dispatch -- the engine
-    // re-calls every tick while the title runs -- until the overrides are
-    // seeded, with a timeout so a vanished host can't strand the title.
+    // = ryu/ryu garbage, 2026-06-11).
+    //
+    // The hold must wait IN PLACE: the engine does NOT reliably re-call
+    // this function -- an early-return hold left the game at mode 0
+    // (black screen, queue piling up) when the ACK missed the boot
+    // window. We pump the control channel ourselves so the JOIN_ACK can
+    // arrive and seed the overrides while we wait.
     {
         static int s_is_spec = -1;
         if (s_is_spec < 0) {
@@ -1096,23 +1100,36 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
             s_is_spec = (v && v[0] == '1') ? 1 : 0;
         }
         if (s_is_spec == 1 && g_runtime_btb_p1_char == 0xFF) {
-            static uint64_t s_hold_start_ms = 0;
-            const uint64_t now = GetTickCount64();
-            if (s_hold_start_ms == 0) s_hold_start_ms = now;
-            if (now - s_hold_start_ms < 20000) {
-                static uint64_t s_last_hold_log_ms = 0;
-                if (now - s_last_hold_log_ms > 2000) {
-                    s_last_hold_log_ms = now;
+            extern void ControlChannel_Poll();
+            const uint64_t start = GetTickCount64();
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "PerGamePatches: holding /F dispatch in place -- pumping "
+                "control channel until JOIN_ACK seeds battle chars");
+            uint64_t last_log = start;
+            for (;;) {
+                ControlChannel_Poll();   // delivers JOIN_ACK -> overrides
+                if (g_runtime_btb_p1_char != 0xFF) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "PerGamePatches: holding /F dispatch -- waiting for "
-                        "JOIN_ACK battle chars (host pre-battle), %llums",
-                        (unsigned long long)(now - s_hold_start_ms));
+                        "PerGamePatches: /F dispatch released after %llums "
+                        "(battle chars seeded)",
+                        (unsigned long long)(GetTickCount64() - start));
+                    break;
                 }
-                return 0;
+                const uint64_t now = GetTickCount64();
+                if (now - start >= 15000) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: /F dispatch hold timed out (15s) "
+                        "-- proceeding with env-default chars");
+                    break;
+                }
+                if (now - last_log > 2000) {
+                    last_log = now;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: still holding /F dispatch (%llums)",
+                        (unsigned long long)(now - start));
+                }
+                Sleep(10);
             }
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "PerGamePatches: /F dispatch hold timed out (20s) -- "
-                "proceeding with env-default chars");
         }
     }
 
