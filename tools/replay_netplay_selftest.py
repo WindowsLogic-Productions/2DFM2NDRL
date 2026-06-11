@@ -122,6 +122,15 @@ def main():
         # on both peers for gekko CSS-delay session to converge.
         "FM2K_TEST_AUTO_CSS": "0,0,0,0,0",
     }
+    # Forward rollback-shaping env from the calling shell. Loopback at the
+    # auto-negotiated delay produces ZERO rollbacks (rb_total=0 -- verified
+    # 2026-06-11), so the recorder's under-rollback behavior goes untested
+    # by default. FM2K_LOCAL_DELAY=0 forces real prediction misses (even
+    # 0ms-ping scheduling jitter makes remote inputs late) -> genuine
+    # rollbacks through the genuine path.
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_RUNAHEAD"):
+        if os.environ.get(k):
+            common_env[k] = os.environ[k]
 
     record_path_p1 = OUT_DIR / "p1_parity.pty"
     record_path_p2 = OUT_DIR / "p2_parity.pty"
@@ -182,8 +191,20 @@ def main():
     t1.join(); t2.join()
     print(f"[harness] P1 rc={rc1[0]} P2 rc={rc2[0]}")
 
-    # Find P1's .fm2krep (host is canonical recorder)
-    p1_rep = find_latest_fm2krep(game_dir, start_ts)
+    # Find P1's .fm2krep (host is canonical recorder; the hook writes
+    # per-player *_p<idx>_harness.fm2krep so P2's slice can't clobber it).
+    # Retry for a few seconds: the file lands milliseconds before the
+    # launcher exits and WSL's drvfs metadata cache can lag the Windows
+    #-side write, so an immediate single check raced it and reported
+    # "no .fm2krep" even though the file was on disk.
+    p1_rep = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        p1_rep = (find_latest_fm2krep(game_dir, start_ts, suffix="_p0_harness")
+                  or find_latest_fm2krep(game_dir, start_ts))
+        if p1_rep:
+            break
+        time.sleep(0.5)
     if not p1_rep:
         print("[harness] FAIL: no .fm2krep found from netplay run")
         return 1
