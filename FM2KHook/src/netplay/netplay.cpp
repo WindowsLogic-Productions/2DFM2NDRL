@@ -2730,6 +2730,21 @@ bool Netplay_ProcessBattleInputPhase() {
             gekko_add_local_input(g_session, 1, &p2_input);
         }
     } else {
+        // Harness autoplay for REAL netplay sessions too: each peer
+        // drives ITS OWN gekko slot with the deterministic autoplay
+        // stream when FM2K_PARITY_AUTOPLAY_BATTLE=1. Without this the
+        // loopback netplay/spectator harnesses played IDLE matches
+        // (keyboard reads 0x000 headless, nobody moves, HP never
+        // changes) -- sync verdicts were real but exercised a
+        // near-static sim. Env-gated; production input is untouched.
+        static int s_np_autoplay_battle = -1;
+        if (s_np_autoplay_battle < 0) {
+            const char* v = std::getenv("FM2K_PARITY_AUTOPLAY_BATTLE");
+            s_np_autoplay_battle = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (s_np_autoplay_battle == 1) {
+            local_input = Hook_ComputeAutoplayBattleInput(g_player_index);
+        }
         gekko_add_local_input(g_session, g_player_index, &local_input);
     }
 

@@ -230,20 +230,50 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
     g_local_sockaddr.sin_addr.s_addr = INADDR_ANY;
     g_local_sockaddr.sin_port = htons(local_port);
 
-    if (bind(g_socket, (sockaddr*)&g_local_sockaddr, sizeof(g_local_sockaddr)) == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-            "NetSocket: bind() failed on port %d (err=%d). %s",
-            (int)local_port, err,
-            err == WSAEADDRINUSE
-                ? "Port already in use — another launcher instance is on this port. "
-                  "If running two launchers on the same machine, configure each "
-                  "with a different FM2K_LOCAL_PORT (e.g. 7000 and 7001)."
-                : "");
-        closesocket(g_socket);
-        g_socket = INVALID_SOCKET;
-        WSACleanup();
-        return false;
+    // Bind with retry. The port can be TRANSIENTLY held at game boot:
+    // the launcher's pre-match STUN probe (LauncherStunProbe) binds the
+    // same local port and releases it "shortly before" we bind -- a
+    // designed-in handoff that a one-shot bind turns into a coin flip
+    // (observed as intermittent err=10013 "stuck at connecting", both in
+    // hub matches and the loopback harnesses). Retry for up to 10s
+    // before declaring the port genuinely taken.
+    {
+        int bind_attempts = 0;
+        for (;;) {
+            if (bind(g_socket, (sockaddr*)&g_local_sockaddr,
+                     sizeof(g_local_sockaddr)) != SOCKET_ERROR) {
+                if (bind_attempts > 0) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "NetSocket: bound port %d after %d retries (%.1fs)",
+                        (int)local_port, bind_attempts, bind_attempts * 0.25);
+                }
+                break;
+            }
+            const int err = WSAGetLastError();
+            ++bind_attempts;
+            if ((err == WSAEACCES || err == WSAEADDRINUSE) && bind_attempts < 40) {
+                if (bind_attempts == 1) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "NetSocket: port %d busy (err=%d) -- retrying for up "
+                        "to 10s (launcher STUN handoff / stale socket)",
+                        (int)local_port, err);
+                }
+                Sleep(250);
+                continue;
+            }
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "NetSocket: bind() failed on port %d (err=%d, %d attempts). %s",
+                (int)local_port, err, bind_attempts,
+                err == WSAEADDRINUSE || err == WSAEACCES
+                    ? "Port already in use — another launcher instance is on this port. "
+                      "If running two launchers on the same machine, configure each "
+                      "with a different FM2K_LOCAL_PORT (e.g. 7000 and 7001)."
+                    : "");
+            closesocket(g_socket);
+            g_socket = INVALID_SOCKET;
+            WSACleanup();
+            return false;
+        }
     }
 
     // Parse remote address (format: "ip:port"). Empty/missing is allowed for
