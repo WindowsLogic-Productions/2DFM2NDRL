@@ -109,6 +109,10 @@ void SendTo(const sockaddr_in& sub_addr, const void* buf, size_t len);
 // a TCP socket.
 void DisconnectSubscriber(const sockaddr_in& sub_addr);
 
+// Drop the bound conn AND all unpaired pending clients from this addr's
+// IP (stale corpses from abandoned dials). Used on re-JOIN bind reset.
+void DropConnectionsFromAddr(const sockaddr_in& sub_addr);
+
 // =============================================================================
 // SPECTATOR-SIDE
 // =============================================================================

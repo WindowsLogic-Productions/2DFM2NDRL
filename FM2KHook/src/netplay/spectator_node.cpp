@@ -597,7 +597,18 @@ constexpr size_t BACKFILL_CHUNK_BYTES = 8192;
 void SendSessionEventsTo(const sockaddr_in& to,
                          size_t   first_event_idx,
                          uint32_t start_input_frame) {
-    const size_t total_events = g_state.session_events.size();
+    // Clamp the backfill at the GLOBAL live-flush cursor, not the vector
+    // tip. Live EVENT_BATCH broadcasts resume from last_flushed_event_idx
+    // for every fenced subscriber; shipping [cursor..tip) here too sent
+    // those events TWICE to a fresh joiner (backfill + next FlushBatch),
+    // shifting its input stream at the handoff -- deep mid-battle join
+    // diverged at exactly the backfill->live boundary (k=3474,
+    // 2026-06-11). The clamped tail reaches the sub via the very next
+    // regular FlushBatch instead.
+    const size_t total_events =
+        (g_state.last_flushed_event_idx < g_state.session_events.size())
+            ? g_state.last_flushed_event_idx
+            : g_state.session_events.size();
     if (first_event_idx >= total_events) return;
 
     char addr_buf[48] = {};
@@ -2557,6 +2568,10 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode) {
             sub.ack_frame    = 0;
             sub.join_mode    = mode;
             sub.last_seen_ms = GetTickCount64();
+            // Drop the old TCP conn + any stale pending clients from this
+            // IP so the bind path pairs the spectator's FRESH dial instead
+            // of an abandoned one (deep-join reconnect-loop fix).
+            SpectatorTCP::DropConnectionsFromAddr(sub.addr);
             // Phase 2c: late-arriving spec_user_id backfill. If the
             // first JOIN_REQ raced past our spec_incoming poll (common
             // on loopback where UDP RTT is microseconds), sub.spec_user_id

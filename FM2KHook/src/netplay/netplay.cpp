@@ -2712,6 +2712,29 @@ bool Netplay_ProcessBattleInputPhase() {
     // In stress mode, skip the network poll (no adapter, no socket).
     if (!g_stress_mode) {
         gekko_network_poll(g_session);
+
+        // Battle-entry signal insurance (match-2 deadlock, 2026-06-11).
+        // When the peer's BATTLE_ENTERING arrives during OUR armed window
+        // BEFORE our own entry fires, IsBattleSynced latches the instant
+        // we enter -- we swap to battle without ever running the
+        // PollBattleSync wait loop, which is where both the
+        // BATTLE_ENTERING resender and the CSS transport keepalive live.
+        // Our single entry signal can then be the ONLY one the peer ever
+        // gets; if it's lost (or lands outside their armed window), they
+        // starve in CSS spamming proposals we drop as stale, while we sit
+        // in an unsyncable battle session at bf=0. There is no entry ACK,
+        // but gekko SessionStarted IS one: it can only fire once the peer
+        // also swapped and synced. Resend until then, plus poll the
+        // control channel so the peer's swap-side traffic keeps flowing.
+        if (!g_session_ready && g_local_battle_entered) {
+            static uint32_t s_last_entry_resend_ms = 0;
+            const uint32_t now_ms = GetTickCount();
+            if (now_ms - s_last_entry_resend_ms > 100) {
+                ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+                s_last_entry_resend_ms = now_ms;
+            }
+            ControlChannel_Poll();
+        }
     }
 
     uint16_t local_input = Input_CaptureLocal();

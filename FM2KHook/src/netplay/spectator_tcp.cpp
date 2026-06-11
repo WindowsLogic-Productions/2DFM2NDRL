@@ -321,6 +321,29 @@ void DisconnectSubscriber(const sockaddr_in& sub_addr) {
     }
 }
 
+void DropConnectionsFromAddr(const sockaddr_in& sub_addr) {
+    // Forget EVERYTHING we hold for this subscriber's IP: the bound conn
+    // (may be a dead socket from an abandoned dial) and any unpaired
+    // pending clients (stale corpses queue ahead of the fresh dial and
+    // the binder pairs first-IP-match -- shipping 1MB into a dead pipe).
+    // Called when a re-JOIN_REQ resets bind state; the spectator's fresh
+    // dial arrives after and pairs cleanly.
+    DisconnectSubscriber(sub_addr);
+    char want_ip[64] = {0};
+    inet_ntop(AF_INET, (void*)&sub_addr.sin_addr, want_ip, sizeof(want_ip));
+    for (size_t i = g_pending_clients.size(); i-- > 0; ) {
+        char peer_ip[64] = {0};
+        if (!GetPeerIpString(g_pending_clients[i], peer_ip, sizeof(peer_ip)))
+            continue;
+        if (std::strcmp(NormalizeIp(peer_ip), want_ip) != 0) continue;
+        NET_DestroyStreamSocket(g_pending_clients[i]);
+        g_pending_clients.erase(g_pending_clients.begin() + i);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorTCP: dropped stale pending client from %s",
+                    want_ip);
+    }
+}
+
 // ===========================================================================
 // SPECTATOR-SIDE
 // ===========================================================================
@@ -514,7 +537,18 @@ bool ConnectUpstream(const char* host_ip, uint16_t host_tcp_port) {
     // spec_tcp_port via the hub-coordinated spectator_incoming flow — sees
     // a matching 4-tuple at its NAT and lets the reply SYN-ACK back through.
     // local_port=0 falls back to NET_CreateClient's kernel-ephemeral.
-    const Uint16 local_bind = g_listen_port;
+    //
+    // RETRY dials use the kernel-ephemeral port instead: re-dialing from
+    // the SAME source port reuses the previous connection's 4-tuple, which
+    // collides with its TIME_WAIT remains on the host stack -- the SYN
+    // retransmits for ~5s, which is LONGER than the spectator's 5s silence
+    // failover, so reconnect loops chased their own corpse forever (deep
+    // mid-battle join repro, 2026-06-11: dial->accept exactly 5.06s, twice).
+    // The punch-friendly fixed port only matters for the hub-coordinated
+    // first dial; failover re-dials on cone NATs ride the established
+    // mapping, and symmetric-NAT retries need the relay transport anyway.
+    static uint32_t s_dial_attempts = 0;
+    const Uint16 local_bind = (s_dial_attempts++ == 0) ? g_listen_port : 0;
     g_upstream_sock = NET_CreateClientBound(addr, host_tcp_port, local_bind);
     NET_UnrefAddress(addr);
     if (!g_upstream_sock) {

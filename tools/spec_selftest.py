@@ -272,6 +272,31 @@ def main():
 
     host_n, spec_n = pty_snapshots(p1_pty), pty_snapshots(spec_pty)
     print(f"[harness] host parity: {host_n} snapshots; spec parity: {spec_n}")
+
+    # Report WHERE the spectator's join landed, in battle frames: delta
+    # between the host's battle-session creation and the subscriber
+    # accept, at 100 fps. Wall-clock --spec-join-delay is dominated by
+    # boot time, so this is the only honest measure of join depth.
+    try:
+        import re as _re
+        host_log = open("/mnt/c/games/2dfm/wanwan/logs/FM2K_P1_Debug.log",
+                        errors="replace").read()
+        def ts_of(pattern):
+            m = _re.search(r"\[(\d+):(\d+):(\d+)\.(\d+)\][^\n]*" + pattern, host_log)
+            if not m: return None
+            h, mn, sc, ms = (int(x) for x in m.groups())
+            return h * 3600 + mn * 60 + sc + ms / 1000.0
+        t_battle = ts_of(_re.escape("GekkoNet battle session created"))
+        t_join   = ts_of(_re.escape("Accepted subscriber"))
+        if t_battle is not None and t_join is not None:
+            join_frame = int((t_join - t_battle) * 100)
+            print(f"[harness] spectator joined ~battle frame {join_frame} "
+                  f"({t_join - t_battle:+.1f}s after battle start)")
+        rounds = len(_re.findall(r"ROUND_END|Round end", host_log))
+        if rounds:
+            print(f"[harness] host log shows ~{rounds} round-end event(s)")
+    except OSError:
+        pass
     if spec_n < min_coverage:
         print(f"[harness] FAIL: spectator covered only {spec_n} frames "
               f"(< required {min_coverage}) -- stream stalled or join failed")

@@ -1152,9 +1152,21 @@ static void RunSpectatorTick() {
                           needs_user_ff       || needs_css_catchup;
 
     const uint64_t catchup_start_ms = GetTickCount64();
+    uint32_t catchup_frames = 0;
     while (g_spectator_catchup) {
         if (!SpectatorSimOneFrame()) break;
-        RenderFrameWithSnapshot();
+        // Render only every 64th catchup frame. Per-frame render here
+        // existed for RNG parity (render-side game_rand advanced the
+        // gameplay seed), which 57b72ad made obsolete: render now has
+        // its own isolated RNG stream and never touches the gameplay
+        // seed -- proven by deep-join parity matching bit-for-bit
+        // through a 3500-frame catchup window. Skipping render turns
+        // catchup from ~10ms/frame into ~0.1ms/frame: a mid-match join
+        // drains thousands of frames in well under a second ("snapshot
+        // feel"). The sparse renders keep visual progress on screen.
+        if ((++catchup_frames & 63u) == 0) {
+            RenderFrameWithSnapshot();
+        }
         ControlChannel_Poll();   // keeps TCP recv drained, no failover side-effects
         if (SpectatorNode_PendingFrameCount() <= SPECTATOR_LIVE_LAG_FRAMES) {
             // Live edge reached. The outer-tick state machine flips
