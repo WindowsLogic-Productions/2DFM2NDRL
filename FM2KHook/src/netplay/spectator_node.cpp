@@ -3517,10 +3517,26 @@ void SpectatorNode_TickHealth() {
         extern bool g_spectator_catchup;
         const uint64_t recv_ms     = SpectatorTCP::LastUpstreamRecvMs();
         const bool     queue_idle  = SpectatorNode_PendingFrameCount() == 0;
+        //   (c) snapshot transfer in progress. Under real loss the 1MB
+        //       snapshot trickles at TCP-throughput pace (~30KB/s at 20%
+        //       loss / 140ms RTT) and a single retransmit-backoff stall
+        //       can exceed 5s. Failing over mid-transfer drops the inbox
+        //       and restarts the 1MB from scratch -- at high loss the
+        //       join NEVER completes (observed: failover at 311296/1081196
+        //       bytes, repeating forever). While the inbox is mid-
+        //       transfer, allow a much longer window (30s without ANY
+        //       TCP bytes) before declaring the upstream dead.
+        const auto& snap_inbox = g_state.pb_snapshot_inbox;
+        const bool snapshot_in_flight =
+            snap_inbox.active &&
+            snap_inbox.bytes_received < snap_inbox.meta.total_bytes;
+        const uint64_t silence_budget_ms = snapshot_in_flight
+            ? (uint64_t)30000
+            : (uint64_t)SPECTATOR_SILENCE_FAILOVER_MS;
         if (!g_spectator_catchup &&
             queue_idle &&
             recv_ms > 0 &&
-            now - recv_ms >= SPECTATOR_SILENCE_FAILOVER_MS)
+            now - recv_ms >= silence_budget_ms)
         {
             char buf[48] = {}; FormatAddr(g_state.upstream_addr, buf, sizeof(buf));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,

@@ -126,6 +126,35 @@ def pty_snapshots(path: Path) -> int:
         return 0
 
 
+def trim_first_battle_segment(src: Path, dst: Path) -> int:
+    """Copy src .pty to dst keeping only [first real battle row .. the row
+    before battle phase first ends]. Multi-match spectator streams contain
+    match1 + CSS + match2 rows; the match-1 replay gate needs just the
+    first battle segment. Returns rows kept."""
+    import struct
+    d = src.read_bytes()
+    hdr, body = d[:32], d[32:]
+    n = len(body) // 260
+    rows = []
+    started = False
+    for k in range(n):
+        off = k * 260
+        phase = struct.unpack_from('<i', body, off + 16)[0]
+        p1s   = struct.unpack_from('<i', body, off + 32)[0]
+        p2s   = struct.unpack_from('<i', body, off + 32 + 92)[0]
+        in_battle = (phase == 3000 and p1s != -1 and p2s != -1)
+        if not started:
+            if in_battle:
+                started = True
+                rows.append(body[off:off + 260])
+        else:
+            if phase != 3000:
+                break
+            rows.append(body[off:off + 260])
+    dst.write_bytes(hdr + b"".join(rows))
+    return len(rows)
+
+
 def wait_ports_free(ports, timeout=20.0):
     """Poll Windows netstat until none of `ports` appear as bound UDP
     sockets. A fixed post-taskkill sleep is unreliable: socket teardown
@@ -150,6 +179,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", type=int, default=1500,
                     help="battle frames the host plays before terminating")
+    ap.add_argument("--total-frames", type=int, default=0,
+                    help="multi-match mode: terminate after N TOTAL confirmed "
+                         "battle frames across matches (FM2K_AUTO_TERMINATE_TOTAL). "
+                         "Spans MATCH_END -> CSS -> match 2; the parity gate uses "
+                         "match 1's canonical .fm2krep.")
     ap.add_argument("--record-timeout", type=float, default=240.0)
     ap.add_argument("--spec-join-delay", type=float, default=3.0,
                     help="seconds after P1/P2 launch before the spectator dials in")
@@ -177,9 +211,12 @@ def main():
         "FM2K_PARITY_AUTOPLAY": "1",
         "FM2K_PARITY_AUTOPLAY_BATTLE": "1",
         "FM2K_AUTO_TITLE_SKIP": "1",
-        "FM2K_AUTO_TERMINATE_AT_FRAME": str(args.frames),
         "FM2K_TEST_AUTO_CSS": "0,0,0,0,0",
     }
+    if args.total_frames > 0:
+        common_env["FM2K_AUTO_TERMINATE_TOTAL"] = str(args.total_frames)
+    else:
+        common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
@@ -302,13 +339,123 @@ def main():
               f"(< required {min_coverage}) -- stream stalled or join failed")
         return 1
 
-    print("[harness] diffing HOST parity vs SPECTATOR parity")
+    # Informational: host-vs-spec. Valid on clean loopback; under loss the
+    # HOST predicts and its parity captures SPECULATIVE states, producing
+    # false divergences here (the spectator consumes confirmed inputs and
+    # is the more trustworthy stream). Do not gate on this.
+    print("[harness] (info) diffing HOST parity vs SPECTATOR parity "
+          "(unreliable under packet loss -- host captures speculative states)")
+    subprocess.call([sys.executable, str(PARITY_DIFF),
+                     str(p1_pty), str(spec_pty)])
+
+    # THE GATE: spec-vs-replay, confirmed-vs-confirmed. Both the spectator
+    # stream and --replay playback are driven by the host's CONFIRMED input
+    # stream (post-e5fe11f recorder), so they must match bit-for-bit
+    # regardless of how much either side predicted live.
+    if args.total_frames > 0:
+        # Multi-match mode: the harness slice at terminate is a MID-MATCH-2
+        # slice; the gate replays match 1's CANONICAL file (written by
+        # Netplay_EndBattle, host-only, no _harness suffix) -- earliest
+        # post-start canonical = match 1.
+        cands = []
+        for f in (game_dir / "replays").glob("*.fm2krep"):
+            if "_harness" in f.name:
+                continue
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                continue
+            if m + 1.0 >= start_ts:
+                cands.append((m, f))
+        p0_rep = min(cands)[1] if cands else None
+        if not p0_rep:
+            print("[harness] FAIL: no canonical match-1 .fm2krep "
+                  "(did match 1 actually complete?)")
+            return 1
+        print(f"[harness] match-1 canonical replay file: {p0_rep.name}")
+
+        # Multi-match liveness assertions.
+        host_log = open("/mnt/c/games/2dfm/wanwan/logs/FM2K_P1_Debug.log",
+                        errors="replace").read()
+        battles = host_log.count("GekkoNet battle session created")
+        print(f"[harness] host battle sessions created: {battles}")
+        if battles < 2:
+            print("[harness] FAIL: match 2 never started on the host "
+                  "(battle-entry transition deadlock?)")
+            return 1
+        # Spectator must have followed into match 2: its parity stream
+        # needs >= 2 battle segments.
+        import struct as _st
+        d = spec_pty.read_bytes()[32:]
+        segs, in_b = 0, False
+        for k in range(len(d) // 260):
+            ph  = _st.unpack_from('<i', d, k * 260 + 16)[0]
+            p1s = _st.unpack_from('<i', d, k * 260 + 32)[0]
+            b = (ph == 3000 and p1s != -1)
+            if b and not in_b:
+                segs += 1
+            in_b = b
+        print(f"[harness] spectator battle segments observed: {segs}")
+        if segs < 2:
+            print("[harness] FAIL: spectator did not follow into match 2")
+            return 1
+    else:
+        p0_rep = None
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            p0_rep = find_latest_fm2krep(game_dir, start_ts, suffix="_p0_harness")
+            if p0_rep:
+                break
+            time.sleep(0.5)
+        if not p0_rep:
+            print("[harness] FAIL: no p0 harness .fm2krep for the replay gate")
+            return 1
+    replay_pty = OUT_DIR / "replay_parity.pty"
+    replay_pty.unlink(missing_ok=True)
+    kill_strays()
+    time.sleep(1.0)
+    wait_ports_free([P1_PORT, P2_PORT, SPEC_PORT])
+    # NOTE: no FM2K_BOOT_TO_BATTLE -- netplay-recorded replays must walk the
+    # title/CSS path (see replay_netplay_diff.py:81-85).
+    rep_env = {"FM2K_PARITY_RECORD_PATH": to_win(replay_pty)}
+    rep_state = {"size": -1, "since": 0.0}
+    def rep_done():
+        try:
+            sz = replay_pty.stat().st_size
+        except OSError:
+            return False
+        now = time.time()
+        if sz != rep_state["size"]:
+            rep_state["size"] = sz
+            rep_state["since"] = now
+            return False
+        return sz > 32 + 260 * 10 and (now - rep_state["since"]) >= 6.0
+    rep_rc = launch("REPLAY", [str(LAUNCHER), "--replay", to_win(p0_rep)],
+                    rep_env, OUT_DIR / "replay.log",
+                    args.record_timeout, rep_done)
+    print(f"[harness] replay rc={rep_rc}")
+    if not replay_pty.exists():
+        print("[harness] FAIL: replay parity missing")
+        return 1
+
+    # Trim both streams to their FIRST battle segment: the spectator's
+    # stream may continue into CSS/match 2, and the replay's stream has a
+    # title/CSS prefix + post-battle tail -- index pairing past either
+    # boundary compares unlike phases.
+    spec_m1   = OUT_DIR / "spec_m1.pty"
+    replay_m1 = OUT_DIR / "replay_m1.pty"
+    n_spec   = trim_first_battle_segment(spec_pty, spec_m1)
+    n_replay = trim_first_battle_segment(replay_pty, replay_m1)
+    print(f"[harness] GATE: diffing SPECTATOR vs REPLAY parity, first battle "
+          f"segment (spec={n_spec} rows, replay={n_replay} rows; both "
+          f"confirmed-stream-driven)")
     diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
-                               str(p1_pty), str(spec_pty)])
+                               str(spec_m1), str(replay_m1)])
 
     if not args.keep and diff_rc == 0:
-        for f in (p1_pty, spec_pty, OUT_DIR / "p1.log", OUT_DIR / "p2.log",
-                  OUT_DIR / "spec.log"):
+        for f in (p1_pty, spec_pty, replay_pty, OUT_DIR / "p1.log",
+                  OUT_DIR / "p2.log", OUT_DIR / "spec.log",
+                  OUT_DIR / "replay.log"):
             f.unlink(missing_ok=True)
     return diff_rc
 

@@ -3286,14 +3286,38 @@ bool Netplay_ProcessBattleInputPhase() {
                                 s_terminate_at, v);
                         }
                     }
-                    if (s_terminate_at > 0 &&
-                        (int)g_netplay_frame >= s_terminate_at &&
+                    // FM2K_AUTO_TERMINATE_TOTAL: session-cumulative variant.
+                    // g_netplay_frame resets per battle, so AT_FRAME cannot
+                    // target anything past match 1 -- multi-match harness
+                    // runs (spectator across MATCH_END -> CSS -> match 2)
+                    // terminate on TOTAL confirmed battle frames instead.
+                    static int s_terminate_total = -2;
+                    static uint32_t s_total_confirmed = 0;
+                    if (s_terminate_total == -2) {
+                        const char* v = std::getenv("FM2K_AUTO_TERMINATE_TOTAL");
+                        s_terminate_total = (v && *v) ? std::atoi(v) : -1;
+                        if (s_terminate_total > 0) {
+                            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Harness: will TerminateProcess at %d TOTAL "
+                                "confirmed battle frames (across matches)",
+                                s_terminate_total);
+                        }
+                    }
+                    if (!update->data.adv.rolling_back &&
+                        !update->data.adv.running_ahead) {
+                        ++s_total_confirmed;
+                    }
+                    const bool fire_at    = s_terminate_at > 0 &&
+                        (int)g_netplay_frame >= s_terminate_at;
+                    const bool fire_total = s_terminate_total > 0 &&
+                        (int)s_total_confirmed >= s_terminate_total;
+                    if ((fire_at || fire_total) &&
                         !update->data.adv.rolling_back &&
                         !update->data.adv.running_ahead) {
                         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Harness: reached battle frame %u — flushing logs, "
-                            "writing .fm2krep, terminating cleanly.",
-                            g_netplay_frame);
+                            "Harness: reached battle frame %u (total %u) — "
+                            "flushing logs, writing .fm2krep, terminating cleanly.",
+                            g_netplay_frame, s_total_confirmed);
                         // Append a synthetic MATCH_END so the slice writer
                         // produces a complete .fm2krep. Replay reader pops
                         // events until MATCH_END; without it playback
