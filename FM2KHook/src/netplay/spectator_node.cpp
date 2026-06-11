@@ -4141,10 +4141,17 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 // fall through to the normal pop
             }
         }
-        if (g_state.pb_post_css_mask_pops > 0) {
-            if (--g_state.pb_post_css_mask_pops == 0) {
-                CssAutoConfirm_SetSeamHold(false);
-            }
+    }
+
+    // Post-CSS confirm-mask countdown -- FUNCTION level, not inside the
+    // boundary block: engaging the mirror clears pb_boundary in the same
+    // call, so a countdown nested in that scope decremented exactly once
+    // and the hold never released -- the mirror traced the host's dance
+    // to the exact picks but the players' lock-ins could never register
+    // (spec sat at CSS until the transport died, 2026-06-11).
+    if (g_state.pb_post_css_mask_pops > 0) {
+        if (--g_state.pb_post_css_mask_pops == 0) {
+            CssAutoConfirm_SetSeamHold(false);
         }
     }
 
