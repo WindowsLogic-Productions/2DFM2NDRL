@@ -348,6 +348,14 @@ struct State {
     // the live edge (riding the edge = every arrival gap stalls the
     // picture). Players are browsing during the hold -- invisible.
     bool                      pb_bank_built         = false;
+    // True between MATCH_START apply and MATCH_END apply. When the local
+    // game reaches CSS while this is still set, the local sim has outrun
+    // the stream's results tail -- those queued inputs belong to results
+    // screens we already finished and MUST NOT feed the fresh CSS (8
+    // leaked frames displaced the cursors before the seam engaged; the
+    // whole mirrored dance then ran offset = wrong chars AND colors at
+    // the rematch, 2026-06-11 15:09).
+    bool                      pb_awaiting_match_end = false;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -2819,6 +2827,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
             }
             break;
         case SessionEventType::MATCH_START: {
+            g_state.pb_awaiting_match_end = true;
             // Look up the cached 96-byte header by side-table index.
             // Header layout matches Replay::ReplayHeader on-disk; pull
             // seed/state-hash/char/color and re-publish into the playback
@@ -2872,7 +2881,36 @@ void ApplySessionEvent(const SessionEvent& ev) {
                         g_state.pb_p2_char, g_state.pb_p2_color,
                         g_state.pb_stage_id);
                 }
-                if (g_state.pb_boundary == State::PbBoundary::SEAM) {
+                // Results-tail guard: the local game can reach CSS a few frames
+        // before the stream's MATCH_END applies (our results screens run
+        // slightly short). The queued inputs in that window are the
+        // host's results presses -- feeding them to the fresh CSS
+        // displaced the cursors before the seam engaged and the whole
+        // mirrored dance ran offset (wrong chars + colors at the
+        // rematch, 2026-06-11 15:09). Discard them, apply ops (one is
+        // MATCH_END, which flips the flag and engages the seam).
+        if (g_state.pb_awaiting_match_end && mode == 2000u &&
+            g_state.pb_boundary == State::PbBoundary::NONE) {
+            while (!g_state.pb_queue.empty() &&
+                   g_state.pb_awaiting_match_end) {
+                const SessionEvent& head = g_state.pb_queue.front();
+                if (head.type != SessionEventType::INPUT) {
+                    ApplySessionEvent(head);
+                }
+                g_state.pb_queue.erase(g_state.pb_queue.begin());
+            }
+            if (g_state.pb_awaiting_match_end) {
+                // MATCH_END hasn't arrived yet -- hold neutral.
+                g_state.pb_current_p1 = 0;
+                g_state.pb_current_p2 = 0;
+                if (p1_input) *p1_input = 0;
+                if (p2_input) *p2_input = 0;
+                return true;
+            }
+            // MATCH_END applied (seam engaged); fall through to the
+            // boundary machinery this same call.
+        }
+        if (g_state.pb_boundary == State::PbBoundary::SEAM) {
                     g_state.pb_boundary = State::PbBoundary::PINNING;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: boundary SEAM -> PINNING (holding "
@@ -2926,6 +2964,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
             const auto& p = ev.u.match_end;
             const char* who = (p.winner_idx == 0) ? "P1"
                             : (p.winner_idx == 1) ? "P2" : "DRAW";
+            g_state.pb_awaiting_match_end = false;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "SpectatorNode: applied MATCH_END winner=%s rounds=%u-%u "
                 "frames=%u (queued=%zu) -- boundary SEAM entered",
