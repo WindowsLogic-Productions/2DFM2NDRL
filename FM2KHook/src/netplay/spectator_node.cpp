@@ -4157,16 +4157,42 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 s_css_reached = true;
             }
             if (!s_css_reached) {
+                // Keep the boot in the VS context: without the netplay
+                // handshake P1/P2 have, the title's attract sequence
+                // (title.demo / characterselect.demo) takes over within
+                // ~300ms and its auto-CSS locks default chars and starts
+                // a demo battle (the 0/0 ryu/ryu "join"). Pin the VS
+                // game-mode flag and clear the demo state every tick so
+                // the demo can never drive, while the synthetic edges
+                // walk the menu.
+                *(uint32_t*)0x470058u = 1;   // g_game_mode_flag = VS
+                *(uint32_t*)0x47010Cu = 0;   // demo mode state
                 uint16_t synthetic = 0;
                 if (mode_now == 1000u) {
                     static uint32_t s_nat_title_tick = 0;
                     synthetic = (s_nat_title_tick++ & 1u) ? 0x010u : 0u;
+                    static uint64_t s_nat_log_ms = 0;
+                    const uint64_t nb_now = GetTickCount64();
+                    if (nb_now - s_nat_log_ms > 1000) {
+                        s_nat_log_ms = nb_now;
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "[NATBOOT] mode=%u flag=%u demo=%u menu=%u",
+                            mode_now, *(uint32_t*)0x470058u,
+                            *(uint32_t*)0x47010Cu,
+                            *(uint32_t*)0x424F30u);
+                    }
                 }
                 g_state.pb_current_p1 = synthetic;
                 g_state.pb_current_p2 = synthetic;
                 if (p1_input) *p1_input = synthetic;
                 if (p2_input) *p2_input = synthetic;
                 return true;
+            }
+            // Post-release guard: the demo machinery must stay quiet
+            // through the mirrored CSS too (it re-engages on input
+            // silence; the early replayed CSS frames are mostly idle).
+            if (mode_now == 2000u) {
+                *(uint32_t*)0x47010Cu = 0;
             }
         }
         if (s_offline_replay_cached == 1) {
