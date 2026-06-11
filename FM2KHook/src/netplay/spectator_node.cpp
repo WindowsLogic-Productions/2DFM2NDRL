@@ -4140,6 +4140,35 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
             const char* v = std::getenv("FM2K_REPLAY_FILE");
             s_offline_replay_cached = (v && v[0]) ? 1 : 0;
         }
+        // Live natural-boot alignment gate (tournament-flow CSS join):
+        // the host's stream begins at ITS CSS, so a viewer that boots
+        // naturally must NOT let its TITLE screen eat those inputs --
+        // that shifted the stream cursor and the viewer's CSS started
+        // mid-dance with diverged state (locked early, entered battle
+        // BEFORE the players). Park the stream and walk the title on
+        // synthetic confirm edges until the local CSS opens; from there
+        // the dance replays in true lockstep from the host's CSS frame 0.
+        // One-shot: once CSS (or any later phase) has been reached, the
+        // gate never re-engages (boundaries are mid-session lockstep).
+        if (s_offline_replay_cached == 0) {
+            static bool s_css_reached = false;
+            const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+            if (mode_now >= 2000u) {
+                s_css_reached = true;
+            }
+            if (!s_css_reached) {
+                uint16_t synthetic = 0;
+                if (mode_now == 1000u) {
+                    static uint32_t s_nat_title_tick = 0;
+                    synthetic = (s_nat_title_tick++ & 1u) ? 0x010u : 0u;
+                }
+                g_state.pb_current_p1 = synthetic;
+                g_state.pb_current_p2 = synthetic;
+                if (p1_input) *p1_input = synthetic;
+                if (p2_input) *p2_input = synthetic;
+                return true;
+            }
+        }
         if (s_offline_replay_cached == 1) {
             // Latch: gate is active only UNTIL the first mode==3000 entry.
             // The gate's purpose is to keep the queue's first INPUT at the
