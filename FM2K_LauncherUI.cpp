@@ -1490,72 +1490,78 @@ void LauncherUI::RenderSettingsWindow() {
 }
 
 // Modern native folder picker via Win32 IFileOpenDialog (the Common Item
-// Dialog) -- NOT SDL_ShowOpenFolderDialog, whose Windows backend uses the
-// legacy SHBrowseForFolder tree dialog (the dated one). FOS_ALLOWMULTISELECT
-// lets the user add several folders in one go. Synchronous + modal to the
-// launcher window, the standard behavior for a native file dialog. Returns
-// the chosen folders as UTF-8; empty on cancel or error.
-static std::vector<std::string> PickGamesFoldersNative(SDL_Window* parent) {
-    HWND hwnd = nullptr;
-    if (parent) {
-        hwnd = static_cast<HWND>(SDL_GetPointerProperty(
-            SDL_GetWindowProperties(parent),
-            SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
-    }
+// Dialog) -- NOT SDL_ShowOpenFolderDialog, whose Windows backend is the
+// legacy SHBrowseForFolder tree dialog. FOS_ALLOWMULTISELECT lets the user
+// add several folders at once.
+//
+// It MUST run ASYNC. IFileOpenDialog::Show is modal to the parent window and
+// drives a message loop the parent window's owning thread (our render thread)
+// has to keep pumping. Blocking the render thread for the result (e.g.
+// join()) DEADLOCKS -- the dialog waits on the render thread to service its
+// messages, the render thread waits on the dialog to finish. (This is what
+// locked up the window.) So: open it on a detached STA worker, keep
+// rendering, and the render thread collects the result via the holder below
+// on a later frame -- the same shape as SDL's own async dialog API.
+namespace {
+std::mutex               g_folder_pick_mtx;
+std::vector<std::string> g_folder_pick_result;
+std::atomic<bool>        g_folder_pick_ready{false};
+std::atomic<bool>        g_folder_dialog_open{false};
 
-    std::vector<std::string> out;
-    // Run on a dedicated STA thread: the Common Item Dialog requires an
-    // apartment-threaded COM context, but SDL may have already put the main
-    // thread in MTA (CoInitializeEx would then fail). Joining keeps the call
-    // synchronous; the main thread blocks (UI frozen behind the modal dialog,
-    // which is the expected native-dialog behavior).
-    std::thread worker([hwnd, &out]() {
-        if (FAILED(CoInitializeEx(nullptr,
+void OpenGamesFolderDialogAsync(HWND hwnd) {
+    if (g_folder_dialog_open.exchange(true)) return;  // one dialog at a time
+    std::thread([hwnd]() {
+        std::vector<std::string> picked;
+        if (SUCCEEDED(CoInitializeEx(nullptr,
                 COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
-            return;
-        }
-        IFileOpenDialog* dlg = nullptr;
-        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                       CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
-                                       reinterpret_cast<void**>(&dlg))) && dlg) {
-            DWORD opts = 0;
-            dlg->GetOptions(&opts);
-            dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT |
-                            FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-            if (SUCCEEDED(dlg->Show(hwnd))) {
-                IShellItemArray* items = nullptr;
-                if (SUCCEEDED(dlg->GetResults(&items)) && items) {
-                    DWORD count = 0;
-                    items->GetCount(&count);
-                    for (DWORD i = 0; i < count; ++i) {
-                        IShellItem* item = nullptr;
-                        if (SUCCEEDED(items->GetItemAt(i, &item)) && item) {
-                            PWSTR wpath = nullptr;
-                            if (SUCCEEDED(item->GetDisplayName(
-                                    SIGDN_FILESYSPATH, &wpath)) && wpath) {
-                                int n = WideCharToMultiByte(CP_UTF8, 0, wpath,
-                                            -1, nullptr, 0, nullptr, nullptr);
-                                if (n > 1) {
-                                    std::string s(static_cast<size_t>(n - 1), '\0');
-                                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
-                                            s.data(), n, nullptr, nullptr);
-                                    out.push_back(std::move(s));
+            IFileOpenDialog* dlg = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                           CLSCTX_INPROC_SERVER, IID_IFileOpenDialog,
+                                           reinterpret_cast<void**>(&dlg))) && dlg) {
+                DWORD opts = 0;
+                dlg->GetOptions(&opts);
+                dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT |
+                                FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+                if (SUCCEEDED(dlg->Show(hwnd))) {
+                    IShellItemArray* items = nullptr;
+                    if (SUCCEEDED(dlg->GetResults(&items)) && items) {
+                        DWORD count = 0;
+                        items->GetCount(&count);
+                        for (DWORD i = 0; i < count; ++i) {
+                            IShellItem* item = nullptr;
+                            if (SUCCEEDED(items->GetItemAt(i, &item)) && item) {
+                                PWSTR wpath = nullptr;
+                                if (SUCCEEDED(item->GetDisplayName(
+                                        SIGDN_FILESYSPATH, &wpath)) && wpath) {
+                                    int n = WideCharToMultiByte(CP_UTF8, 0, wpath,
+                                                -1, nullptr, 0, nullptr, nullptr);
+                                    if (n > 1) {
+                                        std::string s(static_cast<size_t>(n - 1), '\0');
+                                        WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                                                s.data(), n, nullptr, nullptr);
+                                        picked.push_back(std::move(s));
+                                    }
+                                    CoTaskMemFree(wpath);
                                 }
-                                CoTaskMemFree(wpath);
+                                item->Release();
                             }
-                            item->Release();
                         }
+                        items->Release();
                     }
-                    items->Release();
                 }
+                dlg->Release();
             }
-            dlg->Release();
+            CoUninitialize();
         }
-        CoUninitialize();
-    });
-    worker.join();
-    return out;
+        {
+            std::lock_guard<std::mutex> lk(g_folder_pick_mtx);
+            g_folder_pick_result = std::move(picked);
+        }
+        g_folder_pick_ready.store(true, std::memory_order_release);
+        g_folder_dialog_open.store(false, std::memory_order_release);
+    }).detach();
 }
+}  // namespace
 
 // Settings → Games Folders… window. Multi-root editor for the launcher's
 // games-discovery roots. Lives behind a Settings menu entry so the main
@@ -1566,6 +1572,24 @@ void LauncherUI::RenderGamesFoldersBody() {
         games_root_paths_ = paths;
         if (on_games_folders_set) on_games_folders_set(std::move(paths));
     };
+
+    // Drain a result from the async folder dialog (set on the worker thread).
+    // Append each chosen folder, de-duped.
+    if (g_folder_pick_ready.exchange(false, std::memory_order_acq_rel)) {
+        std::vector<std::string> picked;
+        {
+            std::lock_guard<std::mutex> lk(g_folder_pick_mtx);
+            picked.swap(g_folder_pick_result);
+        }
+        if (!picked.empty()) {
+            std::vector<std::string> paths = games_root_paths_;
+            for (auto& p : picked) {
+                if (std::find(paths.begin(), paths.end(), p) == paths.end())
+                    paths.push_back(std::move(p));
+            }
+            commit(std::move(paths));
+        }
+    }
 
     ImGui::TextWrapped("%s", T("hint_games_folders_window"));
     ImGui::Separator();
@@ -1591,18 +1615,19 @@ void LauncherUI::RenderGamesFoldersBody() {
     }
 
     ImGui::Separator();
-    if (ImGui::Button(T("btn_browse_folder"))) {
-        // Modern native folder picker; appends every chosen folder (de-duped).
-        std::vector<std::string> picked = PickGamesFoldersNative(window_);
-        if (!picked.empty()) {
-            std::vector<std::string> paths = games_root_paths_;
-            for (auto& p : picked) {
-                if (std::find(paths.begin(), paths.end(), p) == paths.end())
-                    paths.push_back(std::move(p));
-            }
-            commit(std::move(paths));
-        }
+    const bool dialog_open = g_folder_dialog_open.load(std::memory_order_acquire);
+    ImGui::BeginDisabled(dialog_open);
+    if (ImGui::Button(dialog_open ? "Choosing folder..." : T("btn_browse_folder"))) {
+        // Open the modern native picker async (non-blocking); the result is
+        // applied at the top of this function on a later frame. Extract the
+        // HWND here on the render thread.
+        HWND hwnd = window_ ? static_cast<HWND>(SDL_GetPointerProperty(
+                        SDL_GetWindowProperties(window_),
+                        SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))
+                            : nullptr;
+        OpenGamesFolderDialogAsync(hwnd);
     }
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
