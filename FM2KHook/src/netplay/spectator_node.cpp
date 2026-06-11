@@ -4193,6 +4193,22 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
             // silence; the early replayed CSS frames are mostly idle).
             if (mode_now == 2000u) {
                 *(uint32_t*)0x47010Cu = 0;
+                // [NATCSS] every 10th pop until the mechanism that
+                // advances a mirrored CSS to battle is identified --
+                // logs the state machine's inputs and progression.
+                static uint32_t s_natcss_pop = 0;
+                if ((s_natcss_pop++ % 10u) == 0) {
+                    const int* p1c = (const int*)0x424E50;
+                    const int* p2c = (const int*)0x424E58;
+                    const int* sel = (const int*)0x470020;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "[NATCSS] pop=%u p1@(%d,%d) p2@(%d,%d) sel=%d/%d "
+                        "act=%u/%u timer=%u q=%zu",
+                        s_natcss_pop - 1,
+                        p1c[0], p1c[1], p2c[0], p2c[1], sel[0], sel[1],
+                        *(uint32_t*)0x47019Cu, *(uint32_t*)0x4701A0u,
+                        *(uint32_t*)0x424F00u, g_state.pb_queue.size());
+                }
             }
         }
         if (s_offline_replay_cached == 1) {
