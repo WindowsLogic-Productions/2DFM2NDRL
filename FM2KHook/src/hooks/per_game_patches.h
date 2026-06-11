@@ -104,6 +104,13 @@ void PerGamePatches_SetRuntimeBtbOverrides(uint8_t p1_char,
                                            uint8_t p1_color = 0xFF,
                                            uint8_t p2_color = 0xFF);
 
+// Spectator natural-boot abort: the JOIN_ACK said the host is pre-battle
+// (kind=CSS/NONE), so the /F boot is wrong -- the viewer should walk
+// title->CSS naturally and replay the host's stream from frame 0
+// (tournament flow). Releases the /F dispatch hold; the dispatcher then
+// clears g_debug_mode so the engine takes the normal title path.
+void PerGamePatches_AbortBtbNaturalBoot();
+
 // Returns the user-set team size override (2..8) or 0 if unset / out
 // of range. Called from css_autoconfirm.cpp's Hook_GameStateManager
 // each frame to re-write g_team_round_setting AFTER the engine's

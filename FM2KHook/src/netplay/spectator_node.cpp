@@ -2792,20 +2792,24 @@ void ApplySessionEvent(const SessionEvent& ev) {
             // ExitProcess (observed: replay-phase instance stuck at its
             // results screen after the Phase F boundary rework).
             {
-                static int s_offline_replay_cached2 = -1;
-                if (s_offline_replay_cached2 < 0) {
-                    const char* v = std::getenv("FM2K_REPLAY_FILE");
-                    s_offline_replay_cached2 = (v && v[0]) ? 1 : 0;
+                static int s_seam_mode = -1;
+                if (s_seam_mode < 0) {
+                    const char* rp = std::getenv("FM2K_REPLAY_FILE");
+                    const char* sm = std::getenv("FM2K_SPEC_SEAM");
+                    // Default OFF: a state-synced viewer replays the
+                    // boundary 1:1 (pure lockstep -- the engine's own
+                    // determinism mirrors results/CSS/locks/colors and
+                    // enters battle at the host's exact relative frame).
+                    // The SEAM/hold/pin machinery (FM2K_SPEC_SEAM=1) is
+                    // the fallback if pure replay ever desyncs a
+                    // boundary; it trades fidelity for forced outcomes.
+                    s_seam_mode = (!(rp && rp[0]) && sm && sm[0] == '1') ? 1 : 0;
                 }
-                if (s_offline_replay_cached2 == 0) {
+                if (s_seam_mode == 1) {
                     g_state.pb_boundary = State::PbBoundary::SEAM;
                     g_state.pb_css_marker_seen = false;
                     const uint32_t cur_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
                     g_state.pb_boundary_left_battle = (cur_mode < 3000u);
-                    // Hold the local CSS unadvanceable until MATCH_START
-                    // pins -- the VS-rematch CSS auto-advances on neutral
-                    // inputs (carried locks) and raced into battle-2
-                    // BEFORE the pin targets arrived.
                     CssAutoConfirm_SetSeamHold(true,
                         g_state.pb_p1_color, g_state.pb_p2_color);
                 }
@@ -3235,6 +3239,13 @@ void SpectatorNode_HandleJoinAck(const sockaddr_in& from, uint8_t host_session_k
     // launcher-provided placeholder (char 0). PerGamePatches keeps a
     // hook-internal struct that BTB reads first; this bypasses the CRT
     // cache entirely.
+    if (host_session_kind != 2 /* pre-battle: CSS or NONE */) {
+        // Tournament flow: the host's players are still at CSS (or
+        // between sessions). The viewer must NOT /F-boot -- it walks
+        // title->CSS naturally and replays the from-frame-0 stream,
+        // watching the lock-ins live.
+        PerGamePatches_AbortBtbNaturalBoot();
+    }
     if (host_session_kind == 2 /* BATTLE */) {
         PerGamePatches_SetRuntimeBtbOverrides(host_p1_char,
                                               host_p2_char,
@@ -4525,14 +4536,21 @@ void SpectatorNode_TickHostMaintenance() {
         // The viewer meanwhile holds at title until the battle-entry
         // JOIN_ACK re-broadcast seeds its BTB chars.
         if (sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
-            !g_state.current_snapshot.valid) {
+            !g_state.current_snapshot.valid &&
+            Netplay_GetSessionKind() == NetplaySessionKind::BATTLE) {
+            // Battle just started but StashSnapshot hasn't run yet (the
+            // 51ms bind-vs-stash race) -- wait a tick for the snapshot.
+            // Pre-battle joins do NOT defer: they get the from-frame-0
+            // stream and follow the host's CSS live (tournament flow:
+            // spectators connect while the players sit at CSS, then
+            // watch the lock-ins happen).
             static uint64_t s_last_defer_log_ms = 0;
             if (now - s_last_defer_log_ms > 2000) {
                 s_last_defer_log_ms = now;
                 char dbuf[48] = {}; FormatAddr(sub.addr, dbuf, sizeof(dbuf));
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: deferring CURRENT_MATCH bind for %s "
-                    "until first snapshot (host pre-battle)", dbuf);
+                    "until StashSnapshot (battle-entry race)", dbuf);
             }
             continue;
         }

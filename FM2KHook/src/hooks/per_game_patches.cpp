@@ -991,7 +991,15 @@ static uint8_t g_runtime_btb_p1_char = 0xFF;
 static uint8_t g_runtime_btb_p2_char = 0xFF;
 static uint8_t g_runtime_btb_stage   = 0xFF;
 uint8_t g_runtime_btb_p1_color = 0xFF;
+static volatile bool g_btb_natural_boot_abort = false;
 uint8_t g_runtime_btb_p2_color = 0xFF;
+
+void PerGamePatches_AbortBtbNaturalBoot() {
+    g_btb_natural_boot_abort = true;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "PerGamePatches: BTB abort -> natural boot (host pre-battle; "
+        "viewer will replay from frame 0)");
+}
 
 void PerGamePatches_SetRuntimeBtbOverrides(uint8_t p1_char,
                                            uint8_t p2_char,
@@ -1115,6 +1123,14 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
             uint64_t last_log = start;
             for (;;) {
                 ControlChannel_Poll();   // delivers JOIN_ACK -> overrides
+                if (g_btb_natural_boot_abort) {
+                    *(uint32_t*)0x424744 = 0;  // g_debug_mode: drop /F
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: /F dispatch aborted after %llums "
+                        "-- natural boot (host pre-battle)",
+                        (unsigned long long)(GetTickCount64() - start));
+                    break;
+                }
                 if (g_runtime_btb_p1_char != 0xFF) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "PerGamePatches: /F dispatch released after %llums "
@@ -1239,5 +1255,6 @@ bool PerGamePatches_InstallBootToBattleHook()                  { return true; }
 bool PerGamePatches_InstallStoryInitHijack()                   { return true; }
 void PerGamePatches_OnBattleInitComplete()                     {}
 void PerGamePatches_SetRuntimeBtbOverrides(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t) {}
+void PerGamePatches_AbortBtbNaturalBoot()                      {}
 
 #endif
