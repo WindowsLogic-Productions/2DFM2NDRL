@@ -210,6 +210,11 @@ struct State {
 
     // Viewer-side state (this node subscribed upstream).
     bool                      subscribed_upstream = false;
+    // Join-grace: false from JOIN until the first EVENT_BATCH applies.
+    // The silence failover uses a 30s budget until then -- at real loss
+    // rates the dial + 1MB snapshot + backfill exceed the steady-state
+    // 5s budget and failover used to guillotine the join repeatedly.
+    bool live_established = false;
     bool                      join_req_pending    = false;  // We sent SPEC_JOIN_REQ; expect ACK.
     sockaddr_in               upstream_addr       = {};
     // Sticky copy of the mode we declared on the FIRST RequestJoin from
@@ -802,6 +807,61 @@ void SendSessionBackfillFromFrame(const sockaddr_in& to,
 // Idempotent and side-effect-free on g_state. Caller is responsible for
 // ordering this BEFORE BroadcastToAll re-engages for the new sub
 // (TickHostMaintenance handles that via the backfill_done fence).
+// ---- zero-RLE codec for snapshot transfer ---------------------------------
+// Record stream: [u16 literal_len][u16 zero_len][literal bytes] repeated.
+// Decompress target is pre-zeroed, so zero runs are just skips. The
+// savestate blob is dominated by zeroed pool slots -- typical ratio ~10x.
+static void ZeroRleCompress(const std::vector<uint8_t>& in,
+                            std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve(in.size() / 4);
+    size_t i = 0;
+    const size_t n = in.size();
+    while (i < n) {
+        // literal run: until we hit a zero run worth encoding (>= 8) or cap
+        size_t lit_start = i;
+        size_t zeros_at  = n;
+        while (i < n && i - lit_start < 0xFFFF) {
+            if (in[i] == 0) {
+                size_t z = i;
+                while (z < n && in[z] == 0 && z - i < 0xFFFF) ++z;
+                if (z - i >= 8) { zeros_at = i; break; }
+                i = z;  // short zero run -- keep as literal
+                continue;
+            }
+            ++i;
+        }
+        const size_t lit_len = (zeros_at == n ? i : zeros_at) - lit_start;
+        size_t zero_len = 0;
+        if (zeros_at != n) {
+            size_t z = zeros_at;
+            while (z < n && in[z] == 0 && zero_len < 0xFFFF) { ++z; ++zero_len; }
+            i = z;
+        }
+        const uint16_t l16 = (uint16_t)lit_len;
+        const uint16_t z16 = (uint16_t)zero_len;
+        out.push_back((uint8_t)(l16 & 0xFF)); out.push_back((uint8_t)(l16 >> 8));
+        out.push_back((uint8_t)(z16 & 0xFF)); out.push_back((uint8_t)(z16 >> 8));
+        out.insert(out.end(), in.begin() + lit_start, in.begin() + lit_start + lit_len);
+    }
+}
+
+static bool ZeroRleDecompress(const uint8_t* in, size_t in_len,
+                              uint8_t* out, size_t out_len) {
+    std::memset(out, 0, out_len);
+    size_t ri = 0, wo = 0;
+    while (ri + 4 <= in_len) {
+        const uint16_t lit  = (uint16_t)(in[ri] | (in[ri + 1] << 8));
+        const uint16_t zero = (uint16_t)(in[ri + 2] | (in[ri + 3] << 8));
+        ri += 4;
+        if (ri + lit > in_len || wo + lit + zero > out_len) return false;
+        std::memcpy(out + wo, in + ri, lit);
+        ri += lit;
+        wo += lit + zero;
+    }
+    return ri == in_len && wo == out_len;
+}
+
 void SendSnapshotTo(const sockaddr_in& to) {
     const auto& cache = g_state.current_snapshot;
     if (!cache.valid || cache.blob.empty()) return;
@@ -819,6 +879,8 @@ void SendSnapshotTo(const sockaddr_in& to) {
         meta.version            = SPECTATOR_SNAPSHOT_VERSION;
         meta.total_bytes        = (uint32_t)cache.blob.size();
         meta.match_index        = cache.match_index;
+        meta.flags              = 0;
+        meta.compressed_bytes   = (uint32_t)cache.blob.size();
         // Phase E: tell the spec which mode this snapshot was captured
         // at. v0.2.41 spectators see this as `reserved1` and ignore it
         // (their apply gate is hard-coded to `game_mode >= 3000` which
@@ -834,30 +896,43 @@ void SendSnapshotTo(const sockaddr_in& to) {
         hdr.start_frame = cache.input_frame;       // anchor for spectator's next_expected_frame
         hdr.frame_count = 0;
         hdr.flags       = (uint16_t)sizeof(meta);  // 16 — payload byte count
+        // Zero-RLE the blob; ship compressed when it actually wins.
+        static std::vector<uint8_t> s_wire;   // reused scratch
+        ZeroRleCompress(cache.blob, s_wire);
+        const bool use_rle = s_wire.size() < cache.blob.size();
+        const std::vector<uint8_t>& wire = use_rle ? s_wire : cache.blob;
+        if (use_rle) {
+            meta.flags            |= SNAPSHOT_FLAG_ZERO_RLE;
+            meta.compressed_bytes  = (uint32_t)s_wire.size();
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: snapshot wire size %zu bytes (%s, raw %zu)",
+            wire.size(), use_rle ? "zero-RLE" : "uncompressed",
+            cache.blob.size());
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), &meta, sizeof(meta));
         OutboundSendTo(to, buf.data(), buf.size());
-    }
 
     // ---- SNAPSHOT_CHUNK xN -------------------------------------------
     size_t emitted = 0;
-    while (emitted < cache.blob.size()) {
-        const size_t remaining = cache.blob.size() - emitted;
+    while (emitted < wire.size()) {
+        const size_t remaining = wire.size() - emitted;
         const size_t chunk_n   = std::min(remaining, SPECTATOR_SNAPSHOT_CHUNK_BYTES);
 
-        std::vector<uint8_t> buf(sizeof(SpecDataHeader) + chunk_n);
-        SpecDataHeader hdr = {};
-        hdr.magic       = SPEC_DATA_MAGIC;
-        hdr.type        = SpecDataType::SNAPSHOT_CHUNK;
-        hdr.start_frame = (uint32_t)emitted;       // byte offset (running)
-        hdr.frame_count = 0;
-        hdr.flags       = (uint16_t)chunk_n;
-        std::memcpy(buf.data(), &hdr, sizeof(hdr));
-        std::memcpy(buf.data() + sizeof(hdr),
-                    cache.blob.data() + emitted, chunk_n);
-        OutboundSendTo(to, buf.data(), buf.size());
+        std::vector<uint8_t> cbuf(sizeof(SpecDataHeader) + chunk_n);
+        SpecDataHeader chdr = {};
+        chdr.magic       = SPEC_DATA_MAGIC;
+        chdr.type        = SpecDataType::SNAPSHOT_CHUNK;
+        chdr.start_frame = (uint32_t)emitted;       // byte offset (running)
+        chdr.frame_count = 0;
+        chdr.flags       = (uint16_t)chunk_n;
+        std::memcpy(cbuf.data(), &chdr, sizeof(chdr));
+        std::memcpy(cbuf.data() + sizeof(chdr),
+                    wire.data() + emitted, chunk_n);
+        OutboundSendTo(to, cbuf.data(), cbuf.size());
 
         emitted += chunk_n;
+    }
     }
 
     // ---- SNAPSHOT_END -------------------------------------------------
@@ -2977,22 +3052,39 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // SendSnapshotTo): hdr.start_frame = anchor INPUT-frame for
             // the post-snapshot event stream, hdr.flags = sizeof(meta) =
             // 16, payload = SnapshotMetadata.
-            if (payload_len < sizeof(SnapshotMetadata)) {
+            // v1 meta = 16 bytes (no flags/compressed_bytes); v2 = 20.
+            constexpr size_t META_V1_BYTES = 16;
+            if (payload_len < META_V1_BYTES) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: SNAPSHOT_BEGIN truncated (payload=%zu, need %zu)",
-                    payload_len, sizeof(SnapshotMetadata));
+                    payload_len, META_V1_BYTES);
                 g_state.pb_snapshot_inbox = State::SnapshotInbox{};
                 break;
             }
             SnapshotMetadata meta = {};
-            std::memcpy(&meta, payload, sizeof(meta));
-
-            if (meta.version != SPECTATOR_SNAPSHOT_VERSION) {
+            std::memcpy(&meta, payload,
+                        payload_len >= sizeof(SnapshotMetadata)
+                            ? sizeof(SnapshotMetadata) : META_V1_BYTES);
+            if (meta.version == 1) {
+                // v1 sender: uncompressed, wire size == total.
+                meta.flags            = 0;
+                meta.compressed_bytes = meta.total_bytes;
+            } else if (meta.version != SPECTATOR_SNAPSHOT_VERSION) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: SNAPSHOT_BEGIN version mismatch "
-                    "(got %u, want %u) — dropping snapshot, peer must "
+                    "(got %u, want <= %u) — dropping snapshot, peer must "
                     "rejoin with FULL_SESSION",
                     meta.version, SPECTATOR_SNAPSHOT_VERSION);
+                g_state.pb_snapshot_inbox = State::SnapshotInbox{};
+                break;
+            }
+            const uint32_t wire_bytes =
+                (meta.flags & SNAPSHOT_FLAG_ZERO_RLE) ? meta.compressed_bytes
+                                                      : meta.total_bytes;
+            if (wire_bytes == 0 || wire_bytes > meta.total_bytes) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: SNAPSHOT_BEGIN bad wire size %u (total %u)",
+                    wire_bytes, meta.total_bytes);
                 g_state.pb_snapshot_inbox = State::SnapshotInbox{};
                 break;
             }
@@ -3018,7 +3110,7 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             inbox.meta           = meta;
             inbox.anchor_frame   = hdr.start_frame;
             inbox.bytes_received = 0;
-            inbox.blob.assign(meta.total_bytes, 0);
+            inbox.blob.assign(wire_bytes, 0);   // wire (possibly compressed) bytes
             inbox.active         = true;
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -3102,13 +3194,29 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             uint32_t expected_checksum = 0;
             std::memcpy(&expected_checksum, payload, sizeof(uint32_t));
 
-            if (inbox.bytes_received != inbox.meta.total_bytes) {
+            const uint32_t expected_wire =
+                (inbox.meta.flags & SNAPSHOT_FLAG_ZERO_RLE)
+                    ? inbox.meta.compressed_bytes : inbox.meta.total_bytes;
+            if (inbox.bytes_received != expected_wire) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: SNAPSHOT_END byte-count mismatch "
                     "(received %zu, want %u) — discarding",
-                    inbox.bytes_received, inbox.meta.total_bytes);
+                    inbox.bytes_received, expected_wire);
                 inbox = State::SnapshotInbox{};
                 break;
+            }
+            if (inbox.meta.flags & SNAPSHOT_FLAG_ZERO_RLE) {
+                std::vector<uint8_t> raw(inbox.meta.total_bytes);
+                if (!ZeroRleDecompress(inbox.blob.data(), inbox.blob.size(),
+                                       raw.data(), raw.size())) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: SNAPSHOT_END zero-RLE decompress "
+                        "failed (%zu wire -> %u raw) — discarding",
+                        inbox.blob.size(), inbox.meta.total_bytes);
+                    inbox = State::SnapshotInbox{};
+                    break;
+                }
+                inbox.blob.swap(raw);
             }
             const uint32_t local_checksum =
                 Fletcher32(inbox.blob.data(), inbox.blob.size());
@@ -3156,6 +3264,7 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             // + next-match MATCH_START that flow through the same
             // EVENT_BATCH stream right after MATCH_END.
             if (!g_state.subscribed_upstream) return;
+            g_state.live_established = true;
 
             const uint32_t expected_at_entry = g_state.have_frame_baseline
                 ? g_state.next_expected_frame : 0xFFFFFFFFu;
@@ -3530,9 +3639,10 @@ void SpectatorNode_TickHealth() {
         const bool snapshot_in_flight =
             snap_inbox.active &&
             snap_inbox.bytes_received < snap_inbox.meta.total_bytes;
-        const uint64_t silence_budget_ms = snapshot_in_flight
-            ? (uint64_t)30000
-            : (uint64_t)SPECTATOR_SILENCE_FAILOVER_MS;
+        const uint64_t silence_budget_ms =
+            (snapshot_in_flight || !g_state.live_established)
+                ? (uint64_t)30000
+                : (uint64_t)SPECTATOR_SILENCE_FAILOVER_MS;
         if (!g_spectator_catchup &&
             queue_idle &&
             recv_ms > 0 &&
@@ -3547,6 +3657,7 @@ void SpectatorNode_TickHealth() {
             leave.header.type = CtrlMsg::SPEC_LEAVE;
             ControlChannel_SendTo(leave, g_state.upstream_addr);
             g_state.subscribed_upstream = false;
+            g_state.live_established    = false;
             SpectatorTCP::DisconnectUpstream();
         }
     }

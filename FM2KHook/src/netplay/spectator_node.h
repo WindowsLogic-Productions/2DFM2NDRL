@@ -98,14 +98,17 @@ enum class SpecJoinMode : uint8_t {
 };
 
 // Snapshot-wire constants.
-constexpr uint16_t SPECTATOR_SNAPSHOT_VERSION     = 1;
+constexpr uint16_t SPECTATOR_SNAPSHOT_VERSION     = 2;
 constexpr size_t   SPECTATOR_SNAPSHOT_CHUNK_BYTES = 16384;  // ~16KB / chunk
 
 #pragma pack(push, 1)
+// Snapshot meta flags (v2+).
+constexpr uint16_t SNAPSHOT_FLAG_ZERO_RLE = 0x0001;  // chunks carry zero-RLE-compressed bytes
+
 struct SnapshotMetadata {
-    uint16_t version;             // SPECTATOR_SNAPSHOT_VERSION (= 1)
-    uint16_t reserved0;
-    uint32_t total_bytes;         // SaveState blob size, summed across CHUNKs
+    uint16_t version;             // SPECTATOR_SNAPSHOT_VERSION (v2 adds flags + compressed_bytes)
+    uint16_t flags;               // SNAPSHOT_FLAG_* (v1 senders: always 0)
+    uint32_t total_bytes;         // UNCOMPRESSED SaveState blob size
     uint32_t match_index;         // 0-based index of the match this snapshot covers
     // captured_game_mode: the g_game_mode value when the host captured
     // this snapshot. Phase E (mid-CSS spectator join, v0.2.42+) writes
@@ -116,8 +119,14 @@ struct SnapshotMetadata {
     // capture", matching the v0.2.41 behavior (apply when spec reaches
     // game_mode >= 3000). Hence the wire size + version stay the same.
     uint32_t captured_game_mode;
+    // v2: wire byte count when SNAPSHOT_FLAG_ZERO_RLE is set (the chunks
+    // carry this many compressed bytes; decompressed size = total_bytes).
+    // The ~1MB savestate blob is mostly zero runs -- RLE cuts it ~10x,
+    // which cuts the lossy-network join window ~10x (1MB at 20%-loss TCP
+    // throughput was ~30-45s; every watchdog race lived in that window).
+    uint32_t compressed_bytes;
 };
-static_assert(sizeof(SnapshotMetadata) == 16, "SnapshotMetadata must be 16 bytes");
+static_assert(sizeof(SnapshotMetadata) == 20, "SnapshotMetadata must be 20 bytes (v2: +compressed_bytes)");
 #pragma pack(pop)
 
 #pragma pack(push, 1)
