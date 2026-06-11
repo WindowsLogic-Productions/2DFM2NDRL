@@ -1032,18 +1032,25 @@ static void RunSpectatorTick() {
     // below the floor) used to freeze the picture for the entire pause
     // with seven frames in hand (2026-06-11). If nothing has been
     // admitted for >250ms, play out what we hold at 1:1.
-    const bool starved_bypass =
-        qd > 0 && SpectatorNode_MsSinceLastAdmit() > 250;
     const bool boundary_bypass =
-        SpectatorNode_InBoundary() || starved_bypass ||
+        SpectatorNode_InBoundary() ||
         (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
          SpectatorNode_QueueHasPendingOp());
     if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active &&
         !boundary_bypass) {
-        // Queue starved — hold the current rendered frame. Don't tick sim,
-        // don't read inputs, don't run process_game_inputs/update_game.
-        RenderFrameWithSnapshot();
-        return;
+        // Below the cushion: half-speed glide instead of a hard hold.
+        // The old hold->drain->hold cycle (starvation bypass draining
+        // the cushion at 1:1, floor freezing to rebuild it) oscillated
+        // visibly under loss+latency (clumsy 20%/140ms). Playing every
+        // other tick keeps motion continuous at 50fps while arrivals
+        // outpace consumption 2:1 and the cushion refills itself.
+        static bool s_glide_toggle = false;
+        s_glide_toggle = !s_glide_toggle;
+        if (qd == 0 || !s_glide_toggle) {
+            RenderFrameWithSnapshot();
+            return;
+        }
+        // fall through: sim exactly one frame this tick
     }
     if (qd == 0 && !boundary_bypass) {
         // Truly empty — even offline replay has nothing left to do.
@@ -1188,8 +1195,12 @@ static void RunSpectatorTick() {
     // experience. (Render is gated on g_spectator_catchup so cursor
     // animations still draw — see RenderFrameWithSnapshot in the loop.)
     const uint32_t live_game_mode    = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    // CSS catchup only for genuinely deep backlogs: under realistic
+    // loss+latency the viewer legitimately sits 1-2s behind, and turbo
+    // at CSS stalls on per-hover .player loads (the 1fps slideshow).
+    // Below 400 queued, CSS plays 1:1 and the gentle 2x drain converges.
     const bool needs_css_catchup     = (live_game_mode == 2000u) &&
-                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
+                                       qd > 400;
     // Render parity is required during catchup — every phase. Render-side
     // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
     // mode 3, particle FX) run on the host once per simulated frame. If the

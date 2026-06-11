@@ -153,6 +153,7 @@ struct State {
     // accelerator, ops were the remaining hostage).
     struct OpWire {
         uint32_t op_index;
+        uint32_t input_pos;   // total_input_count at append = inputs before this op
         uint8_t  len;
         uint8_t  bytes[100];
     };
@@ -750,6 +751,7 @@ void SendUdpInputBatches() {
             const auto& slot = g_state.udp_ops_ring[i % State::OPS_RING];
             if (slot.len == 0 || slot.op_index != i) continue;  // overwritten
             std::memcpy(w, &slot.op_index, 4); w += 4;
+            std::memcpy(w, &slot.input_pos, 4); w += 4;
             *w++ = slot.len;
             std::memcpy(w, slot.bytes, slot.len); w += slot.len;
             ++emitted;
@@ -1711,8 +1713,9 @@ void AppendOpAndFlush(const SessionEvent& ev) {
         AppendEventToWire(w, ev, g_state.match_headers);
         if (!w.empty() && w.size() <= sizeof(State::OpWire::bytes)) {
             auto& slot = g_state.udp_ops_ring[g_state.total_op_count % State::OPS_RING];
-            slot.op_index = g_state.total_op_count;
-            slot.len      = (uint8_t)w.size();
+            slot.op_index  = g_state.total_op_count;
+            slot.input_pos = g_state.total_input_count;
+            slot.len       = (uint8_t)w.size();
             std::memcpy(slot.bytes, w.data(), w.size());
         }
     }
@@ -3972,76 +3975,95 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
         g_state.udp_highest_op_seq = op_seq;
     }
 
-    // Redundant ops tail: accept strictly in order (op_index == ops_seen).
-    // This is what makes a dead TCP stream invisible mid-session -- the
-    // boundary op cluster (ROUND/MATCH_END, CSS_ENTERED, PIN/RESET/SOUND,
-    // MATCH_START) re-ships in every datagram until acknowledged by
-    // progression. Ops the TCP stream later re-delivers dedup by index.
+    // Redundant ops tail: parsed here, accepted via accept_eligible()
+    // interleaved with the input admission below. An op enters the queue
+    // only when (a) it is the next op in global order and (b) every
+    // input that precedes it positionally has been admitted -- accepting
+    // early pushed boundary ops ahead of the battle-tail inputs (the
+    // seam engaged early, its mask expired into leftover attack bits,
+    // carried cursors insta-locked: the 17/13 battle restart,
+    // 2026-06-11). The tail reships in every datagram, so deferred
+    // acceptance costs nothing.
+    struct TailOp { uint32_t idx; uint32_t pos; const uint8_t* w; uint8_t wlen; bool done; };
+    TailOp tail_ops[State::OPS_RING] = {};
+    int tail_n = 0;
     if (len > inputs_end + 1) {
         const uint8_t* t   = buf + inputs_end;
         const uint8_t* end = buf + len;
         uint8_t n = *t++;
-        for (uint8_t i = 0; i < n && t + 5 <= end; ++i) {
-            uint32_t op_index = 0;
-            std::memcpy(&op_index, t, 4); t += 4;
-            const uint8_t wlen = *t++;
-            if (t + wlen > end) break;
-            if (op_index == g_state.ops_seen) {
+        for (uint8_t i = 0; i < n && t + 9 <= end &&
+                            tail_n < (int)State::OPS_RING; ++i) {
+            TailOp& o = tail_ops[tail_n];
+            std::memcpy(&o.idx, t, 4); t += 4;
+            std::memcpy(&o.pos, t, 4); t += 4;
+            o.wlen = *t++;
+            if (t + o.wlen > end) break;
+            o.w = t; o.done = false; t += o.wlen;
+            ++tail_n;
+        }
+    }
+    auto accept_eligible = [&]() {
+        for (bool progress = true; progress; ) {
+            progress = false;
+            for (int i = 0; i < tail_n; ++i) {
+                TailOp& o = tail_ops[i];
+                if (o.done || o.idx != g_state.ops_seen ||
+                    g_state.next_expected_frame < o.pos) continue;
+                o.done = true;
                 SessionEvent ev{};
                 uint8_t hdr_buf[SESSION_EVENT_MATCH_HDR_SIZE];
                 const size_t consumed =
-                    SessionEvent_Decode(t, wlen, &ev, hdr_buf);
-                if (consumed == wlen && ev.type != SessionEventType::INPUT) {
-                    if (ev.type == SessionEventType::MATCH_START) {
-                        MatchHeader hdr_copy;
-                        std::memcpy(hdr_copy.data(), hdr_buf, hdr_copy.size());
-                        g_state.pb_match_headers.push_back(hdr_copy);
-                        ev.u.match_start_idx =
-                            (uint16_t)(g_state.pb_match_headers.size() - 1);
+                    SessionEvent_Decode(o.w, o.wlen, &ev, hdr_buf);
+                if (consumed != o.wlen ||
+                    ev.type == SessionEventType::INPUT) continue;
+                if (ev.type == SessionEventType::MATCH_START) {
+                    MatchHeader hdr_copy;
+                    std::memcpy(hdr_copy.data(), hdr_buf, hdr_copy.size());
+                    g_state.pb_match_headers.push_back(hdr_copy);
+                    ev.u.match_start_idx =
+                        (uint16_t)(g_state.pb_match_headers.size() - 1);
+                }
+                g_state.pb_queue.push_back(ev);
+                ++g_state.ops_seen;
+                progress = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[SPEC-UDP] accepted op #%u type=%u at pos=%u via "
+                    "datagram tail", o.idx, (unsigned)ev.type, o.pos);
+                switch (ev.type) {
+                    case SessionEventType::PIN_RNG:
+                        SpectatorNode_AppendPinRng(ev.u.pin_rng_seed); break;
+                    case SessionEventType::RESET_INPUT_STATE:
+                        SpectatorNode_AppendResetInputState(); break;
+                    case SessionEventType::SOUND_INIT:
+                        SpectatorNode_AppendSoundInit(); break;
+                    case SessionEventType::FINGERPRINT:
+                        SpectatorNode_AppendFingerprint(ev.u.fingerprint_hash); break;
+                    case SessionEventType::MATCH_START:
+                        SpectatorNode_AppendMatchStart(hdr_buf); break;
+                    case SessionEventType::MATCH_END:
+                        SpectatorNode_AppendMatchEnd(ev.u.match_end); break;
+                    case SessionEventType::SESSION_ID:
+                        SpectatorNode_AppendSessionId(ev.u.session_id); break;
+                    case SessionEventType::CSS_ENTERED:
+                        SpectatorNode_AppendCssEntered(); break;
+                    case SessionEventType::ROUND_START: {
+                        const auto& rp = ev.u.round_start;
+                        SpectatorNode_AppendRoundStart(rp.round_idx,
+                            rp.p1_hp_max, rp.p2_hp_max, rp.timer_seconds);
+                        break;
                     }
-                    g_state.pb_queue.push_back(ev);
-                    ++g_state.ops_seen;
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "[SPEC-UDP] accepted op #%u type=%u via datagram "
-                        "tail (TCP-independent)",
-                        op_index, (unsigned)ev.type);
-                    // Hop-1 relay parity with the TCP walk.
-                    switch (ev.type) {
-                        case SessionEventType::PIN_RNG:
-                            SpectatorNode_AppendPinRng(ev.u.pin_rng_seed); break;
-                        case SessionEventType::RESET_INPUT_STATE:
-                            SpectatorNode_AppendResetInputState(); break;
-                        case SessionEventType::SOUND_INIT:
-                            SpectatorNode_AppendSoundInit(); break;
-                        case SessionEventType::FINGERPRINT:
-                            SpectatorNode_AppendFingerprint(ev.u.fingerprint_hash); break;
-                        case SessionEventType::MATCH_START:
-                            SpectatorNode_AppendMatchStart(hdr_buf); break;
-                        case SessionEventType::MATCH_END:
-                            SpectatorNode_AppendMatchEnd(ev.u.match_end); break;
-                        case SessionEventType::SESSION_ID:
-                            SpectatorNode_AppendSessionId(ev.u.session_id); break;
-                        case SessionEventType::CSS_ENTERED:
-                            SpectatorNode_AppendCssEntered(); break;
-                        case SessionEventType::ROUND_START: {
-                            const auto& p = ev.u.round_start;
-                            SpectatorNode_AppendRoundStart(p.round_idx,
-                                p.p1_hp_max, p.p2_hp_max, p.timer_seconds);
-                            break;
-                        }
-                        case SessionEventType::ROUND_END: {
-                            const auto& p = ev.u.round_end;
-                            SpectatorNode_AppendRoundEnd(p.winner_idx,
-                                p.p1_hp_remaining, p.p2_hp_remaining);
-                            break;
-                        }
-                        default: break;
+                    case SessionEventType::ROUND_END: {
+                        const auto& rp = ev.u.round_end;
+                        SpectatorNode_AppendRoundEnd(rp.winner_idx,
+                            rp.p1_hp_remaining, rp.p2_hp_remaining);
+                        break;
                     }
+                    default: break;
                 }
             }
-            t += wlen;
         }
-    }
+    };
+    accept_eligible();
 
     // [SPEC-UDP] 1Hz heartbeat BEFORE the gates -- pause periods are
     // exactly when this diagnostic matters (the original tail placement
@@ -4065,9 +4087,21 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
     // Boundary ops in flight (MATCH_END .. MATCH_START) pause admission;
     // the TCP burst that delivers them also jumps the cursor, after which
     // UDP re-engages. Self-healing by redundancy -- nothing is lost.
-    if (op_seq > g_state.ops_seen) {
-        ++g_state.udp_paused_on_gate;
-        return;
+    {
+        bool blocking_op_in_tail = false;
+        for (int i = 0; i < tail_n; ++i) {
+            if (!tail_ops[i].done && tail_ops[i].idx == g_state.ops_seen) {
+                blocking_op_in_tail = true;
+                break;
+            }
+        }
+        if (op_seq > g_state.ops_seen && !blocking_op_in_tail) {
+            // The op we need fell out of the 8-op tail window and TCP
+            // hasn't delivered it -- inputs past it must wait (backfill
+            // or a later tail recovers).
+            ++g_state.udp_paused_on_gate;
+            return;
+        }
     }
     // Window entirely ahead of the cursor (loss burst exceeded the
     // redundancy window): drop whole datagram; TCP fills the hole.
@@ -4081,6 +4115,23 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
     const uint8_t* p = buf + sizeof(SpecDataHeader) + 4;
     for (size_t i = 0; i < frames; ++i, ++cursor) {
         if (cursor != g_state.next_expected_frame) continue;  // already queued
+        // In-order invariant per frame: if an op should precede further
+        // inputs and it is not recoverable from this tail, stop here --
+        // its position is unknown, so any further admit could jump it.
+        if (op_seq > g_state.ops_seen) {
+            bool next_op_in_tail = false;
+            for (int k = 0; k < tail_n; ++k) {
+                if (!tail_ops[k].done &&
+                    tail_ops[k].idx == g_state.ops_seen) {
+                    next_op_in_tail = true;
+                    break;
+                }
+            }
+            if (!next_op_in_tail) {
+                ++g_state.udp_paused_on_gate;
+                break;
+            }
+        }
         uint16_t p1 = 0, p2 = 0;
         std::memcpy(&p1, p + i * 4,     2);
         std::memcpy(&p2, p + i * 4 + 2, 2);
@@ -4092,6 +4143,7 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
         SpectatorNode_StampInputAdmit();
         g_state.next_expected_frame = cursor + 1;
         ++admitted;
+        accept_eligible();  // an op positioned right after this input
         // Hop-1 relay parity with the TCP path (line ~3318): the late TCP
         // copy of these frames is positionally skipped there, so without
         // this append a relay node's downstream stream would lose them.
