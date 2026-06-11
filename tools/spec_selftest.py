@@ -225,7 +225,7 @@ def main():
         common_env["FM2K_AUTO_TERMINATE_TOTAL"] = str(args.total_frames)
     else:
         common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
