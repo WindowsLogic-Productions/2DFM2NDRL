@@ -305,6 +305,11 @@ struct State {
     // when the host's OP_BASELINE for the new connection arrives.
     uint32_t                  ops_seen              = 0;
     bool                      udp_epoch_armed       = false;
+    // True once a snapshot has applied this playback session. The
+    // rewind-discard guard in ApplyPendingSnapshot is strictly for
+    // RE-JOIN re-ships; the FIRST snapshot must always apply (the BTB
+    // boot's local battle state is garbage until it does).
+    bool                      pb_snapshot_applied_once = false;
     // Highest op_seq announced by any received UDP datagram. Drives the
     // silent-TCP-death detector in TickHealth: a persistent gap vs
     // ops_seen while TCP is quiet means the op stream is wedged.
@@ -1467,6 +1472,7 @@ void SpectatorNode_Shutdown() {
     g_state.pb_boundary         = State::PbBoundary::NONE;
     g_state.pending_reset_input = false;
     g_state.pending_sound_init  = false;
+    g_state.pb_snapshot_applied_once = false;
     CssAutoConfirm_SetSeamHold(false);
     SpectatorTCP::Shutdown();
     // Tear down both relay rings if we created them. Close handles
@@ -2040,7 +2046,7 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // so a fresh join (consumed == anchor, nothing popped yet) applies,
     // and a forward jump (anchor ahead of us, e.g. re-join landing in the
     // NEXT match) also applies.
-    if (g_state.have_frame_baseline) {
+    if (g_state.have_frame_baseline && g_state.pb_snapshot_applied_once) {
         uint32_t queued_inputs = 0;
         for (const auto& ev : g_state.pb_queue) {
             if (ev.type == SessionEventType::INPUT) ++queued_inputs;
@@ -2097,6 +2103,7 @@ void SpectatorNode_ApplyPendingSnapshot() {
     g_state.have_frame_baseline    = true;
     g_state.highest_consumed_frame = 0;
     g_state.playing_back           = true;
+    g_state.pb_snapshot_applied_once = true;
     // Snapshot supersedes any in-flight boundary state (e.g. a stale SEAM
     // from a renegotiated join) -- the restored state IS the new baseline.
     g_state.pb_boundary         = State::PbBoundary::NONE;
@@ -3926,6 +3933,14 @@ bool SpectatorNode_IsPlayingBack() {
 }
 
 bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
+    // A validated snapshot is waiting for the local engine to reach its
+    // capture phase: hold the sim. Popping before the apply consumed real
+    // inputs into throwaway pre-snapshot state -- and pushed the consumed
+    // cursor past the anchor, which made the rewind guard discard the
+    // FIRST snapshot (join-during-CSS run, 2026-06-11: spec played the
+    // live stream on a fresh BTB battle, P2 never initialized).
+    if (g_state.pb_snapshot_inbox.pending_apply) return false;
+
     // Drain non-INPUT events from the head before popping the next INPUT.
     // Each non-INPUT event dispatches to ApplySessionEvent — RNG pin,
     // input-state reset, sound dedup init, etc. The dispatch happens at
