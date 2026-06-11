@@ -175,6 +175,26 @@ static uint64_t g_beat_last_emit_ms    = 0;
 // path is identical.
 static void HandleDesyncDetected(int frame, uint32_t local_chk,
                                  uint32_t remote_chk, bool synthetic) {
+    // Phantom-checksum guard (2026-06-11 16:31, battle-2 f=1536): gekko's
+    // SendSessionHealthCheck reads _storage.GetState(confirmed) and only
+    // ASSERTS the slot actually holds that frame -- compiled out in
+    // release, so a wrapped/unwritten slot transmits checksum 0 and the
+    // peer kills itself on a phantom mismatch (P2 saw remote=0x00000000
+    // while P1's own comparator stayed silent, i.e. the real checksums
+    // matched). Our save callback always writes a nonzero fingerprint,
+    // so a zero on either side is never a genuine state hash; a real
+    // divergence keeps firing with nonzero pairs on subsequent frames.
+    if (!synthetic && (local_chk == 0 || remote_chk == 0)) {
+        static uint32_t s_phantom_count = 0;
+        if (s_phantom_count++ < 8 || (s_phantom_count & 0x3F) == 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "DESYNC ignored (phantom #%u): f=%d local=0x%08X "
+                "remote=0x%08X -- zero checksum is a gekko health-slot "
+                "artifact, not a state hash",
+                s_phantom_count, frame, local_chk, remote_chk);
+        }
+        return;
+    }
     g_desync_count++;
     uint32_t now_tick = GetTickCount();
 
