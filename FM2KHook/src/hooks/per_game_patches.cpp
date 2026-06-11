@@ -1113,6 +1113,17 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
         if (s_is_spec < 0) {
             const char* v = std::getenv("FM2K_SPECTATOR_MODE");
             s_is_spec = (v && v[0] == '1') ? 1 : 0;
+            // Offline replay (FM2K_REPLAY_FILE): no host, no JOIN_ACK,
+            // ever -- the hold below would burn its full 8s timeout
+            // pumping a control channel that doesn't exist, then drop /F
+            // into a natural title walk: ~113 extra walked frames in the
+            // parity capture and a divergent battle-start state (A5 soak
+            // red, 2026-06-11 17:33). The harness's FM2K_BOOT_TO_BATTLE
+            // IS the battle authority here; engage /F immediately.
+            if (s_is_spec == 1) {
+                const char* rp = std::getenv("FM2K_REPLAY_FILE");
+                if (rp && rp[0]) s_is_spec = 0;
+            }
         }
         if (s_is_spec == 1 && g_runtime_btb_p1_char == 0xFF) {
             extern void ControlChannel_Poll();
