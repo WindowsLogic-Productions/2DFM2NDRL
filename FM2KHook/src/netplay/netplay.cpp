@@ -2341,7 +2341,16 @@ bool Netplay_StartStressBattle() {
     // self-test green for shipping. Real-netplay savestate correctness
     // is verified by per-frame checksum compares against the peer when
     // gekko rollback fires for genuine prediction misses.
+    //
+    // FM2K_CHECK_DISTANCE env overrides for task #34 bisects: e.g.
+    // FM2K_CHECK_DISTANCE=10 python3 tools/replay_selftest.py ...
+    // (the harness forwards it through the cmd.exe env block).
     config.check_distance = 0;
+    if (const char* env = std::getenv("FM2K_CHECK_DISTANCE"); env && env[0]) {
+        config.check_distance = std::atoi(env);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Netplay: FM2K_CHECK_DISTANCE override -> %d", config.check_distance);
+    }
 
     // StressSession mode: ignores network, forces rollbacks from a single instance.
     gekko_create(&g_session, GekkoStressSession);
@@ -2415,7 +2424,7 @@ bool Netplay_StartStressBattle() {
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Netplay: GekkoStressSession created (check_distance=%d, prediction_window=%d)",
-        10, config.input_prediction_window);
+        config.check_distance, config.input_prediction_window);
     return true;
 }
 
