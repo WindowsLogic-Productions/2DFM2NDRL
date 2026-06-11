@@ -1121,7 +1121,10 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
                 "PerGamePatches: holding /F dispatch in place -- pumping "
                 "control channel until JOIN_ACK seeds battle chars");
             uint64_t last_log = start;
+            extern void SpectatorNode_KickJoin();
             for (;;) {
+                SpectatorNode_KickJoin();  // hold may have beaten the
+                                           // init path's JOIN_REQ send
                 ControlChannel_Poll();   // delivers JOIN_ACK -> overrides
                 if (g_btb_natural_boot_abort) {
                     *(uint32_t*)0x424744 = 0;  // g_debug_mode: drop /F
@@ -1139,9 +1142,9 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
                     break;
                 }
                 const uint64_t now = GetTickCount64();
-                if (now - start >= 15000) {
+                if (now - start >= 8000) {
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "PerGamePatches: /F dispatch hold timed out (15s) "
+                        "PerGamePatches: /F dispatch hold timed out (8s) "
                         "-- proceeding with env-default chars");
                     break;
                 }

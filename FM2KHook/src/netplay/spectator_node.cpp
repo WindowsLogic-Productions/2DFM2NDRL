@@ -3979,6 +3979,22 @@ bool SpectatorNode_QueueHasPendingOp() {
     return false;
 }
 
+// Self-sufficient join kick for the /F dispatch hold: the JOIN_REQ is
+// normally sent by Netplay_InitAsSpectator on the DLL-init path, but the
+// dispatcher's first-tick hold can win that race -- it would then pump a
+// socket with NO join in flight and sit black until the host's battle-
+// entry re-broadcast finally arrived (the "black screen until P1/P2
+// confirm" failure). Re-requests at 1Hz until subscribed; harmless when
+// the original request already landed (host's existing-sub path ACKs
+// idempotently).
+void SpectatorNode_KickJoin() {
+    if (g_state.subscribed_upstream) return;
+    if (g_state.root_addr.sin_port == 0) return;  // init hasn't configured us yet
+    const uint64_t now = GetTickCount64();
+    if (now - g_state.last_reconnect_attempt_ms < 1000) return;
+    SpectatorNode_RequestJoin(g_state.root_addr, g_state.last_requested_mode);
+}
+
 bool SpectatorNode_IsSubscribedUpstream() { return g_state.subscribed_upstream; }
 
 // -----------------------------------------------------------------------------

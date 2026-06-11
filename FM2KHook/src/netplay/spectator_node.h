@@ -700,6 +700,11 @@ void SpectatorNode_OnUpstreamTcpDead();
 bool SpectatorNode_InBoundary();
 bool SpectatorNode_QueueHasPendingOp();
 
+// Re-request the upstream JOIN if none is in flight (1Hz throttle).
+// Used by the /F dispatch hold, which can run before the DLL-init path
+// has sent the original JOIN_REQ.
+void SpectatorNode_KickJoin();
+
 // Are we currently subscribed upstream (receiving a live match stream)?
 bool SpectatorNode_IsSubscribedUpstream();
 
