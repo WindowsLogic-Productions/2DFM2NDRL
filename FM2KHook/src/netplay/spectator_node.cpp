@@ -305,6 +305,10 @@ struct State {
     // when the host's OP_BASELINE for the new connection arrives.
     uint32_t                  ops_seen              = 0;
     bool                      udp_epoch_armed       = false;
+    // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
+    // during which CssAutoConfirm's hold eats confirm bits, so the edge
+    // echo of the last pre-CSS input can't lock the carried cursors.
+    uint32_t                  pb_post_css_mask_pops = 0;
     // Seam mirror split marker: set when the seam stream's CSS_ENTERED
     // op applies. Before it, seam INPUTs are the host's results-screen
     // presses (discarded -- the viewer advances its own results on
@@ -2792,26 +2796,29 @@ void ApplySessionEvent(const SessionEvent& ev) {
             // ExitProcess (observed: replay-phase instance stuck at its
             // results screen after the Phase F boundary rework).
             {
-                static int s_seam_mode = -1;
-                if (s_seam_mode < 0) {
+                static int s_live_spec = -1;
+                if (s_live_spec < 0) {
                     const char* rp = std::getenv("FM2K_REPLAY_FILE");
-                    const char* sm = std::getenv("FM2K_SPEC_SEAM");
-                    // Default OFF: a state-synced viewer replays the
-                    // boundary 1:1 (pure lockstep -- the engine's own
-                    // determinism mirrors results/CSS/locks/colors and
-                    // enters battle at the host's exact relative frame).
-                    // The SEAM/hold/pin machinery (FM2K_SPEC_SEAM=1) is
-                    // the fallback if pure replay ever desyncs a
-                    // boundary; it trades fidelity for forced outcomes.
-                    s_seam_mode = (!(rp && rp[0]) && sm && sm[0] == '1') ? 1 : 0;
+                    s_live_spec = (rp && rp[0]) ? 0 : 1;
                 }
-                if (s_seam_mode == 1) {
+                if (s_live_spec == 1) {
+                    // LEAN seam: pure 1:1 replay through the boundary
+                    // with exactly two thin protections --
+                    //  (a) discard-until-CSS_ENTERED once the local CSS
+                    //      opens, so the mirror starts at the host's CSS
+                    //      frame 0 even when the two results screens'
+                    //      frame counts drift by a few frames;
+                    //  (b) a short confirm mask at CSS open, because CSS
+                    //      init clears the input-edge state and the first
+                    //      consumed input (battle-tail attack bits)
+                    //      otherwise registers as a rising confirm for
+                    //      both players at their carried cursors (locked
+                    //      7/24 five seconds before the host confirmed
+                    //      17/6, 2026-06-11).
+                    // No pinning, no synthetic CSS walk, no forced locks:
+                    // the players' real confirms drive everything.
                     g_state.pb_boundary = State::PbBoundary::SEAM;
                     g_state.pb_css_marker_seen = false;
-                    const uint32_t cur_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-                    g_state.pb_boundary_left_battle = (cur_mode < 3000u);
-                    CssAutoConfirm_SetSeamHold(true,
-                        g_state.pb_p1_color, g_state.pb_p2_color);
                 }
             }
             const auto& p = ev.u.match_end;
@@ -4065,37 +4072,15 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
             }
         }
         if (g_state.pb_boundary == State::PbBoundary::SEAM) {
-            if (!g_state.pb_css_marker_seen) {
-                // Results segment: discard the host's results-screen
-                // presses (their pacing can't align with ours) while
-                // applying any ops that reach the head -- one of them is
-                // CSS_ENTERED, which flips the marker and ends this phase.
-                while (!g_state.pb_queue.empty() &&
-                       !g_state.pb_css_marker_seen) {
-                    const SessionEvent& head = g_state.pb_queue.front();
-                    if (head.type != SessionEventType::INPUT) {
-                        ApplySessionEvent(head);
-                    }
-                    g_state.pb_queue.erase(g_state.pb_queue.begin());
-                }
-                if (!g_state.subscribed_upstream) return false;
-                // Advance our own results on a synthetic confirm edge;
-                // neutral once our CSS opens (waiting for the marker).
-                uint16_t synthetic = 0;
-                if (mode != 2000u) {
-                    static uint32_t s_seam_tick2 = 0;
-                    synthetic = (s_seam_tick2++ & 1u) ? 0x010u : 0u;
-                }
-                g_state.pb_current_p1 = synthetic;
-                g_state.pb_current_p2 = synthetic;
-                if (p1_input) *p1_input = synthetic;
-                if (p2_input) *p2_input = synthetic;
-                return true;
-            }
-            if (mode >= 3000u) {
-                // Marker seen but our results screens aren't done: hold
-                // the CSS inputs (they mirror from CSS frame 0) and keep
-                // walking the results on synthetic edges.
+            if (mode >= 3000u && !g_state.pb_css_marker_seen) {
+                // Our results screens are still running: replay the
+                // host's results inputs 1:1 (battle-end state matched,
+                // so the pacing matches). Fall through to the normal pop.
+            } else if (mode >= 3000u && g_state.pb_css_marker_seen) {
+                // Stream already reached the host's CSS but our results
+                // overran by a few frames: park the CSS inputs (they
+                // mirror from CSS frame 0) and walk the remaining
+                // results on synthetic edges.
                 if (!g_state.subscribed_upstream) return false;
                 static uint32_t s_seam_tick3 = 0;
                 const uint16_t synthetic =
@@ -4105,10 +4090,45 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 if (p1_input) *p1_input = synthetic;
                 if (p2_input) *p2_input = synthetic;
                 return true;
+            } else if (mode == 2000u && !g_state.pb_css_marker_seen) {
+                // Our CSS opened before the stream's CSS_ENTERED: the
+                // remaining head INPUTs are the host's results tail --
+                // discard them (apply ops; one is the marker) and hold
+                // neutral so nothing can advance.
+                while (!g_state.pb_queue.empty() &&
+                       !g_state.pb_css_marker_seen) {
+                    const SessionEvent& head = g_state.pb_queue.front();
+                    if (head.type != SessionEventType::INPUT) {
+                        ApplySessionEvent(head);
+                    }
+                    g_state.pb_queue.erase(g_state.pb_queue.begin());
+                }
+                if (!g_state.subscribed_upstream) return false;
+                g_state.pb_current_p1 = 0;
+                g_state.pb_current_p2 = 0;
+                if (p1_input) *p1_input = 0;
+                if (p2_input) *p2_input = 0;
+                return true;
+            } else {
+                // CSS open + marker seen: the mirror starts at the host's
+                // CSS frame 0. Engage the short confirm mask (eats the
+                // edge-detector echo of the last pre-CSS input) and hand
+                // the boundary over to pure replay.
+                g_state.pb_boundary = State::PbBoundary::NONE;
+                g_state.pb_post_css_mask_pops = 10;
+                CssAutoConfirm_SetSeamHold(true,
+                    g_state.pb_p1_color, g_state.pb_p2_color);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: lean seam -> mirror (CSS aligned at "
+                    "host frame 0, confirm mask 10 pops, q=%zu)",
+                    g_state.pb_queue.size());
+                // fall through to the normal pop
             }
-            // Local CSS open + marker seen: fall through to the normal
-            // pop -- the host's CSS dance mirrors 1:1 from frame 0 (CSS
-            // init reset cursors on both sides).
+        }
+        if (g_state.pb_post_css_mask_pops > 0) {
+            if (--g_state.pb_post_css_mask_pops == 0) {
+                CssAutoConfirm_SetSeamHold(false);
+            }
         }
     }
 
