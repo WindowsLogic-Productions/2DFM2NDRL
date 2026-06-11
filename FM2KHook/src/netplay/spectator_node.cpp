@@ -343,6 +343,11 @@ struct State {
     // deadlock: pending_apply blocks pops, pops are the only road to
     // the apply gate).
     bool                      natural_boot          = false;
+    // Broadcast delay bank built once at CSS open: the mirror start is
+    // held until the queue holds the full bank, so playback never rides
+    // the live edge (riding the edge = every arrival gap stalls the
+    // picture). Players are browsing during the hold -- invisible.
+    bool                      pb_bank_built         = false;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -3282,9 +3287,25 @@ void SpectatorNode_HandleLeave(const sockaddr_in& from) {
 }
 
 void SpectatorNode_HandleHeartbeat(const sockaddr_in& from) {
+    // Viewer side: an echo from the upstream is the gameplay-independent
+    // liveness proof. The session-derived datagram flow stops whenever
+    // the host is between sessions (CSS sync under loss can take many
+    // seconds) and the silence failover then read a healthy-but-quiet
+    // host as dead -- the CSS "disconnect/re-subscribe" the user kept
+    // seeing (2026-06-11 14:32).
+    if (g_state.subscribed_upstream &&
+        AddrEqual(from, g_state.upstream_addr)) {
+        g_state.last_udp_recv_ms = GetTickCount64();
+        return;
+    }
     for (auto& sub : g_state.subscribers) {
         if (AddrEqual(sub.addr, from)) {
             sub.last_seen_ms = GetTickCount64();
+            // Echo so the viewer's liveness clock ticks even when no
+            // session is confirming frames (1Hz, 16 bytes).
+            CtrlPacket hb = {};
+            hb.header.type = CtrlMsg::SPEC_HEARTBEAT;
+            ControlChannel_SendTo(hb, sub.addr);
             return;
         }
     }
@@ -4255,6 +4276,18 @@ void SpectatorNode_KickJoin() {
 
 static uint64_t g_last_input_admit_ms = 0;
 void SpectatorNode_StampInputAdmit() { g_last_input_admit_ms = GetTickCount64(); }
+
+static size_t SpecDelayBankFrames() {
+    static size_t v = []() -> size_t {
+        const char* e = std::getenv("FM2K_SPEC_DELAY");
+        if (e && e[0]) {
+            const long n = std::strtol(e, nullptr, 10);
+            if (n >= 50 && n <= 2000) return (size_t)n;
+        }
+        return 300;
+    }();
+    return v;
+}
 uint32_t SpectatorNode_MsSinceLastAdmit() {
     if (g_last_input_admit_ms == 0) return 0;  // nothing admitted yet
     return (uint32_t)(GetTickCount64() - g_last_input_admit_ms);
@@ -4454,6 +4487,34 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 // stray edge; released in the post-release guard below.
                 if (mode_now == 2000u) {
                     CssAutoConfirm_SetSeamHold(true, 0xFF, 0xFF);  // mask only
+                }
+            }
+            // Bank-building hold: once our CSS is open, do NOT start the
+            // mirror until the queue holds the full delay bank -- the
+            // players are browsing during this, so the extra idle
+            // seconds are invisible, and playback then runs the entire
+            // session a fixed bank behind live (arrival gaps shorter
+            // than the bank never reach the picture). 15s safety cap
+            // for short host CSS phases.
+            if (s_css_reached && g_state.natural_boot &&
+                !g_state.pb_bank_built && mode_now == 2000u) {
+                static uint64_t s_bank_start_ms = 0;
+                const uint64_t bnow = GetTickCount64();
+                if (s_bank_start_ms == 0) s_bank_start_ms = bnow;
+                if (g_state.pb_queue.size() >= SpecDelayBankFrames() ||
+                    bnow - s_bank_start_ms > 15000) {
+                    g_state.pb_bank_built = true;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: delay bank built (q=%zu, %llums) "
+                        "-- mirror starting",
+                        g_state.pb_queue.size(),
+                        (unsigned long long)(bnow - s_bank_start_ms));
+                } else {
+                    g_state.pb_current_p1 = 0;
+                    g_state.pb_current_p2 = 0;
+                    if (p1_input) *p1_input = 0;
+                    if (p2_input) *p2_input = 0;
+                    return true;
                 }
             }
             if (!s_css_reached) {
