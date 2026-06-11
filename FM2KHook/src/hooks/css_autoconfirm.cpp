@@ -197,6 +197,54 @@ char __cdecl Hook_GameStateManager() {
                 g_seam_hold_p1_color.load(std::memory_order_relaxed);
             *(int32_t*)(ADDR_CHARSLOT0_COLOR_PICK + 1 * CHARSLOT_STRIDE_BYTES) =
                 g_seam_hold_p2_color.load(std::memory_order_relaxed);
+
+            // [SEAM-CSS] 1Hz: is the mirror actually moving this CSS?
+            // Pairs with [HOST-CSS] below for a side-by-side diff.
+            static uint64_t s_seam_css_log_ms = 0;
+            const uint64_t now_ms = GetTickCount64();
+            if (now_ms - s_seam_css_log_ms >= 1000) {
+                s_seam_css_log_ms = now_ms;
+                const int* p1c = (const int*)ADDR_P1_CURSOR_POS;
+                const int* p2c = (const int*)ADDR_P2_CURSOR_POS;
+                const int* sel = (const int*)ADDR_SELECTED_CHAR;
+                const uint32_t* proc = (const uint32_t*)ADDR_PROCESSED_INPUT;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[SEAM-CSS] p1@(%d,%d) p2@(%d,%d) sel=%d/%d "
+                    "in=0x%03X/0x%03X timer=%u demo=%u",
+                    p1c[0], p1c[1], p2c[0], p2c[1], sel[0], sel[1],
+                    proc[0], proc[1],
+                    *(uint32_t*)0x424F00u, *(uint32_t*)0x47010Cu);
+            }
+        }
+    }
+
+    // [HOST-CSS] 1Hz mirror reference: any non-spectator instance at CSS
+    // logs the same fields so a seam-mirror diff is one grep away.
+    {
+        static int s_is_spec2 = -1;
+        if (s_is_spec2 < 0) {
+            const char* v = std::getenv("FM2K_SPECTATOR_MODE");
+            s_is_spec2 = (v && v[0] == '1') ? 1 : 0;
+        }
+        if (s_is_spec2 == 0 &&
+            *(uint32_t*)ADDR_GAME_MODE == 2000u) {
+            static uint64_t s_host_css_log_ms = 0;
+            const uint64_t now_ms = GetTickCount64();
+            if (now_ms - s_host_css_log_ms >= 1000) {
+                s_host_css_log_ms = now_ms;
+                const int* p1c = (const int*)ADDR_P1_CURSOR_POS;
+                const int* p2c = (const int*)ADDR_P2_CURSOR_POS;
+                const int* sel = (const int*)ADDR_SELECTED_CHAR;
+                const uint32_t* proc = (const uint32_t*)ADDR_PROCESSED_INPUT;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[HOST-CSS] p1@(%d,%d) p2@(%d,%d) sel=%d/%d "
+                    "in=0x%03X/0x%03X act=%u/%u timer=%u demo=%u",
+                    p1c[0], p1c[1], p2c[0], p2c[1], sel[0], sel[1],
+                    proc[0], proc[1],
+                    *(uint32_t*)ADDR_P1_ACTION_STATE,
+                    *(uint32_t*)ADDR_P2_ACTION_STATE,
+                    *(uint32_t*)0x424F00u, *(uint32_t*)0x47010Cu);
+            }
         }
     }
 
