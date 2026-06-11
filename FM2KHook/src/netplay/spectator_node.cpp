@@ -2077,21 +2077,21 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // and a forward jump (anchor ahead of us, e.g. re-join landing in the
     // NEXT match) also applies.
     if (g_state.have_frame_baseline && g_state.pb_snapshot_applied_once) {
-        uint32_t queued_inputs = 0;
-        for (const auto& ev : g_state.pb_queue) {
-            if (ev.type == SessionEventType::INPUT) ++queued_inputs;
-        }
-        const uint32_t consumed_pos =
-            (g_state.next_expected_frame > queued_inputs)
-                ? g_state.next_expected_frame - queued_inputs : 0;
-        if (consumed_pos > inbox.anchor_frame) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "SpectatorNode: discarding re-join snapshot (anchor=%u "
-                "behind consumed=%u) -- already playing past it",
-                inbox.anchor_frame, consumed_pos);
-            inbox = State::SnapshotInbox{};
-            return;
-        }
+        // Re-join snapshots NEVER re-apply. Backward anchors would rewind
+        // the sim under a live-edge queue; forward anchors (re-join lands
+        // in a LATER match) would overwrite the char slots with the new
+        // match's dynamic data while the locally loaded .player files are
+        // still the old characters -- the sprite renderer reads mismatched
+        // image descriptors and AVs (observed 2026-06-11, 0x40CD47, 100ms
+        // after a fast-forward apply). Proper forward-jump support needs a
+        // re-BTB (reload files for the announced chars) -- future work.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "SpectatorNode: discarding re-join snapshot (anchor=%u, "
+            "already initialized this session) -- continuing on the "
+            "event stream",
+            inbox.anchor_frame);
+        inbox = State::SnapshotInbox{};
+        return;
     }
 
     if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
@@ -4461,6 +4461,11 @@ void SpectatorNode_TickHealth() {
     // back to. Throttle so we don't spam JOIN_REQ.
     if (!g_state.subscribed_upstream &&
         g_state.root_addr.sin_port != 0 &&
+        // Never fire a new JOIN while an upstream connection exists --
+        // the host's existing-sub re-JOIN path drops connections from
+        // our addr, so a retry during an in-flight handshake/backfill
+        // kills its own transfer ("End of stream" loop, 2026-06-11).
+        !SpectatorTCP::IsUpstreamConnected() &&
         now - g_state.last_reconnect_attempt_ms >= SPECTATOR_RECONNECT_BACKOFF_MS)
     {
         char buf[48] = {}; FormatAddr(g_state.root_addr, buf, sizeof(buf));
