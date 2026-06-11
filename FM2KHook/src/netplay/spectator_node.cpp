@@ -2129,11 +2129,12 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // and always captured at battle entry; the captured==0 fallback
     // keeps that wire compat with the v0.2.41 default of
     // `game_mode >= 3000`.
-    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-    const uint32_t captured  = inbox.meta.captured_game_mode;
-    const uint32_t apply_gate = (captured == 0u) ? 3000u : captured;
-    if (game_mode < apply_gate) return;
-
+    // Re-join discard runs BEFORE the phase wait: a snapshot we will
+    // never apply must not sit in pending_apply waiting for a phase
+    // the held pops can never reach. (Captured-at-3000 snapshot +
+    // viewer at CSS = circular deadlock: apply waits for mode 3000,
+    // mode 3000 needs pops, pops wait on pending_apply. Froze the
+    // viewer at q=395 with the stream healthy, 2026-06-11.)
     // Re-join guard (Phase F): a TCP-death re-JOIN makes the host re-ship
     // its cached snapshot. If our sim has already CONSUMED past the
     // snapshot's anchor, loading it would rewind the engine to the anchor
@@ -2160,6 +2161,11 @@ void SpectatorNode_ApplyPendingSnapshot() {
         inbox = State::SnapshotInbox{};
         return;
     }
+
+    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    const uint32_t captured  = inbox.meta.captured_game_mode;
+    const uint32_t apply_gate = (captured == 0u) ? 3000u : captured;
+    if (game_mode < apply_gate) return;
 
     if (!SaveState_LoadFromBytes(inbox.blob.data(), inbox.blob.size())) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
