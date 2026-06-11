@@ -53,6 +53,13 @@ uint16_t Hook_ApplySOCD_Public(uint16_t input);
 // this exact mismatch.
 uint16_t Hook_ComputeAutoplayBattleInput(int player_id);
 
+// CSS counterpart (FM2K_PARITY_AUTOPLAY + FM2K_AUTOPLAY_CSS_DWELL):
+// wander/dwell/confirm synthetic input for one player, returns 0 when
+// game_mode != 2000. Netplay_ProcessCSS feeds this into the CSS
+// GekkoSession for the LOCAL player so both peers' sims consume the
+// identical lockstep stream (split-brain fix, 2026-06-11).
+uint16_t Hook_ComputeAutoplayCssInput(int player_id);
+
 // Flush the buffered FM2K_RNG_TRACE=1 log to disk. Called by the
 // harness auto-terminate path before TerminateProcess to avoid losing
 // trace bytes that are still in stdio's user-space buffer. Safe no-op

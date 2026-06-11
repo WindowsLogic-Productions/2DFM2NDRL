@@ -160,7 +160,10 @@ void ControlChannel_SendBattleAck();
 // swap_frame carries the proposed CSS-session frame at which to swap CSS
 // session for battle session. Both peers compute swap_frame = local_css_frame
 // + SWAP_FRAME_BUFFER and exchange; receiver takes max(local, remote).
-void ControlChannel_SendBattleEntering(uint32_t swap_frame);
+// epoch = barrier instance counter (0 for legacy peers); flags bit0 =
+// sender has completed this barrier (see CtrlPacket.sync).
+void ControlChannel_SendBattleEntering(uint32_t swap_frame, uint8_t epoch = 0,
+                                       uint8_t flags = 0);
 
 // Send battle start (both sides ready)
 void ControlChannel_SendBattleStart(uint32_t start_frame);
@@ -168,8 +171,10 @@ void ControlChannel_SendBattleStart(uint32_t start_frame);
 // Send battle end (game_mode left the [3000,4000) range).
 // swap_frame carries the proposed battle-session frame at which to destroy
 // the battle session and create a CSS session for the next match. Same
-// max(local, remote) convergence as BATTLE_ENTERING.
-void ControlChannel_SendBattleEnd(uint32_t swap_frame);
+// max(local, remote) convergence as BATTLE_ENTERING; same epoch/flags
+// semantics.
+void ControlChannel_SendBattleEnd(uint32_t swap_frame, uint8_t epoch = 0,
+                                  uint8_t flags = 0);
 
 // Host pushes its current match settings (selected stage, round count, time
 // limit, game speed, SOCD mode) to client + spectators. Receiver mem-writes

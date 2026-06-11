@@ -685,6 +685,62 @@ uint16_t Hook_ComputeAutoplayBattleInput(int player_id) {
     return out;
 }
 
+// CSS counterpart of Hook_ComputeAutoplayBattleInput: the wander/dwell/
+// confirm synthetic input for ONE player. Two call sites:
+//   - Hook_GetPlayerInput's FM2K_PARITY_AUTOPLAY block (offline / stress:
+//     called for both player_ids, drives the engine directly), and
+//   - Netplay_ProcessCSS (netplay: called for the LOCAL player only, fed
+//     into the CSS GekkoSession so BOTH peers' sims consume the identical
+//     lockstep stream).
+// The netplay call site is the fix for the 2026-06-11 split-brain: the
+// old in-hook block short-circuited the CSS netplay branch and each
+// peer's sim ran on locally-hashed inputs for BOTH players. The hashes
+// key off local counters (buf_idx, dwell entry tick) which skew under
+// packet loss, so the two sims locked different chars at different
+// frames (P1 flipped at css_frame=733, P2 at 3796) and every rematch
+// downstream failure traced here. All cadence/state below derives from
+// g_input_buffer_index (0x447EE0), never call counters, so the value is
+// stable within a tick and replay-deterministic.
+uint16_t Hook_ComputeAutoplayCssInput(int player_id) {
+    static int s_dwell = -1;
+    if (s_dwell < 0) {
+        const char* v = std::getenv("FM2K_AUTOPLAY_CSS_DWELL");
+        s_dwell = v ? (int)(std::atof(v) * 100.0) : 0;
+        if (s_dwell < 0) s_dwell = 0;
+    }
+    static bool     s_in_css = false;
+    static uint32_t s_entry_buf = 0;
+    const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    if (game_mode != 2000u) {
+        s_in_css = false;
+        return 0;
+    }
+    const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+    if (!s_in_css) { s_in_css = true; s_entry_buf = buf_idx; }
+    const uint32_t in_css = buf_idx - s_entry_buf;
+    if (s_dwell > 0 && in_css < (uint32_t)s_dwell) {
+        // Wander: direction (or idle) stable for ~20-frame steps. Per-player
+        // offset gives P1/P2 independent browsing.
+        const uint32_t step = in_css / 20u;
+        uint32_t h = (step + 1u) * 0x9E3779B9u ^ ((uint32_t)player_id << 16);
+        h = (h ^ (h >> 16)) * 0x7feb352du;
+        h ^= h >> 15;
+        return (h & 1u) ? (uint16_t)(1u << ((h >> 1) & 3u)) : (uint16_t)0u;
+    }
+    if ((in_css % 30u) == 0u) {
+        if (s_dwell > 0) {
+            // Post-dwell confirm: button derived from the dwell hash ->
+            // colors 0..3 vary per player/match.
+            uint32_t h = (buf_idx / 64u + 1u) * 0x85EBCA6Bu
+                       ^ ((uint32_t)player_id << 8);
+            h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+            return (uint16_t)(1u << (4 + (h & 3u)));
+        }
+        return 0x010u;  // legacy instant-confirm pulse
+    }
+    return 0;
+}
+
 static inline uint16_t Hook_ApplySOCD(uint16_t input) {
     constexpr uint16_t LEFT  = 0x001;
     constexpr uint16_t RIGHT = 0x002;
@@ -1318,44 +1374,14 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
                 // instant-confirm. Real players move around at CSS for
                 // 5-30s; the instant mash never exercised the spectator
                 // seam hold (or the host's own CSS phase) at realistic
-                // durations.
-                static int s_css_dwell_frames = -1;
-                if (s_css_dwell_frames < 0) {
-                    const char* v = std::getenv("FM2K_AUTOPLAY_CSS_DWELL");
-                    s_css_dwell_frames = v ? (int)(std::atof(v) * 100.0) : 0;
-                    if (s_css_dwell_frames < 0) s_css_dwell_frames = 0;
+                // durations. Body lives in Hook_ComputeAutoplayCssInput so
+                // the netplay path (Netplay_ProcessCSS) can feed the SAME
+                // values into the CSS GekkoSession for the local player.
+                if (game_mode == 2000u) {
+                    out = Hook_ComputeAutoplayCssInput(player_id);
+                } else if ((frame % 30u) == 0u) {
+                    out = Z;
                 }
-                static bool     s_in_css = false;
-                static uint32_t s_css_entry_buf = 0;
-                const uint32_t buf_idx = *(uint32_t*)0x447EE0;
-                if (game_mode == 2000u && s_css_dwell_frames > 0) {
-                    if (!s_in_css) { s_in_css = true; s_css_entry_buf = buf_idx; }
-                    const uint32_t in_css = buf_idx - s_css_entry_buf;
-                    if (in_css < (uint32_t)s_css_dwell_frames) {
-                        // Wander: direction (or idle) stable for ~20-frame
-                        // steps, derived from buf_idx so record/replay see
-                        // identical inputs. Per-player offset gives P1/P2
-                        // independent browsing.
-                        const uint32_t step = in_css / 20u;
-                        uint32_t h = (step + 1u) * 0x9E3779B9u
-                                   ^ ((uint32_t)player_id << 16);
-                        h = (h ^ (h >> 16)) * 0x7feb352du;
-                        h ^= h >> 15;
-                        out = (h & 1u) ? (uint16_t)(1u << ((h >> 1) & 3u))
-                                       : 0u;
-                    } else if ((frame % 30u) == 0u) {
-                        // Post-dwell confirm: button derived from the
-                        // dwell hash -> colors 0..3 vary per player/match.
-                        uint32_t h = (buf_idx / 64u + 1u) * 0x85EBCA6Bu
-                                   ^ ((uint32_t)player_id << 8);
-                        h = (h ^ (h >> 13)) * 0xC2B2AE35u;
-                        out = (uint16_t)(1u << (4 + (h & 3u)));
-                    }
-                } else {
-                    if (game_mode != 2000u) s_in_css = false;
-                    if ((frame % 30u) == 0u) out = Z;
-                }
-                if (game_mode != 2000u) s_in_css = false;
             }
             // mode >= 3000: idle (out stays 0)
             //
@@ -1496,8 +1522,20 @@ int __cdecl Hook_GetPlayerInput(int player_id, int input_type) {
             // SAME autoplay value via the netplay.cpp gekko_add_local_input
             // path). End result: engine input == spec-stream input == .fm2krep
             // input — replay reproduces record deterministically.
+            //
+            // Same rule for CSS netplay (2026-06-11 split-brain fix): the
+            // engine must consume Netplay_GetCSSInput (the lockstep-
+            // delivered pair) — Netplay_ProcessCSS feeds our local
+            // autoplay value into the session via
+            // Hook_ComputeAutoplayCssInput. Short-circuiting here ran each
+            // peer's sim on locally-hashed inputs for BOTH players; local
+            // counter skew under packet loss made P1's sim lock chars at
+            // css_frame=733 while P2's sim browsed to 3796 — different
+            // chars, different colors, doomed rematch.
             if (game_mode >= 3000u && game_mode < 4000u && Netplay_IsActive()) {
                 // Skip return; let the netplay branch handle it.
+            } else if (IsCSSMode(game_mode) && Netplay_IsConnected()) {
+                // Skip return; let the CSS netplay branch handle it.
             } else {
                 return capture_and_return((int)out);
             }

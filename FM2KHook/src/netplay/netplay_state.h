@@ -183,9 +183,23 @@ struct CtrlPacket {
             uint32_t game_hash; // Game version hash (for compatibility check)
         } hello;
 
-        // BATTLE_START / frame sync data
+        // BATTLE_START / BATTLE_ENTERING / BATTLE_END frame sync data.
+        // epoch/flags are used by the swap barriers only; BATTLE_START
+        // and older builds leave them 0.
+        //   epoch: barrier instance counter (1..255, wraps skipping 0).
+        //          Both peers arm the entry/end barriers in the same
+        //          order (CSS session up / battle session up are both
+        //          bilateral rendezvous), so the counters stay in step.
+        //          0 = legacy peer, treated as wildcard.
+        //   flags bit0: sender has COMPLETED this barrier (has both
+        //          signals). A completed sender answers retries from a
+        //          lagging peer; nobody echoes back to a completed
+        //          sender (storm termination).
         struct {
-            uint32_t frame;     // Frame number
+            uint32_t frame;     // Frame number / proposed swap frame
+            uint8_t  epoch;
+            uint8_t  flags;
+            uint8_t  pad[2];
         } sync;
 
         // CHAT data — short messages (gg, wp, ez, etc.). Longer chat goes

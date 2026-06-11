@@ -394,6 +394,39 @@ static bool     g_battle_end_synced          = false;
 static uint32_t g_battle_end_swap_frame      = 0;
 static bool     g_battle_end_armed           = false;
 
+// Barrier epoch + completion records (deafness fix, 2026-06-11). The old
+// protocol had a fatal asymmetry under loss: peer B completes the barrier
+// the instant it has A's signal, swaps sessions, and disarms ~30ms later.
+// If B's OWN signal packets were all lost in flight, A keeps resending
+// into a peer that now drops everything at the armed gate without
+// answering — A wedges in the barrier indefinitely (observed: 593
+// BATTLE_ENTERING resends over 36s). With B's signal sent effectively
+// once or twice in the short window, that's roughly a coin-flip per
+// barrier at 20% loss. Fix: a peer that COMPLETED a barrier keeps
+// ANSWERING retries for that barrier instance (identified by epoch)
+// with a completed-flag signal, so the lagging peer can always finish.
+// The epoch tag replaces "armed window" as the stale-vs-current
+// disambiguator for these answers: both peers arm entry/end barriers in
+// the same order (CSS-session-up / battle-session-up are bilateral
+// rendezvous), so a uint8 counter stays in step; 0 is reserved for
+// legacy peers and treated as a wildcard.
+static uint8_t  g_barrier_epoch        = 0;  // last assigned instance id
+static uint8_t  g_entry_epoch          = 0;  // armed entry barrier instance
+static uint8_t  g_end_epoch            = 0;  // armed end barrier instance
+static uint8_t  g_entry_done_epoch     = 0;  // last COMPLETED entry instance
+static uint8_t  g_end_done_epoch       = 0;  // last COMPLETED end instance
+static uint32_t g_entry_done_ms        = 0;  // completion wall-clock (legacy TTL)
+static uint32_t g_end_done_ms          = 0;
+// Proposal pair captured for the divergence diagnostic at completion.
+static uint32_t g_entry_local_proposal  = 0;
+static uint32_t g_entry_remote_proposal = 0;
+
+static uint8_t NextBarrierEpoch() {
+    ++g_barrier_epoch;
+    if (g_barrier_epoch == 0) g_barrier_epoch = 1;  // 0 = legacy wildcard
+    return g_barrier_epoch;
+}
+
 // Frames of slack added to the proposed swap_frame so both peers have time
 // to drain in-flight inputs and converge their proposals before reaching it.
 // 8 @ 100 FPS = 80ms — comfortably above typical RTT. Tunable.
@@ -616,6 +649,8 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
 
         case CtrlMsg::BATTLE_ENTERING: {
             const uint32_t remote_proposal = packet->data.sync.frame;
+            const uint8_t  remote_epoch    = packet->data.sync.epoch;
+            const bool     remote_done     = (packet->data.sync.flags & 0x1) != 0;
             // Spectator-side handling: this is host telling us about the
             // upcoming CSS->battle swap. Flip our SpectateSession to battle
             // config. (Spectators don't participate in proposal convergence —
@@ -626,19 +661,46 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             }
             // Reject stale carryover from a previous match. g_battle_entry_armed
             // is true ONLY between "new CSS session up" and "battle session
-            // started" — outside that window, an incoming BATTLE_ENTERING is
-            // either a delayed packet from the prior match (which would
-            // otherwise pre-poison g_battle_entry_swap_frame for the next
-            // match) or a duplicate from the current battle's echo storm
-            // (which has nothing to do but keep both peers latched in the
-            // ping-pong forever).
-            if (!g_battle_entry_armed) {
-                static uint32_t s_drop_count = 0;
-                if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: ignoring out-of-window BATTLE_ENTERING "
-                        "(swap=%u, drop#%u) — armed=false",
-                        remote_proposal, (unsigned)s_drop_count);
+            // started"; the epoch tag additionally rejects packets from a
+            // DIFFERENT barrier instance that happen to land inside our
+            // armed window.
+            const bool epoch_current =
+                (remote_epoch == 0) || (remote_epoch == g_entry_epoch);
+            if (!g_battle_entry_armed || !epoch_current) {
+                // Answer-after-complete: the peer is still retrying a
+                // barrier WE already passed (its copies of our signal were
+                // lost). Answer with a completed-flag signal so it can
+                // finish too — without this the lagging peer wedges
+                // forever resending into a disarmed gate. Never answer a
+                // sender that is itself completed (storm termination), and
+                // for legacy epoch-0 peers bound the answers to a 10s TTL
+                // after our completion so true stale packets die out.
+                const bool answers =
+                    !remote_done && g_entry_done_epoch != 0 &&
+                    (remote_epoch == g_entry_done_epoch ||
+                     (remote_epoch == 0 &&
+                      GetTickCount() - g_entry_done_ms < 10000));
+                if (answers) {
+                    static uint32_t s_last_answer_ms = 0;
+                    const uint32_t now_ms = GetTickCount();
+                    if (now_ms - s_last_answer_ms >= 250) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Netplay: answering completed entry-barrier retry "
+                            "(epoch=%u swap=%u)", remote_epoch, remote_proposal);
+                        ControlChannel_SendBattleEntering(
+                            remote_proposal, g_entry_done_epoch, 0x1);
+                        s_last_answer_ms = now_ms;
+                    }
+                } else {
+                    static uint32_t s_drop_count = 0;
+                    if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Netplay: ignoring out-of-window BATTLE_ENTERING "
+                            "(swap=%u epoch=%u done=%d, drop#%u) — armed=%d our_epoch=%u",
+                            remote_proposal, remote_epoch, (int)remote_done,
+                            (unsigned)s_drop_count, (int)g_battle_entry_armed,
+                            g_entry_epoch);
+                    }
                 }
                 break;
             }
@@ -648,23 +710,29 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
                 g_battle_entry_swap_frame = remote_proposal;
             }
             g_remote_battle_entered = true;
+            g_entry_remote_proposal = remote_proposal;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received BATTLE_ENTERING (remote_swap=%u, prev_agreed=%u, agreed=%u)",
-                remote_proposal, prev_agreed, g_battle_entry_swap_frame);
+                "Netplay: Received BATTLE_ENTERING (remote_swap=%u, prev_agreed=%u, agreed=%u, epoch=%u, done=%d)",
+                remote_proposal, prev_agreed, g_battle_entry_swap_frame,
+                remote_epoch, (int)remote_done);
 
             // Echo our own BATTLE_ENTERING back if we've already signaled
             // locally — needed for the lossy-network case where remote
             // received our signal but their echo to us was dropped.
-            // Without rate-limiting, both peers echo every echo from the
-            // other and we get an infinite ping-pong storm (observed
-            // hundreds of sends in a single millisecond). 100ms cap is
-            // far below the swap-frame transition window so packet-loss
-            // recovery still works, but the storm can't run away.
-            if (g_local_battle_entered) {
+            // Skipped when the sender is already completed (it has our
+            // signal by definition). Without rate-limiting, both peers
+            // echo every echo from the other and we get an infinite
+            // ping-pong storm (observed hundreds of sends in a single
+            // millisecond). 100ms cap is far below the swap-frame
+            // transition window so packet-loss recovery still works, but
+            // the storm can't run away.
+            if (g_local_battle_entered && !remote_done) {
                 static uint32_t last_echo_ms = 0;
                 const uint32_t now_ms = GetTickCount();
                 if (now_ms - last_echo_ms >= 100) {
-                    ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+                    ControlChannel_SendBattleEntering(
+                        g_battle_entry_swap_frame, g_entry_epoch,
+                        g_battle_synced ? 0x1 : 0x0);
                     last_echo_ms = now_ms;
                 }
             }
@@ -673,21 +741,45 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
 
         case CtrlMsg::BATTLE_END: {
             const uint32_t remote_proposal = packet->data.sync.frame;
+            const uint8_t  remote_epoch    = packet->data.sync.epoch;
+            const bool     remote_done     = (packet->data.sync.flags & 0x1) != 0;
             if (g_session_kind == SessionKind::SPECTATE) {
                 Netplay_OnHostBattleEnd(remote_proposal);
                 break;
             }
-            // Same stale-carryover gate as BATTLE_ENTERING. Armed when the
-            // battle GekkoSession comes up; cleared in Netplay_EndBattle.
-            // Outside that window the only thing a BATTLE_END packet can do
-            // is poison the next match's battle-end barrier.
-            if (!g_battle_end_armed) {
-                static uint32_t s_drop_count = 0;
-                if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Netplay: ignoring out-of-window BATTLE_END "
-                        "(swap=%u, drop#%u) — armed=false",
-                        remote_proposal, (unsigned)s_drop_count);
+            // Same stale-carryover gate + epoch check + answer-after-
+            // complete as BATTLE_ENTERING (see that handler for the full
+            // rationale). Armed when the battle GekkoSession comes up;
+            // cleared in Netplay_EndBattle.
+            const bool epoch_current =
+                (remote_epoch == 0) || (remote_epoch == g_end_epoch);
+            if (!g_battle_end_armed || !epoch_current) {
+                const bool answers =
+                    !remote_done && g_end_done_epoch != 0 &&
+                    (remote_epoch == g_end_done_epoch ||
+                     (remote_epoch == 0 &&
+                      GetTickCount() - g_end_done_ms < 10000));
+                if (answers) {
+                    static uint32_t s_last_answer_ms = 0;
+                    const uint32_t now_ms = GetTickCount();
+                    if (now_ms - s_last_answer_ms >= 250) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Netplay: answering completed end-barrier retry "
+                            "(epoch=%u swap=%u)", remote_epoch, remote_proposal);
+                        ControlChannel_SendBattleEnd(
+                            remote_proposal, g_end_done_epoch, 0x1);
+                        s_last_answer_ms = now_ms;
+                    }
+                } else {
+                    static uint32_t s_drop_count = 0;
+                    if (s_drop_count++ < 8 || (s_drop_count & 0x3F) == 0) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Netplay: ignoring out-of-window BATTLE_END "
+                            "(swap=%u epoch=%u done=%d, drop#%u) — armed=%d our_epoch=%u",
+                            remote_proposal, remote_epoch, (int)remote_done,
+                            (unsigned)s_drop_count, (int)g_battle_end_armed,
+                            g_end_epoch);
+                    }
                 }
                 break;
             }
@@ -697,15 +789,19 @@ static void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) 
             }
             g_remote_battle_end_signaled = true;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Netplay: Received BATTLE_END (remote_swap=%u, prev_agreed=%u, agreed=%u)",
-                remote_proposal, prev_agreed, g_battle_end_swap_frame);
+                "Netplay: Received BATTLE_END (remote_swap=%u, prev_agreed=%u, agreed=%u, epoch=%u, done=%d)",
+                remote_proposal, prev_agreed, g_battle_end_swap_frame,
+                remote_epoch, (int)remote_done);
 
-            // Same rate-limited echo as BATTLE_ENTERING.
-            if (g_local_battle_end_signaled) {
+            // Same rate-limited echo as BATTLE_ENTERING; skipped when the
+            // sender is already completed.
+            if (g_local_battle_end_signaled && !remote_done) {
                 static uint32_t last_echo_ms = 0;
                 const uint32_t now_ms = GetTickCount();
                 if (now_ms - last_echo_ms >= 100) {
-                    ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+                    ControlChannel_SendBattleEnd(
+                        g_battle_end_swap_frame, g_end_epoch,
+                        g_battle_end_synced ? 0x1 : 0x0);
                     last_echo_ms = now_ms;
                 }
             }
@@ -874,6 +970,18 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
     g_battle_end_synced          = false;
     g_battle_end_swap_frame      = 0;
     g_battle_end_armed           = false;
+
+    // Fresh connection — restart the barrier epoch sequence on both sides.
+    // (Netplay_EndBattle deliberately does NOT touch these: the completion
+    // records must survive into the next CSS so a lagging peer's barrier
+    // retries still get answered.)
+    g_barrier_epoch    = 0;
+    g_entry_epoch      = 0;
+    g_end_epoch        = 0;
+    g_entry_done_epoch = 0;
+    g_end_done_epoch   = 0;
+    g_entry_done_ms    = 0;
+    g_end_done_ms      = 0;
 
     // Reset handshake
     g_received_hello = false;
@@ -1233,8 +1341,12 @@ bool Netplay_ProcessCSS() {
         // Arm BATTLE_ENTERING acceptance for this match. Stale packets from
         // the prior match arriving before this point are dropped; from
         // here through the actual battle-session start they're accepted
-        // as legitimate signaling.
+        // as legitimate signaling. The epoch tags this barrier instance —
+        // both peers arm here (bilateral CSS rendezvous) so counters match.
         g_battle_entry_armed = true;
+        g_entry_epoch = NextBarrierEpoch();
+        g_entry_local_proposal  = 0;
+        g_entry_remote_proposal = 0;
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "CSS SYNCED: Both ready, GekkoNet CSS session up, RNG reseeded");
@@ -1271,6 +1383,23 @@ bool Netplay_ProcessCSS() {
         if (s_test_auto_css == 1) {
             static uint32_t s_pulse = 0;
             local_raw = (s_pulse++ & 1) ? 0x010u : 0u;
+        }
+    }
+    // Harness autoplay for netplay CSS (split-brain fix, 2026-06-11):
+    // feed OUR slot with the deterministic wander/dwell/confirm stream
+    // so the CSS dance travels through the lockstep session and both
+    // sims consume the identical (p1, p2) pair. Supersedes the
+    // FM2K_TEST_AUTO_CSS pulse above when both envs are set. Mirrors
+    // the FM2K_PARITY_AUTOPLAY_BATTLE feed in ProcessBattleInputPhase.
+    // Production (env unset) keeps Input_CaptureLocal untouched.
+    {
+        static int s_np_autoplay_css = -1;
+        if (s_np_autoplay_css < 0) {
+            const char* v = std::getenv("FM2K_PARITY_AUTOPLAY");
+            s_np_autoplay_css = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (s_np_autoplay_css == 1) {
+            local_raw = Hook_ComputeAutoplayCssInput((int)g_player_index);
         }
     }
     gekko_add_local_input(g_session, g_player_index, &local_raw);
@@ -1405,7 +1534,8 @@ void Netplay_SignalBattleEntry() {
         g_battle_entry_swap_frame = local_proposal;
     }
     g_local_battle_entered = true;
-    ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+    g_entry_local_proposal = local_proposal;
+    ControlChannel_SendBattleEntering(g_battle_entry_swap_frame, g_entry_epoch, 0);
     BroadcastSwapToSubscribers(CtrlMsg::BATTLE_ENTERING, g_battle_entry_swap_frame);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1428,9 +1558,35 @@ bool Netplay_IsBattleSynced() {
         g_local_battle_entered &&
         g_remote_battle_entered) {
         g_battle_synced = true;
+        // Record completion so the handler can keep ANSWERING the peer's
+        // retries after we disarm (deafness fix — see the state block).
+        g_entry_done_epoch = g_entry_epoch;
+        g_entry_done_ms    = GetTickCount();
+        // Completed-flag announce: saves the lagging peer one retry
+        // round-trip, and tells an already-completed peer to go silent.
+        ControlChannel_SendBattleEntering(g_battle_entry_swap_frame,
+                                          g_entry_epoch, 0x1);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "BATTLE SYNC: both peers signaled (css_frame=%u, swap_frame=%u) - swap CSS->battle now",
-            g_css_frame, g_battle_entry_swap_frame);
+            "BATTLE SYNC: both peers signaled (css_frame=%u, swap_frame=%u, epoch=%u) - swap CSS->battle now",
+            g_css_frame, g_battle_entry_swap_frame, g_entry_epoch);
+        // CSS divergence canary: in lockstep both sims flip to battle at
+        // the same logical frame, so the two proposals should differ by
+        // at most transit skew. A large gap means the CSS sims diverged
+        // (different chars/colors are likely locked on each side) and
+        // the upcoming battle is doomed to desync — make that loudly
+        // visible at the moment it's decided, not minutes later.
+        if (g_entry_local_proposal != 0 && g_entry_remote_proposal != 0) {
+            const uint32_t a = g_entry_local_proposal;
+            const uint32_t b = g_entry_remote_proposal;
+            const uint32_t gap = (a > b) ? (a - b) : (b - a);
+            if (gap > 300) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "BATTLE SYNC: CSS DIVERGENCE SUSPECTED — flip proposals "
+                    "%u frames apart (local=%u remote=%u). Both sims should "
+                    "leave CSS at the same lockstep frame.",
+                    gap, a, b);
+            }
+        }
     }
     return g_battle_synced;
 }
@@ -1483,10 +1639,27 @@ void Netplay_PollBattleSync() {
     // agreed swap_frame each time. If remote's proposal arrived higher than
     // ours, the agreed value bumped — keep both sides in sync via resend.
     static uint32_t last_send = 0;
+    static uint32_t wait_started = 0;
+    static uint32_t last_wait_warn = 0;
     uint32_t now = GetTickCount();
-    if (g_local_battle_entered && !g_remote_battle_entered && now - last_send > 50) {
-        ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
-        last_send = now;
+    if (g_local_battle_entered && !g_remote_battle_entered) {
+        if (now - last_send > 50) {
+            ControlChannel_SendBattleEntering(g_battle_entry_swap_frame,
+                                              g_entry_epoch, 0);
+            last_send = now;
+        }
+        if (wait_started == 0) wait_started = now;
+        if (now - wait_started > 5000 && now - last_wait_warn > 5000) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "BATTLE SYNC: waiting on remote for %us (swap=%u epoch=%u) — "
+                "peer hasn't flipped to battle yet (its CSS sim may be "
+                "behind or diverged)",
+                (now - wait_started) / 1000, g_battle_entry_swap_frame,
+                g_entry_epoch);
+            last_wait_warn = now;
+        }
+    } else {
+        wait_started = 0;
     }
 }
 
@@ -1505,7 +1678,7 @@ void Netplay_SignalBattleEnd() {
         g_battle_end_swap_frame = local_proposal;
     }
     g_local_battle_end_signaled = true;
-    ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
+    ControlChannel_SendBattleEnd(g_battle_end_swap_frame, g_end_epoch, 0);
     BroadcastSwapToSubscribers(CtrlMsg::BATTLE_END, g_battle_end_swap_frame);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1524,9 +1697,14 @@ bool Netplay_IsBattleEndSynced() {
         g_local_battle_end_signaled &&
         g_remote_battle_end_signaled) {
         g_battle_end_synced = true;
+        // Completion record + announce — mirrors the entry barrier (the
+        // handler answers post-disarm retries from a lagging peer).
+        g_end_done_epoch = g_end_epoch;
+        g_end_done_ms    = GetTickCount();
+        ControlChannel_SendBattleEnd(g_battle_end_swap_frame, g_end_epoch, 0x1);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "BATTLE END SYNC: both peers signaled (battle_frame=%u, swap_frame=%u) - swap battle->CSS now",
-            g_netplay_frame, g_battle_end_swap_frame);
+            "BATTLE END SYNC: both peers signaled (battle_frame=%u, swap_frame=%u, epoch=%u) - swap battle->CSS now",
+            g_netplay_frame, g_battle_end_swap_frame, g_end_epoch);
     }
     return g_battle_end_synced;
 }
@@ -1539,10 +1717,25 @@ void Netplay_PollBattleEndSync() {
     ControlChannel_Poll();
 
     static uint32_t last_send = 0;
+    static uint32_t wait_started = 0;
+    static uint32_t last_wait_warn = 0;
     uint32_t now = GetTickCount();
-    if (g_local_battle_end_signaled && !g_remote_battle_end_signaled && now - last_send > 50) {
-        ControlChannel_SendBattleEnd(g_battle_end_swap_frame);
-        last_send = now;
+    if (g_local_battle_end_signaled && !g_remote_battle_end_signaled) {
+        if (now - last_send > 50) {
+            ControlChannel_SendBattleEnd(g_battle_end_swap_frame,
+                                         g_end_epoch, 0);
+            last_send = now;
+        }
+        if (wait_started == 0) wait_started = now;
+        if (now - wait_started > 5000 && now - last_wait_warn > 5000) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "BATTLE END SYNC: waiting on remote for %us (swap=%u epoch=%u)",
+                (now - wait_started) / 1000, g_battle_end_swap_frame,
+                g_end_epoch);
+            last_wait_warn = now;
+        }
+    } else {
+        wait_started = 0;
     }
 }
 
@@ -2356,6 +2549,7 @@ bool Netplay_StartBattle() {
     // Arm BATTLE_END for the eventual return-to-CSS swap.
     g_battle_entry_armed = false;
     g_battle_end_armed   = true;
+    g_end_epoch = NextBarrierEpoch();
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Netplay: GekkoNet battle session created (runahead=%d, prediction_window=%d)",
@@ -2690,6 +2884,16 @@ void Netplay_EndBattle() {
     g_css_synced = false;
     g_local_css_ready = false;
     g_remote_css_ready = false;
+    // Stale-advance scrub: pre-rendezvous CSS frames consume
+    // Netplay_GetCSSInput before the new session delivers anything. The
+    // last advance pair of the PREVIOUS CSS session must not leak into
+    // them — each peer stops consuming its old session at its own flip
+    // frame, so the leftovers can differ across peers and seed a CSS
+    // divergence before the lockstep stream even starts.
+    g_css_advance_p1    = 0;
+    g_css_advance_p2    = 0;
+    g_css_advance_ready = false;
+    g_css_frame         = 0;
 
     // Reset battle sync state for next battle (entry direction). Both gates
     // disarmed: the next CSS rendezvous re-arms BATTLE_ENTERING when the
@@ -2777,7 +2981,11 @@ bool Netplay_ProcessBattleInputPhase() {
             static uint32_t s_last_entry_resend_ms = 0;
             const uint32_t now_ms = GetTickCount();
             if (now_ms - s_last_entry_resend_ms > 100) {
-                ControlChannel_SendBattleEntering(g_battle_entry_swap_frame);
+                // We're past the barrier (battle session exists), so this
+                // is a completed-flag announce: peer latches remote=true
+                // and won't echo back.
+                ControlChannel_SendBattleEntering(g_battle_entry_swap_frame,
+                                                  g_entry_done_epoch, 0x1);
                 s_last_entry_resend_ms = now_ms;
             }
             ControlChannel_Poll();

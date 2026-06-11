@@ -873,14 +873,18 @@ void ControlChannel_SendBattleAck() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ControlChannel: Sent BATTLE_ACK");
 }
 
-void ControlChannel_SendBattleEntering(uint32_t swap_frame) {
+void ControlChannel_SendBattleEntering(uint32_t swap_frame, uint8_t epoch,
+                                       uint8_t flags) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_ENTERING;
     pkt.data.sync.frame = swap_frame;
+    pkt.data.sync.epoch = epoch;
+    pkt.data.sync.flags = flags;
     ControlChannel_Send(pkt);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "ControlChannel: Sent BATTLE_ENTERING (swap_frame=%u)", swap_frame);
+                "ControlChannel: Sent BATTLE_ENTERING (swap_frame=%u epoch=%u flags=0x%02X)",
+                swap_frame, epoch, flags);
 }
 
 void ControlChannel_SendBattleStart(uint32_t start_frame) {
@@ -893,14 +897,18 @@ void ControlChannel_SendBattleStart(uint32_t start_frame) {
                 start_frame);
 }
 
-void ControlChannel_SendBattleEnd(uint32_t swap_frame) {
+void ControlChannel_SendBattleEnd(uint32_t swap_frame, uint8_t epoch,
+                                  uint8_t flags) {
     CtrlPacket pkt = {};
     pkt.header.type = CtrlMsg::BATTLE_END;
     pkt.data.sync.frame = swap_frame;
+    pkt.data.sync.epoch = epoch;
+    pkt.data.sync.flags = flags;
     ControlChannel_Send(pkt);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "ControlChannel: Sent BATTLE_END (swap_frame=%u)", swap_frame);
+                "ControlChannel: Sent BATTLE_END (swap_frame=%u epoch=%u flags=0x%02X)",
+                swap_frame, epoch, flags);
 }
 
 void ControlChannel_SendHostConfig(uint32_t selected_stage,
