@@ -685,6 +685,15 @@ uint16_t Hook_ComputeAutoplayBattleInput(int player_id) {
     return out;
 }
 
+// Dwell anchor state for Hook_ComputeAutoplayCssInput — file scope so
+// the netplay CSS-sync path can reset it deterministically (the
+// in-function gap heuristic only covers the offline path).
+static bool     g_css_autoplay_in_css    = false;
+static uint32_t g_css_autoplay_entry_buf = 0;
+void Hook_AutoplayCssResetDwell() {
+    g_css_autoplay_in_css = false;
+}
+
 // CSS counterpart of Hook_ComputeAutoplayBattleInput: the wander/dwell/
 // confirm synthetic input for ONE player. Two call sites:
 //   - Hook_GetPlayerInput's FM2K_PARITY_AUTOPLAY block (offline / stress:
@@ -708,11 +717,9 @@ uint16_t Hook_ComputeAutoplayCssInput(int player_id) {
         s_dwell = v ? (int)(std::atof(v) * 100.0) : 0;
         if (s_dwell < 0) s_dwell = 0;
     }
-    static bool     s_in_css = false;
-    static uint32_t s_entry_buf = 0;
     const uint32_t game_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
     if (game_mode != 2000u) {
-        s_in_css = false;
+        g_css_autoplay_in_css = false;
         return 0;
     }
     const uint32_t buf_idx = *(uint32_t*)0x447EE0;
@@ -721,12 +728,40 @@ uint16_t Hook_ComputeAutoplayCssInput(int player_id) {
     // sees the mode leave 2000 during a battle -- the dwell anchor from
     // match 1 went stale and CSS-2 computed in_css ~8000, skipping the
     // dwell entirely (instant confirm pulses, 2026-06-11 15:50). A big
-    // buf_idx gap between calls means a battle ran in between: re-anchor.
+    // FORWARD buf_idx gap between calls means a battle ran in between:
+    // re-anchor. Backward jumps are excluded (gap < 0x80000000): the
+    // snapshot-render path restores state after rendering, so buf_idx
+    // can step backward between calls -- the unsigned wrap read as a
+    // huge gap and re-anchored the dwell EVERY frame (CSS never left
+    // the wander phase, nobody ever confirmed, 2026-06-11 16:03).
+    // Netplay additionally resets explicitly at CSS SYNCED
+    // (Hook_AutoplayCssResetDwell), which is the authoritative signal.
     static uint32_t s_last_call_buf = 0;
-    if (s_in_css && buf_idx - s_last_call_buf > 120) s_in_css = false;
+    {
+        const uint32_t gap = buf_idx - s_last_call_buf;
+        if (g_css_autoplay_in_css && gap > 120u && gap < 0x80000000u) {
+            g_css_autoplay_in_css = false;
+        }
+    }
     s_last_call_buf = buf_idx;
-    if (!s_in_css) { s_in_css = true; s_entry_buf = buf_idx; }
-    const uint32_t in_css = buf_idx - s_entry_buf;
+    if (!g_css_autoplay_in_css) {
+        g_css_autoplay_in_css = true;
+        g_css_autoplay_entry_buf = buf_idx;
+    }
+    const uint32_t in_css = buf_idx - g_css_autoplay_entry_buf;
+    // 1Hz diag: which phase is the autoplay in, and is the anchor sane?
+    {
+        static uint32_t s_diag_last_ms = 0;
+        const uint32_t now_ms = GetTickCount();
+        if (now_ms - s_diag_last_ms >= 1000) {
+            s_diag_last_ms = now_ms;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[CSSAP] buf=%u anchor=%u in_css=%u dwell=%d phase=%s",
+                buf_idx, g_css_autoplay_entry_buf, in_css, s_dwell,
+                (s_dwell > 0 && in_css < (uint32_t)s_dwell) ? "wander"
+                                                            : "confirm");
+        }
+    }
     if (s_dwell > 0 && in_css < (uint32_t)s_dwell) {
         // Wander: direction (or idle) stable for ~20-frame steps. Per-player
         // offset gives P1/P2 independent browsing.

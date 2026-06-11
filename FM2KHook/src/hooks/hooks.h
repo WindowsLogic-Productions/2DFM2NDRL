@@ -60,6 +60,11 @@ uint16_t Hook_ComputeAutoplayBattleInput(int player_id);
 // identical lockstep stream (split-brain fix, 2026-06-11).
 uint16_t Hook_ComputeAutoplayCssInput(int player_id);
 
+// Reset the dwell anchor above. Called at CSS SYNCED (each new CSS
+// GekkoSession) so the browse window restarts per CSS phase regardless
+// of the buf_idx gap heuristic.
+void Hook_AutoplayCssResetDwell();
+
 // Flush the buffered FM2K_RNG_TRACE=1 log to disk. Called by the
 // harness auto-terminate path before TerminateProcess to avoid losing
 // trace bytes that are still in stdio's user-space buffer. Safe no-op

@@ -1342,6 +1342,10 @@ bool Netplay_ProcessCSS() {
         if constexpr (FM2K::ADDR_ROUND_TIMER_COUNTER != 0) {
             *(uint32_t*)FM2K::ADDR_ROUND_TIMER_COUNTER = 0;
         }
+        // Restart the harness-autoplay browse window for this CSS phase
+        // (authoritative per-session reset; the in-function gap heuristic
+        // only covers offline runs).
+        Hook_AutoplayCssResetDwell();
 
         if (!Netplay_StartCSSSession()) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
