@@ -700,6 +700,12 @@ void SpectatorNode_OnUpstreamTcpDead();
 bool SpectatorNode_InBoundary();
 bool SpectatorNode_QueueHasPendingOp();
 
+// Milliseconds since the last INPUT was admitted to the playback queue
+// (0 until the first admission). The jitter floor uses this to detect
+// genuine starvation and play out its held frames instead of freezing.
+uint32_t SpectatorNode_MsSinceLastAdmit();
+void SpectatorNode_StampInputAdmit();
+
 // Re-request the upstream JOIN if none is in flight (1Hz throttle).
 // Used by the /F dispatch hold, which can run before the DLL-init path
 // has sent the original JOIN_REQ.

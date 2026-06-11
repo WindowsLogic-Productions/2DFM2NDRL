@@ -323,6 +323,11 @@ struct State {
     // are skipped as duplicates.
     uint32_t                  conn_ops_baseline     = 0;
     uint32_t                  conn_ops_decoded      = 0;
+    // TCP died but the subscription lives on: UDP (inputs + ops tail)
+    // keeps feeding pb_queue while TickHealth re-JOINs in the background
+    // to restore the TCP side. Cleared when the new connection's
+    // OP_BASELINE lands.
+    bool                      tcp_rejoin_pending    = false;
     bool                      udp_epoch_armed       = false;
     // Post-CSS-open confirm-mask countdown (lean seam): pops remaining
     // during which CssAutoConfirm's hold eats confirm bits, so the edge
@@ -3734,6 +3739,7 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                 std::memcpy(&baseline, payload, 4);
                 g_state.conn_ops_baseline = baseline;
                 g_state.conn_ops_decoded  = 0;
+                g_state.tcp_rejoin_pending = false;
                 if (baseline > g_state.ops_seen) {
                     g_state.ops_seen = baseline;
                 }
@@ -3810,6 +3816,7 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                         if (gap_first == 0xFFFFFFFFu) gap_first = cursor_input;
                     } else {
                         g_state.pb_queue.push_back(ev);
+                        SpectatorNode_StampInputAdmit();
                         g_state.next_expected_frame = cursor_input + 1;
                         ++pushed_inputs;
                         // Hop-1 relay.
@@ -4074,6 +4081,7 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
         ev.u.input.p1 = p1;
         ev.u.input.p2 = p2;
         g_state.pb_queue.push_back(ev);
+        SpectatorNode_StampInputAdmit();
         g_state.next_expected_frame = cursor + 1;
         ++admitted;
         // Hop-1 relay parity with the TCP path (line ~3318): the late TCP
@@ -4086,20 +4094,25 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
 
 void SpectatorNode_OnUpstreamTcpDead() {
     if (!g_state.subscribed_upstream) return;
+    if (g_state.tcp_rejoin_pending) return;  // already riding it out
     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-        "SpectatorNode: upstream TCP died -- dropping subscription for "
-        "immediate re-JOIN (q=%zu, ops_seen=%u, boundary=%d)",
+        "SpectatorNode: upstream TCP died -- riding on UDP, re-JOIN in "
+        "background (q=%zu, ops_seen=%u, boundary=%d)",
         g_state.pb_queue.size(), g_state.ops_seen,
         (int)g_state.pb_boundary);
-    g_state.subscribed_upstream = false;
-    g_state.live_established    = false;
-    g_state.udp_epoch_armed     = false;   // stale-stream datagrams rejected
-    // Queue + frame baseline + boundary state are KEPT (F4 semantics):
-    // received-but-unplayed frames stay playable; the re-JOIN's
-    // OP_BASELINE re-seeds ops_seen exactly for the new connection, and
-    // its backfill dedups against next_expected_frame.
-    // TickHealth's reconnect branch (subscribed=false + root_addr) fires
-    // RequestJoin on its 2s backoff.
+    // The subscription and UDP admission stay ARMED. The host's node-
+    // level subscriber entry survives its TCP-layer erase (heartbeats
+    // flow over UDP), so datagrams -- inputs AND the redundant ops tail
+    // -- keep arriving through the dead window. Dropping the
+    // subscription here used to reject every one of them: an 8-second
+    // self-inflicted starvation while 5 re-JOINs begged a host whose
+    // control channel was stalled in its own boundary (2026-06-11).
+    // Op indexing is global, so ops_seen survives the rebind; the new
+    // connection's OP_BASELINE re-seeds only the per-conn dedup cursor.
+    g_state.tcp_rejoin_pending = true;
+    // TickHealth's reconnect branch (rejoin pending + no live conn)
+    // fires RequestJoin on its 2s backoff; the host's existing-sub path
+    // resets bind state and re-ships backfill on the fresh socket.
 }
 
 bool SpectatorNode_InBoundary() {
@@ -4127,6 +4140,13 @@ void SpectatorNode_KickJoin() {
     const uint64_t now = GetTickCount64();
     if (now - g_state.last_reconnect_attempt_ms < 1000) return;
     SpectatorNode_RequestJoin(g_state.root_addr, g_state.last_requested_mode);
+}
+
+static uint64_t g_last_input_admit_ms = 0;
+void SpectatorNode_StampInputAdmit() { g_last_input_admit_ms = GetTickCount64(); }
+uint32_t SpectatorNode_MsSinceLastAdmit() {
+    if (g_last_input_admit_ms == 0) return 0;  // nothing admitted yet
+    return (uint32_t)(GetTickCount64() - g_last_input_admit_ms);
 }
 
 bool SpectatorNode_IsSubscribedUpstream() { return g_state.subscribed_upstream; }
@@ -4615,7 +4635,7 @@ void SpectatorNode_TickHealth() {
 
     // Reconnect path: not subscribed, but we have a root we can fall
     // back to. Throttle so we don't spam JOIN_REQ.
-    if (!g_state.subscribed_upstream &&
+    if ((!g_state.subscribed_upstream || g_state.tcp_rejoin_pending) &&
         g_state.root_addr.sin_port != 0 &&
         // Never fire a new JOIN while an upstream connection exists --
         // the host's existing-sub re-JOIN path drops connections from

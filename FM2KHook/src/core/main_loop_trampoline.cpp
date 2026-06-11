@@ -1021,8 +1021,15 @@ static void RunSpectatorTick() {
     // 2026-06-11). If any non-INPUT op is queued, drain toward it; if a
     // boundary is active, the synthetic feed must keep ticking even at
     // q == 0 (it consumes nothing while walking results/CSS).
+    // Starvation bypass: the floor exists to absorb jitter, not to
+    // withhold playable frames during a genuine stream pause. q=7 (one
+    // below the floor) used to freeze the picture for the entire pause
+    // with seven frames in hand (2026-06-11). If nothing has been
+    // admitted for >250ms, play out what we hold at 1:1.
+    const bool starved_bypass =
+        qd > 0 && SpectatorNode_MsSinceLastAdmit() > 250;
     const bool boundary_bypass =
-        SpectatorNode_InBoundary() ||
+        SpectatorNode_InBoundary() || starved_bypass ||
         (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
          SpectatorNode_QueueHasPendingOp());
     if (qd < SPECTATOR_LIVE_TARGET && !s_offline_replay_env_active &&
