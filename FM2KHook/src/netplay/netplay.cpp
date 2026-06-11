@@ -1172,6 +1172,9 @@ bool Netplay_ProcessCSS() {
         g_local_css_ready = true;
         ControlChannel_SendBattleReady();
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CSS: Entered, signaling remote...");
+        // Phase F seam mirror: mark the seam stream so viewers know where
+        // the results-screen inputs end and the CSS dance begins.
+        SpectatorNode_AppendCssEntered();
     }
 
     // Keep resending BATTLE_READY until BOTH sides are bilaterally

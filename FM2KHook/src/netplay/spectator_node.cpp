@@ -305,6 +305,12 @@ struct State {
     // when the host's OP_BASELINE for the new connection arrives.
     uint32_t                  ops_seen              = 0;
     bool                      udp_epoch_armed       = false;
+    // Seam mirror split marker: set when the seam stream's CSS_ENTERED
+    // op applies. Before it, seam INPUTs are the host's results-screen
+    // presses (discarded -- the viewer advances its own results on
+    // synthetic edges); after it, seam INPUTs are the host's CSS dance
+    // and mirror 1:1 from CSS frame 0 on both sides.
+    bool                      pb_css_marker_seen = false;
     // True once a snapshot has applied this playback session. The
     // rewind-discard guard in ApplyPendingSnapshot is strictly for
     // RE-JOIN re-ships; the FIRST snapshot must always apply (the BTB
@@ -584,6 +590,9 @@ void AppendEventToWire(std::vector<uint8_t>& out, const SessionEvent& ev,
         case SessionEventType::SESSION_ID:
             w = SessionEvent_EncodeSessionId(buf, sizeof(buf), ev.u.session_id);
             break;
+        case SessionEventType::CSS_ENTERED:
+            w = SessionEvent_EncodeCssEntered(buf, sizeof(buf));
+            break;
     }
     if (w > 0) out.insert(out.end(), buf, buf + w);
 }
@@ -841,6 +850,9 @@ void SendSessionEventsTo(const sockaddr_in& to,
                 case SessionEventType::SESSION_ID:
                     one_w = SessionEvent_EncodeSessionId(one, sizeof(one),
                                                          ev.u.session_id);
+                    break;
+                case SessionEventType::CSS_ENTERED:
+                    one_w = SessionEvent_EncodeCssEntered(one, sizeof(one));
                     break;
             }
             if (one_w == 0) { ++ev_idx; continue; }   // unknown / unencodable
@@ -1157,13 +1169,14 @@ size_t WirePayloadSize(SessionEventType t) {
         case SessionEventType::ROUND_START:       return sizeof(RoundStartPayload);  // 7
         case SessionEventType::ROUND_END:         return sizeof(RoundEndPayload);    // 9
         case SessionEventType::SESSION_ID:        return 8;   // u64
+        case SessionEventType::CSS_ENTERED:       return 0;
     }
     return SIZE_MAX;  // unknown tag — caller treats as malformed
 }
 
 bool IsValidEventTag(uint8_t tag) {
     return tag >= static_cast<uint8_t>(SessionEventType::INPUT)
-        && tag <= static_cast<uint8_t>(SessionEventType::SESSION_ID);
+        && tag <= static_cast<uint8_t>(SessionEventType::CSS_ENTERED);
 }
 
 } // namespace
@@ -1194,6 +1207,12 @@ size_t SessionEvent_EncodeResetInputState(uint8_t* out, size_t cap) {
 size_t SessionEvent_EncodeSoundInit(uint8_t* out, size_t cap) {
     if (cap < 1) return 0;
     out[0] = static_cast<uint8_t>(SessionEventType::SOUND_INIT);
+    return 1;
+}
+
+size_t SessionEvent_EncodeCssEntered(uint8_t* out, size_t cap) {
+    if (cap < 1) return 0;
+    out[0] = static_cast<uint8_t>(SessionEventType::CSS_ENTERED);
     return 1;
 }
 
@@ -1291,6 +1310,7 @@ size_t SessionEvent_Decode(const uint8_t* in, size_t in_len,
                 break;
             case SessionEventType::RESET_INPUT_STATE:
             case SessionEventType::SOUND_INIT:
+            case SessionEventType::CSS_ENTERED:
                 break;
         }
     }
@@ -1654,6 +1674,12 @@ void SpectatorNode_AppendPinRng(uint32_t seed) {
 void SpectatorNode_AppendResetInputState() {
     SessionEvent ev{};
     ev.type = SessionEventType::RESET_INPUT_STATE;
+    AppendOpAndFlush(ev);
+}
+
+void SpectatorNode_AppendCssEntered() {
+    SessionEvent ev{};
+    ev.type = SessionEventType::CSS_ENTERED;
     AppendOpAndFlush(ev);
 }
 
@@ -2669,6 +2695,11 @@ void ApplySessionEvent(const SessionEvent& ev) {
                     "SpectatorNode: applied RESET_INPUT_STATE");
             }
             break;
+        case SessionEventType::CSS_ENTERED:
+            g_state.pb_css_marker_seen = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: applied CSS_ENTERED (seam mirror split)");
+            break;
         case SessionEventType::SOUND_INIT:
             if (g_state.pb_boundary != State::PbBoundary::NONE) {
                 g_state.pending_sound_init = true;
@@ -2768,6 +2799,7 @@ void ApplySessionEvent(const SessionEvent& ev) {
                 }
                 if (s_offline_replay_cached2 == 0) {
                     g_state.pb_boundary = State::PbBoundary::SEAM;
+                    g_state.pb_css_marker_seen = false;
                     const uint32_t cur_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
                     g_state.pb_boundary_left_battle = (cur_mode < 3000u);
                     // Hold the local CSS unadvanceable until MATCH_START
@@ -3768,6 +3800,9 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
                             case SessionEventType::SESSION_ID:
                                 SpectatorNode_AppendSessionId(ev.u.session_id);
                                 break;
+                            case SessionEventType::CSS_ENTERED:
+                                SpectatorNode_AppendCssEntered();
+                                break;
                             case SessionEventType::ROUND_START: {
                                 const auto& p = ev.u.round_start;
                                 SpectatorNode_AppendRoundStart(
@@ -4018,7 +4053,52 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
                 return true;
             }
         }
-        // SEAM falls through: mirror the host's seam inputs 1:1.
+        if (g_state.pb_boundary == State::PbBoundary::SEAM) {
+            if (!g_state.pb_css_marker_seen) {
+                // Results segment: discard the host's results-screen
+                // presses (their pacing can't align with ours) while
+                // applying any ops that reach the head -- one of them is
+                // CSS_ENTERED, which flips the marker and ends this phase.
+                while (!g_state.pb_queue.empty() &&
+                       !g_state.pb_css_marker_seen) {
+                    const SessionEvent& head = g_state.pb_queue.front();
+                    if (head.type != SessionEventType::INPUT) {
+                        ApplySessionEvent(head);
+                    }
+                    g_state.pb_queue.erase(g_state.pb_queue.begin());
+                }
+                if (!g_state.subscribed_upstream) return false;
+                // Advance our own results on a synthetic confirm edge;
+                // neutral once our CSS opens (waiting for the marker).
+                uint16_t synthetic = 0;
+                if (mode != 2000u) {
+                    static uint32_t s_seam_tick2 = 0;
+                    synthetic = (s_seam_tick2++ & 1u) ? 0x010u : 0u;
+                }
+                g_state.pb_current_p1 = synthetic;
+                g_state.pb_current_p2 = synthetic;
+                if (p1_input) *p1_input = synthetic;
+                if (p2_input) *p2_input = synthetic;
+                return true;
+            }
+            if (mode >= 3000u) {
+                // Marker seen but our results screens aren't done: hold
+                // the CSS inputs (they mirror from CSS frame 0) and keep
+                // walking the results on synthetic edges.
+                if (!g_state.subscribed_upstream) return false;
+                static uint32_t s_seam_tick3 = 0;
+                const uint16_t synthetic =
+                    (s_seam_tick3++ & 1u) ? 0x010u : 0u;
+                g_state.pb_current_p1 = synthetic;
+                g_state.pb_current_p2 = synthetic;
+                if (p1_input) *p1_input = synthetic;
+                if (p2_input) *p2_input = synthetic;
+                return true;
+            }
+            // Local CSS open + marker seen: fall through to the normal
+            // pop -- the host's CSS dance mirrors 1:1 from frame 0 (CSS
+            // init reset cursors on both sides).
+        }
     }
 
     if (g_state.pb_queue.empty()) return false;

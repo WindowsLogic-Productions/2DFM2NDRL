@@ -233,6 +233,12 @@ enum class SessionEventType : uint8_t {
     ROUND_START       = 8,   // C3.5 — emitted at vs_round_function 100→101 edge
     ROUND_END         = 9,   // C3.5 — emitted at vs_round_function *→900 edge
     SESSION_ID        = 10,  // C7 — once per session (host-generated u64)
+    CSS_ENTERED       = 11,  // Phase F seam mirror — host's game_mode hit
+                             // 2000 (CSS opened). Lets the viewer split the
+                             // seam stream into [results inputs | CSS
+                             // inputs] so the CSS dance mirrors from its
+                             // frame 0 with both sides' CSS state freshly
+                             // initialized (cursor reset). No payload.
 };
 
 constexpr size_t SESSION_EVENT_MATCH_HDR_SIZE = 96;
@@ -298,6 +304,7 @@ size_t SessionEvent_EncodeInput            (uint8_t* out, size_t cap, uint16_t p
 size_t SessionEvent_EncodePinRng           (uint8_t* out, size_t cap, uint32_t seed);
 size_t SessionEvent_EncodeResetInputState  (uint8_t* out, size_t cap);
 size_t SessionEvent_EncodeSoundInit        (uint8_t* out, size_t cap);
+size_t SessionEvent_EncodeCssEntered       (uint8_t* out, size_t cap);
 size_t SessionEvent_EncodeMatchStart       (uint8_t* out, size_t cap,
                                             const uint8_t header[SESSION_EVENT_MATCH_HDR_SIZE]);
 size_t SessionEvent_EncodeMatchEnd         (uint8_t* out, size_t cap,
@@ -374,6 +381,8 @@ void SpectatorNode_OnMatchEnd(const MatchEndPayload& p);
 void SpectatorNode_AppendPinRng(uint32_t seed);
 void SpectatorNode_AppendResetInputState();
 void SpectatorNode_AppendSoundInit();
+// Phase F seam mirror: host's game_mode reached 2000 (CSS opened).
+void SpectatorNode_AppendCssEntered();
 void SpectatorNode_AppendFingerprint(uint32_t hash);
 
 // C3.5 — round boundary events. Hook-side (vs_round_function detour) calls
