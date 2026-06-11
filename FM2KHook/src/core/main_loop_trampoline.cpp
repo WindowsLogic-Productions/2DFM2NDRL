@@ -838,6 +838,24 @@ constexpr size_t SPECTATOR_FF_EXIT     = 16;  // hysteresis: 2x live target
 // noticeably behind real-time.
 constexpr size_t SPECTATOR_LIVE_LAG_FRAMES = 100;
 
+// Broadcast delay target: the spectator deliberately sits this many
+// frames behind live (default 3s at 100fps). Riding the live edge made
+// playback arrival-limited -- every loss burst or host stall hit the
+// picture as a stall (q=0, pops=0). With a 300-frame bank, any arrival
+// gap shorter than the bank is structurally invisible; drains target
+// the bank, never the edge. FM2K_SPEC_DELAY overrides (frames).
+inline size_t SpectatorTargetDelayFrames() {
+    static size_t v = []() -> size_t {
+        const char* e = std::getenv("FM2K_SPEC_DELAY");
+        if (e && e[0]) {
+            const long n = std::strtol(e, nullptr, 10);
+            if (n >= 50 && n <= 2000) return (size_t)n;
+        }
+        return 300;
+    }();
+    return v;
+}
+
 // One sim step (popped INPUT → PGI → UG → diagnostics). Returns false if
 // the queue couldn't supply an INPUT (head non-INPUTs were drained but no
 // INPUT followed them), true if a frame was simulated. Render is the
@@ -1177,16 +1195,16 @@ static void RunSpectatorTick() {
         qd > SPECTATOR_LIVE_LAG_FRAMES) {
         s_initial_catchup_active = true;
     }
-    if (s_initial_catchup_active && qd <= SPECTATOR_LIVE_LAG_FRAMES) {
+    if (s_initial_catchup_active && qd <= SpectatorTargetDelayFrames()) {
         s_initial_catchup_active = false;
         s_initial_catchup_done   = true;
     }
     const bool needs_initial_catchup = s_initial_catchup_active;
     const bool needs_always_catchup  = s_always_catchup_env != 0 &&
-                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
+                                       qd > SpectatorTargetDelayFrames();
     // User-toggled FF (F12) is the explicit "speed up to live" lever.
     const bool needs_user_ff         = g_spectator_ff_user &&
-                                       qd > SPECTATOR_LIVE_LAG_FRAMES;
+                                       qd > SpectatorTargetDelayFrames();
     // CSS-phase catchup: drain the backlog aggressively while the host
     // sits in character select. Battle has no visible action to "fast-
     // forward through" so the user can't tell catchup from steady-state,
@@ -1206,7 +1224,7 @@ static void RunSpectatorTick() {
     // previously had NO recovery path -- lag compounded into a perceived
     // hang. Battle frames are cheap; turbo to the live band.
     const bool needs_battle_emergency = (live_game_mode >= 3000u) &&
-                                        qd > 600;
+                                        qd > SpectatorTargetDelayFrames() + 600;
     // Render parity is required during catchup — every phase. Render-side
     // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
     // mode 3, particle FX) run on the host once per simulated frame. If the
@@ -1238,7 +1256,7 @@ static void RunSpectatorTick() {
             RenderFrameWithSnapshot();
         }
         ControlChannel_Poll();   // keeps TCP recv drained, no failover side-effects
-        if (SpectatorNode_PendingFrameCount() <= SPECTATOR_LIVE_LAG_FRAMES) {
+        if (SpectatorNode_PendingFrameCount() <= SpectatorTargetDelayFrames()) {
             // Live edge reached. The outer-tick state machine flips
             // s_initial_catchup_active → s_initial_catchup_done next
             // call, so this branch only needs to bail.
@@ -1268,7 +1286,8 @@ static void RunSpectatorTick() {
     // tens of seconds. This is the ONLY drain mechanism at CSS (see
     // needs_css_catchup above); battle additionally has the emergency
     // turbo.
-    if (SpectatorNode_PendingFrameCount() > 50) {
+    if (SpectatorNode_PendingFrameCount() >
+        SpectatorTargetDelayFrames() + 100) {
         SpectatorSimOneFrame();
     }
 
