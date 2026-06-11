@@ -71,6 +71,10 @@ struct Subscriber {
     // TCP-borne OP_BASELINE (an old build's framer drops the connection
     // on an unknown SpecDataType).
     bool         udp_ok = false;
+    // Light re-join (SPEC_JOIN_RESUME): the viewer's next_expected_frame
+    // from its JOIN_REQ. Non-zero = the viewer is mid-stream; the bind
+    // path skips the snapshot and backfills exactly the gap from here.
+    uint32_t     resume_frame = 0;
 };
 
 // Cached initial-match metadata so new joiners get a consistent handoff.
@@ -3023,8 +3027,9 @@ static CtrlPacket BuildJoinAckPacket() {
 }
 
 void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
-                                 uint8_t caps) {
+                                 uint8_t caps, uint32_t resume_frame) {
     const bool udp_ok = SpecUdpEnabled() && (caps & SPEC_JOIN_UDP_OK) != 0;
+    if ((caps & SPEC_JOIN_RESUME) == 0) resume_frame = 0;
     char addr_buf[48] = {};
     FormatAddr(from, addr_buf, sizeof(addr_buf));
 
@@ -3099,6 +3104,7 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
             sub.ack_frame    = 0;
             sub.join_mode    = mode;
             sub.udp_ok       = udp_ok;
+            sub.resume_frame = resume_frame;
             sub.last_seen_ms = GetTickCount64();
             // Drop the old TCP conn + any stale pending clients from this
             // IP so the bind path pairs the spectator's FRESH dial instead
@@ -3136,6 +3142,7 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from, SpecJoinMode mode,
         sub.tcp_bound    = false;
         sub.join_mode    = mode;
         sub.udp_ok       = udp_ok;
+        sub.resume_frame = resume_frame;
         // Phase 2c: pop the cached spec_user_id (if any) for this addr.
         // Punch-target poll wrote it earlier when the hub's
         // spec_incoming forwarded the sub's user_id. Used by relay-mode
@@ -3301,6 +3308,13 @@ bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
     // zero from the {} init above). Old hosts ignore reserved bits.
     if (SpecUdpEnabled()) {
         req.data.spec_join_req.reserved[0] |= SPEC_JOIN_UDP_OK;
+    }
+    // Light re-join: mid-stream viewers declare where their admission
+    // cursor stands so the host backfills exactly the gap (no snapshot).
+    if (g_state.have_frame_baseline && g_state.pb_started) {
+        req.data.spec_join_req.reserved[0] |= SPEC_JOIN_RESUME;
+        const uint32_t resume = g_state.next_expected_frame;
+        std::memcpy(&req.data.spec_join_req.reserved[1], &resume, 4);
     }
     ControlChannel_SendTo(req, upstream);
     return true;
@@ -4709,7 +4723,8 @@ void SpectatorNode_TickHealth() {
         // our addr, so a retry during an in-flight handshake/backfill
         // kills its own transfer ("End of stream" loop, 2026-06-11).
         !SpectatorTCP::IsUpstreamConnected() &&
-        now - g_state.last_reconnect_attempt_ms >= SPECTATOR_RECONNECT_BACKOFF_MS)
+        now - g_state.last_reconnect_attempt_ms >=
+            (g_state.tcp_rejoin_pending ? 500u : SPECTATOR_RECONNECT_BACKOFF_MS))
     {
         char buf[48] = {}; FormatAddr(g_state.root_addr, buf, sizeof(buf));
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -4942,7 +4957,12 @@ void SpectatorNode_TickHostMaintenance() {
             // anchor frame. Otherwise (FULL_SESSION, OR no snapshot yet
             // because this is the first match before its StashSnapshot
             // ran) fall back to legacy from-frame-0 backfill.
-            const bool use_snapshot =
+            // Light re-join: a mid-stream viewer declared its resume
+            // position -- ship NOTHING but the gap. No snapshot (it
+            // would be discarded viewer-side anyway), no from-anchor
+            // re-delivery; one round trip and the stream is whole.
+            const bool resume_bind = sub.resume_frame > 0;
+            const bool use_snapshot = !resume_bind &&
                 sub.join_mode == SpecJoinMode::CURRENT_MATCH &&
                 g_state.current_snapshot.valid;
 
@@ -4956,7 +4976,9 @@ void SpectatorNode_TickHostMaintenance() {
             // connection on an unknown SpecDataType.
             if (sub.udp_ok && SpecUdpEnabled() &&
                 !g_state.spec_transport_relay) {
-                const size_t first_idx = use_snapshot
+                const size_t first_idx = resume_bind
+                    ? BackfillFirstIdxForFrame(sub.resume_frame)
+                    : use_snapshot
                     ? BackfillFirstIdxForFrame(g_state.current_snapshot.input_frame)
                     : 0;
                 const size_t clamp = std::min(g_state.last_flushed_event_idx,
@@ -4975,7 +4997,13 @@ void SpectatorNode_TickHostMaintenance() {
             }
 
             const char* xport = g_state.spec_transport_relay ? "RELAY" : "TCP";
-            if (use_snapshot) {
+            if (resume_bind) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: %s bound for %s — LIGHT RESUME "
+                    "(gap backfill from INPUT-frame=%u, no snapshot)",
+                    xport, buf, sub.resume_frame);
+                SendSessionBackfillFromFrame(sub.addr, sub.resume_frame);
+            } else if (use_snapshot) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SpectatorNode: %s bound for %s%s%s — CURRENT_MATCH "
                     "(snapshot match=%u + tail from INPUT-frame=%u)",

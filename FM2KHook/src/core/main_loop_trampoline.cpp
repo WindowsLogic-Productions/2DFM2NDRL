@@ -1195,12 +1195,17 @@ static void RunSpectatorTick() {
     // experience. (Render is gated on g_spectator_catchup so cursor
     // animations still draw — see RenderFrameWithSnapshot in the loop.)
     const uint32_t live_game_mode    = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-    // CSS catchup only for genuinely deep backlogs: under realistic
-    // loss+latency the viewer legitimately sits 1-2s behind, and turbo
-    // at CSS stalls on per-hover .player loads (the 1fps slideshow).
-    // Below 400 queued, CSS plays 1:1 and the gentle 2x drain converges.
-    const bool needs_css_catchup     = (live_game_mode == 2000u) &&
-                                       qd > 400;
+    // NO turbo at CSS, ever: hover-triggered .player loads are real
+    // deterministic sim work (100-500ms of CPU each) that the host paid
+    // at human pace -- any multi-pop burst stalls into a slideshow. CSS
+    // drains at a smooth 2x via the steady-state gentle drain; residual
+    // backlog clears in battle where frames cost ~0.1ms.
+    const bool needs_css_catchup     = false;
+    // Emergency battle drain: entering battle hundreds of frames behind
+    // previously had NO recovery path -- lag compounded into a perceived
+    // hang. Battle frames are cheap; turbo to the live band.
+    const bool needs_battle_emergency = (live_game_mode >= 3000u) &&
+                                        qd > 600;
     // Render parity is required during catchup — every phase. Render-side
     // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
     // mode 3, particle FX) run on the host once per simulated frame. If the
@@ -1212,7 +1217,8 @@ static void RunSpectatorTick() {
     // 50+ catchup-loop iterations. Render in the loop costs more GPU but
     // keeps RNG locked to host across CSS, battle, and inter-match drain.
     g_spectator_catchup = needs_initial_catchup || needs_always_catchup ||
-                          needs_user_ff       || needs_css_catchup;
+                          needs_user_ff       || needs_css_catchup ||
+                          needs_battle_emergency;
 
     const uint64_t catchup_start_ms = GetTickCount64();
     uint32_t catchup_frames = 0;
@@ -1255,6 +1261,14 @@ static void RunSpectatorTick() {
     if (!SpectatorSimOneFrame()) {
         RenderFrameWithSnapshot();
         return;
+    }
+    // Gentle drain: one extra sim step per tick above the live band --
+    // 2x playback, barely perceptible, converges a multi-second lag in
+    // tens of seconds. This is the ONLY drain mechanism at CSS (see
+    // needs_css_catchup above); battle additionally has the emergency
+    // turbo.
+    if (SpectatorNode_PendingFrameCount() > 50) {
+        SpectatorSimOneFrame();
     }
 
     RenderFrameWithSnapshot();

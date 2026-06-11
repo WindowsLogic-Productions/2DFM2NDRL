@@ -126,12 +126,21 @@ enum class SpecDataType : uint8_t {
 // a frame is re-shipped in ~32 consecutive datagrams: at 20% loss the
 // probability that ALL of them drop is ~0.2^32. ~270 B per datagram at
 // 50/s = ~13.5 KB/s per subscriber.
-constexpr size_t   SPEC_UDP_WINDOW        = 64;
+// 256 confirmed frames = ~2.5s of input redundancy per datagram
+// (~1KB inputs + ops tail, still under MTU). TCP outages shorter than
+// this window are invisible; longer ones heal via the light resume
+// re-join (no snapshot, gap-only backfill).
+constexpr size_t   SPEC_UDP_WINDOW        = 256;
 constexpr uint32_t SPEC_UDP_SEND_INTERVAL = 2;   // confirmed frames per send
 constexpr size_t   SPEC_UDP_MAX_FANOUT    = 8;   // cap UDP sends per tick
 
 // SPEC_JOIN_REQ reserved[0] capability bits (old builds send zeros).
-constexpr uint8_t SPEC_JOIN_UDP_OK = 0x01;  // viewer accepts UDP_INPUT_BATCH + OP_BASELINE
+constexpr uint8_t SPEC_JOIN_UDP_OK = 0x01;
+// reserved[0] bit 1: reserved[1..4] carry the viewer's resume position
+// (next_expected_frame, LE u32). The host backfills exactly the gap and
+// ships NO snapshot -- the light re-join that makes TCP death healing
+// one round trip instead of a 1MB snapshot ceremony.
+constexpr uint8_t SPEC_JOIN_RESUME = 0x02;  // viewer accepts UDP_INPUT_BATCH + OP_BASELINE
 
 // Spectator's preferred backfill mode, declared in SPEC_JOIN_REQ payload.
 // Default at the wire level (zero-init) is FULL_SESSION so an older host
@@ -603,7 +612,8 @@ void SpectatorNode_ClearGekkoSpectatorTracking();
 // zeros from older builds).
 void SpectatorNode_HandleJoinReq(const sockaddr_in& from,
                                  SpecJoinMode mode = SpecJoinMode::FULL_SESSION,
-                                 uint8_t caps = 0);
+                                 uint8_t caps = 0,
+                                 uint32_t resume_frame = 0);
 
 // Handle SPEC_LEAVE — remove subscriber from list.
 void SpectatorNode_HandleLeave(const sockaddr_in& from);
