@@ -344,6 +344,13 @@ struct State {
     // RE-JOIN re-ships; the FIRST snapshot must always apply (the BTB
     // boot's local battle state is garbage until it does).
     bool                      pb_snapshot_applied_once = false;
+    // True once the viewer has popped its first INPUT this session --
+    // the real "we are mid-stream" signal. Snapshot applies must be
+    // refused from then on: a naturally-joined viewer has
+    // pb_snapshot_applied_once == false, so a re-join's re-shipped
+    // snapshot passed the old guard as a "first apply" and rewound the
+    // live sim to the match anchor (battle restarted, 2026-06-11).
+    bool                      pb_started               = false;
     // Highest op_seq announced by any received UDP datagram. Drives the
     // silent-TCP-death detector in TickHealth: a persistent gap vs
     // ops_seen while TCP is quiet means the op stream is wedged.
@@ -1542,6 +1549,7 @@ void SpectatorNode_Shutdown() {
     g_state.pending_reset_input = false;
     g_state.pending_sound_init  = false;
     g_state.pb_snapshot_applied_once = false;
+    g_state.pb_started               = false;
     CssAutoConfirm_SetSeamHold(false);
     SpectatorTCP::Shutdown();
     // Tear down both relay rings if we created them. Close handles
@@ -2132,7 +2140,7 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // so a fresh join (consumed == anchor, nothing popped yet) applies,
     // and a forward jump (anchor ahead of us, e.g. re-join landing in the
     // NEXT match) also applies.
-    if (g_state.have_frame_baseline && g_state.pb_snapshot_applied_once) {
+    if (g_state.pb_snapshot_applied_once || g_state.pb_started) {
         // Re-join snapshots NEVER re-apply. Backward anchors would rewind
         // the sim under a live-edge queue; forward anchors (re-join lands
         // in a LATER match) would overwrite the char slots with the new
@@ -4463,6 +4471,7 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
 
     const SessionEvent ev = g_state.pb_queue.front();
     g_state.pb_queue.erase(g_state.pb_queue.begin());
+    g_state.pb_started    = true;
     g_state.pb_current_p1 = ev.u.input.p1;
     g_state.pb_current_p2 = ev.u.input.p2;
     if (p1_input) *p1_input = ev.u.input.p1;
