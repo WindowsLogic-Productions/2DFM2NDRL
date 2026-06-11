@@ -305,6 +305,10 @@ struct State {
     // when the host's OP_BASELINE for the new connection arrives.
     uint32_t                  ops_seen              = 0;
     bool                      udp_epoch_armed       = false;
+    // Highest op_seq announced by any received UDP datagram. Drives the
+    // silent-TCP-death detector in TickHealth: a persistent gap vs
+    // ops_seen while TCP is quiet means the op stream is wedged.
+    uint32_t                  udp_highest_op_seq    = 0;
     // [SPEC-UDP] diagnostics (rate-limited 1Hz log).
     uint32_t                  udp_admitted_total    = 0;
     uint32_t                  udp_paused_on_gate    = 0;
@@ -1453,6 +1457,7 @@ void SpectatorNode_Shutdown() {
     g_state.total_op_count         = 0;
     g_state.ops_seen               = 0;
     g_state.udp_epoch_armed        = false;
+    g_state.udp_highest_op_seq     = 0;
     g_state.udp_admitted_total     = 0;
     g_state.udp_paused_on_gate     = 0;
     g_state.udp_dropped_on_gap     = 0;
@@ -3782,6 +3787,9 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
     std::memcpy(&op_seq, buf + sizeof(SpecDataHeader), 4);
     const size_t frames = (len - sizeof(SpecDataHeader) - 4) / 4;
     if (frames == 0 || frames != hdr.frame_count) return;  // malformed
+    if (op_seq > g_state.udp_highest_op_seq) {
+        g_state.udp_highest_op_seq = op_seq;
+    }
 
     // [SPEC-UDP] 1Hz heartbeat BEFORE the gates -- pause periods are
     // exactly when this diagnostic matters (the original tail placement
@@ -4125,6 +4133,30 @@ void SpectatorNode_TickHealth() {
             hb.header.type = CtrlMsg::SPEC_HEARTBEAT;
             ControlChannel_SendTo(hb, g_state.upstream_addr);
             g_state.last_heartbeat_send_ms = now;
+        }
+
+        // Phase F: silent-TCP-death detector. A connection can die
+        // asymmetrically -- the host's side errors out while ours never
+        // surfaces anything (observed 2026-06-11: host "subscriber read
+        // error" at the match-2 boundary, spec recv just went quiet; the
+        // op gate then paused UDP forever and nothing re-joined). The UDP
+        // datagrams announce the host's op count: if ops we provably lack
+        // (udp_highest_op_seq > ops_seen) stay undeliverable while the
+        // TCP stream has been silent for several seconds, the stream is
+        // wedged regardless of HOW it died. Re-join is cheap (~2s).
+        if (!g_state.spec_transport_relay &&
+            g_state.udp_epoch_armed &&
+            g_state.udp_highest_op_seq > g_state.ops_seen) {
+            const uint64_t tcp_last = SpectatorTCP::LastUpstreamRecvMs();
+            if (tcp_last > 0 && now > tcp_last && now - tcp_last >= 4000) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: op-gap stall -- UDP announces op_seq=%u "
+                    "but ops_seen=%u and TCP silent %llums; declaring "
+                    "upstream TCP dead",
+                    g_state.udp_highest_op_seq, g_state.ops_seen,
+                    (unsigned long long)(now - tcp_last));
+                SpectatorNode_OnUpstreamTcpDead();
+            }
         }
 
         // (Removed: periodic INPUT_REQUEST poll — under TCP the kernel
