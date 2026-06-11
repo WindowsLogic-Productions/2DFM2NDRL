@@ -196,7 +196,25 @@ def main():
         "FM2K_AUTO_TERMINATE_AT_FRAME": str(args.frames + 20),
     }
     rep_args = [str(LAUNCHER), "--replay", to_win(p1_rep)]
-    def rep_done(): return replay_pty.exists() and replay_pty.stat().st_size > 100
+    # Replay-side completion: in --replay mode there is no GekkoNet session,
+    # so FM2K_AUTO_TERMINATE_AT_FRAME never fires -- the game instead
+    # ExitProcess(0)s when the pb_queue drains. The old predicate
+    # (size > 100) tripped on the FIRST stdio flush and killed the replay
+    # a few frames in, collapsing the diff window. Instead wait for the
+    # .pty to go quiescent: size unchanged for 6s after real content
+    # appeared means the drain finished and the game exited.
+    rep_state = {"size": -1, "since": 0.0}
+    def rep_done():
+        try:
+            sz = replay_pty.stat().st_size
+        except OSError:
+            return False
+        now = time.time()
+        if sz != rep_state["size"]:
+            rep_state["size"] = sz
+            rep_state["since"] = now
+            return False
+        return sz > 32 + 260 * 10 and (now - rep_state["since"]) >= 6.0
     rep_rc = launch("REPLAY", rep_args, rep_env, OUT_DIR / "replay.log",
                     args.replay_timeout, rep_done)
     print(f"[harness] replay rc={rep_rc}")

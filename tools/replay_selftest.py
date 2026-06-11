@@ -117,7 +117,9 @@ def run_phase(label: str, args: list[str], env: dict[str, str],
     # list is layered on top if present in os.environ (phase env wins on clash).
     env = dict(env)
     for k in ("FM2K_PERF_PROFILE", "FM2K_STRESS_DIAG", "FM2K_FULL_CRCS",
-              "FM2K_RUNAHEAD", "FM2K_PRED_WINDOW", "FM2K_LOCAL_DELAY"):
+              "FM2K_RUNAHEAD", "FM2K_PRED_WINDOW", "FM2K_LOCAL_DELAY",
+              "FM2K_CHECK_DISTANCE", "FM2K_PARITY_CAPTURE_TRACE",
+              "FM2K_CAMTRACE", "FM2K_CAMTRACE_HEX", "FM2K_CAM_DIAG"):
         if k not in env and os.environ.get(k):
             env[k] = os.environ[k]
 
@@ -316,15 +318,31 @@ def main() -> int:
     # Replay phase: target the SAME snapshot count as the record side so
     # the parity diff has comparable windows. 32-byte header + 260 bytes
     # per snapshot.
+    #
+    # Off-by-one: the record-side terminator slices the .fm2krep BEFORE
+    # the final frame's INPUT lands, so the replay queue drains after
+    # record_snap_count - 1 sim frames and the .pty plateaus one snapshot
+    # short of the record. Demanding an exact match here is unsatisfiable
+    # -- the 2026-06-08 "truncated" artifact and a 240s timeout on
+    # 2026-06-11 were both this predicate spinning at N-1. Accept a
+    # 2-snapshot tolerance plus 3s of quiescence (no growth) so we don't
+    # kill the launcher mid-flush.
     record_snap_count = max(0, (record_pty.stat().st_size - 32) // 260)
-    REPLAY_DONE_MIN_SIZE = 32 + 260 * record_snap_count
+    REPLAY_DONE_MIN_SIZE = 32 + 260 * max(0, record_snap_count - 2)
     print(f"[selftest] record produced {record_snap_count} snapshots; "
-          f"waiting for replay to match that count")
+          f"waiting for replay to reach >= {record_snap_count - 2}")
+    replay_done_state = {"size": -1, "since": 0.0}
     def replay_done():
         try:
-            return replay_pty.stat().st_size >= REPLAY_DONE_MIN_SIZE
+            sz = replay_pty.stat().st_size
         except OSError:
             return False
+        now = time.time()
+        if sz != replay_done_state["size"]:
+            replay_done_state["size"] = sz
+            replay_done_state["since"] = now
+            return False
+        return sz >= REPLAY_DONE_MIN_SIZE and (now - replay_done_state["since"]) >= 3.0
     rc = run_phase(
         "REPLAY",
         [str(args.launcher), "--replay", to_windows_path(fm2krep)],
