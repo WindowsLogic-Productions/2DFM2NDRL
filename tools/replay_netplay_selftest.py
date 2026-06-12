@@ -129,7 +129,9 @@ def main():
     # 0ms-ping scheduling jitter makes remote inputs late) -> genuine
     # rollbacks through the genuine path.
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD",
-              "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG"):
+              "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG",
+              "FM2K_STAGE_RANDOM_SEED", "FM2K_STAGE_RANDOM_MIN",
+              "FM2K_STAGE_RANDOM_MAX"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
