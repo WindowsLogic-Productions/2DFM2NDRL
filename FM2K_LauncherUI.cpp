@@ -3233,10 +3233,7 @@ void LauncherUI::RenderHostConfigBody() {
     // re-roll deterministically without per-match wire traffic.
     ImGui::Spacing();
     ImGui::SeparatorText("Random stage");
-    if (!random_state_loaded_) {
-        random_state_loaded_ = true;
-        LoadRandomStageState();
-    }
+    EnsureRandomStageLoaded();  // per-game; reloads when the game changes
     bool prev_enable = random_stage_enable_;
     if (ImGui::Checkbox("Enable random stage", &random_stage_enable_)) {
         SaveRandomStageState();
@@ -3257,10 +3254,12 @@ void LauncherUI::RenderHostConfigBody() {
             SaveRandomStageState();
         }
         ImGui::TextWrapped(
-            "Inclusive range. Set to your game's stage count - 1 (FM2K "
-            "indexes from 0). Both peers' hooks seed an xorshift PRNG with "
-            "the host's seed, then advance by one per match — deterministic "
-            "lockstep, no extra wire traffic per rematch.");
+            "Inclusive range, saved PER GAME. Set to your game's stage "
+            "count - 1 (FM2K indexes from 0); the hook additionally clamps "
+            "to the game's real stage list so an oversized range can never "
+            "load a missing stage. Both peers' hooks seed an xorshift PRNG "
+            "with the host's seed, then advance by one per match — "
+            "deterministic lockstep, no extra wire traffic per rematch.");
     }
     (void)prev_enable;
 
@@ -4545,22 +4544,66 @@ void LauncherUI::SaveSocdState() {
 }
 
 void LauncherUI::LoadRandomStageState() {
-    const std::string path = NotifySettingsPath();
-    if (path.empty()) return;
-    random_stage_enable_ = (ReadIntSetting(path, "random_stage_enable", 0) != 0);
-    random_stage_min_    = ReadIntSetting(path, "random_stage_min", 0);
-    random_stage_max_    = ReadIntSetting(path, "random_stage_max", 7);
+    // Per-game (Patrick, 2026-06-11: "stage range isn't game specific").
+    // A range tuned for one game's stage list followed the user into
+    // every other game; out-of-range indices make LoadStageFile throw a
+    // modal "GameStage Open error" box mid-match. The legacy GLOBAL
+    // settings.ini values are kept as first-load defaults so existing
+    // users keep their range for the game they already play.
+    int g_enable = 0, g_min = 0, g_max = 7;
+    {
+        const std::string path = NotifySettingsPath();
+        if (!path.empty()) {
+            g_enable = ReadIntSetting(path, "random_stage_enable", 0);
+            g_min    = ReadIntSetting(path, "random_stage_min", 0);
+            g_max    = ReadIntSetting(path, "random_stage_max", 7);
+        }
+    }
+    std::string gid;
+    if (selected_game_index_ >= 0 &&
+        selected_game_index_ < (int)games_.size()) {
+        gid = GameIdForExePath(games_[selected_game_index_].exe_path);
+    }
+    if (!gid.empty()) {
+        random_stage_enable_ =
+            LoadGamePatchBool(gid, "random_stage_enable", g_enable != 0);
+        random_stage_min_ = LoadGamePatchInt(gid, "random_stage_min", g_min);
+        random_stage_max_ = LoadGamePatchInt(gid, "random_stage_max", g_max);
+    } else {
+        random_stage_enable_ = (g_enable != 0);
+        random_stage_min_    = g_min;
+        random_stage_max_    = g_max;
+    }
     if (random_stage_min_ < 0)   random_stage_min_ = 0;
     if (random_stage_max_ > 99)  random_stage_max_ = 99;
     if (random_stage_max_ < random_stage_min_) random_stage_max_ = random_stage_min_;
 }
 
 void LauncherUI::SaveRandomStageState() {
+    std::string gid;
+    if (selected_game_index_ >= 0 &&
+        selected_game_index_ < (int)games_.size()) {
+        gid = GameIdForExePath(games_[selected_game_index_].exe_path);
+    }
+    if (!gid.empty()) {
+        SaveGamePatchBool(gid, "random_stage_enable", random_stage_enable_);
+        SaveGamePatchInt (gid, "random_stage_min",    random_stage_min_);
+        SaveGamePatchInt (gid, "random_stage_max",    random_stage_max_);
+        return;
+    }
+    // No game selected (shouldn't happen from the host UI) -- legacy global.
     const std::string path = NotifySettingsPath();
     if (path.empty()) return;
     WriteIntSetting(path, "random_stage_enable", random_stage_enable_ ? 1 : 0);
     WriteIntSetting(path, "random_stage_min",    random_stage_min_);
     WriteIntSetting(path, "random_stage_max",    random_stage_max_);
+}
+
+void LauncherUI::EnsureRandomStageLoaded() {
+    if (random_state_loaded_for_ != selected_game_index_) {
+        random_state_loaded_for_ = selected_game_index_;
+        LoadRandomStageState();
+    }
 }
 
 void LauncherUI::RenderInputBindingsTab(int player_slot) {
@@ -6580,10 +6623,7 @@ void LauncherUI::RenderHubPanel() {
                         // is the wire signal "random is on" — keep
                         // a tiny rejection loop so we never accidentally
                         // hand a 0 seed.
-                        if (!random_state_loaded_) {
-                            random_state_loaded_ = true;
-                            LoadRandomStageState();
-                        }
+                        EnsureRandomStageLoaded();  // per-game
                         if (random_stage_enable_ &&
                             random_stage_max_ >= random_stage_min_)
                         {

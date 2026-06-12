@@ -180,6 +180,10 @@ namespace FM2K {
     constexpr uintptr_t ADDR_SELECTED_STAGE       = 0x43274c;
     constexpr uintptr_t ADDR_LOAD_STAGE_FILE_ALT  = 0x4054b0;
     constexpr uintptr_t ADDR_CHAR_STAGE_PER_ROUND = 0x540337;
+    // Stage filename table (256-byte name entries; LoadStageFile does
+    // sprintf("%s.stage", table[256*idx])). 0 = not mapped on FM95 yet;
+    // the random-stage clamp skips when 0.
+    constexpr uintptr_t ADDR_STAGE_FILE_TABLE     = 0;
 
     // FM2K-only fields stubbed at 0 on FM95 — the AssignPlayerColor /
     // per-slot color-pick mechanism is FM2K-specific. FM95 has its own
@@ -319,6 +323,11 @@ namespace FM2K {
     // from the random-stage feature went to a dead address while
     // the game read the cursor's own pick from 0x43010c.
     constexpr uintptr_t ADDR_SELECTED_STAGE       = 0x43010c;
+    // g_stage_file_buffer @ 0x43A29C: 256-byte stage filename entries;
+    // LoadStageFile(idx) does sprintf("%s.stage", table[256*idx]). An
+    // out-of-range idx gives an empty/garbage name -> modal "GameStage
+    // Open error" box mid-match. First NUL first-byte = end of list.
+    constexpr uintptr_t ADDR_STAGE_FILE_TABLE     = 0x43A29C;
 
     // Per-character-slot record table. Each slot is 0xE03F bytes;
     // 8 slots span 0x4D1D80..0x54FF83. Field at slot+0xE00B is the

@@ -1032,15 +1032,20 @@ private:
     bool socd_state_loaded_ = false;
     void LoadSocdState();
     void SaveSocdState();
-    // Random-stage host preference (#56). Persisted in settings.ini
-    // alongside SOCD; consumed at challenge time to populate
-    // MatchSettings::random_seed/min/max.
-    bool random_stage_enable_   = false;
-    int  random_stage_min_      = 0;
-    int  random_stage_max_      = 7;
-    bool random_state_loaded_   = false;
+    // Random-stage host preference (#56). Persisted PER GAME in the
+    // game-patches ini (Patrick, 2026-06-11: "stage range isn't game
+    // specific" -- a range tuned for one game's stage list carried into
+    // every other game; the legacy global settings.ini values serve as
+    // first-load defaults). Consumed at challenge time to populate
+    // MatchSettings::random_seed/min/max. random_state_loaded_for_
+    // tracks WHICH game the members hold so a game switch reloads.
+    bool random_stage_enable_       = false;
+    int  random_stage_min_          = 0;
+    int  random_stage_max_          = 7;
+    int  random_state_loaded_for_   = -2;   // selected_game_index_ tag
     void LoadRandomStageState();
     void SaveRandomStageState();
+    void EnsureRandomStageLoaded();
 
     // Refresh the SDL window title to "FM2K Rollback Launcher — <nick> (W-L-D)"
     // any time the user's record changes. No-op if we don't have a record

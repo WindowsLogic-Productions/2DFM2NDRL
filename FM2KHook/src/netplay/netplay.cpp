@@ -1960,6 +1960,43 @@ bool Netplay_StartBattle() {
             }
         }
 
+        // Clamp the range to the game's REAL stage list (Patrick,
+        // 2026-06-11: "stage range isn't game specific"). The launcher's
+        // range is a per-game setting now, but a stale or hand-edited
+        // value must still never roll an index past the stage table:
+        // LoadStageFile sprintf's the filename from the 256-byte entry
+        // and an empty one throws a modal "GameStage Open error" box
+        // mid-match. Both peers scan the same table of the same game,
+        // so the clamp is identical on both sides and rolls stay
+        // deterministic. Scanned once, lazily (battle start = game data
+        // long since loaded).
+        if constexpr (FM2K::ADDR_STAGE_FILE_TABLE != 0) {
+            static int s_stage_count = -1;
+            if (s_stage_count < 0 && g_stage_max >= 0) {
+                const char* tbl = (const char*)FM2K::ADDR_STAGE_FILE_TABLE;
+                int n = 0;
+                while (n < 100 && tbl[256 * n] != '\0') ++n;
+                s_stage_count = n;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Netplay: random-stage: game defines %d stage(s)", n);
+            }
+            if (g_stage_max >= 0 && s_stage_count >= 0) {
+                if (s_stage_count == 0) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: random-stage disabled -- stage table is "
+                        "empty");
+                    g_stage_max = -1;
+                } else if (g_stage_max >= s_stage_count) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Netplay: random-stage range %d..%d exceeds the "
+                        "game's %d stages -- clamped",
+                        g_stage_min, g_stage_max, s_stage_count);
+                    g_stage_max = s_stage_count - 1;
+                    if (g_stage_min > g_stage_max) g_stage_min = g_stage_max;
+                }
+            }
+        }
+
         if (g_stage_max >= g_stage_min && g_stage_max >= 0) {
             // Advance one step. xorshift128 — identical to Lilith's
             // RandomStage() arrival-no-args branch (stdafx.cpp:670).
