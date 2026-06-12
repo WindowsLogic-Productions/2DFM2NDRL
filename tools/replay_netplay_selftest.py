@@ -20,7 +20,18 @@ import argparse, os, shutil, subprocess, sys, time
 from pathlib import Path
 
 LAUNCHER = Path("/mnt/c/games/FM2K_RollbackLauncher.exe")
-GAME_EXE = Path("/mnt/c/games/2dfm/wanwan/WonderfulWorld_ver_0946.exe")
+# Game override: FM2K_GAME_EXE targets a specific game (e.g. pkmncc)
+# instead of the default WonderfulWorld. Accepts a Windows (D:\...) or
+# WSL (/mnt/d/...) path. Pair with FM2K_TEST_CSS_CHAR to select a
+# specific roster character mirror (e.g. Bewear=3 in pkmncc).
+def _resolve_game_exe() -> Path:
+    v = os.environ.get("FM2K_GAME_EXE")
+    if not v:
+        return Path("/mnt/c/games/2dfm/wanwan/WonderfulWorld_ver_0946.exe")
+    if len(v) > 2 and v[1] == ":":  # Windows path -> /mnt/<drive>/
+        v = "/mnt/" + v[0].lower() + v[2:].replace("\\", "/")
+    return Path(v)
+GAME_EXE = _resolve_game_exe()
 OUT_DIR  = Path("/mnt/c/dev/wanwan/tools/.netplay_selftest")
 PARITY_DIFF = Path(__file__).parent / "parity_diff.py"
 P1_PORT = 7000
@@ -131,9 +142,17 @@ def main():
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD",
               "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG",
               "FM2K_STAGE_RANDOM_SEED", "FM2K_STAGE_RANDOM_MIN",
-              "FM2K_STAGE_RANDOM_MAX"):
+              "FM2K_STAGE_RANDOM_MAX", "FM2K_TEST_CSS_CHAR",
+              "FM2K_RACE_DETECT"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
+    # When a specific character mirror is requested, the cursor must NOT
+    # confirm at the grid origin -- let CssAutoConfirm (armed by
+    # FM2K_TEST_CSS_CHAR at CSS sync) drive the pick. The TEST_AUTO_CSS
+    # pulse still provides the gekko confirm edge.
+    if os.environ.get("FM2K_TEST_CSS_CHAR"):
+        print(f"[harness] char mirror: FM2K_TEST_CSS_CHAR="
+              f"{os.environ['FM2K_TEST_CSS_CHAR']}  game={GAME_EXE.name}")
 
     record_path_p1 = OUT_DIR / "p1_parity.pty"
     record_path_p2 = OUT_DIR / "p2_parity.pty"

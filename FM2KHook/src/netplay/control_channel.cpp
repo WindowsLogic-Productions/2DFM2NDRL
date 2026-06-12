@@ -411,8 +411,48 @@ static void RawSend(const void* data, size_t len) {
 }
 
 // Receive all pending packets, filter control vs GekkoNet
+// Race detector (FM2K_RACE_DETECT=1). RawReceive mutates the shared
+// g_gekko_packet_queue / g_recv_buffer. It is meant to run only under
+// g_poll_mutex; the MM-timer path holds it, but MultiplexAdapter_Receive
+// (the bug) did not. This guard increments an atomic on entry and
+// decrements on exit -- if two threads are ever inside concurrently the
+// depth exceeds 1, which is the smoking-gun data race that corrupts
+// GekkoNet's heap. Deterministic proof for the A/B: unfixed build trips
+// this under clumsy within seconds; fixed build (lock added) never does.
+struct RawReceiveRaceGuard {
+    static std::atomic<int>      s_depth;
+    static std::atomic<uint32_t> s_first_tid;
+    bool armed;
+    RawReceiveRaceGuard() {
+        static int cached = -1;
+        if (cached < 0) {
+            const char* v = std::getenv("FM2K_RACE_DETECT");
+            cached = (v && v[0] == '1') ? 1 : 0;
+        }
+        armed = (cached == 1);
+        if (!armed) return;
+        const uint32_t tid = (uint32_t)GetCurrentThreadId();
+        const int d = s_depth.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (d == 1) {
+            s_first_tid.store(tid, std::memory_order_relaxed);
+        } else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "[RACE-DETECT] RawReceive concurrent entry: depth=%d "
+                "this_tid=%u other_tid=%u -- g_gekko_packet_queue mutated "
+                "from two threads WITHOUT g_poll_mutex (heap-corruption bug)",
+                d, tid, s_first_tid.load(std::memory_order_relaxed));
+        }
+    }
+    ~RawReceiveRaceGuard() {
+        if (armed) s_depth.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+std::atomic<int>      RawReceiveRaceGuard::s_depth{0};
+std::atomic<uint32_t> RawReceiveRaceGuard::s_first_tid{0};
+
 static void RawReceive() {
     if (g_socket == INVALID_SOCKET) return;
+    RawReceiveRaceGuard _race_guard;
 
     while (true) {
         sockaddr_in from_addr;

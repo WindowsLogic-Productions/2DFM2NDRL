@@ -4,6 +4,7 @@
 // - Uses game's internal timer for frame counting
 #include "netplay.h"
 #include "../hooks/hooks.h"   // Hook_ApplySOCD_Public for SOCD-pre-apply on spec capture
+#include "../hooks/css_autoconfirm.h"  // CssAutoConfirm_OnReplayMatchStart (TEST_CSS_CHAR pin)
 #include "control_channel.h"
 #include "game_hash.h"
 #include "input.h"
@@ -1386,6 +1387,38 @@ bool Netplay_ProcessCSS() {
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "CSS SYNCED: Both ready, GekkoNet CSS session up, RNG reseeded");
+
+        // Test-harness char pin (FM2K_TEST_CSS_CHAR=<grid_idx>[,<color>]):
+        // arm CssAutoConfirm on BOTH live peers so the netplay CSS
+        // deterministically selects a SPECIFIC character mirror instead
+        // of confirming char 0 at the grid origin. Needed to reproduce
+        // content-specific bugs on the real game (e.g. Bewear=3 in
+        // pkmncc, babel's counterhit crash) -- char 0/0 in WonderfulWorld
+        // never exercised the same moves/effects. Both peers run the same
+        // pin with the same target, so the lockstep stays in step.
+        {
+            static int s_css_char = -2;
+            static int s_css_color = 0;
+            if (s_css_char == -2) {
+                const char* v = std::getenv("FM2K_TEST_CSS_CHAR");
+                if (v && v[0]) {
+                    s_css_char = std::atoi(v);
+                    const char* comma = std::strchr(v, ',');
+                    s_css_color = comma ? std::atoi(comma + 1) : 0;
+                } else {
+                    s_css_char = -1;  // disabled
+                }
+            }
+            if (s_css_char >= 0) {
+                CssAutoConfirm_OnReplayMatchStart(
+                    (uint8_t)s_css_char, (uint8_t)s_css_color,
+                    (uint8_t)s_css_char, (uint8_t)s_css_color,
+                    /*stage_id=*/0);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Netplay: TEST_CSS_CHAR pin armed -- both players -> "
+                    "char %d color %d (mirror)", s_css_char, s_css_color);
+            }
+        }
     }
 
     // Drive the GekkoNet CSS session for this tick.
