@@ -1010,6 +1010,28 @@ static void MultiplexAdapter_Send(GekkoNetAddress* addr, const char* data, int l
 
 // Adapter receive function - returns queued GekkoNet packets
 static GekkoNetResult** MultiplexAdapter_Receive(int* length) {
+    // CRITICAL: hold g_poll_mutex for the whole body. This runs on the
+    // MAIN thread (gekko's receive_data callback, fired from
+    // gekko_network_poll / gekko_update_session). RawReceive() push_backs
+    // onto g_gekko_packet_queue, and the MM-timer worker thread
+    // (KeepaliveTimerProc -> PollImplLocked -> RawReceive) push_backs onto
+    // the SAME vector under this mutex. Without taking it here, the two
+    // threads mutate g_gekko_packet_queue / g_recv_buffer / g_gekko_result_ptrs
+    // concurrently: a push_back reallocation on the timer thread frees the
+    // buffer this thread is iterating, the freed block is recycled into
+    // GekkoNet's own heap (the session_health std::map node pool), and the
+    // received InputMsg bytes land inside a tree node -> AV the next time
+    // SendSessionHealthCheck walks the map (registers full of the
+    // "Gekko::InputMsg" serializer tag). This was the intermittent
+    // netplay-only counterhit crash (babel, pkmncc, 0.2.71): counterhits
+    // spawn extra effects -> heavier frames -> gekko polls harder -> the
+    // race window widens. RawReceive's own contract ("touching this
+    // without holding g_poll_mutex is a bug") was being violated here.
+    // The timer thread uses try_lock, so it simply skips its poll on the
+    // ticks we hold the lock -- no deadlock, no recursion (the main-thread
+    // gekko_* callers do NOT hold g_poll_mutex).
+    std::lock_guard<std::mutex> lock(g_poll_mutex);
+
     // Clear previous pointer array (results were freed by GekkoNet)
     g_gekko_result_ptrs.clear();
 
