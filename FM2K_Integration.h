@@ -1159,7 +1159,7 @@ private:
     // Hub server hostname / IP. Edited from Settings → Hub Server…
     // (used to live in the Hub panel; moved out so casual users don't
     // see it by default). Persisted via FM2K_HUB_HOST env var on
-    // connect. Empty = use FM2K_HUB_HOST env var or 2dfm.sytes.net.
+    // connect. Empty = use FM2K_HUB_HOST env var or hub.2dfm.org.
     char     hub_host_[128] = {};
     bool     hub_host_initialized_ = false;
 

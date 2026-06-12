@@ -1,5 +1,17 @@
 # Hub VPS migration
 
+> **STATUS: DONE (2026).** The hub is live on a DigitalOcean droplet
+> (`67.205.183.131`, DNS `hub.2dfm.org`) behind **Caddy**, which terminates
+> TLS on :443 and reverse-proxies `wss://hub.2dfm.org/ws` → `127.0.0.1:7711`
+> and `https://hub.2dfm.org/discord_oauth_callback` (+ `/pair/*`, `/healthz`)
+> → `127.0.0.1:7700`. UDP STUN (7711) and relay (7712) are hit directly. The
+> Discord OAuth redirect is `https://hub.2dfm.org/discord_oauth_callback`
+> (registered in the dev portal). The old No-IP host `2dfm.sytes.net` is
+> retired. The text below is the original home-box→VPS playbook, kept for
+> history and as a rebuild reference; substitute `hub.2dfm.org` for
+> `2dfm.sytes.net` and note that TLS is now Caddy (not the optional nginx
+> path described near the end).
+
 Plan for moving the FM2K Rollback hub off your home box and onto a VPS.
 
 The hub is currently a single Python process (`hub/hub.py`) that listens on

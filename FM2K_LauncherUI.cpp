@@ -1379,7 +1379,7 @@ void LauncherUI::RenderMenuBar() {
 // Settings → Hub Server… window. Lets the user point the launcher at a
 // custom hub (their own hub.py instance, a friend's box, etc.) without
 // cluttering the main Hub panel for casual users who just want the
-// default 2dfm.sytes.net.
+// default hub.2dfm.org.
 void LauncherUI::RenderHubServerBody() {
     if (!hub_host_initialized_) {
         hub_host_initialized_ = true;
@@ -1391,7 +1391,7 @@ void LauncherUI::RenderHubServerBody() {
     ImGui::InputText(T("netcfg_host"), hub_host_, sizeof(hub_host_));
     ImGui::PopItemWidth();
     ImGui::TextWrapped(
-        "Hub server hostname or IP. Default 2dfm.sytes.net for public play. "
+        "Hub server hostname or IP. Default hub.2dfm.org for public play. "
         "Use 127.0.0.1 (or localhost) when running your own hub.py on the same "
         "machine — NAT routers rarely hairpin so the public DNS won't loop back. "
         "Takes effect on next Connect.");
@@ -2893,13 +2893,13 @@ void LauncherUI::RenderDiscordAuthWindow() {
     const bool busy = s_pairing && s_pairing->status() == Pairing::Status::Pending;
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button(s_cached.valid ? T("hub_resignin") : T("hub_signin"))) {
-        // Build hub HTTP base URL. v0.2.8 default uses HTTPS via the
-        // public reverse proxy (hub.2dfm.org → Caddy → 127.0.0.1:7700
-        // on the droplet). Legacy direct-port path
-        // ("http://2dfm.sytes.net:7700") is gone from the default but
-        // users who set a custom hub_host_ that includes the old
-        // hostname still hit the bridged 2dfm.sytes.net endpoint that
-        // points at the same droplet.
+        // Build hub HTTP base URL. Default is HTTPS via the public
+        // reverse proxy (hub.2dfm.org → Caddy → 127.0.0.1:7700 on the
+        // DO droplet). The old No-IP host 2dfm.sytes.net is fully
+        // retired (DNS gone); the sytes.net branch below is dead
+        // legacy-compat, kept only so a stale saved hub_host_ resolves
+        // to nothing loudly rather than silently — clear the Hub Server
+        // host field to fall back to the hub.2dfm.org default.
         std::string base;
         const char* host = hub_host_[0] ? hub_host_ : "hub.2dfm.org";
         // Heuristic: any host that's the new public hostname OR an

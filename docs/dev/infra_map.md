@@ -14,13 +14,24 @@ secrets are involved.
 
 ## Live services
 
-| Service | Address | Process | Notes |
+Hosted on a DigitalOcean droplet (`67.205.183.131`), DNS `hub.2dfm.org`.
+The old No-IP host `2dfm.sytes.net` and the home-box deployment are retired.
+**Caddy** terminates TLS on :443 and reverse-proxies the two TCP/HTTP paths to
+the hub process on localhost; the UDP STUN/relay ports are hit directly (Caddy
+doesn't front UDP, and game traffic doesn't need TLS).
+
+| Service | Public address | Backed by | Notes |
 |---|---|---|---|
-| Matchmaking hub (WebSocket) | `2dfm.sytes.net:7711` | `python hub/hub.py` | DNS points at your home box; requires port-forwarding 7711 + 7712 (relay) |
-| OAuth callback (HTTP) | `2dfm.sytes.net:7700` | same process as above | Discord redirects browser here after Authorize |
-| STUN responder (UDP) | `2dfm.sytes.net:7711` | same process | Same port as WS — different protocol, demuxed by first byte |
-| Hub relay (UDP) | `2dfm.sytes.net:7712` | same process | Symmetric NAT fallback path for game traffic |
-| Discord bot | runs on your desktop | `python bot/bot.py` | Welcomes new patrons via DM, `/check` slash command |
+| Matchmaking hub (WebSocket) | `wss://hub.2dfm.org/ws` (:443) | Caddy → `127.0.0.1:7711` | `python hub/hub.py` |
+| OAuth callback + pairing (HTTPS) | `https://hub.2dfm.org/discord_oauth_callback`, `/pair/*`, `/healthz` | Caddy → `127.0.0.1:7700` | same process; aiohttp server in `auth.py` |
+| STUN responder (UDP) | `hub.2dfm.org:7711` (direct) | hub process | same port as WS, demuxed by first byte; no TLS (UDP) |
+| Hub relay (UDP) | `hub.2dfm.org:7712` (direct) | hub process | symmetric-NAT fallback for game traffic; no TLS (UDP) |
+| Discord bot | (outbound only) | `python bot/bot.py` | welcomes new patrons via DM, `/check` slash command |
+
+Legacy note: the launcher keeps a dead `sytes.net` branch (direct WS on :7711,
+plain http on :7700) for users whose saved `hub_host_` still names the old
+host; since that DNS is gone it just fails loudly. Clearing the Hub Server
+host field falls back to the `hub.2dfm.org` default.
 
 ## Secrets
 

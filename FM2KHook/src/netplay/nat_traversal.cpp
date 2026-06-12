@@ -83,7 +83,7 @@ bool ParseHostPort(const std::string& s, std::string& host, uint16_t& port) {
 
 // Resolve a hostname (or literal IPv4 string) to in_addr. Returns
 // false on failure. Used so the launcher / dllmain can pass either
-// "127.0.0.1" or "2dfm.sytes.net" as the hub address — getaddrinfo
+// "127.0.0.1" or "hub.2dfm.org" as the hub address — getaddrinfo
 // handles both cases. Only the FIRST A record is taken; sufficient
 // for our small hub deployments.
 bool ResolveHostA(const std::string& host, in_addr& out) {

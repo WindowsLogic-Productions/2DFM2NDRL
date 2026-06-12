@@ -48,7 +48,7 @@ CachedAuth   LoadCached();
 bool         SaveCached(const CachedAuth& a);
 void         ClearCached();
 
-// Pairing flow. hub_base_url is e.g. "http://2dfm.sytes.net:7700"
+// Pairing flow. hub_base_url is e.g. "https://hub.2dfm.org"
 // (no trailing slash). Begin() returns a Pairing handle that the UI
 // polls each frame.
 struct Pairing {
