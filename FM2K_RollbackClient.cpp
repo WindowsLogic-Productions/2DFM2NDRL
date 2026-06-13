@@ -906,6 +906,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     bool spectate_mode = false;
     bool stress_mode_cli = false;        // --stress: auto-launches stress determinism test on first game in scan
     std::string stress_game_filter;       // --stress <name>: filter discovered games by substring (case-insensitive)
+    bool offline_mode_cli = false;       // --offline: auto-launches the pure FM2K_TRUE_OFFLINE native path (no rollback) for perf profiling
+    std::string offline_game_filter;      // --offline <name|path>: substring filter or direct .exe path
     std::string direct_game_filter;       // --host/--connect <name-or-path>: pick a specific game instead of "first discovered"
     std::string spectate_target_addr;     // "host_ip:host_port" for --spectate
     std::string spectate_join_mode = "current";  // --spectate-mode {current,full}; default flipped back to "current" 2026-05-13 (v0.2.42 Phases C/D/E)
@@ -1010,6 +1012,24 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                 std::cerr << "Error: --port requires a port number\n";
                 return SDL_APP_FAILURE;
             }
+        } else if (arg == "--remote" || arg == "-r") {
+            // Override the remote peer address regardless of host/guest
+            // role. --connect already sets remote_address for the guest;
+            // --host leaves it at the placeholder (the hook then learns
+            // the peer from the first inbound HELLO). --remote lets the
+            // HOST be pointed at a specific peer/blackhole too, which the
+            // relay self-test needs: pointing both peers at a TEST-NET-1
+            // blackhole makes the direct punch fail on BOTH sides so the
+            // hub relay engages. StartOnlineSession only clears the host
+            // remote when it equals the "127.0.0.1:7001" placeholder, so
+            // any other value (e.g. 192.0.2.1:6001) flows through to the
+            // hook's StartPunch.
+            if (i + 1 < argc) {
+                config.remote_address = argv[++i];
+            } else {
+                std::cerr << "Error: --remote requires an address\n";
+                return SDL_APP_FAILURE;
+            }
         } else if (arg == "--delay" || arg == "-d") {
             if (i + 1 < argc) {
                 config.input_delay = std::stoi(argv[++i]);
@@ -1041,6 +1061,18 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             // for the RNG-determinism check to fire).
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 stress_game_filter = argv[++i];
+            }
+        } else if (arg == "--offline") {
+            // Auto-launches the pure offline native path (FM2K_TRUE_OFFLINE)
+            // on a matched game and skips the launcher UI -- the path Yamada's
+            // Robot Heroes slowdown lives on. Unlike --stress this runs NO
+            // GekkoNet/rollback, so the [OFFLINE-SECT]/[FRAMETIME] perf
+            // instruments (FM2K_PERF_PROFILE=1) measure the real offline
+            // per-frame cost. Optional next arg = game substring or direct
+            // .exe path (same convention as --stress).
+            offline_mode_cli = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                offline_game_filter = argv[++i];
             }
         }
     }
@@ -1201,6 +1233,54 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         std::cout << "Stress mode: GekkoStressSession started for "
                   << game_to_launch.exe_path
                   << " — watch logs/FM2K_P1_Debug.log\n";
+    }
+
+    if (offline_mode_cli) {
+        // Mirror of the --stress resolution, but launches the pure offline
+        // native path for perf profiling. Boots straight to battle (skips the
+        // CSS, which crashes on some games like Robot Heroes) and idles --
+        // NO autoplay-mash, so the per-frame cost is stage/object dominated
+        // and stable across runs. Stage is pinned via FM2K_BTB_STAGE (passed
+        // through from the environment); FM2K_PERF_PROFILE / FM2K_DUMP_STAGES
+        // likewise flow through to the spawned game.
+        std::vector<FM2K::FM2KGameInfo> games;
+        const bool is_direct_path = !offline_game_filter.empty()
+            && (offline_game_filter.find('/')  != std::string::npos ||
+                offline_game_filter.find('\\') != std::string::npos);
+        if (is_direct_path) {
+            FM2K::FM2KGameInfo info{};
+            info.exe_path = offline_game_filter;
+            games.push_back(info);
+            offline_game_filter.clear();
+        } else {
+            games = g_launcher->DiscoverGames();
+        }
+        if (games.empty()) {
+            std::cerr << "No FM2K games found for --offline\n";
+            return SDL_APP_FAILURE;
+        }
+        ::SetEnvironmentVariableA("FM2K_BOOT_TO_BATTLE", "1");
+        ::SetEnvironmentVariableA("FM2K_AUTO_TITLE_SKIP", "1");
+        size_t pick = 0;
+        if (!offline_game_filter.empty()) {
+            auto lowercase = [](std::string s) {
+                for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+                return s;
+            };
+            std::string needle = lowercase(offline_game_filter);
+            for (size_t i = 0; i < games.size(); ++i) {
+                if (lowercase(games[i].exe_path).find(needle) != std::string::npos) {
+                    pick = i;
+                    break;
+                }
+            }
+        }
+        g_launcher->SetSelectedGame(games[pick]);
+        g_launcher->StartOfflineSession();
+        g_launcher->SetState(LauncherState::InGame);
+        std::cout << "Offline mode: native session started for "
+                  << games[pick].exe_path
+                  << " — watch logs/FM2K_P1_Debug.log [OFFLINE-SECT]/[FRAMETIME]\n";
     }
 
     // If direct mode, skip UI and go straight to game launch + network
