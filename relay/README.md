@@ -72,6 +72,7 @@ All flags also read from env (`FM2K_RELAY_HUB`, `FM2K_RELAY_REGISTER_KEY`,
 
 ## Status
 
-Code-complete; **not yet compile/integration-tested** (the dev box has no Go
-toolchain). Build + the loopback test live under task #6 / the Phase 4 test
-plan in `docs/dev/nat_reachability_plan.md`.
+`go build` clean, `go vet` clean, unit tests green (routing / authorization /
+rate-limit -- `go test ./...`). Integration (loopback two-client through a
+running relay, then a real SEA relay) is the remaining step, under task #6 /
+the Phase 4 test plan in `docs/dev/nat_reachability_plan.md`.
