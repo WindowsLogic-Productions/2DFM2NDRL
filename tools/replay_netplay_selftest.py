@@ -16,10 +16,17 @@ which is what users actually hit.
 """
 
 from __future__ import annotations
-import argparse, os, shutil, subprocess, sys, time
+import argparse, os, secrets, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 LAUNCHER = Path("/mnt/c/games/FM2K_RollbackLauncher.exe")
+RELAY_STUB = Path(__file__).parent / "relay_stub.py"
+# TEST-NET-1 (RFC 5737). Globally routable as "documentation/example" only;
+# real networks blackhole it, so punch packets sent here vanish and the
+# direct hole-punch provably fails -> the hub relay engages. We give each
+# peer a DISTINCT blackhole port purely for log clarity; the address is
+# unreachable either way.
+RELAY_BLACKHOLE_IP = "192.0.2.1"
 # Game override: FM2K_GAME_EXE targets a specific game (e.g. pkmncc)
 # instead of the default WonderfulWorld. Accepts a Windows (D:\...) or
 # WSL (/mnt/d/...) path. Pair with FM2K_TEST_CSS_CHAR to select a
@@ -42,6 +49,23 @@ def to_win(p: Path) -> str:
     if s.startswith("/mnt/") and len(s) > 6 and s[6] == "/":
         return s[5].upper() + ":" + s[6:]
     return s
+
+def find_windows_python() -> str | None:
+    # The relay stub MUST run as a Windows process so it binds the same
+    # 127.0.0.1 loopback the Windows game sees. WSL2 ("nat" networking) puts
+    # the Linux side on a separate stack -- a WSL-bound socket is unreachable
+    # from the Windows game at 127.0.0.1. Prefer python.exe / py.exe on PATH.
+    for cand in ("python.exe", "py.exe"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    # Common fixed install location as a fallback.
+    for p in ("/mnt/c/Program Files/Python313/python.exe",
+              "/mnt/c/Program Files/Python312/python.exe",
+              "/mnt/c/Program Files/Python311/python.exe"):
+        if Path(p).exists():
+            return p
+    return None
 
 def launch(label, args, env_extra, log_path, timeout, done_when=None):
     # WSL→Windows env vars don't cross via subprocess.Popen(env=) directly.
@@ -106,6 +130,17 @@ def main():
     ap.add_argument("--record-timeout", type=float, default=180.0)
     ap.add_argument("--replay-timeout", type=float, default=120.0)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--relay", action="store_true",
+                    help="Relay-floor mode: start a local hub-relay data plane "
+                         "(tools/relay_stub.py), inject FM2K_HUB_RELAY_ADDR + "
+                         "FM2K_HUB_RELAY_SESSION into both peers, and point each "
+                         "peer's remote at a TEST-NET-1 blackhole so the direct "
+                         "hole-punch fails and the hub relay engages. PASS = both "
+                         "logs show 'relay mode ENGAGED' then 'CONNECTED!', and "
+                         "the match completes through CSS -> battle.")
+    ap.add_argument("--relay-port", type=int, default=7712,
+                    help="UDP port for the local relay stub (default 7712, "
+                         "matches the hub's relay listen port).")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,12 +162,23 @@ def main():
         "FM2K_PARITY_AUTOPLAY_BATTLE": "1",
         "FM2K_AUTO_TITLE_SKIP": "1",
         "FM2K_AUTO_TERMINATE_AT_FRAME": str(args.frames),
-        # CSS auto-confirm — both peers pick char 0/color 0, stage 0,
-        # press confirm. Drives both engines deterministically through
-        # CSS into battle without the user mashing keys. Must be IDENTICAL
-        # on both peers for gekko CSS-delay session to converge.
-        "FM2K_TEST_AUTO_CSS": "0,0,0,0,0",
     }
+    # Boot-to-battle mode (set FM2K_BTB_STAGE): both peers /F straight into
+    # battle on the pinned stage, skipping CSS entirely. Needed for games
+    # whose CSS crashes (Robot Heroes) AND to pin a specific (heavy) stage so
+    # the netplay frame-skip catch-up gets exercised on a real heavy render.
+    # Otherwise use CSS auto-confirm (char 0 / stage 0), the default for
+    # well-behaved games like WonderfulWorld.
+    if os.environ.get("FM2K_BTB_STAGE"):
+        common_env["FM2K_BOOT_TO_BATTLE"] = "1"
+        common_env["FM2K_BTB_STAGE"] = os.environ["FM2K_BTB_STAGE"]
+        print(f"[harness] boot-to-battle mode: stage={os.environ['FM2K_BTB_STAGE']} "
+              f"game={GAME_EXE.name}")
+    else:
+        # CSS auto-confirm — both peers pick char 0/color 0, stage 0, press
+        # confirm. Must be IDENTICAL on both peers for the gekko CSS-delay
+        # session to converge.
+        common_env["FM2K_TEST_AUTO_CSS"] = "0,0,0,0,0"
     # Forward rollback-shaping env from the calling shell. Loopback at the
     # auto-negotiated delay produces ZERO rollbacks (rb_total=0 -- verified
     # 2026-06-11), so the recorder's under-rollback behavior goes untested
@@ -140,6 +186,8 @@ def main():
     # 0ms-ping scheduling jitter makes remote inputs late) -> genuine
     # rollbacks through the genuine path.
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD",
+              "FM2K_RENDER_STALL_US", "FM2K_NO_NETPLAY_CATCHUP", "FM2K_PERF_PROFILE",
+              "FM2K_DEV_MODE", "FM2K_BTB_P1_CHAR", "FM2K_BTB_P2_CHAR",
               "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG",
               "FM2K_STAGE_RANDOM_SEED", "FM2K_STAGE_RANDOM_MIN",
               "FM2K_STAGE_RANDOM_MAX", "FM2K_TEST_CSS_CHAR",
@@ -161,17 +209,112 @@ def main():
 
     start_ts = time.time()
 
+    # ---- Relay-floor mode setup (Phase 0 NAT plan) ----
+    # When --relay is set we stand up a local hub-relay data plane and force
+    # BOTH peers through it: each peer's remote points at a TEST-NET-1
+    # blackhole, so the direct hole-punch fails on both sides, and after the
+    # ~2s post-burst grace the hook engages relay mode and routes all
+    # gameplay (HELLO + GekkoNet) through the relay endpoint. This exercises
+    # exactly the production relay floor, not a forced shortcut.
+    relay_proc = None
+    relay_token = None
+    relay_env = {}
+    if args.relay:
+        # 32-hex match token. The SAME hex feeds both FM2K_HUB_MATCH_TOKEN
+        # (so the hook's Netplay_Init runs StartPunch, whose post-burst
+        # worker engages relay on failure) and FM2K_HUB_RELAY_SESSION (the
+        # 0xCF envelope session id). The relay stub pre-registers the same
+        # token so route() can pair the two peers. make_relay_session in the
+        # hub and the stub derive the 16-byte id identically (hex -> bytes).
+        relay_token = secrets.token_hex(16)  # 32 hex chars == 16 bytes
+        relay_addr = f"127.0.0.1:{args.relay_port}"
+        relay_env = {
+            "FM2K_HUB_RELAY_ADDR":   relay_addr,
+            "FM2K_HUB_RELAY_SESSION": relay_token,
+            "FM2K_HUB_MATCH_TOKEN":  relay_token,
+        }
+        print(f"[harness] RELAY mode: stub on {relay_addr} "
+              f"session={relay_token}")
+        print(f"[harness]   both peers point remote at blackhole "
+              f"{RELAY_BLACKHOLE_IP} so direct punch fails -> relay engages")
+        # Start the relay stub (hub data-plane equivalent: 0xCF route + 0xCD
+        # STUN ack). We prefer the real hub.py with --test-relay-session, but
+        # hub.py also stands up WS/HTTP/auth + 4 ports; the stub is the
+        # hermetic, dependency-free path and freezes the exact wire behavior
+        # (copied from hub.py:1826-1878). Where `websockets` is installed,
+        # re-verify this same scenario against the real hub.py at least once.
+        #
+        # CRITICAL: launch the stub as a WINDOWS process (python.exe). The
+        # game is a Windows process; under WSL2 "nat" networking the Linux
+        # and Windows loopbacks are separate stacks, so a WSL-bound stub at
+        # 127.0.0.1:7712 is invisible to the game. Running the stub on
+        # Windows python binds the SAME loopback the game's relay sendto
+        # targets. Falls back to the WSL interpreter only if no Windows
+        # python is found (test will then fail loudly with zero routes).
+        relay_log = OUT_DIR / "relay_stub.log"
+        if relay_log.exists(): relay_log.unlink()
+        win_py = find_windows_python()
+        relay_log_f = None
+        if win_py:
+            # Launch the Windows python DIRECTLY (relay_proc IS the python.exe
+            # so terminate() reaps it). The stub owns its own --logfile write
+            # because a WSL stdout pipe does not reliably capture a Windows
+            # child's output; both sides read the same physical file on C:.
+            stub_cmd = [win_py, "-u", to_win(RELAY_STUB),
+                        "--host", "127.0.0.1", "--port", str(args.relay_port),
+                        "--session", relay_token, "--verbose",
+                        "--logfile", to_win(relay_log)]
+            print(f"[harness]   relay stub via Windows python: {win_py}")
+            relay_proc = subprocess.Popen(stub_cmd,
+                                          stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+        else:
+            # No Windows python -- fall back to WSL python. Under WSL2 nat
+            # networking the game likely cannot reach it; the test will fail
+            # loudly (zero routes / relay timeout) rather than silently.
+            print("[harness]   WARNING: no Windows python found; running stub "
+                  "under WSL python -- under WSL2 nat networking the game may "
+                  "not reach it (expect zero routes / relay timeout).")
+            relay_log_f = open(relay_log, "w")
+            relay_proc = subprocess.Popen(
+                [sys.executable, str(RELAY_STUB),
+                 "--host", "127.0.0.1", "--port", str(args.relay_port),
+                 "--session", relay_token, "--verbose"],
+                stdout=relay_log_f, stderr=subprocess.STDOUT)
+        # Wait for the stub's READY line so neither peer punches before the
+        # relay socket is bound. Short bounded poll on the log file.
+        ready_deadline = time.time() + 5.0
+        while time.time() < ready_deadline:
+            if relay_proc.poll() is not None:
+                print(f"[harness] FAIL: relay stub exited early "
+                      f"rc={relay_proc.returncode} (see {relay_log})")
+                if relay_log_f is not None: relay_log_f.close()
+                return 1
+            try:
+                if "[relay-stub] READY" in relay_log.read_text():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        print(f"[harness]   relay stub ready (log: {relay_log})")
+
     # Launch P1 (host) and P2 (joiner) concurrently. Loopback 127.0.0.1.
     # P1 = --host with FM2K_LOCAL_PORT=7000, FM2K_REMOTE_ADDR=127.0.0.1:7001
     # P2 = --connect with FM2K_LOCAL_PORT=7001, FM2K_REMOTE_ADDR=127.0.0.1:7000
+    # In --relay mode the remotes below are overridden to a blackhole (via
+    # --remote for the host and the --connect arg for the guest); the env
+    # FM2K_REMOTE_ADDR here is then ignored because StartOnlineSession
+    # re-derives it from the CLI args.
     p1_env = {
         **common_env,
+        **relay_env,
         "FM2K_LOCAL_PORT": str(P1_PORT),
         "FM2K_REMOTE_ADDR": f"127.0.0.1:{P2_PORT}",
         "FM2K_PARITY_RECORD_PATH": to_win(record_path_p1),
     }
     p2_env = {
         **common_env,
+        **relay_env,
         "FM2K_LOCAL_PORT": str(P2_PORT),
         "FM2K_REMOTE_ADDR": f"127.0.0.1:{P1_PORT}",
         "FM2K_PARITY_RECORD_PATH": to_win(record_path_p2),
@@ -190,6 +333,18 @@ def main():
     p1_args = [str(LAUNCHER), "--host", game_arg, "--port", str(P1_PORT)]
     p2_args = [str(LAUNCHER), "--connect", f"127.0.0.1:{P1_PORT}", game_arg,
                "--port", str(P2_PORT)]
+    if args.relay:
+        # Point BOTH peers at the blackhole so direct punch fails on both.
+        # Host needs --remote (it otherwise listens-and-learns and never
+        # runs StartPunch); guest's --connect target IS its remote, so we
+        # just retarget it. The relay envelope then carries everything to
+        # the actual peer via the stub. Distinct blackhole ports are
+        # cosmetic (the IP is unreachable regardless) but make the punch
+        # targets distinguishable in the logs.
+        p1_args = [str(LAUNCHER), "--host", game_arg, "--port", str(P1_PORT),
+                   "--remote", f"{RELAY_BLACKHOLE_IP}:{P2_PORT}"]
+        p2_args = [str(LAUNCHER), "--connect", f"{RELAY_BLACKHOLE_IP}:{P1_PORT}",
+                   game_arg, "--port", str(P2_PORT)]
 
     # done_when: wait for the harness terminator inside the hook to flush
     # the .fm2krep slice. parity.pty's first byte appears at frame 1 — way
@@ -212,6 +367,47 @@ def main():
     t2.start()
     t1.join(); t2.join()
     print(f"[harness] P1 rc={rc1[0]} P2 rc={rc2[0]}")
+
+    # ---- Relay-floor verification ----
+    # The peers each write FM2K_P<n>_Debug.log next to the game exe. Confirm
+    # both engaged relay AND completed the handshake through it. We check the
+    # exact hook strings: "relay mode ENGAGED" (nat_traversal.cpp) and "Full
+    # handshake complete - CONNECTED!" (netplay.cpp). The stdout cmd.exe logs
+    # (p1_log/p2_log) don't carry the SDL_Log lines, so read the game-side
+    # debug logs. Tear the relay stub down regardless of outcome.
+    relay_ok = True
+    if args.relay:
+        if relay_proc is not None:
+            relay_proc.terminate()
+            try: relay_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: relay_proc.kill()
+        def _peer_log(idx: int) -> str:
+            # Hook writes logs\FM2K_P<idx+1>_Debug.log relative to the game's
+            # CWD (Fm2k_BuildLogPath -> "logs\\<name>"). Fall back to the game
+            # dir root in case the logs subdir path ever changes. Tolerate
+            # absence / unreadable.
+            for p in (game_dir / "logs" / f"FM2K_P{idx+1}_Debug.log",
+                      game_dir / f"FM2K_P{idx+1}_Debug.log"):
+                try:
+                    if p.exists():
+                        return p.read_text(errors="ignore")
+                except OSError:
+                    pass
+            return ""
+        for idx, label in ((0, "P1"), (1, "P2")):
+            txt = _peer_log(idx)
+            engaged   = "relay mode ENGAGED" in txt
+            connected = "Full handshake complete - CONNECTED!" in txt
+            print(f"[harness] RELAY {label}: ENGAGED={engaged} "
+                  f"CONNECTED={connected}")
+            if not (engaged and connected):
+                relay_ok = False
+        if relay_ok:
+            print("[harness] RELAY: both peers ENGAGED relay + CONNECTED -- PASS")
+        else:
+            print("[harness] RELAY: FAIL -- a peer did not engage relay or did "
+                  "not complete the handshake through it (see "
+                  "FM2K_P{1,2}_Debug.log)")
 
     # Find P1's .fm2krep (host is canonical recorder; the hook writes
     # per-player *_p<idx>_harness.fm2krep so P2's slice can't clobber it).
@@ -273,6 +469,14 @@ def main():
     print("[harness] diffing P1 parity vs replay parity")
     diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
                                str(record_path_p1), str(replay_pty)])
+    # In relay mode the run only PASSES if BOTH the parity diff is clean AND
+    # both peers provably went through the relay (ENGAGED + CONNECTED). A
+    # clean diff with no relay engagement would be a false green (the peers
+    # might have connected directly), so fold relay_ok into the exit code.
+    if args.relay and not relay_ok:
+        print("[harness] OVERALL FAIL: relay engagement check failed "
+              f"(parity diff_rc={diff_rc})")
+        return 1
     return diff_rc
 
 if __name__ == "__main__":
