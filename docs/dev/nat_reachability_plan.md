@@ -2,11 +2,18 @@
 
 Date: 2026-06-12
 Author: design by Fable 5 (orchestrator), implementation by Opus 4.8 agents
-Status: Phase 0 SHIPPED (hub live, client floor 0.2.73-bleeding).
-        Phase 1 committed (wanwan ccaf3db, hub a0df2be pushed); hub
-        a0df2be pulled to VPS but NOT yet restarted (held for a quiet
-        window, dormant until a UPnP launcher ships). Launcher release
-        TBD. Phases 2-3 not started.
+Status: Phase 0 SHIPPED (relay floor, client floor 0.2.73-bleeding).
+        Phase 1 SHIPPED (UPnP): hub a0df2be, client v0.2.74-bleeding.
+        Phase 2a SHIPPED hub-side 2026-06-13: hub 87a5b42 live (restarted,
+        STUN-2 on 7714 + nat_type parse/peer_dict + [relay]-active log).
+        Launcher classification committed (wanwan 4f0838f) but NOT released
+        -- needs a bleeding cut to activate nat_type reporting.
+        Phase 2b (REACH_CHECK active verification) DEFERRED -- needs a
+        lobby-persistent socket; only a confidence upgrade over Phase 1's
+        CGNAT-guarded UPnP honoring. Revisit if Phase 3 gating needs it.
+        Phase 3 (anchor + relay gating) not started.
+        Revert levers: FM2K_NO_UPNP=1 (per-user); hub `git revert`+restart;
+        client = cut next bleeding from revert or delete GH release.
 
 ## Goal
 
