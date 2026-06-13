@@ -712,22 +712,48 @@ static void RunBattleTick() {
         // rollback reconciles -- the same mechanism runahead already uses. No
         // wall-clock value reaches the sim. FM2K_NO_NETPLAY_CATCHUP=1 forces
         // single-step (the pre-decouple behavior).
+        // DEFAULT OFF (2026-06-13). The netplay catch-up holds heavy-stage sim
+        // at 100fps, but it fundamentally fights gekko's frame-advantage model:
+        // running extra gekko cycles off one peer's wall-clock pushes that peer
+        // ahead, the 1.6% time-sync slowdown can't pull it back, so FA pins near
+        // the prediction window (+/-13) and that peer rolls back pathologically
+        // (2500-frame soak: P2 ~1100 rollbacks vs P1's 12, FA +13.8 vs -13.6).
+        // The render-gate stops it engaging on LIGHT stages, but on genuinely
+        // heavy stages it still imbalances. Render-bound single-step (both peers
+        // equally slow, FA balanced, no one-sided rollback) beats that. Offline
+        // frame-skip is unaffected (no gekko / no FA). Opt in for experiments
+        // only: FM2K_NETPLAY_CATCHUP=1. A future gekko-paced design could revive
+        // it without the imbalance.
         static int s_np_catchup = -1;
         if (s_np_catchup < 0) {
-            const char* off = std::getenv("FM2K_NO_NETPLAY_CATCHUP");
-            s_np_catchup = (off && off[0] == '1') ? 0 : 1;
+            const char* on = std::getenv("FM2K_NETPLAY_CATCHUP");
+            s_np_catchup = (on && on[0] == '1') ? 1 : 0;
         }
+        const uint64_t freq     = SDL_GetPerformanceFrequency();
+        const uint64_t step_qpc = freq / 100;                // 10ms = one 100fps step
+        static uint64_t s_logical_qpc     = 0;
+        static uint64_t s_last_render_qpc = 0;               // duration of the previous battle render
+        const uint64_t now_qpc = SDL_GetPerformanceCounter();
+        if (s_logical_qpc == 0) s_logical_qpc = now_qpc - step_qpc;
+
         int steps = 1;
-        if (s_np_catchup == 1) {
-            const uint64_t freq = SDL_GetPerformanceFrequency();
-            const uint64_t step_qpc = freq / 100;            // 10ms = one 100fps step
-            static uint64_t s_logical_qpc = 0;
-            const uint64_t now_qpc = SDL_GetPerformanceCounter();
-            if (s_logical_qpc == 0) s_logical_qpc = now_qpc - step_qpc;
-            steps = step_qpc ? (int)((now_qpc - s_logical_qpc) / step_qpc) : 1;
+        // RENDER-GATED catch-up: only run multiple gekko cycles when the
+        // PREVIOUS render genuinely blew the 10ms frame budget (a heavy stage).
+        // On a light stage render fits, so we force steps=1 and keep the
+        // accumulator pinned one step behind now -- otherwise it banks gekko's
+        // RTT-driven frame-advantage slowdown (the intentional ~1.6% when ahead)
+        // as wall-clock debt and "corrects" it with a periodic double gekko-step,
+        // a 1-frame lurch felt as choppiness on EVERY normal netplay match
+        // (confirmed: spurious NET-FRAMESKIP on a light stage under clumsy RTT).
+        // Single-stepping light stages is byte-identical to the pre-decouple
+        // path. FM2K_NO_NETPLAY_CATCHUP=1 disables catch-up outright.
+        if (s_np_catchup == 1 && step_qpc && s_last_render_qpc > step_qpc) {
+            steps = (int)((now_qpc - s_logical_qpc) / step_qpc);
             if (steps < 1) steps = 1;
             if (steps > 4) { steps = 4; s_logical_qpc = now_qpc - 4 * step_qpc; }
             s_logical_qpc += (uint64_t)steps * step_qpc;
+        } else {
+            s_logical_qpc = now_qpc - step_qpc;              // pinned: no banked drift on light stages
         }
         // Run up to `steps` gekko cycles, but stop early if one didn't advance
         // (lockstep stall waiting on remote input) -- spinning would not help
@@ -746,7 +772,9 @@ static void RunBattleTick() {
                     "[NET-FRAMESKIP] sim ran %d gekko steps for 1 render (heavy stage)", taken);
         }
         if (g_frame_pending_render) {
+            const uint64_t _r0 = SDL_GetPerformanceCounter();
             RenderFrameWithSnapshot();
+            s_last_render_qpc = SDL_GetPerformanceCounter() - _r0;
             g_frame_pending_render = false;
         }
         // Drift adjustment now lives in SleepToTarget at the outer
