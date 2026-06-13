@@ -23,6 +23,10 @@
 // Forward declarations
 class FM2KGameInstance;
 class LauncherUI;
+namespace fm2k { class PortMapper; }  // UPnP port mapper (Phase 1); defined
+                                      // in FM2K_PortMapper.h, owned by
+                                      // LauncherUI as a unique_ptr so the
+                                      // miniupnpc headers stay out of here.
 
 // FM2K Memory addresses and structures (from research)
 namespace FM2K {
@@ -1176,6 +1180,20 @@ private:
     // FM2K_LauncherUI.cpp.
     struct HubState;
     std::unique_ptr<HubState> hub_state_;
+
+    // UPnP port mapper (Phase 1 NAT reachability). One instance per
+    // launcher; StartAsync fires at the hub Connected event for ONLINE
+    // sessions only, mapping the game's UDP port on the router so peers can
+    // reach us directly. Polled each frame in RenderHubPanel; on the
+    // transition into Mapped we re-send udp_addr carrying the external
+    // endpoint. Stop() on session teardown / launcher exit. unique_ptr so
+    // the miniupnpc-dependent type stays fully out of this header.
+    std::unique_ptr<fm2k::PortMapper> port_mapper_;
+    // Last PortMapper state we acted on, so the udp_addr re-send fires
+    // EXACTLY once per state transition (the Snapshot() is polled every
+    // frame; without this we'd spam the hub). int mirror of
+    // fm2k::PortMapper::State; -1 = "never polled yet".
+    int port_mapper_last_state_ = -1;
 
 public:
     // Tell the hub the current match (if any) has ended. Called by

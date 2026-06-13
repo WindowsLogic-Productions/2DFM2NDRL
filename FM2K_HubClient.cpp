@@ -375,6 +375,31 @@ void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
     EnqueueOut(std::move(m));
 }
 
+void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
+                               const std::string& ext_ip, int ext_udp_port,
+                               bool upnp) {
+    // Same base shape as SendUdpAddr (ip/port[/tcp_port]) plus the optional
+    // UPnP fields. Kept as a separate method so the 3-arg call sites stay
+    // untouched and the wire payload only grows the ext_* keys on the
+    // post-mapping re-send. ext_ip is JSON-escaped like every other string
+    // we emit; ext_udp_port is a plain int; upnp is a JSON bool literal.
+    std::string m = "{\"type\":\"udp_addr\",\"ip\":\"" + EscapeJsonString(ip)
+                  + "\",\"port\":" + std::to_string(port);
+    if (tcp_port > 0) {
+        m += ",\"tcp_port\":" + std::to_string(tcp_port);
+    }
+    if (!ext_ip.empty()) {
+        m += ",\"ext_ip\":\"" + EscapeJsonString(ext_ip) + "\"";
+    }
+    if (ext_udp_port > 0) {
+        m += ",\"ext_udp_port\":" + std::to_string(ext_udp_port);
+    }
+    m += ",\"upnp\":";
+    m += (upnp ? "true" : "false");
+    m += "}";
+    EnqueueOut(std::move(m));
+}
+
 void HubClient::SendTcpAddr(const std::string& ip, int port) {
     // External TCP addr learned via TCP-STUN against the hub. Hub stores
     // it on user.external_tcp_addr and forwards in spectator_incoming

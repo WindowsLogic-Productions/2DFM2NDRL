@@ -321,6 +321,23 @@ public:
     // connected, sent in order once the upgrade completes.
     void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1);
 
+    // UPnP-extended udp_addr (Phase 1 NAT reachability). Sent as a SECOND
+    // udp_addr after the PortMapper completes a router mapping: carries the
+    // IGD-reported external endpoint so the hub can advertise it to a peer
+    // as an authoritative any-source inbound mapping (D5 precedence:
+    // verified-UPnP > STUN-learned > client-claimed). The first
+    // SendUdpAddr(ip,port,tcp_port) still fires immediately at connect time
+    // with upnp absent, so behavior is unchanged when UPnP is slow/absent.
+    //
+    // ext_ip / ext_udp_port are the WAN side the router granted; upnp=true
+    // flags the claim. Old hubs ignore the unknown fields (GetSub/GetStr
+    // return empty), so this is backward-compatible. The hub additionally
+    // CGNAT-guards the claim by comparing ext_ip against the WS-source IP
+    // (D6) before honoring the port.
+    void SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
+                         const std::string& ext_ip, int ext_udp_port,
+                         bool upnp);
+
     // External TCP addr discovered by the spec hook via hub TCP-STUN
     // (see FM2KHook/src/netplay/spectator_tcp.cpp PerformTcpStun). Sent
     // separately from SendUdpAddr because TCP-STUN is async — the

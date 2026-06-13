@@ -191,6 +191,15 @@ Changes:
 1. vendored/miniupnp (submodule), static build of miniupnpc for
    i686-w64-mingw32 in CMakeLists (MINIUPNP_STATICLIB; link ws2_32,
    iphlpapi). UPNPC_BUILD_STATIC=ON, SHARED/TESTS/SAMPLE off.
+   IMPLEMENTED 2026-06-12: submodule pinned to tag miniupnpc_2_3_3
+   (commit bf4215a). Built with a HAND-ROLLED add_library(miniupnpc STATIC)
+   listing the 14 canonical MINIUPNPC_SOURCES (mirrors upstream's own
+   library set) rather than add_subdirectory, so we never pull in the
+   shared lib / upnpc+listdevices samples / test suite / python module /
+   install rules. miniupnpcstrings.h is configure_file-generated from the
+   upstream .h.cmake template into the build dir (no hand-edited copy that
+   could drift from the pin). MINIUPNP_STATICLIB is PUBLIC on the target so
+   the wrapper sees the dllimport-free declarations.
 2. New FM2K_PortMapper.{h,cpp} (launcher):
    - StartAsync(udp_port [, tcp_port]) -> background thread: SSDP discover
      (2s budget), select valid IGD, GetExternalIPAddress, AddPortMapping
@@ -200,8 +209,22 @@ Changes:
    - Stop() -> DeletePortMapping + thread join. Called on launcher exit.
    - Backend interface so libnatpmp slots in later.
 3. Wire-in at hub Connected event (FM2K_LauncherUI.cpp:5300): start
-   mapping, then SendUdpAddr carries ext_udp_port + upnp flag when mapped
-   (D5). CGNAT check per D6.
+   mapping asynchronously; SendUdpAddr fires immediately as today, then
+   when the mapping completes the launcher RE-SENDS udp_addr with the
+   ext fields (the hub already accepts udp_addr updates at any time, and
+   STUN re-sends the same way). Poll PortMapper status from the UI loop
+   and re-send on state transition. CGNAT check per D6.
+3b. Router quirk handling (pinned): UPnP error 725
+   (OnlyPermanentLeasesSupported) -> retry AddPortMapping with lease 0
+   and rely on Stop()'s DeletePortMapping; error 718
+   (ConflictInMappingEntry) -> try local+1000, then 3 alternate high
+   ports per D4. Mapping description string: "FM2K Rollback". Env escape
+   hatch FM2K_NO_UPNP=1 skips the whole subsystem.
+3c. Phase 1 precedence note: an (unverified) UPnP claim outranks the
+   STUN-learned port at the hub -- an explicit any-source inbound mapping
+   beats an observed outbound mapping when they differ, and punch +
+   relay still back it up if the claim is stale. Phase 2's REACH_CHECK
+   upgrades this to verified.
 4. hub.py: parse new udp_addr fields; store on User; peer_dict precedence
    per D5.
 5. UI: small status in the lobby/network area: "Port: open via UPnP

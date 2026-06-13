@@ -1,5 +1,6 @@
 #include "FM2K_Integration.h"
 #include "FM2K_HubClient.h"
+#include "FM2K_PortMapper.h"  // UPnP port mapper member of LauncherUI (Phase 1)
 #include "FM2K_DiscordAuth.h"
 #include "FM2K_Locale.h"
 #include "FM2K_Updater.h"
@@ -804,6 +805,13 @@ void LauncherUI::Shutdown() {
     // rather than racing with shutdown).
     fm2k::updater::Shutdown();
     fm2k::cnc_ddraw::Shutdown();
+
+    // Tear down the UPnP mapping (DeletePortMapping + join the worker) so we
+    // don't leave a stale router forward behind on exit and don't leak the
+    // discovery/renewal thread. Idempotent + a no-op if we never mapped.
+    if (port_mapper_) {
+        port_mapper_->Stop();
+    }
 
     // Restore original logger
     SDL_SetLogOutputFunction(original_log_function_, original_log_userdata_);
@@ -5254,6 +5262,49 @@ void LauncherUI::RenderHubPanel() {
         }
     }
 
+    // UPnP port-mapper poll (Phase 1). Snapshot the mapper status once per
+    // frame and, on a state TRANSITION, act exactly once. The mapper itself
+    // is off-thread; this is the cheap UI-thread side. port_mapper_ is only
+    // non-null for non-loopback online sessions (set at the Connected
+    // event), so this is implicitly skipped for LOCAL / local-dev hubs.
+    if (port_mapper_ && hs.client.IsConnected()) {
+        fm2k::PortMapper::Status st = port_mapper_->Snapshot();
+        const int cur_state = static_cast<int>(st.state);
+        if (cur_state != port_mapper_last_state_) {
+            port_mapper_last_state_ = cur_state;
+            if (st.state == fm2k::PortMapper::State::Mapped &&
+                st.ext_udp_port > 0 && !st.ext_ip.empty()) {
+                // RE-SEND udp_addr carrying the external endpoint. The hub
+                // accepts udp_addr updates at any time (STUN re-sends the
+                // same way), applies the D5 precedence (UPnP ext_port
+                // outranks STUN-learned), and CGNAT-guards ext_ip against
+                // the WS-source IP (D6). We still send "127.0.0.1" as the
+                // base ip exactly like the connect-time send -- the hub
+                // ignores it for the udp_addr IP (it uses the WS source);
+                // ext_ip is the field that carries the WAN address.
+                hs.client.SendUdpAddrUpnp(
+                    "127.0.0.1",
+                    network_config_.local_port,
+                    network_config_.local_port,
+                    st.ext_ip,
+                    static_cast<int>(st.ext_udp_port),
+                    /*upnp=*/true);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[upnp] mapping live -- re-sent udp_addr ext=%s:%u to hub",
+                    st.ext_ip.c_str(),
+                    static_cast<unsigned>(st.ext_udp_port));
+            } else if (st.state == fm2k::PortMapper::State::Cgnat) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[upnp] IGD behind CGNAT/double-NAT -- not advertising a "
+                    "UPnP port (punch + relay still cover us)");
+            } else if (st.state == fm2k::PortMapper::State::NoIgd) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[upnp] no UPnP-capable router found -- direct reach via "
+                    "punch only");
+            }
+        }
+    }
+
     // Drain hub events into local state once per frame.
     hs.client.Poll([&](const fm2k::HubEvent& ev) {
         using K = fm2k::HubEvent::Kind;
@@ -5309,6 +5360,44 @@ void LauncherUI::RenderHubPanel() {
                 // spectator_incoming event for the host's TCP punch.
                 hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port,
                                       network_config_.local_port);
+
+                // UPnP automatic port mapping (Phase 1 NAT reachability).
+                // Kick off an asynchronous router mapping of our game UDP
+                // port so peers can reach us directly. This runs ALONGSIDE
+                // the SendUdpAddr above -- we never block on it; if UPnP is
+                // slow or absent the SendUdpAddr already gave the hub our
+                // STUN-learned endpoint, so behavior is exactly today's. On
+                // success the per-frame poll in RenderHubPanel re-sends
+                // udp_addr with the external endpoint (see below).
+                //
+                // Skip entirely for a loopback hub: that's the local-dev /
+                // multi-instance test path (the netcfg hint literally says
+                // "use 127.0.0.1 when running your own hub.py"), where two
+                // launchers on one machine must NOT both grab the same
+                // router mapping. Real online sessions always run against a
+                // non-loopback hub.
+                {
+                    const char* hub_host_env = std::getenv("FM2K_HUB_HOST");
+                    std::string hh = (hub_host_env && hub_host_env[0])
+                                   ? hub_host_env
+                                   : (hub_host_[0] ? hub_host_ : "hub.2dfm.org");
+                    const bool loopback_hub =
+                        (hh == "127.0.0.1" || hh == "localhost" || hh == "::1");
+                    if (!loopback_hub) {
+                        if (!port_mapper_) {
+                            port_mapper_ = std::make_unique<fm2k::PortMapper>();
+                        }
+                        // Reset the re-send latch so a reconnect re-arms the
+                        // one-shot Mapped transition send.
+                        port_mapper_last_state_ = -1;
+                        port_mapper_->StartAsync(
+                            static_cast<uint16_t>(network_config_.local_port));
+                    } else {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "[upnp] loopback hub (%s) -- skipping UPnP mapping",
+                            hh.c_str());
+                    }
+                }
                 // Pre-match STUN. The in-game hook does its own STUN at
                 // launch but match_start fires immediately on accept and
                 // the hook's STUN doesn't arrive at the hub for several
@@ -6371,6 +6460,36 @@ void LauncherUI::RenderHubPanel() {
         ImGui::SameLine();
         if (ImGui::SmallButton(T("hub_disconnect"))) {
             hs.client.Disconnect();
+        }
+        // One-line UPnP port status (Phase 1). Reflects the off-thread
+        // mapper's current state so the user can see whether they're
+        // directly reachable. Only shown when we actually started a mapper
+        // (non-loopback online session).
+        if (port_mapper_) {
+            fm2k::PortMapper::Status st = port_mapper_->Snapshot();
+            switch (st.state) {
+                case fm2k::PortMapper::State::Mapped:
+                    ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, 1.0f),
+                        "Port: open via UPnP (ext %u)",
+                        static_cast<unsigned>(st.ext_udp_port));
+                    break;
+                case fm2k::PortMapper::State::Discovering:
+                    ImGui::TextDisabled("Port: checking router (UPnP)...");
+                    break;
+                case fm2k::PortMapper::State::Cgnat:
+                    ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f),
+                        "Port: router behind CGNAT (UPnP can't help)");
+                    break;
+                case fm2k::PortMapper::State::NoIgd:
+                    ImGui::TextDisabled("Port: closed (no UPnP router)");
+                    break;
+                case fm2k::PortMapper::State::Failed:
+                    ImGui::TextDisabled("Port: closed (UPnP unavailable)");
+                    break;
+                case fm2k::PortMapper::State::Idle:
+                default:
+                    break;
+            }
         }
     }
     if (!hs.status_line.empty()) {

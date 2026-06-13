@@ -18,6 +18,7 @@
 #include "vendored/xxhash/xxhash.h"
 #include "LocalSession.h"
 #include "OnlineSession.h"
+#include "FM2K_PortMapper.h"  // --upnp-test self-contained router validation
 
 #include <chrono>
 #include <string>
@@ -916,6 +917,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // preserves prior behavior (always /F boot-to-battle).
     std::string spectate_session_kind = "battle";
     std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
+    bool upnp_test_cli = false;           // --upnp-test: discover->map->report->unmap then exit (router validation)
+    uint16_t upnp_test_port = 7000;       // --upnp-test [port]: UDP port to map for the test
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -1074,7 +1077,77 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 offline_game_filter = argv[++i];
             }
+        } else if (arg == "--upnp-test") {
+            // Manual router validation for the Phase 1 UPnP port mapper.
+            // Runs PortMapper::StartAsync on a test port, waits a few
+            // seconds for the off-thread discovery+map to land, prints the
+            // full Status, tears the mapping down, and exits -- without
+            // ever spawning the launcher UI or a game. This is how the user
+            // checks UPnP against their real router. Optional next arg = the
+            // UDP port to map (default 7000), so the user can match the port
+            // their game actually binds.
+            upnp_test_cli = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                upnp_test_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            }
         }
+    }
+
+    // --upnp-test: self-contained UPnP probe, runs before any launcher /
+    // SDL window / game setup and exits the process. PortMapper uses
+    // SDL_Log* internally which works against SDL's default log output
+    // without SDL_Init, so we get the discovery/IGD/error lines for free.
+    if (upnp_test_cli) {
+        std::cout << "[upnp-test] mapping UDP port " << upnp_test_port
+                  << " via UPnP (up to ~6s for SSDP + map)...\n";
+        // Winsock isn't up yet in this early-exit path (SDL_Init, which
+        // calls WSAStartup, hasn't run). miniupnpc creates raw sockets for
+        // the SSDP discover, so initialize Winsock ourselves first --
+        // otherwise upnpDiscover fails with WSANOTINITIALISED (10093) and
+        // we'd report a false NoIgd. In normal launcher operation the
+        // mapper runs at the hub Connected event, long after WSAStartup.
+        WSADATA wsa{};
+        const bool wsa_ok = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+        if (!wsa_ok) {
+            std::cout << "[upnp-test] WARNING: WSAStartup failed -- "
+                         "discovery may not work\n";
+        }
+        fm2k::PortMapper mapper;
+        mapper.StartAsync(upnp_test_port);
+        // Poll the status until it leaves Discovering or the ~6s budget
+        // elapses (SSDP is a 2s budget + description fetch + AddPortMapping
+        // round-trips; 6s comfortably covers a responsive home router).
+        fm2k::PortMapper::Status st;
+        for (int waited_ms = 0; waited_ms < 6000; waited_ms += 200) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            st = mapper.Snapshot();
+            if (st.state != fm2k::PortMapper::State::Discovering &&
+                st.state != fm2k::PortMapper::State::Idle) {
+                break;
+            }
+        }
+        st = mapper.Snapshot();
+        auto state_name = [](fm2k::PortMapper::State s) -> const char* {
+            switch (s) {
+                case fm2k::PortMapper::State::Idle:        return "Idle";
+                case fm2k::PortMapper::State::Discovering: return "Discovering";
+                case fm2k::PortMapper::State::Mapped:      return "Mapped";
+                case fm2k::PortMapper::State::NoIgd:       return "NoIgd";
+                case fm2k::PortMapper::State::Failed:      return "Failed";
+                case fm2k::PortMapper::State::Cgnat:       return "Cgnat";
+            }
+            return "?";
+        };
+        std::cout << "[upnp-test] result:\n"
+                  << "  state        = " << state_name(st.state)   << "\n"
+                  << "  backend      = " << st.backend             << "\n"
+                  << "  ext_ip       = " << st.ext_ip              << "\n"
+                  << "  ext_udp_port = " << st.ext_udp_port        << "\n"
+                  << "  igd          = " << st.igd_desc            << "\n";
+        mapper.Stop();
+        if (wsa_ok) WSACleanup();
+        std::cout << "[upnp-test] done (mapping torn down).\n";
+        return SDL_APP_SUCCESS;
     }
 
     // Create launcher instance
