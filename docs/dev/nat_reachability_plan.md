@@ -355,6 +355,39 @@ Chile-NYC baseline, compare [BEAT-RELAY] RTT + rollback symmetry.
 Effort: M (new binary + hub registry + selection). Risk: low (additive; relay
 selection falls back to the droplet if no volunteer relay is closer/alive).
 
+**Control protocol (relay <-> hub, WSS, JSON text frames):**
+- relay -> hub `relay_register {region, udp_port, public?, ts, nonce, mac}`
+  where `mac = HMAC-SHA256(KEY, "relay_register|region|udp_port|ts|nonce")` hex.
+  Hub checks `|now-ts|<=30s` + mac; replies `relay_register_ok` or `error`.
+- relay -> hub `relay_heartbeat {ts}` every 15s (>50s silence = dead).
+- hub -> relay `relay_authorize_session {session_id(hex32), ttl_s}` per match.
+The 0xCF UDP data path is UNCHANGED -- no hook/launcher change. Confirmed: the
+launcher reads `relay.addr[0]` as-is and DNS-resolves it (FM2K_LauncherUI.cpp
+~5970); the hub `--advertise-host` already rewrites RELAY_LISTEN's 0.0.0.0 to a
+real host (hub.py ~2710), so a volunteer relay's real `public_host` flows
+straight through.
+
+**Status: BUILT + VERIFIED 2026-06-13 (not yet deployed).**
+- Binary `relay/` (wanwan): go build + vet clean, unit tests (routing / 3rd-
+  source-drop / authorize-gating / rate-limit) + an end-to-end loopback
+  (`relay/loopback_test.py`: stub hub authorizes -> real binary forwards both
+  ways -> unauthorized dropped) all green. Commits b23c9e8, e9b4717.
+- Hub: fm2k-hub commit 4df7b01 (relay_register HMAC handler + registry +
+  select_relay + match_start wire-in). py_compile clean; cross-language HMAC
+  interop verified Go<->Python. INERT until FM2K_RELAY_REGISTER_KEY is set.
+
+**Deploy runbook (PFTM / SEA, when ready):**
+1. Hub: set `FM2K_RELAY_REGISTER_KEY=<random hex>` (+ `FM2K_RELAY_HOME_REGION=NA`)
+   in the service env; deploy fm2k-hub 4df7b01; restart (see reference_hub_deploy).
+2. PFTM: `cd relay && go build -o fm2k-relay .`; run
+   `./fm2k-relay -hub wss://hub.2dfm.org/ -key <same key> -region AS -public <his-host>:7712`;
+   open UDP 7712 inbound. Hub log shows `[relay] registered region=AS ...`.
+3. First test (pre-GeoIP): set `FM2K_RELAY_PREFER=AS` on the hub -> every
+   relayed match routes to PFTM's relay; confirm `[BEAT-RELAY]` RTT drops vs the
+   NA-droplet baseline. Then unset PREFER and drop a GeoLite2 db (`GEOIP_DB=...`)
+   for automatic geo-selection (both peers' continent == relay region).
+4. Revert: unset the key (relays stop registering) or `git revert 4df7b01`.
+
 ## Orchestration model
 
 - Fable 5 (main session): architecture, this doc, work-package specs,
