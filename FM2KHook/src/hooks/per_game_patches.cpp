@@ -15,6 +15,12 @@
 #include <safetyhook.hpp>  // SafetyHook MidHook for KOF HP-init patch
 #include "round_events.h"  // RoundEvents_KofSnapshot* accessors
 #include "combat_state.h"  // combat_state::ShouldGuardP2 for state-driven Guard
+#include "../netplay/netplay.h"          // Netplay_IsConnected (BTB handshake hold)
+#include "../netplay/control_channel.h"  // ControlChannel_Poll/SendHello
+#include "../netplay/game_hash.h"        // fm2k::game_hash::Compute
+extern int g_player_index;               // core/globals.h (avoid full include: it
+                                         // re-declares original_get_player_input,
+                                         // which this TU already forward-declares)
 
 namespace {
 
@@ -1085,6 +1091,27 @@ void ApplyBootToBattleStateOverrides() {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "PerGamePatches: BTB P2 meter init → %d", v);
     }
+
+    // One-shot stage-table dump (FM2K_DUMP_STAGES=1) -- prints index -> filename
+    // for every stage so a profiler knows which FM2K_BTB_STAGE index is the
+    // light stage (Grid) vs a heavy one (Gurish/Baraga/...). g_stage_file_buffer
+    // is 256-byte filename entries at 0x43A29C on FM2K; LoadStageFile sprintf's
+    // the name from [256*idx]. Stops at the first empty entry.
+    {
+        static bool s_dumped = false;
+        const char* de = std::getenv("FM2K_DUMP_STAGES");
+        if (!s_dumped && de && de[0] == '1') {
+            s_dumped = true;
+            constexpr uintptr_t kStageNameBuf = 0x43A29Cu;
+            constexpr size_t    kStageStride  = 256u;
+            for (int i = 0; i < 50; ++i) {
+                const char* name = (const char*)(kStageNameBuf + (size_t)i * kStageStride);
+                if (name[0] == '\0') break;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[STAGE-TABLE] idx=%d name=\"%.255s\"", i, name);
+            }
+        }
+    }
 }
 
 // MinHook detour for InitializeGameFromCommandLine. Restamps the kgt
@@ -1175,6 +1202,62 @@ int __cdecl Hook_InitializeGameFromCommandLine() {
                         (unsigned long long)(now - start));
                 }
                 Sleep(10);
+            }
+        }
+    }
+
+    // Player-netplay BTB hold: boot-to-battle skips the title/CSS ticks that
+    // normally resend HELLO until the peer connects (RunNativeTick /
+    // RunCssTick). Without that, the two peers fire a single HELLO each at
+    // init -- and whichever launches first sends into a dead port (the other
+    // process hasn't bound its socket yet) and never retries, so the handshake
+    // never completes and both wedge at battle entry ">>> waiting for sync"
+    // (black screen). Hold the /F dispatch here, pumping the control channel
+    // and resending HELLO, until both peers complete the handshake. Then they
+    // enter battle already CONNECTED, the game_mode edge in hooks.cpp can
+    // signal BATTLE_ENTERING, and Netplay_ArmBattleEntryBarrier lets them sync.
+    // Gated to real netplay players (not offline / stress / spectator) so it
+    // never burns the timeout when there is no peer.
+    {
+        static int s_netplay_player = -1;
+        if (s_netplay_player < 0) {
+            auto on = [](const char* n){ const char* v = std::getenv(n);
+                                         return v && v[0] == '1' && v[1] == '\0'; };
+            s_netplay_player = (!on("FM2K_TRUE_OFFLINE") && !on("FM2K_STRESS_MODE") &&
+                                !on("FM2K_SPECTATOR_MODE")) ? 1 : 0;
+        }
+        if (s_netplay_player == 1 && !Netplay_IsConnected()) {
+            const uint64_t start = GetTickCount64();
+            uint64_t last_hello = 0, last_log = start;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "PerGamePatches: holding /F dispatch -- pumping HELLO until peer connects");
+            for (;;) {
+                ControlChannel_Poll();
+                const uint64_t now = GetTickCount64();
+                if (Netplay_IsConnected()) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: /F dispatch released after %llums (peer connected)",
+                        (unsigned long long)(now - start));
+                    break;
+                }
+                if (now - last_hello >= 250) {
+                    ControlChannel_SendHello((uint8_t)g_player_index,
+                                             fm2k::game_hash::Compute());
+                    last_hello = now;
+                }
+                if (now - start >= 15000) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: /F handshake hold timed out (15s) -- "
+                        "booting to battle unconnected (peer missing?)");
+                    break;
+                }
+                if (now - last_log > 2000) {
+                    last_log = now;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PerGamePatches: still holding /F dispatch for handshake (%llums)",
+                        (unsigned long long)(now - start));
+                }
+                Sleep(5);
             }
         }
     }

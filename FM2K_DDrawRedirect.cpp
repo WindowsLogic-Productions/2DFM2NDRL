@@ -308,6 +308,12 @@ bool GetForceRedirect() {
 }
 
 bool ShouldRedirect() {
+    // Hard override for A/B: FM2K_NO_DDRAW_REDIRECT=1 forces the game to load
+    // its OWN ddraw.dll (whatever it ships) instead of our injected cnc-ddraw.
+    // Used to isolate whether our cnc-ddraw setup is the render cost on games
+    // that bundle their own (e.g. Robot Heroes).
+    if (const char* off = std::getenv("FM2K_NO_DDRAW_REDIRECT"); off && off[0] == '1')
+        return false;
     if (g_force_redirect) return true;
     const char* env = std::getenv("FM2K_TEST_IAT_REWRITE");
     return env && env[0] == '1';

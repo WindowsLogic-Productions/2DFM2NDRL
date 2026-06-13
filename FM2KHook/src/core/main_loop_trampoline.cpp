@@ -58,6 +58,7 @@ extern "C" void Hook_BattleDiag_TickIfActive();
 // owns the render step end-to-end.
 #include "../netplay/savestate.h"  // WaveCAddrs
 
+uint64_t g_render_game_only_ns = 0;  // #63 diag: original_render_game() time, set by RenderFrameWithSnapshot
 static uint8_t s_render_saved_object_pool[FM2K::SIZE_OBJECT_POOL];
 static uint8_t s_render_saved_afterimage[WaveCAddrs::AFTERIMAGE_POOL_SZ];
 static uint8_t s_render_saved_input_tracking[0xA0];
@@ -251,7 +252,24 @@ static void RenderFrameWithSnapshot() {
     // determinism; render colors stay deterministic per confirmed frame.
     g_render_rng_seed = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
     g_in_render_rng = true;
+    // #63 diag: time original_render_game alone vs the wrapper (diagnostics).
+    extern uint64_t g_render_game_only_ns;
+    const uint64_t _rg0 = SDL_GetPerformanceCounter();
     original_render_game();
+    // #63 TEST: FM2K_RENDER_STALL_US busy-waits to SIMULATE a heavy-stage
+    // render (e.g. Robot Heroes Aubeclisse ~13ms) on a light game, so the
+    // netplay/offline frame-skip catch-up can be exercised + determinism-
+    // verified in the loopback harness (which runs light WonderfulWorld).
+    {
+        static const long s_stall_us = []{ const char* v = std::getenv("FM2K_RENDER_STALL_US");
+                                           return (v && v[0]) ? std::atol(v) : 0L; }();
+        if (s_stall_us > 0) {
+            const uint64_t freq = SDL_GetPerformanceFrequency();
+            const uint64_t end = SDL_GetPerformanceCounter() + (uint64_t)s_stall_us * freq / 1000000ull;
+            while (SDL_GetPerformanceCounter() < end) { /* busy-wait */ }
+        }
+    }
+    g_render_game_only_ns = SDL_GetPerformanceCounter() - _rg0;
     g_in_render_rng = false;
     EbDiag_Dump("POST-RENDER");
 
@@ -477,6 +495,49 @@ static void MaybeLogFrametime(uint64_t tick_start) {
     }
 }
 
+// Per-section breakdown of the OFFLINE battle tick (#63 follow-up for the
+// Robot Heroes object-count slowdown Yamada reported). Splits the frame into
+// process-inputs / update / render so an A/B across stages (Grid vs a heavy
+// stage) shows WHICH section scales with object count. The hooked hot
+// functions (Hook_GameRand, Hook_DispatchScriptSoundCommand) execute INSIDE
+// original_update_game / RenderFrameWithSnapshot, so their per-call overhead
+// shows up in the `update` / `render` buckets here. Same FM2K_PERF_PROFILE=1
+// gate as [FRAMETIME]; logs every 300 frames.
+static void MaybeLogOfflineSections(uint64_t pgi, uint64_t ug, uint64_t render,
+                                    uint32_t render_rand) {
+    static const bool on = []{
+        const char* v = std::getenv("FM2K_PERF_PROFILE");
+        return v && v[0] == '1';
+    }();
+    if (!on) return;
+    const uint64_t freq = SDL_GetPerformanceFrequency();
+    extern uint64_t g_render_game_only_ns;
+    static uint64_t s_pgi = 0, s_ug = 0, s_render = 0;
+    static uint64_t s_ug_max = 0, s_render_max = 0;
+    static uint64_t s_rand = 0, s_rand_max = 0, s_render_game_acc = 0;
+    static uint32_t s_n = 0;
+    s_pgi += pgi; s_ug += ug; s_render += render; s_rand += render_rand;
+    s_render_game_acc += g_render_game_only_ns;
+    if (ug > s_ug_max) s_ug_max = ug;
+    if (render > s_render_max) s_render_max = render;
+    if (render_rand > s_rand_max) s_rand_max = render_rand;
+    if (++s_n >= 300) {
+        auto ms = [freq](uint64_t t){ return (double)t * 1000.0 / (double)freq; };
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[OFFLINE-SECT] n=%u pgi=%.2fms update=%.2fms(max %.2f) "
+            "render=%.2fms(max %.2f) render_game_only=%.2fms render_rand=%llu/f(max %llu)",
+            s_n, ms(s_pgi) / s_n, ms(s_ug) / s_n, ms(s_ug_max),
+            ms(s_render) / s_n, ms(s_render_max),
+            ms(s_render_game_acc) / s_n,
+            (unsigned long long)(s_rand / s_n), (unsigned long long)s_rand_max);
+        s_pgi = s_ug = s_render = 0;
+        s_ug_max = s_render_max = 0;
+        s_rand = s_rand_max = 0;
+        s_render_game_acc = 0;
+        s_n = 0;
+    }
+}
+
 // ============================================================================
 // PER-PHASE TICK BODIES
 // ============================================================================
@@ -540,74 +601,79 @@ static void RunBattleTick() {
         // touch. Per-slot fan-out also removed from spectator + GekkoNet
         // paths (same reason — DirectPlay isn't used anywhere).
 
-        // Round-end-flag tripwire — leave in place to confirm the writer.
+        // ---- Frame-skip: decouple sim from render (the fix for the Robot
+        // Heroes heavy-stage slowdown). The trampoline replaced FM2K's native
+        // main_game_loop @ 0x405AD0, which is a "100fps fixed timestep WITH
+        // frame skipping": it runs process_inputs+update_game as many 10ms
+        // steps as real time demands (capped at 10 = spiral-of-death guard)
+        // and calls render_game ONCE per loop. Our offline tick rendered every
+        // sim tick, so a heavy stage's ~13ms render dragged the SIM itself to
+        // ~70fps -- the game ran at ~70% speed (Yamada's report; render-bound).
+        // Catch-up ticks here hold the sim at 100fps; only DISPLAY frames drop
+        // on heavy stages, exactly like vanilla. Determinism/netcode-safe: the
+        // sim sequence is byte-identical (same inputs, same order; render never
+        // feeds the sim), and the netplay + spectator paths above never reach
+        // this offline-only branch.
         constexpr uintptr_t REF_ADDR = 0x424718;
-        uint32_t ref_before = *(volatile uint32_t*)REF_ADDR;
+        const uint64_t qpc_freq = SDL_GetPerformanceFrequency();
+        const uint64_t step_qpc = qpc_freq / 100;  // 10ms = one 100fps step
+        static uint64_t s_logical_qpc = 0;
+        const uint64_t now_qpc = SDL_GetPerformanceCounter();
+        if (s_logical_qpc == 0) s_logical_qpc = now_qpc - step_qpc;  // first tick
+        int sim_steps = step_qpc ? (int)((now_qpc - s_logical_qpc) / step_qpc) : 1;
+        if (sim_steps < 1)  sim_steps = 1;
+        if (sim_steps > 10) { sim_steps = 10; s_logical_qpc = now_qpc - 10 * step_qpc; }
+        s_logical_qpc += (uint64_t)sim_steps * step_qpc;
 
-        // Pre-update snapshot of the case-200 exit conditions in
-        // vs_round_function. Case 200 transitions to state 300 (round
-        // end) on:
-        //   (1) g_score_value crosses below 0 in the same frame
-        //   (2) active type-4 fighter count < 2 in story/team mode
-        //   (3) g_round_end_flag != 0
-        // Render-time logs show -1 / 2 / 0 — none should trigger. But
-        // the bail still happens, so one of these MUST be firing during
-        // update_game (the per-frame snapshot at render time misses
-        // transient values). Log the fields right before update_game so
-        // we capture the value the game's case-200 walk actually sees.
-        int32_t  pre_score = *(int32_t*)0x470050;
-        uint32_t pre_ref   = *(uint32_t*)0x424718;
-        uint32_t pre_mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
-
-        if (original_process_game_inputs) original_process_game_inputs();
-        uint32_t ref_after_pgi = *(volatile uint32_t*)REF_ADDR;
-        if (ref_after_pgi != ref_before && ref_after_pgi != 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "[REF-TRIP] round_end_flag flipped %u->%u during "
-                        "original_process_game_inputs",
-                        ref_before, ref_after_pgi);
+        if (sim_steps > 1) {
+            static uint32_t s_skip_log = 0;
+            static const bool s_perf = []{ const char* v = std::getenv("FM2K_PERF_PROFILE");
+                                           return v && v[0] == '1'; }();
+            if (s_perf && (s_skip_log++ % 100) == 0)
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[FRAMESKIP] sim caught up %d ticks for 1 render (heavy stage)",
+                    sim_steps);
         }
 
-        if (original_update_game) original_update_game();
-        uint32_t ref_after_ug = *(volatile uint32_t*)REF_ADDR;
-        if (ref_after_ug != ref_after_pgi && ref_after_ug != 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "[REF-TRIP] round_end_flag flipped %u->%u during "
-                        "original_update_game",
-                        ref_after_pgi, ref_after_ug);
-        }
-
-        // Post-update bracket of case-200 exit conditions. Only fires
-        // on rare real transitions; t4 path is patched out in
-        // game_patches.cpp (PatchVsRoundCase200T4FalsePositive) so no
-        // longer diagnosed here.
-        int32_t post_score = *(int32_t*)0x470050;
-        if (pre_mode >= 3000 && pre_mode < 4000) {
-            // Score-cross trigger: only the actual zero crossing
-            // (pre>=0, post<0) fires the case-200 → state-300 path.
-            if (pre_score >= 0 && post_score < 0) {
+        uint64_t sim_ns = 0;
+        for (int _sf = 0; _sf < sim_steps; ++_sf) {
+            const uint32_t ref_before = *(volatile uint32_t*)REF_ADDR;
+            const int32_t  pre_score = *(int32_t*)0x470050;
+            const uint32_t pre_ref   = *(uint32_t*)0x424718;
+            const uint32_t pre_mode  = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+            const uint64_t _s0 = SDL_GetPerformanceCounter();
+            if (original_process_game_inputs) original_process_game_inputs();
+            const uint32_t ref_after_pgi = *(volatile uint32_t*)REF_ADDR;
+            if (ref_after_pgi != ref_before && ref_after_pgi != 0)
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "[CASE200-TRIP] score path fired: %d -> %d (case 200 "
-                    "decremented past 0 -> state 300)",
-                    pre_score, post_score);
-            }
-            // round_end_flag trigger: pre_ref was non-zero
-            if (pre_ref != 0) {
+                    "[REF-TRIP] round_end_flag flipped %u->%u during PGI",
+                    ref_before, ref_after_pgi);
+            if (original_update_game) original_update_game();
+            ++g_sim_step_count;   // sim-fps: one logic tick (offline frame-skip)
+            const uint64_t _s1 = SDL_GetPerformanceCounter();
+            sim_ns += _s1 - _s0;
+            const uint32_t ref_after_ug = *(volatile uint32_t*)REF_ADDR;
+            if (ref_after_ug != ref_after_pgi && ref_after_ug != 0)
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "[CASE200-TRIP] round_end_flag path fired: pre_ref=%u",
-                    pre_ref);
+                    "[REF-TRIP] round_end_flag flipped %u->%u during UG",
+                    ref_after_pgi, ref_after_ug);
+            const int32_t post_score = *(int32_t*)0x470050;
+            if (pre_mode >= 3000 && pre_mode < 4000) {
+                if (pre_score >= 0 && post_score < 0)
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[CASE200-TRIP] score path fired: %d -> %d", pre_score, post_score);
+                if (pre_ref != 0)
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[CASE200-TRIP] round_end_flag path fired: pre_ref=%u", pre_ref);
             }
+            ParityRecorder::Capture();   // per confirmed sim frame
         }
 
-        ParityRecorder::Capture();
-        RenderFrameWithSnapshot();
-        uint32_t ref_after_render = *(volatile uint32_t*)REF_ADDR;
-        if (ref_after_render != ref_after_ug && ref_after_render != 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "[REF-TRIP] round_end_flag flipped %u->%u during "
-                        "RenderFrameWithSnapshot",
-                        ref_after_ug, ref_after_render);
-        }
+        g_render_rand_calls = 0;
+        const uint64_t _r0 = SDL_GetPerformanceCounter();
+        RenderFrameWithSnapshot();       // ONCE per loop, regardless of sim_steps
+        const uint64_t _r1 = SDL_GetPerformanceCounter();
+        MaybeLogOfflineSections(0, sim_ns, _r1 - _r0, g_render_rand_calls);
         return;
     }
 
@@ -628,7 +694,57 @@ static void RunBattleTick() {
     }
 
     if (Netplay_IsActive()) {
-        Netplay_ProcessBattleInputPhase();
+        // ---- Netplay sim/render decouple (heavy-stage frame-skip, the
+        // netplay analog of the offline fix). Step gekko at a fixed 100fps
+        // cadence -- one FULL add->update->advance cycle
+        // (Netplay_ProcessBattleInputPhase) per 10ms of real time -- and
+        // render ONCE per outer iteration. On a heavy stage where render
+        // exceeds the 10ms budget (~13ms = ~77fps), the accumulator runs the
+        // gekko step 1-2x per render so the SIM holds 100fps while only
+        // DISPLAY frames drop.
+        //
+        // Determinism: unlike the old in-function catch-up (N local adds
+        // before ONE update_session -- broke gekko's frame accounting,
+        // desynced at RoHe/Aubeclisse f139), each step here is a complete
+        // add->update->advance. The sim's clock is virtual (Hook_timeGetTime
+        // returns g_virtual_time_ms = frame*10, frame-derived), so a peer
+        // running an extra step only deepens PREDICTION, which gekko's
+        // rollback reconciles -- the same mechanism runahead already uses. No
+        // wall-clock value reaches the sim. FM2K_NO_NETPLAY_CATCHUP=1 forces
+        // single-step (the pre-decouple behavior).
+        static int s_np_catchup = -1;
+        if (s_np_catchup < 0) {
+            const char* off = std::getenv("FM2K_NO_NETPLAY_CATCHUP");
+            s_np_catchup = (off && off[0] == '1') ? 0 : 1;
+        }
+        int steps = 1;
+        if (s_np_catchup == 1) {
+            const uint64_t freq = SDL_GetPerformanceFrequency();
+            const uint64_t step_qpc = freq / 100;            // 10ms = one 100fps step
+            static uint64_t s_logical_qpc = 0;
+            const uint64_t now_qpc = SDL_GetPerformanceCounter();
+            if (s_logical_qpc == 0) s_logical_qpc = now_qpc - step_qpc;
+            steps = step_qpc ? (int)((now_qpc - s_logical_qpc) / step_qpc) : 1;
+            if (steps < 1) steps = 1;
+            if (steps > 4) { steps = 4; s_logical_qpc = now_qpc - 4 * step_qpc; }
+            s_logical_qpc += (uint64_t)steps * step_qpc;
+        }
+        // Run up to `steps` gekko cycles, but stop early if one didn't advance
+        // (lockstep stall waiting on remote input) -- spinning would not help
+        // and would over-predict.
+        int taken = 0;
+        for (int s = 0; s < steps; ++s) {
+            if (!Netplay_ProcessBattleInputPhase()) break;
+            ++taken;
+        }
+        if (steps > 1 && taken > 1) {
+            static uint32_t s_skip_log = 0;
+            static const bool s_perf = []{ const char* v = std::getenv("FM2K_PERF_PROFILE");
+                                           return v && v[0] == '1'; }();
+            if (s_perf && (s_skip_log++ % 100) == 0)
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[NET-FRAMESKIP] sim ran %d gekko steps for 1 render (heavy stage)", taken);
+        }
         if (g_frame_pending_render) {
             RenderFrameWithSnapshot();
             g_frame_pending_render = false;
@@ -700,6 +816,7 @@ static void RunCssTick() {
     // Run the native CSS tick.
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+    ++g_sim_step_count;   // sim-fps: one logic tick
     ParityRecorder::Capture();  // post-update snapshot for parity .pty
 
     // Advance virtual_time to match the spectator's per-pop bump cadence.
@@ -786,6 +903,7 @@ static void RunNativeTick() {
 
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+    ++g_sim_step_count;   // sim-fps: one logic tick
     ParityRecorder::Capture();  // post-update snapshot for parity .pty
 
     // Same virtual-time alignment as RunCssTick — keep timeGetTime cadence
@@ -894,6 +1012,7 @@ static bool SpectatorSimOneFrame() {
 
     if (original_process_game_inputs) original_process_game_inputs();
     if (original_update_game)         original_update_game();
+    ++g_sim_step_count;   // sim-fps: one logic tick
 
     ParityRecorder::Capture();
 

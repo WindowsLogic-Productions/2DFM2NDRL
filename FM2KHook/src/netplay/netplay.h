@@ -85,6 +85,12 @@ void Netplay_ProcessMenu();
 // value flowing until both sides converge. Returns immediately.
 void Netplay_SignalBattleEntry();
 
+// Boot-to-battle (FM2K_BOOT_TO_BATTLE) only: arm the battle-entry barrier when
+// the CSS rendezvous was skipped, so the two direct-to-battle peers will accept
+// each other's BATTLE_ENTERING instead of rejecting them as out-of-window.
+// No-op if already armed (the normal CSS path). See definition for details.
+void Netplay_ArmBattleEntryBarrier();
+
 // Check if the CSS->battle swap is ready to fire: both peers have signaled
 // AND the active CSS-session frame has reached the agreed swap_frame.
 // Callers should perform gekko_destroy(css) -> gekko_create(battle) once

@@ -1590,6 +1590,25 @@ static void BroadcastSwapToSubscribers(CtrlMsg type, uint32_t swap_frame) {
     }
 }
 
+// Boot-to-battle (FM2K_BOOT_TO_BATTLE) test/dev path: the two peers skip the
+// CSS rendezvous entirely and boot straight into a battle stage. Normally the
+// battle-entry barrier is armed inside the CSS-synced path (g_battle_entry_armed
+// = true after Netplay_StartCSSSession). With CSS skipped that never runs, so
+// each peer's BATTLE_ENTERING packet is rejected by the other as "out-of-window"
+// (armed=0) and both wedge forever at ">>> ENTERING BATTLE MODE - waiting for
+// sync". Arm the barrier here so boot-to-battle netplay can sync. epoch stays 0
+// (both peers send epoch 0, which the receive handler always accepts), and
+// g_css_frame is 0 so both propose the same swap_frame. Production never calls
+// this (it always goes through CSS); it's only invoked from the BTB signal site.
+void Netplay_ArmBattleEntryBarrier() {
+    if (g_battle_entry_armed) return;  // already armed (normal CSS path)
+    g_battle_entry_armed    = true;
+    g_entry_local_proposal  = 0;
+    g_entry_remote_proposal = 0;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Netplay: armed battle-entry barrier for boot-to-battle (no CSS rendezvous)");
+}
+
 void Netplay_SignalBattleEntry() {
     if (g_local_battle_entered) {
         return;  // Already signaled
@@ -3161,6 +3180,17 @@ bool Netplay_ProcessBattleInputPhase() {
         // GekkoNet's examples only add inputs in lockstep with a started
         // session.
         if (g_session_ready) {
+            // ONE local input per call. This function is exactly one gekko
+            // step (add -> update -> advance); the heavy-stage sim/render
+            // decouple is orchestrated ONE LEVEL UP in the trampoline's
+            // RunBattleTick, which calls this N times per rendered frame to
+            // hold the sim at 100fps while display frames drop. Doing the
+            // catch-up here (the old approach -- N adds before one
+            // update_session) broke gekko's per-frame accounting and desynced
+            // (RoHe/Aubeclisse f139); N full add->update->advance cycles do
+            // not, because the sim clock is virtual (g_virtual_time_ms =
+            // frame*10) so per-peer wall-clock only changes prediction depth,
+            // which rollback absorbs. See RunBattleTick for the accumulator.
             gekko_add_local_input(g_session, g_player_index, &local_input);
         }
     }
@@ -3555,6 +3585,7 @@ bool Netplay_ProcessBattleInputPhase() {
                     if (original_update_game) {
                         original_update_game();
                     }
+                    ++g_sim_step_count;   // sim-fps: one logic tick (netplay battle advance, incl. re-sims)
                 }
                 PerfMaybeReport();
 
@@ -3612,7 +3643,20 @@ bool Netplay_ProcessBattleInputPhase() {
                 // duplicate frame entries.
                 if (!update->data.adv.rolling_back &&
                     !update->data.adv.running_ahead) {
-                    ParityRecorder::Capture();
+                    // Monotonic per-frame dedup. Under the heavy-stage
+                    // sim/render decouple (RunBattleTick runs this N times per
+                    // render) with asymmetric rollback, gekko can re-emit a
+                    // confirmed advance for a frame already captured, padding
+                    // the .pty and misaligning the cross-peer index diff
+                    // (wanwan stall run: 850 vs 813 snapshots). A confirmed
+                    // frame's state is FINAL, so record each frame number once.
+                    // != (not >) so a fresh battle's frame 0 after a stale high
+                    // value still records.
+                    static uint32_t s_last_parity_frame = UINT32_MAX;
+                    if (g_netplay_frame != s_last_parity_frame) {
+                        ParityRecorder::Capture();
+                        s_last_parity_frame = g_netplay_frame;
+                    }
                 }
 
                 // Synthetic desync trigger — runs after the frame

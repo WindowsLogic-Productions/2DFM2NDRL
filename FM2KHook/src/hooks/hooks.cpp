@@ -61,7 +61,13 @@ static inline void PinFPUControlWord() {
     // SSE: also pin MXCSR. FM2K's hit-detection and physics likely emit SSE
     // float ops under -mfpmath or vectorizer, and MXCSR rounding mode is
     // independent of the x87 control word. Both peers must agree.
-    SetMXCSR(0x1F80u);
+    // #63 TEST: FM2K_FTZ_TEST=1 enables FZ(0x8000)+DAZ(0x0040) to check whether
+    // denormal stalls in the game's render math are the Robot Heroes slowdown.
+    static const unsigned int s_mxcsr = []{
+        const char* v = std::getenv("FM2K_FTZ_TEST");
+        return (v && v[0] == '1') ? 0x9FC0u : 0x1F80u;
+    }();
+    SetMXCSR(s_mxcsr);
 }
 
 // Deterministic timeGetTime: during an active GekkoNet battle session the
@@ -1084,6 +1090,19 @@ static void CheckGameModeTransition() {
             Hook_FlushPendingCapture();
 
             if (!g_offline_mode && Netplay_IsConnected()) {
+                // Boot-to-battle (test/dev) skips the CSS rendezvous that
+                // normally arms the battle-entry barrier. Arm it here so the
+                // two direct-to-battle peers accept each other's signal
+                // instead of deadlocking at "waiting for sync". No-op (and
+                // never reached as an arm) on the production CSS path.
+                static const bool s_btb = []{
+                    const char* e = std::getenv("FM2K_BOOT_TO_BATTLE");
+                    return e && e[0] == '1' && e[1] == '\0';
+                }();
+                if (s_btb) {
+                    extern void Netplay_ArmBattleEntryBarrier();
+                    Netplay_ArmBattleEntryBarrier();
+                }
                 Netplay_SignalBattleEntry();
                 g_battle_entry_signaled = true;
                 // NOTE: GekkoNet will be started in Hook_UpdateGameState
@@ -2171,6 +2190,14 @@ static DWORD g_last_fps_time = 0;
 static int g_fps_frame_count = 0;
 int g_current_fps = 0;
 
+// Sim-fps: sampled from g_sim_step_count (incremented once per update_game
+// tick across all paths). Render-fps counts renders; sim-fps counts logic
+// ticks. On a heavy stage render drops but sim must hold 100 -- showing both
+// makes that explicit instead of one ambiguous number. g_current_sim_fps is
+// read by the title bar + overlay HUD.
+static uint32_t s_last_sim_step_sample = 0;
+int g_current_sim_fps = 0;
+
 // Hook: RenderGame
 // Set in the GekkoNet AdvanceEvent handler (netplay.cpp). Each advance
 // produces exactly one new simulation tick; this flag says "that tick is
@@ -2189,12 +2216,16 @@ extern "C" void Hook_RenderDiagnostics_Tick();
 extern "C" void Hook_RenderDiagnostics_Tick() {
     CheckOverlayHotkey();
 
-    // Track FPS
+    // Track FPS -- render (this tick fires once per render) + sim (delta of
+    // the global logic-tick counter over the same 1s window).
     g_fps_frame_count++;
     DWORD now = GetTickCount();
     if (now - g_last_fps_time >= 1000) {
         g_current_fps = g_fps_frame_count;
         g_fps_frame_count = 0;
+        const uint32_t sim_now = g_sim_step_count;
+        g_current_sim_fps = (int)(sim_now - s_last_sim_step_sample);
+        s_last_sim_step_sample = sim_now;
         g_last_fps_time = now;
     }
 
@@ -2348,13 +2379,13 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                 const char* tag = g_stress_mode ? "STRESS" : "BATTLE";
                 if (desyncs > 0) {
                     snprintf(title, sizeof(title),
-                        "%s | %s (%s) | %dfps RTT %ums | D%d FA%.1f RB%u | DESYNC x%u",
-                        s_game_prefix, lead, tag, g_current_fps,
+                        "%s | %s (%s) | %dsim/%drdr RTT %ums | D%d FA%.1f RB%u | DESYNC x%u",
+                        s_game_prefix, lead, tag, g_current_sim_fps, g_current_fps,
                         stats.last_ping, delay, ahead, rollbacks, desyncs);
                 } else {
                     snprintf(title, sizeof(title),
-                        "%s | %s (%s) | %dfps RTT %ums | D%d FA%.1f RB%u",
-                        s_game_prefix, lead, tag, g_current_fps,
+                        "%s | %s (%s) | %dsim/%drdr RTT %ums | D%d FA%.1f RB%u",
+                        s_game_prefix, lead, tag, g_current_sim_fps, g_current_fps,
                         stats.last_ping, delay, ahead, rollbacks);
                 }
             } else if (connected) {
@@ -2372,15 +2403,16 @@ extern "C" void Hook_RenderDiagnostics_Tick() {
                     phase = phase_buf;
                 }
                 snprintf(title, sizeof(title),
-                    "%s | %s (%s) | %dfps RTT %ums",
-                    s_game_prefix, lead, phase, g_current_fps, ping);
+                    "%s | %s (%s) | %dsim/%drdr RTT %ums",
+                    s_game_prefix, lead, phase, g_current_sim_fps, g_current_fps, ping);
             } else if (!g_offline_mode) {
                 snprintf(title, sizeof(title),
-                    "%s | %s | Connecting... | %dfps",
-                    s_game_prefix, lead, g_current_fps);
+                    "%s | %s | Connecting... | %dsim/%drdr",
+                    s_game_prefix, lead, g_current_sim_fps, g_current_fps);
             } else {
                 snprintf(title, sizeof(title),
-                    "%s | Offline | %dfps", s_game_prefix, g_current_fps);
+                    "%s | Offline | %dsim/%drdr", s_game_prefix,
+                    g_current_sim_fps, g_current_fps);
             }
 
             // SetWindowTextW + UTF-8 → UTF-16 conversion: SetWindowTextA
@@ -2771,6 +2803,7 @@ uint32_t __cdecl Hook_GameRand() {
     // colors stay deterministic per confirmed frame and identical on both
     // peers. Render rng is intentionally NOT traced (it's a separate stream).
     if (g_in_render_rng) {
+        ++g_render_rand_calls;  // #63 diag: count render-side rng draws
         const uint32_t gameplay = *(uint32_t*)FM2K::ADDR_RANDOM_SEED;
         *(uint32_t*)FM2K::ADDR_RANDOM_SEED = g_render_rng_seed;
         const uint32_t r = original_game_rand ? original_game_rand() : 0;

@@ -14,6 +14,11 @@ ProcessGameInputsFunc original_process_game_inputs = nullptr;
 // render; advanced only by render-side game_rand draws via Hook_GameRand.
 uint32_t g_render_rng_seed = 0;
 bool     g_in_render_rng   = false;
+// Diagnostic counter (#63): render-side game_rand calls, to test whether the
+// Robot Heroes heavy-stage render cost is our Hook_GameRand overhead scaling
+// with per-frame rng draws. Reset per offline frame by the trampoline.
+uint32_t g_render_rand_calls = 0;
+volatile uint32_t g_sim_step_count = 0;
 
 // Minimal global state
 int g_player_index = 0;

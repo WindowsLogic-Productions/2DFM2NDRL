@@ -36,6 +36,14 @@ extern ProcessGameInputsFunc original_process_game_inputs;
 // colors are deterministic per confirmed frame AND identical across peers.
 extern uint32_t g_render_rng_seed;
 extern bool     g_in_render_rng;
+extern uint32_t g_render_rand_calls;  // #63 diag: render-side game_rand calls/frame
+
+// Sim throughput counter: incremented once per game logic tick (update_game),
+// across every path (offline frame-skip loop, netplay battle advance, CSS,
+// native). Sampled in Hook_RenderDiagnostics_Tick to derive sim-fps separately
+// from render-fps, so the title bar can show "sim N / rdr M" -- sim must hold
+// 100 even when render drops on heavy stages. Monotonic; wraps harmlessly.
+extern volatile uint32_t g_sim_step_count;
 
 // ============================================================================
 // ENGINE TARGET — the same source compiles into:
