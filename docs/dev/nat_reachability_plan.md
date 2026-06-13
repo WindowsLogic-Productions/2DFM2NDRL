@@ -294,6 +294,67 @@ python); live soak on bleeding.
 
 Effort: S-M. Risk: low.
 
+### Phase 4 -- federated relay mesh (volunteer-hosted, geo-distributed)
+
+Motivation is LATENCY, not offload. The hub relay is one box (NYC droplet).
+A symmetric+symmetric pair in Chile relays Chile->NYC->Chile -- the detour is
+exactly what produced the 310ms RTT + one-sided rollback + desync in the
+2026-06-13 relay cluster (see project_relay_desync_cluster). Volunteer relays
+near players cut that to a fraction and make relayed matches actually
+playable.
+
+Key framing: a volunteer hosts a RELAY (and/or a STUN reflector), NOT a hub.
+The two share nothing. Hub = lobby + matchmaking + auth + WebSocket + DB
+(private). Relay = the ~100-line dumb 0xCF forwarder already isolated in
+hub.py:1966-2008 (inbound `0xCF 0x01 [16B session_id] [payload]` -> learn each
+peer into one of two slots -> forward to the other). It never touches lobby,
+auth, or user data. The 0xCF wire format already ships inside the public
+client, so exposing it leaks nothing.
+
+Trust tiers (pick one; recommend Tier 1):
+- Tier 0 (open): relay forwards any session_id with <=2 learned peers.
+  Abuse-bounded: only forward our 0xCF magic, strict 1:1 (no amplification),
+  per-session bandwidth + packet-size caps, short TTL. Fine for fight-game
+  trickle UDP.
+- Tier 1 (HMAC-gated) -- RECOMMENDED: hub + each operator share ONE symmetric
+  registration key (NOT hub source, NOT the WS auth handshake). Hub HMAC-signs
+  each session_id; relay verifies. The key's only power is "may forward
+  hub-blessed sessions"; revocable; exposes nothing. Operator surface = a
+  binary + one key + an open UDP port.
+- Tier 2 (hub-authorized): relay holds a thin control link; hub pushes
+  authorized session_ids as matches start. Overkill now.
+
+Changes:
+1. New standalone `fm2k-relay` binary (Go or Rust -> one static binary, no
+   Python/Node runtime for volunteers). ~150 lines: 0xCF forward + HMAC check
+   + caps. Extract from hub.py's relay proto; keep wire format identical.
+2. Hub relay registry: operators register {addr, region, key-fingerprint,
+   liveness}. WS or simple authed HTTP POST heartbeat.
+3. Geo-aware selection: when a pairing needs relay (Phase 3 gating says
+   symmetric+symmetric), match_start picks the registered relay minimizing
+   max(peerA->relay, peerB->relay) RTT (seed from region; refine with
+   measured probes) instead of the hardcoded droplet. Fresh HMAC-signed
+   session_id per match.
+4. Optional: STUN reflector is even more trivial to federate (stateless,
+   reflects source ip:port, zero state/auth/coupling). Volunteers can run one
+   to spread STUN load, but STUN is cheap so this is low priority vs relay.
+5. Client: already accepts its relay address from match_start; little/no
+   change.
+
+Caveat (honest): a relay is a MITM by definition -- it sees the UDP it
+forwards. Payload is gekko inputs + checksums (not sensitive), but a malicious
+relay could drop/delay/corrupt to grief a match. Mitigations: client already
+desync-detects (corruption -> clean fail, not exploit), HMAC gates WHO can
+relay, only register vetted operators. Full trustless = per-packet auth on
+gekko traffic, a bigger future lift, overkill among community volunteers.
+
+Test: fm2k-relay unit tests (forward/HMAC/caps); two-client loopback through
+a locally-run fm2k-relay; one real geo relay (e.g. a Chilean volunteer) vs the
+Chile-NYC baseline, compare [BEAT-RELAY] RTT + rollback symmetry.
+
+Effort: M (new binary + hub registry + selection). Risk: low (additive; relay
+selection falls back to the droplet if no volunteer relay is closer/alive).
+
 ## Orchestration model
 
 - Fable 5 (main session): architecture, this doc, work-package specs,
