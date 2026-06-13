@@ -4429,6 +4429,28 @@ void Netplay_TickHeartbeat() {
         g_pred_window,
         g_rollback_count, rb_count, rb_avg, rb_max);
 
+    // [RELAY-RTT-DIAG] Under relay, surface whether gekko's RTT-match address
+    // (the live g_remote_sockaddr stamp) still equals the string we registered
+    // with gekko_add_actor (g_remote_addr). If they diverge, gekko's
+    // NetworkHealth addr.Equals(actor) fails -> last_ping pins at 0 -> this peer
+    // runs ahead -> one-sided rollback -> desync amplification (relay desync
+    // cluster, 2026-06-13). Diagnostic only -- no behavior change. Formatting
+    // mirrors g_remote_addr's (inet_ntop + "%s:%u") so the compare is byte-exact.
+    if (::fm2k::nat::IsRelayMode()) {
+        char live[INET_ADDRSTRLEN + 8] = "?";
+        if (const sockaddr_in* rs = NetSocket_GetRemoteAddr()) {
+            char ip_buf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, (void*)&rs->sin_addr, ip_buf, sizeof(ip_buf));
+            snprintf(live, sizeof(live), "%s:%u", ip_buf, ntohs(rs->sin_port));
+        }
+        const bool match = (strcmp(live, g_remote_addr) == 0);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[BEAT-RELAY] gekko_ping=%ums actor='%s' live_stamp='%s' addr_match=%s%s",
+            stats.last_ping, g_remote_addr, live, match ? "yes" : "NO",
+            (!match || stats.last_ping == 0)
+                ? "  <-- RTT-match BROKEN (ping pins at 0 -> one-sided rollback)" : "");
+    }
+
     // Reset window so next emit describes only the next ~10s.
     g_beat_window_rb_sum   = 0;
     g_beat_window_rb_max   = 0;

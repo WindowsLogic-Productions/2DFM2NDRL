@@ -611,6 +611,20 @@ void ControlChannel_LatchPeerAddr(const sockaddr_in& peer) {
             "ControlChannel: peer addr latched -> %s:%u (was %u)",
             ip, (unsigned)ntohs(peer.sin_port),
             (unsigned)ntohs(g_remote_sockaddr.sin_port));
+        // [RELAY-RTT-DIAG] A re-latch AFTER g_connected desyncs
+        // g_remote_sockaddr from the address ALREADY registered with
+        // gekko_add_actor (netplay.cpp:1928). gekko's NetworkHealth RTT only
+        // accrues when addr.Equals(actor) (backend.cpp:781); once the stamp
+        // diverges, AddRTT never fires -> last_ping pins at 0 -> that peer
+        // runs ahead -> one-sided rollback -> desync amplification. This WARN
+        // confirms/refutes that timing live on the next relay match; the fix
+        // (freeze the stamp post-connect) waits on this evidence. (2026-06-13)
+        if (g_connected) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "[RELAY-RTT-DIAG] post-connect peer re-latch -> %s:%u "
+                "DIVERGES gekko actor addr; expect ping=0 + one-sided rollback",
+                ip, (unsigned)ntohs(peer.sin_port));
+        }
     }
     g_remote_sockaddr = peer;
 }
