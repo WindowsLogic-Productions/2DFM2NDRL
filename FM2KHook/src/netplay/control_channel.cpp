@@ -572,7 +572,24 @@ static void RawReceive() {
             std::vector<char> pkt_data(
                 reinterpret_cast<const char*>(eff_data),
                 reinterpret_cast<const char*>(eff_data) + eff_len);
-            g_gekko_packet_queue.push_back({std::move(pkt_data), from_addr});
+            // Source-address stamping. GekkoNet drops any inbound packet
+            // whose source string doesn't byte-match the address handed to
+            // gekko_add_actor (netplay.cpp:1928 / 2520). For DIRECT packets
+            // that's from_addr (the genuine peer source) -- unchanged, the
+            // path stays bit-identical to before (preserves D9). For RELAY
+            // packets from_addr is the relay (e.g. 127.0.0.1:7712), NOT the
+            // peer, so stamping it would make every relayed gekko input get
+            // dropped and stall CSS lockstep forever. Stamp g_remote_sockaddr
+            // instead: it is the configured remote (peer-addr learning is
+            // skipped for relayed packets at ~507, so it stays exactly as
+            // FM2K_REMOTE_ADDR was parsed). The actor string CANNOT diverge
+            // from this -- both the actor string (NetSocket_GetRemoteAddr ->
+            // inet_ntop) and the receive string (MultiplexAdapter_Receive ->
+            // inet_ntoa) are derived from this same g_remote_sockaddr, and
+            // it was set via inet_pton (dotted-decimal only, no hostnames),
+            // so the two formattings produce identical "ip:port" text.
+            const sockaddr_in& stamp = from_relay ? g_remote_sockaddr : from_addr;
+            g_gekko_packet_queue.push_back({std::move(pkt_data), stamp});
         }
     }
 }

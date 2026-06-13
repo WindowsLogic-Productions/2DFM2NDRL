@@ -5781,7 +5781,49 @@ void LauncherUI::RenderHubPanel() {
                         ::SetEnvironmentVariableA("FM2K_SOCD_MODE", socd_buf);
                     }
                     if (!ev.match.relay_ip.empty() && ev.match.relay_port > 0) {
-                        std::string relay_addr = ev.match.relay_ip + ":" +
+                        // Pre-resolve the relay host to a dotted-quad for the
+                        // same reason as FM2K_HUB_UDP_ADDR above: ConfigureRelay
+                        // -> ResolveHostA -> getaddrinfo runs inside the hook's
+                        // Netplay_Init (DllMain context). A hostname here would
+                        // put a DNS lookup on the loader-lock path; resolving it
+                        // in the launcher (a normal thread) keeps DllMain off
+                        // DNS. If relay_ip is already a dotted-quad, getaddrinfo
+                        // short-circuits via the numeric path. On failure we fall
+                        // back to the hostname so the hook still gets a try.
+                        std::string relay_host = ev.match.relay_ip;
+                        bool is_dotted_quad = false;
+                        {
+                            in_addr probe{};
+                            is_dotted_quad =
+                                (inet_pton(AF_INET, relay_host.c_str(), &probe) == 1);
+                        }
+                        if (!is_dotted_quad) {
+                            addrinfo hints{};
+                            hints.ai_family   = AF_INET;
+                            hints.ai_socktype = SOCK_DGRAM;
+                            addrinfo* res = nullptr;
+                            if (getaddrinfo(relay_host.c_str(), nullptr,
+                                            &hints, &res) == 0 && res) {
+                                char ip_str[INET_ADDRSTRLEN] = {};
+                                const sockaddr_in* sin =
+                                    reinterpret_cast<const sockaddr_in*>(res->ai_addr);
+                                if (inet_ntop(AF_INET, &sin->sin_addr,
+                                              ip_str, sizeof(ip_str))) {
+                                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "Relay: pre-resolved %s -> %s for "
+                                        "FM2K_HUB_RELAY_ADDR (keeps DllMain off DNS)",
+                                        relay_host.c_str(), ip_str);
+                                    relay_host = ip_str;
+                                }
+                                freeaddrinfo(res);
+                            } else {
+                                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Relay: getaddrinfo('%s') failed; passing "
+                                    "hostname to game (hook will retry)",
+                                    relay_host.c_str());
+                            }
+                        }
+                        std::string relay_addr = relay_host + ":" +
                                                  std::to_string(ev.match.relay_port);
                         ::SetEnvironmentVariableA("FM2K_HUB_RELAY_ADDR",    relay_addr.c_str());
                         ::SetEnvironmentVariableA("FM2K_HUB_RELAY_SESSION",
