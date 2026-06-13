@@ -400,6 +400,21 @@ void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
     EnqueueOut(std::move(m));
 }
 
+void HubClient::SendNatType(const std::string& nat_type) {
+    // Minimal udp_addr update carrying only the NAT classification (Phase
+    // 2a). The hub's udp_addr handler reads "nat_type" independently of the
+    // ip/port/upnp fields, so we don't need to re-send those here -- the
+    // primary SendUdpAddr already registered them. Validate locally too so a
+    // bogus value never goes on the wire.
+    if (nat_type != "cone" && nat_type != "symmetric" &&
+        nat_type != "blocked" && nat_type != "unknown") {
+        return;
+    }
+    std::string m = "{\"type\":\"udp_addr\",\"nat_type\":\""
+                  + EscapeJsonString(nat_type) + "\"}";
+    EnqueueOut(std::move(m));
+}
+
 void HubClient::SendTcpAddr(const std::string& ip, int port) {
     // External TCP addr learned via TCP-STUN against the hub. Hub stores
     // it on user.external_tcp_addr and forwards in spectator_incoming

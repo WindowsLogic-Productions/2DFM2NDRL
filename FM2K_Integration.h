@@ -28,6 +28,38 @@ namespace fm2k { class PortMapper; }  // UPnP port mapper (Phase 1); defined
                                       // LauncherUI as a unique_ptr so the
                                       // miniupnpc headers stay out of here.
 
+namespace fm2k {
+// NAT classification result (Phase 2a). Produced by the launcher's dual STUN
+// probe: one probe to the hub's primary STUN port and one to its
+// classification port (+3) from the same bound socket. Comparing the two
+// reflected external ports yields the RFC-4787 mapping behavior:
+//   "cone"      -- both ports equal: endpoint-independent mapping, punchable.
+//   "symmetric" -- ports differ: a new external port per destination, hard
+//                  to punch.
+//   "blocked"   -- no acks at all: UDP appears filtered.
+//   "unknown"   -- only one ack (inconclusive) or the probe couldn't run.
+// port_a / port_b are the reflected external ports (0 if that ack was
+// missing). This is the value reported to the hub as udp_addr.nat_type.
+struct NatClassifyResult {
+    std::string nat_type = "unknown";
+    uint16_t    port_a   = 0;  // reflected ext port from the primary STUN port
+    uint16_t    port_b   = 0;  // reflected ext port from the classification port
+};
+
+// Run the dual STUN classification probe against a hub. Binds local_port,
+// sends a 0xCD/0x01 probe to hub_udp_port AND to hub_udp_port+3 from the same
+// socket, collects both acks under one ~1s window, and returns the
+// classification. The probe to hub_udp_port also serves as the primary STUN
+// pre-stamp (the hub records user.udp_addr from it), so this fully replaces
+// the old single-port pre-match STUN. user_id is the 24-byte-padded Discord
+// id the hub keys on; pass empty to skip (returns "unknown"). Transient: the
+// socket is closed before return, exactly like the old single probe.
+NatClassifyResult LauncherStunClassify(uint16_t local_port,
+                                       const std::string& hub_host,
+                                       uint16_t hub_udp_port,
+                                       const std::string& user_id);
+}  // namespace fm2k
+
 // FM2K Memory addresses and structures (from research)
 namespace FM2K {
     // Forward declarations for FM2K namespace classes

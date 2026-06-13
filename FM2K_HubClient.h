@@ -338,6 +338,17 @@ public:
                          const std::string& ext_ip, int ext_udp_port,
                          bool upnp);
 
+    // NAT classification report (Phase 2a). Sent as a small udp_addr update
+    // carrying just the nat_type string once the launcher's dual STUN probe
+    // resolves (cone/symmetric/blocked/unknown -- see
+    // fm2k::LauncherStunClassify). The hub validates against that set, stores
+    // user.nat_type, and exposes it per-peer in match_start (peer_dict) so the
+    // hook logs see it and Phase 3 can orient the match. Separate from
+    // SendUdpAddr / SendUdpAddrUpnp so the classification result can be sent
+    // on its own schedule (it resolves a beat after the primary STUN). Old
+    // hubs ignore the unknown nat_type field -- backward compatible.
+    void SendNatType(const std::string& nat_type);
+
     // External TCP addr discovered by the spec hook via hub TCP-STUN
     // (see FM2KHook/src/netplay/spectator_tcp.cpp PerformTcpStun). Sent
     // separately from SendUdpAddr because TCP-STUN is async — the

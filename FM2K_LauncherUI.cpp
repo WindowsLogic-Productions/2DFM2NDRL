@@ -199,6 +199,11 @@ struct LauncherUI::HubState {
     // port stays alive — most home NATs idle-time UDP mappings out
     // around 30 s, so 20 s gives one re-bind worth of headroom.
     uint32_t    last_stun_refresh_ms = 0;
+    // Last NAT classification reported to the hub (Phase 2a). The STUN probe
+    // now doubles as a classification probe; we only re-send the nat_type WS
+    // update when the result changes (it's stable on a given network), so a
+    // quiet lobby doesn't spam udp_addr updates every refresh.
+    std::string last_nat_type;
 };
 
 // Case-insensitive match of `room_id` against installed games. A
@@ -342,30 +347,50 @@ static bool HubPreflightPunch(uint16_t local_port,
     return peer_seen;
 }
 
-// Pre-match launcher STUN. Binds the UDP port the game will reuse, sends
-// 0xCD 0x01 STUN probe to hub:7711 with the full Discord user_id (24-byte
-// padded), so the hub records this user's *external* NAT mapping BEFORE
-// any match_start fires. Without this, hub's peer_dict() ships the
-// launcher-reported local port — which only matches reality on
-// port-preserving NATs, and silently breaks for everyone else (Comcast
-// CGNAT, Spanish ISPs that randomize ports, etc.).
+// Pre-match launcher STUN + NAT classification (Phase 2a). Binds the UDP
+// port the game will reuse, then sends TWO 0xCD 0x01 probes from the SAME
+// socket:
+//   (A) to hub:hub_udp_port  (the primary STUN port, 7711) -- the hub
+//       records this user's *external* NAT mapping (user.udp_addr) BEFORE
+//       any match_start fires. Without this, hub's peer_dict() ships the
+//       launcher-reported local port -- which only matches reality on
+//       port-preserving NATs, and silently breaks for everyone else
+//       (Comcast CGNAT, Spanish ISPs that randomize ports, etc.).
+//   (B) to hub:hub_udp_port+3 (the classification port, 7714) -- a PURE
+//       REFLECTOR on the hub that echoes the observed source but never
+//       touches user state.
+// Both probes go to the SAME hub IP but DIFFERENT ports. Comparing the two
+// reflected external ports gives the RFC-4787 mapping behavior:
+//   port_a == port_b -> endpoint/port-independent mapping  -> "cone".
+//   port_a != port_b -> a new external port per destination -> "symmetric".
+//   no acks          -> "blocked" ; only one ack            -> "unknown".
 //
-// Called on Connected so the lobby is STUN-stamped from the moment we
-// appear, and refreshed periodically while we sit in the lobby. Closes
-// the socket on return — the game's hook re-binds the same local port
-// shortly after, and most cone NATs preserve the (local_port -> ext_port)
-// mapping for ≥30 s of inactivity.
-static void LauncherStunProbe(uint16_t local_port,
-                              const std::string& hub_host,
-                              uint16_t hub_udp_port,
-                              const std::string& user_id)
+// KNOWN LIMITATION (D7, accepted): same-IP-different-port catches
+// PORT-dependent symmetric NATs but NOT a purely address-dependent one
+// (which assigns a new port only per destination *IP*, not per port). That
+// needs two different hub IPs, which we don't have. The miss is benign:
+// such a NAT classifies as "cone" here, Phase 3 may try direct first, and
+// punch + peer-learning + relay still back it up.
+//
+// The two probes are sent BACK-TO-BACK and both acks are collected under a
+// SINGLE ~1s deadline (not two serial 800ms waits) to keep the UI hitch
+// small. Closes the socket on return -- the game's hook re-binds the same
+// local port shortly after, and most cone NATs preserve the
+// (local_port -> ext_port) mapping for >=30s of inactivity.
+//
+// Returns the classification (also surfaced to the hub as udp_addr.nat_type).
+fm2k::NatClassifyResult fm2k::LauncherStunClassify(uint16_t local_port,
+                                                   const std::string& hub_host,
+                                                   uint16_t hub_udp_port,
+                                                   const std::string& user_id)
 {
-    if (user_id.empty()) return;
+    fm2k::NatClassifyResult out;  // defaults to "unknown", ports 0
+    if (user_id.empty()) return out;
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) return out;
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof(reuse));
@@ -378,7 +403,7 @@ static void LauncherStunProbe(uint16_t local_port,
             "STUN: bind() to %u failed err=%d (skipping pre-match STUN)",
             (unsigned)local_port, WSAGetLastError());
         closesocket(s);
-        return;
+        return out;
     }
 
     addrinfo hints{};
@@ -389,11 +414,13 @@ static void LauncherStunProbe(uint16_t local_port,
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
             "STUN: getaddrinfo('%s') failed", hub_host.c_str());
         closesocket(s);
-        return;
+        return out;
     }
-    sockaddr_in haddr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
-    haddr.sin_port = htons(hub_udp_port);
+    sockaddr_in haddr_a = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
     freeaddrinfo(res);
+    sockaddr_in haddr_b = haddr_a;            // same IP...
+    haddr_a.sin_port = htons(hub_udp_port);    // ...port 7711 (primary STUN)
+    haddr_b.sin_port = htons(hub_udp_port + 3);// ...port 7714 (classification)
 
     constexpr size_t kUserIdLen = 24;
     uint8_t pkt[2 + kUserIdLen] = { 0xCD, 0x01 };
@@ -401,40 +428,87 @@ static void LauncherStunProbe(uint16_t local_port,
     if (n > kUserIdLen) n = kUserIdLen;
     std::memcpy(pkt + 2, user_id.data(), n);
 
-    int sent = sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
-                      reinterpret_cast<const sockaddr*>(&haddr), sizeof(haddr));
-    if (sent != (int)sizeof(pkt)) {
+    // Fire both probes back-to-back so the hub answers them in parallel and
+    // we wait once, not twice. The primary (A) is the one whose ack the hub
+    // also uses to register user.udp_addr.
+    int sent_a = sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                        reinterpret_cast<const sockaddr*>(&haddr_a), sizeof(haddr_a));
+    int sent_b = sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                        reinterpret_cast<const sockaddr*>(&haddr_b), sizeof(haddr_b));
+    if (sent_a != (int)sizeof(pkt) || sent_b != (int)sizeof(pkt)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "STUN: sendto failed err=%d", WSAGetLastError());
+            "STUN: sendto failed err=%d (a=%d b=%d)", WSAGetLastError(),
+            sent_a, sent_b);
     }
 
-    DWORD recv_to = 800;  // hub is on the same continent for most users; 800 ms is plenty
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&recv_to), sizeof(recv_to));
-    uint8_t buf[64];
-    sockaddr_in from{};
-    int from_len = sizeof(from);
-    int got = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
-                       reinterpret_cast<sockaddr*>(&from), &from_len);
-    if (got >= 8 && buf[0] == 0xCD && buf[1] == 0x02) {
+    // Single ~1s collection window for BOTH acks. We can't tell which ack is
+    // which by the packet alone (both are 0xCD 0x02 ip port from the hub),
+    // so we disambiguate by the recvfrom *source port*: an ack from
+    // hub_udp_port answers probe A, one from hub_udp_port+3 answers probe B.
+    // Loop until both arrive or the deadline passes, shrinking the per-recv
+    // timeout to the remaining budget each pass.
+    bool have_a = false, have_b = false;
+    uint16_t ext_a = 0, ext_b = 0;
+    char ip_a_str[INET_ADDRSTRLEN] = {}, ip_b_str[INET_ADDRSTRLEN] = {};
+    const uint32_t deadline = static_cast<uint32_t>(SDL_GetTicks()) + 1000;
+    while (!(have_a && have_b)) {
+        uint32_t now = static_cast<uint32_t>(SDL_GetTicks());
+        if (now >= deadline) break;
+        DWORD recv_to = deadline - now;            // remaining budget, ms
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&recv_to), sizeof(recv_to));
+        uint8_t buf[64];
+        sockaddr_in from{};
+        int from_len = sizeof(from);
+        int got = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                           reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (got < 8 || buf[0] != 0xCD || buf[1] != 0x02) {
+            if (got <= 0) break;  // timeout/error -- stop waiting
+            continue;             // junk packet, keep waiting within budget
+        }
         uint32_t ip_be = 0;
         std::memcpy(&ip_be, buf + 2, 4);
         uint16_t port_be = 0;
         std::memcpy(&port_be, buf + 6, 2);
+        uint16_t reflected = ntohs(port_be);
         in_addr ia{}; ia.s_addr = ip_be;
         char ip_str[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &ia, ip_str, sizeof(ip_str));
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "STUN: hub ack — reflexive %s:%u (local=%u, user=%s)",
-            ip_str, (unsigned)ntohs(port_be), (unsigned)local_port,
-            user_id.c_str());
+        uint16_t src_port = ntohs(from.sin_port);
+        if (src_port == hub_udp_port && !have_a) {
+            have_a = true; ext_a = reflected;
+            std::memcpy(ip_a_str, ip_str, sizeof(ip_a_str));
+        } else if (src_port == (uint16_t)(hub_udp_port + 3) && !have_b) {
+            have_b = true; ext_b = reflected;
+            std::memcpy(ip_b_str, ip_str, sizeof(ip_b_str));
+        }
+        // Any other source port: ignore (not one of our two probes).
+    }
+
+    out.port_a = ext_a;
+    out.port_b = ext_b;
+    if (have_a && have_b) {
+        out.nat_type = (ext_a == ext_b) ? "cone" : "symmetric";
+    } else if (!have_a && !have_b) {
+        out.nat_type = "blocked";
     } else {
+        out.nat_type = "unknown";  // only one side answered -- inconclusive
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "NAT classify: %s (port_a=%u port_b=%u, refl_ip=%s, local=%u, user=%s)",
+        out.nat_type.c_str(), (unsigned)ext_a, (unsigned)ext_b,
+        have_a ? ip_a_str : (have_b ? ip_b_str : "?"),
+        (unsigned)local_port, user_id.c_str());
+    if (!have_a) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "STUN: no ack from %s:%u within 800ms (hub records mapping anyway)",
+            "STUN: no ack from primary %s:%u within ~1s "
+            "(hub records mapping anyway)",
             hub_host.c_str(), (unsigned)hub_udp_port);
     }
 
     closesocket(s);
+    return out;
 }
 
 // Read the spawned game's hook log and extract the most recent
@@ -5255,10 +5329,17 @@ void LauncherUI::RenderHubPanel() {
             std::string hub_host = (hub_host_env && hub_host_env[0])
                                  ? hub_host_env
                                  : (hub_host_[0] ? hub_host_ : "hub.2dfm.org");
-            LauncherStunProbe(
+            fm2k::NatClassifyResult nat = fm2k::LauncherStunClassify(
                 static_cast<uint16_t>(network_config_.local_port),
                 hub_host, 7711, hs.my_id);
             hs.last_stun_refresh_ms = now_ms;
+            // Re-send nat_type only on a change (it's stable on a given
+            // network; "unknown"/"blocked" can flap on a dropped ack, so we
+            // still update so the hub reflects the latest reading).
+            if (nat.nat_type != hs.last_nat_type) {
+                hs.client.SendNatType(nat.nat_type);
+                hs.last_nat_type = nat.nat_type;
+            }
         }
     }
 
@@ -5413,10 +5494,17 @@ void LauncherUI::RenderHubPanel() {
                     std::string hub_host = (hub_host_env && hub_host_env[0])
                                          ? hub_host_env
                                          : (hub_host_[0] ? hub_host_ : "hub.2dfm.org");
-                    LauncherStunProbe(
+                    // The probe doubles as NAT classification (Phase 2a): it
+                    // still STUNs :7711 (registering user.udp_addr exactly as
+                    // before) and additionally probes :7714 to derive
+                    // cone/symmetric. Report the result to the hub so it lands
+                    // in peer_dict for the next match_start.
+                    fm2k::NatClassifyResult nat = fm2k::LauncherStunClassify(
                         static_cast<uint16_t>(network_config_.local_port),
                         hub_host, 7711, hs.my_id);
                     hs.last_stun_refresh_ms = static_cast<uint32_t>(SDL_GetTicks());
+                    hs.client.SendNatType(nat.nat_type);
+                    hs.last_nat_type = nat.nat_type;
                 }
                 // Pull our own W/L/D + per-opponent breakdown so the
                 // lobby column and titlebar both have data on first

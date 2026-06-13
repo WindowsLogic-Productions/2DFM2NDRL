@@ -919,6 +919,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     std::string replay_file_path;         // "--replay <path>" — offline .fm2krep playback
     bool upnp_test_cli = false;           // --upnp-test: discover->map->report->unmap then exit (router validation)
     uint16_t upnp_test_port = 7000;       // --upnp-test [port]: UDP port to map for the test
+    bool nat_test_cli = false;            // --nat-test <hub_host> [port]: run only the dual STUN classify probe then exit
+    std::string nat_test_host;            // --nat-test <hub_host>: hub to probe (UDP-STUN at :7711, classify at :7714)
+    uint16_t nat_test_port = 7000;        // --nat-test <hub_host> [port]: local UDP port to bind for the probe
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -1090,6 +1093,23 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 upnp_test_port = static_cast<uint16_t>(std::stoi(argv[++i]));
             }
+        } else if (arg == "--nat-test") {
+            // Manual / harness validation for the Phase 2a NAT classifier.
+            // Runs ONLY fm2k::LauncherStunClassify against a given hub
+            // (UDP-STUN on :7711, classification reflector on :7714),
+            // prints nat_type + the two reflexive ports, and exits -- no
+            // launcher UI, no game, no WS. Drives the same probe the lobby
+            // uses at the Connected event. On a local hub (127.0.0.1) this
+            // expects "cone" (same external port from both responders).
+            // Args: --nat-test <hub_host> [local_port]. local_port defaults
+            // to 7000 (the game's default bind).
+            nat_test_cli = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                nat_test_host = argv[++i];
+            }
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                nat_test_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            }
         }
     }
 
@@ -1147,6 +1167,37 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         mapper.Stop();
         if (wsa_ok) WSACleanup();
         std::cout << "[upnp-test] done (mapping torn down).\n";
+        return SDL_APP_SUCCESS;
+    }
+
+    // --nat-test: self-contained NAT classification probe. Runs the exact
+    // dual STUN probe the lobby uses (fm2k::LauncherStunClassify) against the
+    // given hub, prints the verdict + reflexive ports, and exits. This is the
+    // harness for the Phase 2a plumbing: point it at a local hub.py
+    // (--host 127.0.0.1, which binds 7711-7714) and expect "cone" with
+    // port_a == port_b. LauncherStunClassify calls WSAStartup internally, so
+    // no Winsock bring-up is needed here (mirrors the launcher path, where it
+    // runs at the hub Connected event with Winsock already up).
+    if (nat_test_cli) {
+        if (nat_test_host.empty()) {
+            std::cout << "[nat-test] usage: --nat-test <hub_host> [local_port]\n";
+            return SDL_APP_FAILURE;
+        }
+        // A synthetic user id so the probe doesn't early-out on empty; the
+        // classification reflector (:7714) ignores it entirely and the
+        // primary (:7711) just records a throwaway mapping for an unknown
+        // user (harmless -- no such User exists on a fresh local hub).
+        const std::string test_uid = "nat-test-harness";
+        std::cout << "[nat-test] probing hub '" << nat_test_host
+                  << "' (UDP-STUN :7711, classify :7714) from local port "
+                  << nat_test_port << " ...\n";
+        fm2k::NatClassifyResult r = fm2k::LauncherStunClassify(
+            nat_test_port, nat_test_host, 7711, test_uid);
+        std::cout << "[nat-test] result:\n"
+                  << "  nat_type = " << r.nat_type << "\n"
+                  << "  port_a   = " << r.port_a   << "  (reflected ext port from :7711)\n"
+                  << "  port_b   = " << r.port_b   << "  (reflected ext port from :7714)\n";
+        std::cout << "[nat-test] done.\n";
         return SDL_APP_SUCCESS;
     }
 
