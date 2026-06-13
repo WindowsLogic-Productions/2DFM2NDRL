@@ -2,7 +2,11 @@
 
 Date: 2026-06-12
 Author: design by Fable 5 (orchestrator), implementation by Opus 4.8 agents
-Status: Phase 0 in flight
+Status: Phase 0 SHIPPED (hub live, client floor 0.2.73-bleeding).
+        Phase 1 committed (wanwan ccaf3db, hub a0df2be pushed); hub
+        a0df2be pulled to VPS but NOT yet restarted (held for a quiet
+        window, dormant until a UPnP launcher ships). Launcher release
+        TBD. Phases 2-3 not started.
 
 ## Goal
 
