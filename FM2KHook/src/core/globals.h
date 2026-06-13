@@ -14,6 +14,13 @@ typedef BOOL(__cdecl* RunGameLoopFunc)();
 typedef void(__cdecl* RenderGameFunc)();
 typedef uint32_t(__cdecl* GameRandFunc)();
 typedef int(__cdecl* ProcessGameInputsFunc)();
+// Render sub-profiler leaf (BlitSpriteWithBlendMode @ 0x40C140) — the per-sprite
+// software pixel blit. Hooked only when FM2K_RENDER_PROFILE=1, to rank heavy-
+// stage render cost. Display-only; a6=width, a7=height, *(obj+336)=blend mode.
+typedef int(__cdecl* BlitSpriteFunc)(int, int, int, int, int, int, int, short);
+// sprite_rendering_engine @ 0x40CC30 -- hooked under FM2K_BLIT_SIMD to
+// intercept the case -10 full-screen blur (render_mode obj[+0x10] == -10).
+typedef void(__cdecl* SpriteRenderEngineFunc)(int);
 
 // Original function pointers (set by MinHook)
 extern GetPlayerInputFunc original_get_player_input;
@@ -24,6 +31,8 @@ extern RunGameLoopFunc original_run_game_loop;
 extern RenderGameFunc original_render_game;
 extern GameRandFunc original_game_rand;
 extern ProcessGameInputsFunc original_process_game_inputs;
+extern BlitSpriteFunc original_blit_sprite;  // set only under FM2K_RENDER_PROFILE / FM2K_BLIT_SIMD
+extern SpriteRenderEngineFunc original_sprite_render_engine;  // set only under FM2K_BLIT_SIMD
 
 // Render RNG stream isolation (rollback/cross-peer determinism).
 // game_rand() is a single shared LCG used by BOTH sim and render. Render runs
@@ -37,6 +46,18 @@ extern ProcessGameInputsFunc original_process_game_inputs;
 extern uint32_t g_render_rng_seed;
 extern bool     g_in_render_rng;
 extern uint32_t g_render_rand_calls;  // #63 diag: render-side game_rand calls/frame
+
+// Render sub-profiler accumulators (FM2K_RENDER_PROFILE=1). Cumulative census
+// of the per-sprite blit, filled by Hook_BlitSpriteWithBlendMode during
+// render_game; RenderFrameWithSnapshot snapshots deltas every 300 frames and
+// logs render_game-total vs blit-time vs residual(blur+rle+lut+tail), plus the
+// blend-mode mix and blit-calls-per-object (afterimage multiplier). Display-
+// only — these never feed sim/rollback state, so the renderer is free to
+// optimize without desync risk.
+extern volatile uint32_t g_rp_blit_calls;    // total blit calls
+extern volatile uint64_t g_rp_blit_ns;       // total time inside the blit leaf
+extern volatile uint64_t g_rp_blit_area;     // total nominal width*height blitted
+extern volatile uint32_t g_rp_blit_mode[5];  // calls per blend mode (0=copy..4=alpha)
 
 // Sim throughput counter: incremented once per game logic tick (update_game),
 // across every path (offline frame-skip loop, netplay battle advance, CSS,
@@ -71,6 +92,8 @@ namespace FM2K {
     constexpr uintptr_t ADDR_UPDATE_GAME = 0x40A060;
     constexpr uintptr_t ADDR_RUN_GAME_LOOP = 0x40AB60;       // FM95: _WinMain@16 (frame loop is inlined)
     constexpr uintptr_t ADDR_RENDER_GAME = 0x40A910;
+    constexpr uintptr_t ADDR_BLIT_SPRITE = 0;                // render profiler is FM2K-only; unused on FM95 (guarded by kIsFM2K)
+    constexpr uintptr_t ADDR_SPRITE_RENDER_ENGINE = 0;       // blur intercept is FM2K-only; unused on FM95
     constexpr uintptr_t ADDR_GAME_RAND = 0x41A864;           // FM95: CRT _rand
     constexpr uintptr_t ADDR_PROCESS_INPUTS = 0x408FF0;
     constexpr uintptr_t ADDR_DISPATCH_SCRIPT_SOUND = 0x401FF0;
@@ -213,6 +236,8 @@ namespace FM2K {
     constexpr uintptr_t ADDR_UPDATE_GAME = 0x404CD0;
     constexpr uintptr_t ADDR_RUN_GAME_LOOP = 0x405AD0;
     constexpr uintptr_t ADDR_RENDER_GAME = 0x404DD0;
+    constexpr uintptr_t ADDR_BLIT_SPRITE = 0x40C140;  // BlitSpriteWithBlendMode (render profiler leaf / SIMD reimpl)
+    constexpr uintptr_t ADDR_SPRITE_RENDER_ENGINE = 0x40CC30;  // sprite_rendering_engine (case -10 blur intercept)
     constexpr uintptr_t ADDR_GAME_RAND = 0x417A22;
     constexpr uintptr_t ADDR_PROCESS_INPUTS = 0x4146D0;
     constexpr uintptr_t ADDR_DISPATCH_SCRIPT_SOUND = 0x403430;  // SFX dispatcher — rollback sound hook

@@ -4,6 +4,7 @@
 #include "round_events.h"     // C3.5 — vs_round_function detour install
 #include "css_autoconfirm.h"  // CSS lock-and-confirm for offline replay playback
 #include "per_game_patches.h" // damage multiplier MinHook + team-size override
+#include "render_simd.h"      // FM2K_BLIT_SIMD: blit + case -10 blur reimplementation
 #include "globals.h"
 
 #include <cstdlib>
@@ -2549,6 +2550,156 @@ int __cdecl Hook_DispatchScriptSoundCommand(int script_item) {
     return 1;
 }
 
+// Render reimplementation config (FM2K_BLIT_SIMD) + profiler gate, set at
+// hook install. g_blit_cfg.mode==Off means profiler-only (FM2K_RENDER_PROFILE).
+static fm2k::render_simd::Config g_blit_cfg;
+
+// Verify mode: render the original blit, snapshot the dirty box, restore the
+// pre-blit pixels, render OUR reimplementation, and compare. Leaves OUR output
+// in the framebuffer (so the displayed frame is the reimpl, eyeballable) and
+// logs the first mismatches. Box-scoped so the per-blit cost stays bounded.
+static void BlitVerify(int sprite_desc, int src_pixels, int palette_lut,
+                       int dst_x, int dst_y, int width, int height, short flags) {
+    static uint16_t s_pre[640 * 480];
+    static uint16_t s_org[640 * 480];
+    static int s_logged = 0;
+    uint8_t* fb = *(uint8_t**)0x4246CC;
+    int bx0 = dst_x < 0 ? 0 : dst_x, by0 = dst_y < 0 ? 0 : dst_y;
+    int bx1 = dst_x + width, by1 = dst_y + height;
+    if (bx1 > 640) bx1 = 640;
+    if (by1 > 480) by1 = 480;
+    if (bx0 >= bx1 || by0 >= by1) {
+        original_blit_sprite(sprite_desc, src_pixels, palette_lut, dst_x, dst_y, width, height, flags);
+        return;
+    }
+    const int bw = bx1 - bx0, bh = by1 - by0;
+    const int rowbytes = bw * 2;
+    for (int y = 0; y < bh; ++y) memcpy(&s_pre[y*bw], fb + 1280*(by0+y) + 2*bx0, rowbytes);
+    original_blit_sprite(sprite_desc, src_pixels, palette_lut, dst_x, dst_y, width, height, flags);
+    for (int y = 0; y < bh; ++y) memcpy(&s_org[y*bw], fb + 1280*(by0+y) + 2*bx0, rowbytes);
+    for (int y = 0; y < bh; ++y) memcpy(fb + 1280*(by0+y) + 2*bx0, &s_pre[y*bw], rowbytes);
+    // allow_threads=true so verify exercises the row-band path -> validates the
+    // band-split math is bit-exact against the original, not just the inline path.
+    fm2k::render_simd::BlitSprite(sprite_desc, src_pixels, palette_lut, dst_x, dst_y,
+                                  width, height, flags,
+                                  g_blit_cfg.mode == fm2k::render_simd::Mode::Simd, true);
+    for (int y = 0; y < bh; ++y) {
+        const uint16_t* row = (const uint16_t*)(fb + 1280*(by0+y) + 2*bx0);
+        const uint16_t* org = &s_org[y*bw];
+        for (int xx = 0; xx < bw; ++xx) {
+            if (row[xx] != org[xx]) {
+                if (s_logged < 40) {
+                    ++s_logged;
+                    const uint32_t obj = *(uint32_t*)0x4CFA00;
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[BLIT-VERIFY] MISMATCH blend=%d flags=0x%04X @ (%d,%d) "
+                        "expected=0x%04X got=0x%04X (box %dx%d at %d,%d)",
+                        obj ? *(int*)(obj+0x54) : -1, (unsigned)(uint16_t)flags,
+                        bx0+xx, by0+y, org[xx], row[xx], bw, bh, bx0, by0);
+                }
+                return;  // one report per blit
+            }
+        }
+    }
+}
+
+// BlitSpriteWithBlendMode @ 0x40C140 hook. Three roles by env:
+//   FM2K_BLIT_SIMD=simd/scalar -> replace with our reimplementation (the fix)
+//   ...,verify                 -> double-render + pixel-diff vs original
+//   FM2K_RENDER_PROFILE=1 only -> time/count/area/blend census (g_blit_cfg Off)
+// Pure display path — never touches sim/rollback state, so this is desync-safe.
+static int __cdecl Hook_BlitSpriteWithBlendMode(int sprite_desc, int src_pixels,
+                                                int palette_lut, int dst_x, int dst_y,
+                                                int width, int height, short flags) {
+    if (g_blit_cfg.mode != fm2k::render_simd::Mode::Off) {
+        if (g_blit_cfg.verify) {
+            BlitVerify(sprite_desc, src_pixels, palette_lut, dst_x, dst_y, width, height, flags);
+            return 0;
+        }
+        if (g_blit_cfg.mode == fm2k::render_simd::Mode::Simd) {
+            // LARGE blits (>=128kpx, >=64 tall) -> our reimpl with row-band
+            // threading across cores, ALL modes: this is the only way to beat
+            // copy mode (at the scalar floor) and what gets the copy-bound
+            // heaviest stages to 100fps.
+            const int aw = width  < 0 ? -width  : width;
+            const int ah = height < 0 ? -height : height;
+            if ((long)aw * ah >= 131072 && ah >= 64)
+                return fm2k::render_simd::BlitSprite(sprite_desc, src_pixels, palette_lut,
+                                                     dst_x, dst_y, width, height, flags, true, true);
+            // Small blits: SSE2 wins only on the read-modify-write blend modes
+            // (50%/add/sub). Copy (0) needs NO dst read (engine just does
+            // `if(c) *dst=c`) and alpha (4) needs 32-bit products epi16 can't
+            // hold -- both stay on the engine's already-optimal scalar loops.
+            const uint32_t obj = *(volatile uint32_t*)0x4CFA00;
+            const int bm = obj ? *(volatile int*)(obj + 0x54) : 0;
+            if (bm >= 1 && bm <= 3)
+                return fm2k::render_simd::BlitSprite(sprite_desc, src_pixels, palette_lut,
+                                                     dst_x, dst_y, width, height, flags, true, false);
+            return original_blit_sprite(sprite_desc, src_pixels, palette_lut,
+                                        dst_x, dst_y, width, height, flags);
+        }
+        // Scalar reimplementation (FM2K_BLIT_SIMD=scalar) -- debug/verify path.
+        return fm2k::render_simd::BlitSprite(sprite_desc, src_pixels, palette_lut, dst_x, dst_y,
+                                             width, height, flags, false);
+    }
+    // Profiler-only census path.
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    const int ret = original_blit_sprite(sprite_desc, src_pixels, palette_lut,
+                                         dst_x, dst_y, width, height, flags);
+    QueryPerformanceCounter(&t1);
+    g_rp_blit_ns += (uint64_t)(t1.QuadPart - t0.QuadPart);
+    ++g_rp_blit_calls;
+    int w = width  < 0 ? -width  : width;
+    int h = height < 0 ? -height : height;
+    g_rp_blit_area += (uint64_t)(unsigned)w * (uint64_t)(unsigned)h;
+    const uint32_t obj = *(volatile uint32_t*)0x4CFA00;  // g_object_data_ptr
+    if (obj) {
+        const int m = *(volatile int*)(obj + 0x54);      // 0=copy 1=50% 2=add 3=sub 4=alpha
+        if (m >= 0 && m <= 4) ++g_rp_blit_mode[m];
+    }
+    return ret;
+}
+
+// sprite_rendering_engine @ 0x40CC30 hook (FM2K_BLIT_SIMD only). Intercepts
+// the case -10 full-screen feedback blur (render_mode obj[+0x10]==-10, which
+// does ONLY the blur), runs our reimplementation, and skips the original. All
+// other render modes fall through untouched.
+static void __cdecl Hook_SpriteRenderingEngine(int mode_arg) {
+    const uint32_t obj = *(uint32_t*)0x4CFA00;
+    if (obj && *(int*)(obj + 0x10) == -10) {
+        const int passes = *(int*)(obj + 342) / 20;       // obj[+342]/20 (case -10)
+        if (passes > 0) {
+            uint16_t* fb = *(uint16_t**)0x4246CC;
+            const bool fmt565 = (*(int*)0x424704 != 0);
+            const bool simd = (g_blit_cfg.mode == fm2k::render_simd::Mode::Simd);
+            if (g_blit_cfg.verify) {
+                // Full-screen verify: original blur, snapshot, restore, ours, diff.
+                static uint16_t s_pre[640 * 480];
+                static uint16_t s_org[640 * 480];
+                static int s_blurlog = 0;
+                const int N = 640 * 480;
+                memcpy(s_pre, fb, N * 2);
+                original_sprite_render_engine(mode_arg);   // runs original blur
+                memcpy(s_org, fb, N * 2);
+                memcpy(fb, s_pre, N * 2);
+                fm2k::render_simd::BlurFullscreen(fb, passes, fmt565, simd);
+                if (memcmp(fb, s_org, N * 2) != 0 && s_blurlog < 10) {
+                    ++s_blurlog;
+                    int fi = 0; for (; fi < N; ++fi) if (fb[fi] != s_org[fi]) break;
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "[BLUR-VERIFY] MISMATCH passes=%d fmt565=%d @px%d expected=0x%04X got=0x%04X",
+                        passes, (int)fmt565, fi, s_org[fi], fb[fi]);
+                }
+            } else {
+                fm2k::render_simd::BlurFullscreen(fb, passes, fmt565, simd);
+            }
+            return;  // skip original (case -10 does nothing but the blur)
+        }
+    }
+    original_sprite_render_engine(mode_arg);
+}
+
 void __cdecl Hook_RenderGame() {
     // FM95 host-driven trampoline: if Hook_UpdateGameState already drove
     // RenderFrameWithSnapshot inside the tick (non-NATIVE phase), the
@@ -3016,6 +3167,46 @@ bool InitializeHooks() {
         MH_QueueEnableHook((void*)FM2K::ADDR_RENDER_GAME) != MH_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Hooks: Failed to hook RenderGame");
         return false;
+    }
+
+    // Render reimplementation (FM2K_BLIT_SIMD) and/or profiler census
+    // (FM2K_RENDER_PROFILE). FM2K-only; installed only when one of those envs
+    // is set, so normal play carries zero extra hooks. The blit-leaf hook
+    // serves both roles; the sprite-engine hook (case -10 blur) only matters
+    // for the reimplementation. All display-only -> desync-safe.
+    if constexpr (FM2K::kIsFM2K) {
+        g_blit_cfg = fm2k::render_simd::ParseConfig();
+        const char* rp = std::getenv("FM2K_RENDER_PROFILE");
+        const bool want_profile = (rp && rp[0] == '1');
+        const bool want_simd    = (g_blit_cfg.mode != fm2k::render_simd::Mode::Off);
+        if (want_profile || want_simd) {
+            if (MH_CreateHook((void*)FM2K::ADDR_BLIT_SPRITE,
+                              (void*)Hook_BlitSpriteWithBlendMode,
+                              (void**)&original_blit_sprite) != MH_OK ||
+                MH_QueueEnableHook((void*)FM2K::ADDR_BLIT_SPRITE) != MH_OK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Hooks: Failed to hook BlitSpriteWithBlendMode");
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: BlitSpriteWithBlendMode @ 0x%08X hooked (simd=%d verify=%d profile=%d)",
+                    (unsigned)FM2K::ADDR_BLIT_SPRITE,
+                    (int)(g_blit_cfg.mode == fm2k::render_simd::Mode::Simd),
+                    (int)g_blit_cfg.verify, (int)want_profile);
+            }
+        }
+        if (want_simd) {
+            if (MH_CreateHook((void*)FM2K::ADDR_SPRITE_RENDER_ENGINE,
+                              (void*)Hook_SpriteRenderingEngine,
+                              (void**)&original_sprite_render_engine) != MH_OK ||
+                MH_QueueEnableHook((void*)FM2K::ADDR_SPRITE_RENDER_ENGINE) != MH_OK) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Hooks: Failed to hook sprite_rendering_engine (case -10 blur)");
+            } else {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Hooks: sprite_rendering_engine @ 0x%08X hooked (case -10 blur reimpl)",
+                    (unsigned)FM2K::ADDR_SPRITE_RENDER_ENGINE);
+            }
+        }
     }
 
     // Hook RunGameLoop — FM2K only. On FM95, ADDR_RUN_GAME_LOOP IS WinMain

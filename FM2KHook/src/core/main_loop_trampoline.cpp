@@ -271,6 +271,58 @@ static void RenderFrameWithSnapshot() {
     }
     g_render_game_only_ns = SDL_GetPerformanceCounter() - _rg0;
     g_in_render_rng = false;
+
+    // Render sub-profiler report (FM2K_RENDER_PROFILE=1). Decomposes the heavy-
+    // stage render cost into blit (per-sprite pixel push, timed in
+    // Hook_BlitSpriteWithBlendMode) vs residual = render_game-total - blit
+    // (the full-screen blur case -10 + RLEDecompress + per-sprite LUT rebuild +
+    // ddraw tail). blit calls / g_object_count reveals afterimage-trail
+    // multiplication; the blend-mode mix shows which blit modes (additive/alpha
+    // are ~5x copy) to SIMD first. Display-only — no sim/determinism impact.
+    {
+        static const bool s_rp_on = []{ const char* v = std::getenv("FM2K_RENDER_PROFILE");
+                                        return v && v[0] == '1'; }();
+        if (s_rp_on) {
+            extern volatile uint32_t g_rp_blit_calls;
+            extern volatile uint64_t g_rp_blit_ns;
+            extern volatile uint64_t g_rp_blit_area;
+            extern volatile uint32_t g_rp_blit_mode[5];
+            const uint64_t freq = SDL_GetPerformanceFrequency();
+            static uint32_t s_n = 0;
+            static uint64_t s_rg_ns = 0;
+            static uint64_t s_last_calls = 0, s_last_ns = 0, s_last_area = 0;
+            static uint64_t s_last_mode[5] = {0, 0, 0, 0, 0};
+            s_rg_ns += g_render_game_only_ns;
+            if (++s_n >= 300) {
+                auto ms = [freq](uint64_t t){ return (double)t * 1000.0 / (double)freq; };
+                const uint64_t d_calls = (uint64_t)g_rp_blit_calls - s_last_calls;
+                const uint64_t d_ns    = g_rp_blit_ns - s_last_ns;
+                const uint64_t d_area  = g_rp_blit_area - s_last_area;
+                uint64_t d_mode[5];
+                for (int i = 0; i < 5; ++i) d_mode[i] = (uint64_t)g_rp_blit_mode[i] - s_last_mode[i];
+                const uint32_t objs   = *(volatile uint32_t*)0x4246FC;  // g_object_count
+                const double rg_ms    = ms(s_rg_ns) / s_n;
+                const double blit_ms  = ms(d_ns) / s_n;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[RENDER-PROF] n=%u objs=%u render_game=%.2fms/f | blit %.0f calls/f "
+                    "area=%.0fkpx/f time=%.2fms/f | residual(blur+rle+lut+tail)=%.2fms/f | "
+                    "blend copy=%llu half=%llu add=%llu sub=%llu alpha=%llu (calls/300)",
+                    s_n, objs, rg_ms,
+                    (double)d_calls / s_n, (double)d_area / s_n / 1000.0, blit_ms,
+                    rg_ms - blit_ms,
+                    (unsigned long long)d_mode[0], (unsigned long long)d_mode[1],
+                    (unsigned long long)d_mode[2], (unsigned long long)d_mode[3],
+                    (unsigned long long)d_mode[4]);
+                s_last_calls = g_rp_blit_calls;
+                s_last_ns    = g_rp_blit_ns;
+                s_last_area  = g_rp_blit_area;
+                for (int i = 0; i < 5; ++i) s_last_mode[i] = g_rp_blit_mode[i];
+                s_rg_ns = 0;
+                s_n = 0;
+            }
+        }
+    }
+
     EbDiag_Dump("POST-RENDER");
 
     if (protect) {

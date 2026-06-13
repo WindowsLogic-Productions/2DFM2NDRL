@@ -9,6 +9,14 @@ RunGameLoopFunc original_run_game_loop = nullptr;
 RenderGameFunc original_render_game = nullptr;
 GameRandFunc original_game_rand = nullptr;
 ProcessGameInputsFunc original_process_game_inputs = nullptr;
+BlitSpriteFunc original_blit_sprite = nullptr;  // set only under FM2K_RENDER_PROFILE / FM2K_BLIT_SIMD
+SpriteRenderEngineFunc original_sprite_render_engine = nullptr;  // set only under FM2K_BLIT_SIMD
+
+// Render sub-profiler accumulators (see globals.h). Cumulative; display-only.
+volatile uint32_t g_rp_blit_calls = 0;
+volatile uint64_t g_rp_blit_ns = 0;
+volatile uint64_t g_rp_blit_area = 0;
+volatile uint32_t g_rp_blit_mode[5] = {0, 0, 0, 0, 0};
 
 // Render RNG stream (see globals.h). Re-seeded from the gameplay seed each
 // render; advanced only by render-side game_rand draws via Hook_GameRand.

@@ -19,7 +19,7 @@ Usage:
   python3 tools/rohe_offline_profile.py --secs 15       # idle longer per stage
 """
 from __future__ import annotations
-import argparse, re, subprocess, time
+import argparse, os, re, subprocess, time
 from pathlib import Path
 
 LAUNCHER = Path("/mnt/c/games/FM2K_RollbackLauncher.exe")
@@ -29,6 +29,14 @@ GAME_IMG = "RoHe_0_7_1.exe"
 
 SECT_RE  = re.compile(r"\[OFFLINE-SECT\] n=\d+ pgi=([\d.]+)ms update=([\d.]+)ms\(max ([\d.]+)\) render=([\d.]+)ms\(max ([\d.]+)\)")
 FRAME_RE = re.compile(r"\[FRAMETIME\].*work avg=([\d.]+)ms max=([\d.]+)ms \| frame avg=([\d.]+)ms max=([\d.]+)ms")
+# [RENDER-PROF] (FM2K_RENDER_PROFILE=1) decomposes render_game into blit vs
+# residual(blur+rle+lut+tail) + blit area + blend-mode mix -- tells us WHICH
+# render cost center to optimize (blit-bound vs blur-bound) per stage.
+RPROF_RE = re.compile(
+    r"\[RENDER-PROF\] n=\d+ objs=(\d+) render_game=([\d.]+)ms/f \| "
+    r"blit ([\d.]+) calls/f area=([\d.]+)kpx/f time=([\d.]+)ms/f \| "
+    r"residual\([^)]*\)=([\d.]+)ms/f \| "
+    r"blend copy=(\d+) half=(\d+) add=(\d+) sub=(\d+) alpha=(\d+)")
 STAGE_RE = re.compile(r'\[STAGE-TABLE\] idx=(\d+) name="([^"]*)"')
 # The engine LoadStageFile's the picked stage; the CreateFileA hook logs its
 # bare filename. That gives us the index->name map for free, per run.
@@ -62,8 +70,19 @@ def profile_stage(idx: int, secs: float, dump_stages: bool):
         # the game and matches the known-good manual launch.
         "FM2K_DEV_MODE": "1",
         "FM2K_PERF_PROFILE": "1",
+        "FM2K_RENDER_PROFILE": "1",   # emit [RENDER-PROF] blit/residual decomposition
         "FM2K_BTB_STAGE": str(idx),
     }
+    # Forward the render-reimplementation toggle (scalar|simd[,verify]) from the
+    # calling shell so this profiler can drive the FM2K_BLIT_SIMD verify/A-B.
+    import os as _os
+    _bs = _os.environ.get("FM2K_BLIT_SIMD")
+    if _bs:
+        env["FM2K_BLIT_SIMD"] = _bs
+    # Forward the render reimplementation toggle (scalar/simd[,verify]) so the
+    # same offline sweep validates the SIMD blit/blur against the original.
+    if os.environ.get("FM2K_BLIT_SIMD"):
+        env["FM2K_BLIT_SIMD"] = os.environ["FM2K_BLIT_SIMD"]
     if dump_stages:
         env["FM2K_DUMP_STAGES"] = "1"
     sets = "&& ".join(f"set {k}={v}" for k, v in env.items())
@@ -77,7 +96,7 @@ def profile_stage(idx: int, secs: float, dump_stages: bool):
     # per [OFFLINE-SECT] emit (and the sim itself may be at half speed). Budget
     # generously; accept 1 sample if a 2nd doesn't arrive in time.
     deadline = time.time() + max(secs, 10.0) + 50.0
-    sect = frame = None
+    sect = frame = rprof = None
     names = {}
     loaded = None
     try:
@@ -92,6 +111,9 @@ def profile_stage(idx: int, secs: float, dump_stages: bool):
                 loaded = m.group(1)  # last .stage opened = the one we loaded
             sects = SECT_RE.findall(txt)
             frames = FRAME_RE.findall(txt)
+            rprofs = RPROF_RE.findall(txt)
+            if rprofs:
+                rprof = rprofs[-1]
             if len(sects) >= 2:           # 600 frames = stable
                 sect = sects[-1]
                 frame = frames[-1] if frames else None
@@ -103,7 +125,7 @@ def profile_stage(idx: int, secs: float, dump_stages: bool):
         kill_strays()
     if loaded and idx not in names:
         names[idx] = loaded.replace(".stage", "")
-    return sect, frame, names
+    return sect, frame, names, rprof
 
 
 def main():
@@ -121,7 +143,7 @@ def main():
     all_names = {}
     for n, idx in enumerate(indices):
         print(f"[profile] stage idx={idx} ({n+1}/{len(indices)}) ...", flush=True)
-        sect, frame, names = profile_stage(idx, args.secs, dump_stages=(n == 0))
+        sect, frame, names, rprof = profile_stage(idx, args.secs, dump_stages=(n == 0))
         all_names.update(names)
         if sect is None:
             print(f"[profile]   idx={idx}: NO [OFFLINE-SECT] captured "
@@ -131,11 +153,24 @@ def main():
         pgi, upd, upd_max, rnd, rnd_max = (float(x) for x in sect)
         work = float(frame[0]) if frame else (pgi + upd + rnd)
         fr   = float(frame[2]) if frame else 0.0
-        rows.append((idx, dict(pgi=pgi, upd=upd, upd_max=upd_max, rnd=rnd,
-                               rnd_max=rnd_max, work=work, frame=fr)))
-        print(f"[profile]   idx={idx} name={all_names.get(idx,'?'):<14} "
-              f"work={work:5.2f}ms frame={fr:5.2f}ms | pgi={pgi:4.2f} "
-              f"update={upd:5.2f}(max {upd_max:5.2f}) render={rnd:5.2f}(max {rnd_max:5.2f})")
+        d = dict(pgi=pgi, upd=upd, upd_max=upd_max, rnd=rnd,
+                 rnd_max=rnd_max, work=work, frame=fr)
+        if rprof:
+            objs, rg, bc, area, bt, resid, cp, hf, ad, sb, al = rprof
+            d.update(rg=float(rg), blit_ms=float(bt), resid_ms=float(resid),
+                     area_kpx=float(area), blit_calls=float(bc),
+                     blend=(int(cp), int(hf), int(ad), int(sb), int(al)))
+        rows.append((idx, d))
+        line = (f"[profile]   idx={idx} name={all_names.get(idx,'?'):<14} "
+                f"work={work:5.2f}ms frame={fr:5.2f}ms | pgi={pgi:4.2f} "
+                f"update={upd:5.2f}(max {upd_max:5.2f}) render={rnd:5.2f}(max {rnd_max:5.2f})")
+        if rprof:
+            line += (f"\n              [render-prof] render_game={d['rg']:.2f}ms "
+                     f"blit={d['blit_ms']:.2f}ms ({d['blit_ms']/d['rg']*100:.0f}%) "
+                     f"residual={d['resid_ms']:.2f}ms | area={d['area_kpx']/1000:.1f}Mpx/f "
+                     f"calls={d['blit_calls']:.0f} | blend copy/half/add/sub/alpha="
+                     f"{d['blend'][0]}/{d['blend'][1]}/{d['blend'][2]}/{d['blend'][3]}/{d['blend'][4]}")
+        print(line)
 
     print("\n==================== SORTED BY per-frame WORK (slow -> fast) ====================")
     print(f"{'idx':>3} {'stage':<16} {'work':>7} {'frame':>7} {'pgi':>6} {'update':>8} {'render':>8}")

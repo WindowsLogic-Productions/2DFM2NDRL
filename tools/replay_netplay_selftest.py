@@ -187,6 +187,7 @@ def main():
     # rollbacks through the genuine path.
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD",
               "FM2K_RENDER_STALL_US", "FM2K_NO_NETPLAY_CATCHUP", "FM2K_PERF_PROFILE",
+              "FM2K_RENDER_PROFILE", "FM2K_DUMP_STAGES",
               "FM2K_DEV_MODE", "FM2K_BTB_P1_CHAR", "FM2K_BTB_P2_CHAR",
               "FM2K_RING_TRACE", "FM2K_CAM_DIAG", "FM2K_CSM_DIAG",
               "FM2K_STAGE_RANDOM_SEED", "FM2K_STAGE_RANDOM_MIN",

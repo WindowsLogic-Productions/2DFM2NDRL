@@ -28,6 +28,7 @@ set(FM2KHOOK_SOURCES
     src/hooks/csm_diag.cpp
     src/hooks/combat_state.cpp
     src/hooks/wndproc_subclass.cpp
+    src/hooks/render_simd.cpp
     # Netplay
     src/netplay/netplay.cpp
     src/netplay/control_channel.cpp
@@ -140,3 +141,14 @@ fm2khook_configure_target(FM2KHook)
 add_library(FM95Hook SHARED ${FM2KHOOK_SOURCES})
 fm2khook_configure_target(FM95Hook ENGINE_FM95=1)
 set_target_properties(FM95Hook PROPERTIES OUTPUT_NAME "FM95Hook")
+
+# render_simd.cpp vectorizes the FM2K software blit/blur with SSE2 intrinsics
+# (<emmintrin.h>). The rest of the DLL is built unoptimized (-O0) for
+# debuggability, but this is the ONE hot path that must beat the game's
+# precompiled-optimized blit -- at -O0 the intrinsics spill to stack on every op
+# and the blend helpers don't inline, making it slower than the original. So
+# force -O3 + -msse2 for just this translation unit (32-bit MinGW defaults to
+# x87/no __SSE2__). Integer SSE2 is bit-exact at any -O (no float/-ffast-math),
+# re-verified via FM2K_BLIT_SIMD=simd,verify.
+set_source_files_properties(src/hooks/render_simd.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3;-msse2")
