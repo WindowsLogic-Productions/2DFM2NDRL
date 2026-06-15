@@ -314,6 +314,17 @@ public:
 
     bool IsConnected() const { return connected_.load(std::memory_order_acquire); }
 
+    // Stealth / "ghost" mode. When on, the WS hello carries "stealth":true and
+    // the hub keeps this user's match + characters out of the lobby + public
+    // stats (privacy for testing unreleased builds). Set BEFORE Connect -- the
+    // hello is sent once at connect, so toggling mid-session applies on the next
+    // (re)connect. Env FM2K_STEALTH=1 also forces it on. Thread-safe.
+    // Set stealth on/off. Stores the flag for the next hello AND, if currently
+    // connected, sends a live "set_stealth" message so the hub flips us in/out
+    // of the lobby immediately (no reconnect). Safe to call from the UI thread.
+    void SetStealth(bool on);
+    bool GetStealth() const { return stealth_.load(); }
+
     // Drain pending events on the UI thread. Call once per frame.
     void Poll(const std::function<void(const HubEvent&)>& on_event);
 
@@ -479,6 +490,7 @@ private:
     // disables auth (FM2K_HUB_AUTH_DISABLE=1 server-side).
     std::string hub_token_;
     bool        use_tls_ = false;  // wss:// when true
+    std::atomic<bool> stealth_{false};  // SetStealth(); read into the hello in IoThread
 
     // Outbox holds both UTF-8 JSON control messages AND binary frames
     // (spec hub-relay, Phase 2c). The sender thread inspects is_binary
