@@ -297,19 +297,38 @@ static HttpResp HttpGetOnce(const std::string& url, int timeout_ms,
     return out;
 }
 
-// Public: tries auto-proxy first, then falls back to no-proxy if WinHttp
-// failed before getting an HTTP response. Covers the case where WPAD
-// auto-detection stalls or returns a bad proxy that breaks the
-// connection — common on machines with broken/orphaned VPN clients.
+// Public: walks an access-type ladder until one returns an HTTP response.
+//   1. AUTOMATIC_PROXY — WPAD auto-detect (corporate / managed networks).
+//      BUT this access type only exists on Windows 8.1+; on Windows 8.0 and
+//      earlier WinHttpOpen rejects it with ERROR_INVALID_PARAMETER (87)
+//      BEFORE any network I/O. That 87 is pure noise on old OSes.
+//   2. DEFAULT_PROXY — honors the system/WinHTTP proxy config. Works on
+//      EVERY Windows version, so this is what saves Win8.0 guests.
+//   3. NO_PROXY — direct, ignores proxy config (broken/orphaned VPN clients).
+// On total failure we must NOT surface the auto-proxy 87: it masks the real
+// reason (it's just "old OS doesn't know that access type"). Prefer an attempt
+// that got PAST WinHttpOpen — that carries the genuine network error.
 HttpResp HttpGet(const std::string& url, int timeout_ms = 15000) {
+    auto is_open_param_noise = [](const HttpResp& x) {
+        return x.status == 0 && x.failed_at
+            && std::strcmp(x.failed_at, "WinHttpOpen") == 0
+            && x.last_error == ERROR_INVALID_PARAMETER;  // 87 = pre-8.1 auto-proxy
+    };
+
     HttpResp r = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY);
-    if (r.status == 0 && r.last_error != 0) {
-        // Any WinHttp-level failure → retry without proxy detection.
-        HttpResp r2 = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_NO_PROXY);
-        if (r2.status > 0) return r2;
-        // Both failed — return the auto-proxy result so the error code
-        // matches the typical failure mode (most users hit this path
-        // because of AV/firewall, not because of proxy config).
+    if (r.status > 0) return r;
+
+    HttpResp rd = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY);
+    if (rd.status > 0) return rd;
+
+    HttpResp rn = HttpGetOnce(url, timeout_ms, WINHTTP_ACCESS_TYPE_NO_PROXY);
+    if (rn.status > 0) return rn;
+
+    // All three failed. Return the most informative error: skip the auto-proxy
+    // 87 noise in favor of a real network-stage failure from a later attempt.
+    if (is_open_param_noise(r)) {
+        if (!is_open_param_noise(rn)) return rn;
+        if (!is_open_param_noise(rd)) return rd;
     }
     return r;
 }
