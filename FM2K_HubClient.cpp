@@ -779,6 +779,16 @@ void HubClient::IoThread(std::string host, uint16_t port,
                           std::strcmp(transport, "tcp") == 0)) {
             hello += ",\"spec_transport\":\"" + std::string(transport) + "\"";
         }
+        // FM2K_STEALTH=1 -- ghost/stealth mode for beta testers running an
+        // unreleased build (e.g. a secret character). The hub then presents
+        // this user as idle and keeps their match + characters out of the
+        // lobby and out of public stats, so the secret build doesn't leak.
+        // They stay challengeable (visible as idle) so testers can still
+        // reach each other. Hub side: User.stealth in hub.py.
+        if (const char* stealth = std::getenv("FM2K_STEALTH");
+            stealth && stealth[0] == '1') {
+            hello += ",\"stealth\":true";
+        }
         hello += "}";
         DWORD r = WinHttpWebSocketSend(ws_,
             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
