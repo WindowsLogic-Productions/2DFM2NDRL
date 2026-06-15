@@ -1507,6 +1507,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_CONTINUE;
 }
 
+// Timestamp (ns) of the last input/window event, stamped in SDL_AppEvent.
+// SDL_AppIterate uses it to drop the focused-but-idle render rate from ~60fps
+// to ~15fps: ImGui rebuilds + redraws the ENTIRE UI every iteration, so sitting
+// focused on a static panel still pegs a low-power CPU (e.g. Pentium Gold 8505
+// ~50-60%). Any event resets this -> instant snap back to full framerate.
+static Uint64 g_last_input_activity_ns = 0;
+
 SDL_AppResult SDL_AppIterate(void *appstate) {
     FM2KLauncher* launcher = static_cast<FM2KLauncher*>(appstate);
     if (!launcher) {
@@ -1546,15 +1553,24 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     launcher->Update(delta_time);
     launcher->Render();
 
-    // Soft 60 fps cap when vsync isn't doing the limiting for us, or
-    // when the window is unfocused (most users alt-tab between matches
-    // and don't need 144Hz update rates on a static panel).
+    // Frame pacing. Vsync caps us when focused on a real swap chain, but ImGui
+    // redraws the ENTIRE UI every iteration, so sitting focused-but-idle still
+    // burns a low-power CPU at 60fps (Pentium Gold 8505 ~50-60%). When focused
+    // with no input for >0.5s, drop to ~15fps; the next event (mouse/key/window)
+    // resets g_last_input_activity_ns and we snap back to full rate instantly.
+    // Unfocused -> 30fps; vsync-unavailable -> soft cap. Hub/match updates don't
+    // arrive as SDL events, so they refresh at the idle rate (>=15fps), which is
+    // imperceptible. The applied cap (DelayNS) also covers the focused-idle case
+    // even when vsync is available, so we don't redraw 60x/s for a static panel.
     static Uint64 last_present_ns = 0;
     const Uint64 now_ns = SDL_GetTicksNS();
-    const Uint64 frame_target_ns =
-        unfocused ? 33'333'333ULL  // ~30 fps when unfocused
-                  : 16'666'666ULL; // ~60 fps focused fallback
-    if (!launcher->IsVsyncAvailable() || unfocused) {
+    const bool idle = !unfocused &&
+        (now_ns - g_last_input_activity_ns) > 500'000'000ULL;  // 0.5 s since last event
+    Uint64 frame_target_ns;
+    if (unfocused)    frame_target_ns = 33'333'333ULL;  // ~30 fps (alt-tabbed)
+    else if (idle)    frame_target_ns = 66'666'666ULL;  // ~15 fps (focused, idle)
+    else              frame_target_ns = 16'666'666ULL;  // ~60 fps (focused, active)
+    if (!launcher->IsVsyncAvailable() || unfocused || idle) {
         if (last_present_ns != 0) {
             const Uint64 elapsed = now_ns - last_present_ns;
             if (elapsed < frame_target_ns) {
@@ -1572,6 +1588,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     if (!launcher) {
         return SDL_APP_FAILURE;
     }
+
+    // Any event = user/window activity -> wake the render loop to full
+    // framerate (consumed by the idle throttle in SDL_AppIterate).
+    g_last_input_activity_ns = SDL_GetTicksNS();
 
     // Gamepad hot-plug: refresh the binder's pad list so the input
     // bindings window (and the SOCD picker's "gamepad N" labels)
