@@ -736,6 +736,10 @@ void HubClient::IoThread(std::string host, uint16_t port,
                            WINHTTP_ACCESS_TYPE_NO_PROXY,
                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session_) { fail("WinHttpOpen"); return; }
+    // Win8.0/7: enable TLS 1.2 (WinHTTP defaults to TLS 1.0 there, breaking wss://
+    // to a modern hub). No-op on 8.1+. See FM2K_DiscordAuth for the full why.
+    { DWORD sp = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+      WinHttpSetOption(session_, WINHTTP_OPTION_SECURE_PROTOCOLS, &sp, sizeof(sp)); }
 
     std::wstring whost = Widen(host);
     conn_ = WinHttpConnect(session_, whost.c_str(), port, 0);

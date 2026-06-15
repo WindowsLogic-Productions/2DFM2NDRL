@@ -233,6 +233,19 @@ static HttpResp HttpGetOnce(const std::string& url, int timeout_ms,
         out.failed_at  = "WinHttpOpen";
         return out;
     }
+    // Windows 8.0 / 7: WinHTTP defaults to TLS 1.0 ONLY and will not negotiate
+    // TLS 1.2, so HTTPS to a modern server (hub.2dfm.org, GitHub) dies at the
+    // handshake even after WinHttpOpen succeeds -- the real wall the Win8.0
+    // guest hit once the AUTOMATIC_PROXY/87 issue was past. Explicitly enable
+    // TLS 1.0/1.1/1.2 on the session. No-op on 8.1+ (they already negotiate
+    // 1.2); required on 8.0/7. Browsers work because they do their own TLS.
+    {
+        DWORD secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1
+                               | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1
+                               | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        WinHttpSetOption(hSes, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                         &secure_protocols, sizeof(secure_protocols));
+    }
     WinHttpSetTimeouts(hSes, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
     HINTERNET hCon = WinHttpConnect(hSes, host.c_str(), port, 0);
