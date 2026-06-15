@@ -271,7 +271,7 @@ bool HttpPostMultipart(const std::string& url,
     }
 
     HINTERNET hSes = WinHttpOpen(L"FM2K_Rollback/log-uploader",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,  // not AUTOMATIC: that needs Win8.1+ (WinHttpOpen -> 87 on Win8.0); DEFAULT works on every OS + honors system proxy
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSes) { out.last_error = GetLastError(); out.failed_at = "WinHttpOpen"; return false; }
     WinHttpSetTimeouts(hSes, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS);

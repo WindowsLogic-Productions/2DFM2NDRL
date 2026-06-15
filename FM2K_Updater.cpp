@@ -181,7 +181,7 @@ GetResp HttpGetText(const std::string& url, int timeout_ms = 8000) {
     if (!ParseHttpsUrl(url, https, host, port, path)) return out;
 
     HINTERNET hSes = WinHttpOpen(L"FM2K_Updater/0.1",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,  // not AUTOMATIC: that needs Win8.1+ (WinHttpOpen -> 87 on Win8.0); DEFAULT works on every OS + honors system proxy
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSes) return out;
     WinHttpSetTimeouts(hSes, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
@@ -252,7 +252,7 @@ bool HttpDownloadFile(const std::string& url,
     if (!ParseHttpsUrl(url, https, host, port, path)) return false;
 
     HINTERNET hSes = WinHttpOpen(L"FM2K_Updater/0.1",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,  // not AUTOMATIC: that needs Win8.1+ (WinHttpOpen -> 87 on Win8.0); DEFAULT works on every OS + honors system proxy
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSes) return false;
     WinHttpSetTimeouts(hSes, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
