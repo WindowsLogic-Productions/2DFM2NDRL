@@ -6,9 +6,16 @@ project(FM2KHook)
 # Force 32-bit build
 set(CMAKE_GENERATOR_PLATFORM Win32)
 
-# Enable debug symbols
+# Debug SYMBOLS are always kept (-g, for crash-dump symbolication), but the hook
+# ships OPTIMIZED by default -- it runs the rollback save/restore, checksums,
+# GekkoNet, sound, input and IPC EVERY frame in-game, so -O0 is a 2-4x
+# self-inflicted per-frame cost (the dominant slowdown on low-end CPUs). The
+# CMAKE_BUILD_TYPE Debug here only supplies -g + the DEBUG define set; the -O
+# level is chosen per-target below. Build the hook UNOPTIMIZED (-O0) only when
+# actively step-debugging it:  cmake -D FM2K_HOOK_DEBUG=ON ...
 set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
+option(FM2K_HOOK_DEBUG "Build the hook DLL unoptimized (-O0) for step-debugging; OFF (default) = optimized -O2" OFF)
 
 # Shared source list — both FM2KHook and FM95Hook are built from the same
 # sources; only the engine ifdef in src/core/globals.h changes the address
@@ -118,6 +125,19 @@ function(fm2khook_configure_target target_name)
     target_compile_definitions(${target_name} PRIVATE ${FM2KHOOK_DEFS} ${ARGN})
     target_link_libraries(${target_name} PRIVATE ${FM2KHOOK_LIBS})
     target_include_directories(${target_name} PRIVATE ${FM2KHOOK_INCLUDES})
+    # Optimize the hook DLL -- it runs the rollback save/restore, checksums,
+    # GekkoNet, sound, input and IPC EVERY frame in-game; at -O0 that overhead is
+    # 2-4x larger (the dominant self-inflicted cost on low-end CPUs). -g is kept
+    # for crash-dump symbols. -fno-strict-aliasing is MANDATORY at any -O: the
+    # hook reads/writes game memory via type-punned pointers (*(int*)0xADDR ...),
+    # strict-aliasing UB that -O2 would otherwise miscompile. FM2K_HOOK_DEBUG=ON
+    # drops to -O0 for step-debugging (never ship that).
+    if(FM2K_HOOK_DEBUG)
+        target_compile_options(${target_name} PRIVATE -O0 -g -fno-strict-aliasing)
+        message(STATUS "${target_name}: UNOPTIMIZED -O0 step-debug build (FM2K_HOOK_DEBUG=ON)")
+    else()
+        target_compile_options(${target_name} PRIVATE -O2 -g -fno-strict-aliasing)
+    endif()
     set_target_properties(${target_name} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
