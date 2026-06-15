@@ -49,6 +49,9 @@
 // living in this file (line 82 onwards).
 struct LauncherUI::HubState {
     fm2k::HubClient client;
+    // Stealth/ghost mode (persisted to dev_flags.ini "stealth_mode"). Mirrors
+    // client.SetStealth(); the Hub-panel checkbox drives both.
+    bool stealth = false;
     std::string my_id;
     std::string my_nick;
     std::string current_room_id;
@@ -6381,6 +6384,25 @@ void LauncherUI::RenderHubPanel() {
     // FM2K_PREDICTION_WINDOW / FM2K_RUNAHEAD env vars still force-pin
     // either value for dev bisecting (set on BOTH peers for prediction).
 
+    // Stealth / ghost mode (persisted to dev_flags.ini). When on, the hub keeps
+    // your match + characters out of the lobby and public stats -- for testing
+    // unreleased builds without leaking them. Rendered in BOTH connect states so
+    // it can be toggled LIVE: SetStealth() rides the next hello while
+    // disconnected, and sends a live "set_stealth" update while connected (hub
+    // flips us in/out of the lobby immediately, no reconnect).
+    {
+        static bool s_stealth_loaded = false;
+        if (!s_stealth_loaded) {
+            s_stealth_loaded = true;
+            hs.stealth = LoadDevFlagInt("stealth_mode", 0) != 0;
+            hs.client.SetStealth(hs.stealth);
+        }
+    }
+    if (ImGui::Checkbox("Stealth mode (hide my match + characters from the lobby)", &hs.stealth)) {
+        SaveDevFlagInt("stealth_mode", hs.stealth ? 1 : 0);
+        hs.client.SetStealth(hs.stealth);  // rides hello if disconnected; live update if connected
+    }
+
     if (!hs.client.IsConnected()) {
         // "Use Discord name" checkbox — when checked, the nick input is
         // grayed and shows the user's Discord global_name (read-only).
@@ -6537,6 +6559,7 @@ void LauncherUI::RenderHubPanel() {
                         hub_host.c_str(), ws_path, (unsigned)ws_port,
                         ws_tls ? "WSS via " : "",
                         cached.valid ? "present" : "missing");
+            hs.client.SetStealth(hs.stealth);  // ensure the hello reflects the current toggle
             hs.client.Connect(hub_host, ws_port, ws_path, hs.my_nick,
                               cached.hub_token, ws_tls);
             hs.status_line = "connecting to " + hub_host + " ...";

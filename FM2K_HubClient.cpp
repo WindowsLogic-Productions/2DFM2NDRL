@@ -361,6 +361,18 @@ void HubClient::EmitEvent(HubEvent ev) {
 
 // ----- public outbound helpers — all just queue a JSON string -----
 
+void HubClient::SetStealth(bool on) {
+    stealth_.store(on);
+    // Live update while connected: the hub flips User.stealth and re-broadcasts
+    // the lobby so we appear/disappear immediately, no reconnect. When not
+    // connected this sends nothing -- the value rides the next hello (built in
+    // IoThread from stealth_). Hub side handler: "set_stealth" in hub.py.
+    if (connected_.load()) {
+        EnqueueOut(std::string("{\"type\":\"set_stealth\",\"stealth\":")
+                   + (on ? "true" : "false") + "}");
+    }
+}
+
 void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
     // tcp_port < 0 → omit; spec hook listens on the same number as UDP by
     // convention (launcher passes the same value for both bind ports). Hub
@@ -823,14 +835,19 @@ void HubClient::IoThread(std::string host, uint16_t port,
                           std::strcmp(transport, "tcp") == 0)) {
             hello += ",\"spec_transport\":\"" + std::string(transport) + "\"";
         }
-        // FM2K_STEALTH=1 -- ghost/stealth mode for beta testers running an
-        // unreleased build (e.g. a secret character). The hub then presents
-        // this user as idle and keeps their match + characters out of the
-        // lobby and out of public stats, so the secret build doesn't leak.
-        // They stay challengeable (visible as idle) so testers can still
-        // reach each other. Hub side: User.stealth in hub.py.
-        if (const char* stealth = std::getenv("FM2K_STEALTH");
-            stealth && stealth[0] == '1') {
+        // Stealth / "ghost" mode for testers on an unreleased build (e.g. a
+        // secret character). The hub then presents this user as idle and keeps
+        // their match + characters out of the lobby and out of public stats so
+        // the build doesn't leak. They stay challengeable (visible as idle) so
+        // testers can still reach each other. Hub side: User.stealth in hub.py.
+        // Driven by the launcher's Stealth checkbox via SetStealth(); env
+        // FM2K_STEALTH=1 also forces it on (dev/CI convenience).
+        bool stealth_on = stealth_.load();
+        if (!stealth_on) {
+            const char* env = std::getenv("FM2K_STEALTH");
+            stealth_on = (env && env[0] == '1');
+        }
+        if (stealth_on) {
             hello += ",\"stealth\":true";
         }
         hello += "}";
