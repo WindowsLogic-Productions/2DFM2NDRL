@@ -433,7 +433,8 @@ add_executable(FM2K_RollbackLauncher
     launcher_init.cpp  # FM2KLauncher ctor/dtor + Initialize/InitializeSDL/Shutdown (split from RollbackClient)
     launcher_frame.cpp  # HandleEvent/Update/Render + small setters (split from RollbackClient)
     launcher_cli.cpp  # CLI parse + headless probes + replay/stress/offline/direct launch modes (split from RollbackClient)
-    FM2K_GameInstance.cpp
+    FM2K_GameInstance.cpp      # process mgmt: lifecycle + spawn + DLL injection (split)
+    FM2K_GameInstance_ipc.cpp  # runtime IPC: rollback ops + DLL-event pump + shared mem + debug cmds (split)
     OnlineSession.cpp
     LocalSession.cpp
     FM2K_LauncherUI.cpp
