@@ -426,6 +426,8 @@ add_executable(FM2K_RollbackLauncher
     # Main launcher files
     FM2K_RollbackClient.cpp
     game_discovery.cpp  # game scan/cache/engine-sniff + async discovery (split from RollbackClient)
+    process_manager.cpp  # game-instance spawn/terminate + per-instance config (split from RollbackClient)
+    session_control.cpp  # offline/stress/online session start + stop (split from RollbackClient)
     FM2K_GameInstance.cpp
     OnlineSession.cpp
     LocalSession.cpp
