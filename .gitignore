@@ -2,7 +2,12 @@
 /vcpkg
 vendored/minhook/
 vendored/SDL/
+# Orphaned, unused-by-build embedded checkout (was a stray gitlink not in
+# .gitmodules, which broke `git submodule` for everyone). De-tracked; ignore
+# whatever lingers on disk.
+vendored/locale-emulator/
 /build
+/dist
 /.venv
 /build_linux
 /sdlwiki

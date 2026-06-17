@@ -116,8 +116,11 @@ set(FM2KHOOK_INCLUDES
     # include/opus and pulls <ogg/ogg.h> from include, so both are on the path.
     ${CMAKE_SOURCE_DIR}/vendored/opus-i686/include
     ${CMAKE_SOURCE_DIR}/vendored/opus-i686/include/opus
-    # kgtengine parity-snapshot header (sibling repo at /mnt/c/dev/kgtengine).
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../kgtengine/include
+    # kgtengine parity-snapshot header, vendored in-tree at
+    # vendored/kgt-parity/ (was an include into the sibling /mnt/c/dev/kgtengine
+    # repo, which doesn't exist in a fresh clone -> hook DLL failed to build for
+    # anyone but the author). Only src/parity/parity_recorder.cpp consumes it.
+    ${CMAKE_SOURCE_DIR}/vendored/kgt-parity/include
 )
 
 set(FM2KHOOK_LIBS

@@ -916,6 +916,17 @@ void LauncherUI::NewFrame() {
     ImGui::NewFrame();
 }
 
+bool LauncherUI::WantsContinuousRedraw() const {
+    // Animations that must keep ticking even when the user is idle:
+    //  - scanning_games_: the "Scanning for games..." spinner (short-lived).
+    //  - input-binder windows: they show live analog-stick positions and a
+    //    "press a button" capture state that aren't always event-driven.
+    // The Discord-pill pulse and transient modal dots intentionally fall back
+    // to the 250ms safety-net repaint -- keeping the CPU spinning for a menu-
+    // bar pulse is exactly the weak-CPU idle drain we're eliminating.
+    return scanning_games_ || show_input_binder_p1_ || show_input_binder_p2_;
+}
+
 void LauncherUI::Render() {
     // First-run nudge: if no cached Discord session and we haven't
     // shown the prompt yet this run, auto-open the sign-in window.

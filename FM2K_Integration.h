@@ -595,8 +595,17 @@ public:
     const fm2k::KgtSummary* FindKgtByGameId(const std::string& game_id) const;
     
     void SetState(LauncherState state);
+    LauncherState GetState() const { return current_state_; }
     bool IsRunning() const { return running_; }
     void SetRunning(bool running) { running_ = running; }
+
+    // True when the UI has a live animation (background-discovery spinner or an
+    // open input-binder window showing live pad state) that must keep painting
+    // even while the user is idle. SDL_AppIterate ORs this into its repaint
+    // decision so the event-driven idle path doesn't freeze an animation.
+    // Forwards to LauncherUI::WantsContinuousRedraw (defined out-of-line
+    // because LauncherUI is only forward-declared here).
+    bool UiWantsContinuousRedraw() const;
     
     // Games directory management
     const std::vector<std::string>& GetGamesRootPaths() const { return games_root_paths_; }
@@ -766,7 +775,16 @@ public:
     
     void NewFrame();
     void Render();
-    
+
+    // True while a continuous animation is on screen that the event-driven
+    // idle path must keep repainting: the background-game scan spinner, or an
+    // input-binder window (which shows live analog-stick state). Everything
+    // else (Discord-pill pulse, transient modal dots) degrades gracefully to
+    // the 250ms safety-net repaint when idle -- we deliberately do NOT keep
+    // the CPU spinning for those, since pegging weak CPUs at idle is the whole
+    // bug we're fixing.
+    bool WantsContinuousRedraw() const;
+
     // UI state callbacks
     std::function<void(const FM2K::FM2KGameInfo&)> on_game_selected;
     std::function<void()> on_offline_session_start;

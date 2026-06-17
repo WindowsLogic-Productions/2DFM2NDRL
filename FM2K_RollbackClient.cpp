@@ -834,6 +834,27 @@ namespace Utils {
     }
 }
 
+// Timestamp (ns) of the last input/window event, stamped in SDL_AppEvent.
+// SDL_AppIterate uses it to keep painting at full rate for ~0.5s after the
+// last input (so click/hover transitions finish), then fall to the idle path.
+// Seeded to "now" at the end of SDL_AppInit (NOT left at 0 -- a zero here makes
+// the very first iteration look ~100s idle and boots straight into the parked
+// path before the first event arrives).
+static Uint64 g_last_input_activity_ns = 0;
+
+// Repaint-needed flag for the event-driven idle path. Set true by any SDL
+// event (input/focus/window/gamepad/async-discovery completion) and at
+// startup; consumed by SDL_AppIterate. The key difference from the old
+// "lower fps" throttle: when this is clear AND the user is idle, we SKIP the
+// whole ImGui frame (no NewFrame/Render/Present) and leave the last presented
+// image on the SDL_Renderer backbuffer -- ~zero CPU/GPU instead of a full UI
+// rebuild every tick. That is what stops the launcher pegging weak CPUs and
+// stealing cycles from the game. A periodic safety-net repaint (see
+// SDL_AppIterate) bounds how stale non-input-driven UI (hub lobby, relay
+// counters) can get. Plain bool: SDL_AppEvent and SDL_AppIterate run on the
+// same thread, and the discovery thread wakes us via SDL_PushEvent.
+static bool g_ui_dirty = true;
+
 // SDL Callback Implementation
 extern "C" {
 
@@ -1503,16 +1524,15 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     
     // Store launcher in appstate for other callbacks
     *appstate = g_launcher.get();
-    
+
+    // Seed the activity clock to "now" so the first SDL_AppIterate doesn't see
+    // a ~100s idle gap (g_last_input_activity_ns left at 0) and park the UI
+    // before the first event. Start dirty so the first frame paints.
+    g_last_input_activity_ns = SDL_GetTicksNS();
+    g_ui_dirty = true;
+
     return SDL_APP_CONTINUE;
 }
-
-// Timestamp (ns) of the last input/window event, stamped in SDL_AppEvent.
-// SDL_AppIterate uses it to drop the focused-but-idle render rate from ~60fps
-// to ~15fps: ImGui rebuilds + redraws the ENTIRE UI every iteration, so sitting
-// focused on a static panel still pegs a low-power CPU (e.g. Pentium Gold 8505
-// ~50-60%). Any event resets this -> instant snap back to full framerate.
-static Uint64 g_last_input_activity_ns = 0;
 
 SDL_AppResult SDL_AppIterate(void *appstate) {
     FM2KLauncher* launcher = static_cast<FM2KLauncher*>(appstate);
@@ -1520,65 +1540,117 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
         return SDL_APP_FAILURE;
     }
 
+    const Uint64 loop_start_ns = SDL_GetTicksNS();
+
     // Calculate delta time
     static auto last_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
     float delta_time = std::chrono::duration<float>(current_time - last_time).count();
     last_time = current_time;
 
-    // Idle/visibility throttle. Vsync is our framerate cap when the
-    // window is on a real swap chain — but when the window is MINIMIZED
-    // or HIDDEN, presents complete instantly (no real swap), and we'd
-    // otherwise spin at thousands of fps redrawing an offscreen surface.
-    // Same story when vsync fell back to software (RDP / headless / a
-    // refused driver path): without a cap we burn cores.
-    //
-    // Symptom in the wild: users on Xeon E3 1230 v3 + GTX 1060 and on a
-    // 3060 both reported ~17–22% CPU/GPU just sitting on the launcher.
-    // Capping the unfocused/uncapped path to ~60 fps fixes that
-    // without affecting the active-user experience.
+    // IPC-critical slice: drain DLL events, forward TCP-STUN / session-kind,
+    // pump the spec hub-relay ring, and watch for game exit. This is the live
+    // spectator data plane plus the game-termination watchdog, so it MUST run
+    // every tick regardless of visibility/idle/render-skip. Update() no longer
+    // touches ImGui (NewFrame moved into Render()), so it's safe to call
+    // without painting. It's cheap when no game is running (target pid == 0).
+    launcher->Update(delta_time);
+
+    // Window visibility + session state drive an event-driven repaint model.
+    // Instead of redrawing the ENTIRE ImGui UI every frame and merely lowering
+    // the rate when idle (the old throttle, which still pegged a Pentium Gold
+    // 8505 because each frame did a full ImGui::Render()+present), we SKIP the
+    // frame entirely when nothing changed and leave the last image on the
+    // backbuffer. Tiers:
+    //   MINIMIZED/HIDDEN     -> never paint, 10 Hz IPC wake
+    //   BACKGROUND_GAME      -> game has foreground; never paint so we stop
+    //                           stealing cycles from the game, 30 Hz IPC wake
+    //   IDLE_VISIBLE         -> visible+focused but idle; paint only on dirty/
+    //                           animation/safety-net, 60 Hz wake (low latency)
+    //   UNFOCUSED_VISIBLE    -> visible but not focused; same, 30 Hz wake
+    //   ACTIVE               -> input within last 0.5s; paint every wake, vsync-
+    //                           paced (soft 60fps cap only when vsync is off)
     SDL_Window* w = launcher->GetWindow();
     const SDL_WindowFlags flags = w ? SDL_GetWindowFlags(w) : 0;
     const bool minimized = (flags & SDL_WINDOW_MINIMIZED) != 0;
     const bool hidden    = (flags & SDL_WINDOW_HIDDEN) != 0;
     const bool unfocused = !(flags & SDL_WINDOW_INPUT_FOCUS);
+    const bool in_game   = (launcher->GetState() == LauncherState::InGame);
+
+    enum Tier { TIER_MINIMIZED, TIER_BACKGROUND_GAME, TIER_IDLE_VISIBLE,
+                TIER_UNFOCUSED_VISIBLE, TIER_ACTIVE };
+
+    static Uint64 last_render_ns = 0;
+    const Uint64  kSafetyNetNs = 250'000'000ULL;  // 4 Hz forced repaint when visible
+    const bool    recent_input =
+        (loop_start_ns - g_last_input_activity_ns) < 500'000'000ULL;
+
+    Tier   tier;
+    Uint64 wake_target_ns;   // minimum loop period; 0 = let vsync pace
+    bool   should_render;
 
     if (minimized || hidden) {
-        // Nothing visible — skip render entirely and sleep ~100 ms.
-        // Events still pump via SDL_AppEvent so a restore wakes us up.
-        SDL_Delay(100);
-        return SDL_APP_CONTINUE;
+        tier = TIER_MINIMIZED;
+        wake_target_ns = 100'000'000ULL;   // ~10 Hz; events still wake us
+        should_render = false;
+    } else if (in_game && unfocused) {
+        // Game has the foreground. Don't paint per-frame -- that full-UI
+        // rebuild every tick is what tanked the game on weak HW. Keep only a
+        // slow 2 Hz safety-net repaint so any launcher stats the user is
+        // watching (e.g. on a second monitor) stay vaguely live, at ~1/30th
+        // the cost of the old 60fps path. IPC tick stays brisk for spec relay.
+        tier = TIER_BACKGROUND_GAME;
+        wake_target_ns = 33'333'333ULL;    // ~30 Hz IPC wake
+        should_render = (last_render_ns == 0) ||
+            (loop_start_ns - last_render_ns) >= 500'000'000ULL;
+    } else {
+        const bool safety_net = (last_render_ns == 0) ||
+            (loop_start_ns - last_render_ns) >= kSafetyNetNs;
+        const bool want = recent_input || g_ui_dirty ||
+            launcher->UiWantsContinuousRedraw() || safety_net;
+        g_ui_dirty = false;   // consume
+
+        if (!unfocused && recent_input) {
+            tier = TIER_ACTIVE;
+            wake_target_ns = launcher->IsVsyncAvailable() ? 0ULL : 16'666'666ULL;
+        } else if (unfocused) {
+            tier = TIER_UNFOCUSED_VISIBLE;
+            wake_target_ns = 33'333'333ULL;  // ~30 Hz wake; paint only when want
+        } else {
+            tier = TIER_IDLE_VISIBLE;
+            wake_target_ns = 16'666'666ULL;  // ~60 Hz wake (latency); paint when want
+        }
+        should_render = want;
     }
 
-    launcher->Update(delta_time);
-    launcher->Render();
+    if (should_render) {
+        launcher->Render();   // NewFrame + build + present (matched ImGui pair)
+        last_render_ns = SDL_GetTicksNS();
+    }
 
-    // Frame pacing. Vsync caps us when focused on a real swap chain, but ImGui
-    // redraws the ENTIRE UI every iteration, so sitting focused-but-idle still
-    // burns a low-power CPU at 60fps (Pentium Gold 8505 ~50-60%). When focused
-    // with no input for >0.5s, drop to ~15fps; the next event (mouse/key/window)
-    // resets g_last_input_activity_ns and we snap back to full rate instantly.
-    // Unfocused -> 30fps; vsync-unavailable -> soft cap. Hub/match updates don't
-    // arrive as SDL events, so they refresh at the idle rate (>=15fps), which is
-    // imperceptible. The applied cap (DelayNS) also covers the focused-idle case
-    // even when vsync is available, so we don't redraw 60x/s for a static panel.
-    static Uint64 last_present_ns = 0;
-    const Uint64 now_ns = SDL_GetTicksNS();
-    const bool idle = !unfocused &&
-        (now_ns - g_last_input_activity_ns) > 500'000'000ULL;  // 0.5 s since last event
-    Uint64 frame_target_ns;
-    if (unfocused)    frame_target_ns = 33'333'333ULL;  // ~30 fps (alt-tabbed)
-    else if (idle)    frame_target_ns = 66'666'666ULL;  // ~15 fps (focused, idle)
-    else              frame_target_ns = 16'666'666ULL;  // ~60 fps (focused, active)
-    if (!launcher->IsVsyncAvailable() || unfocused || idle) {
-        if (last_present_ns != 0) {
-            const Uint64 elapsed = now_ns - last_present_ns;
-            if (elapsed < frame_target_ns) {
-                SDL_DelayNS(frame_target_ns - elapsed);
-            }
+    // Observability: log tier transitions (rate-limited to changes) so the
+    // ThinkPad / Pentium Gold logs prove the launcher actually parks rather
+    // than spinning. Renderer name + vsync state are logged once at init.
+    static Tier last_logged_tier = (Tier)-1;
+    if (tier != last_logged_tier) {
+        static const char* const kTierName[] = {
+            "MINIMIZED", "BACKGROUND_GAME", "IDLE_VISIBLE",
+            "UNFOCUSED_VISIBLE", "ACTIVE" };
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "UI tier -> %s (paint=%s)", kTierName[tier],
+                    should_render ? "on" : "skip");
+        last_logged_tier = tier;
+    }
+
+    // Pace: sleep so this iteration spans at least wake_target_ns. When we
+    // painted with vsync available in ACTIVE, wake_target_ns is 0 and the
+    // blocking present already paced us.
+    if (wake_target_ns != 0) {
+        const Uint64 elapsed = SDL_GetTicksNS() - loop_start_ns;
+        if (elapsed < wake_target_ns) {
+            SDL_DelayNS(wake_target_ns - elapsed);
         }
     }
-    last_present_ns = SDL_GetTicksNS();
 
     return SDL_APP_CONTINUE;
 }
@@ -1589,9 +1661,14 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_FAILURE;
     }
 
-    // Any event = user/window activity -> wake the render loop to full
-    // framerate (consumed by the idle throttle in SDL_AppIterate).
+    // Any event = user/window activity. Stamp the activity clock (keeps us in
+    // the ACTIVE tier for ~0.5s) and mark the UI dirty so the event-driven
+    // idle path repaints this iteration. Covers mouse/keyboard/focus/window,
+    // gamepad hot-plug, and the async-discovery completion event (pushed via
+    // SDL_PushEvent from the discovery thread), so all of them snap the UI
+    // back to a fresh frame instantly.
     g_last_input_activity_ns = SDL_GetTicksNS();
+    g_ui_dirty = true;
 
     // Gamepad hot-plug: refresh the binder's pad list so the input
     // bindings window (and the SOCD picker's "gamepad N" labels)
@@ -2537,10 +2614,16 @@ void FM2KLauncher::Update(float delta_time SDL_UNUSED) {
         // Game has ended, stop the session and return to selection
         StopSession();
     }
-    ui_->NewFrame();
 }
 
 void FM2KLauncher::Render() {
+    // ImGui frame begins here, NOT in Update(). SDL_AppIterate skips this whole
+    // method when the UI is idle/backgrounded; keeping NewFrame paired with
+    // Render()+present means a skipped frame never leaves a half-open ImGui
+    // frame (which would assert). Update() runs every tick for IPC; Render()
+    // runs only when we actually paint.
+    ui_->NewFrame();
+
     // Clear screen
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
@@ -3515,6 +3598,29 @@ void FM2KLauncher::SetState(LauncherState state) {
     if (ui_) {
         ui_->SetLauncherState(state);
     }
+    // Optional power-saving UX, default OFF (the launcher-while-game behavior
+    // is otherwise handled by the BACKGROUND_GAME render-skip tier, which
+    // already drops to ~zero paint cost while keeping IPC alive). When the
+    // user opts in with FM2K_MINIMIZE_ON_LAUNCH=1, minimize the window the
+    // moment a game starts so SDL_AppIterate routes into the MINIMIZED tier
+    // (cheapest: IPC-only, 10 Hz, never paints). Spec relay still flows there
+    // because the IPC slice runs regardless of visibility. Restoring the
+    // window (taskbar click) snaps it back to a normal tier.
+    if (state == LauncherState::InGame && window_) {
+        static const bool minimize_on_launch = [] {
+            const char* v = std::getenv("FM2K_MINIMIZE_ON_LAUNCH");
+            return v && v[0] == '1';
+        }();
+        if (minimize_on_launch) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "FM2K_MINIMIZE_ON_LAUNCH=1 -> minimizing launcher behind game");
+            SDL_MinimizeWindow(window_);
+        }
+    }
+}
+
+bool FM2KLauncher::UiWantsContinuousRedraw() const {
+    return ui_ ? ui_->WantsContinuousRedraw() : false;
 }
 
 // Multi-client testing implementation
