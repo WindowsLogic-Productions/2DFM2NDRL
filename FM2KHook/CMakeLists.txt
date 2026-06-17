@@ -33,6 +33,9 @@ set(FM2KHOOK_SOURCES
     src/core/trampoline_spectator.cpp  # RunSpectatorTick + SpectatorSimOneFrame
     # Hooks
     src/hooks/hooks.cpp
+    src/hooks/hooks_rng.cpp        # RNG trace + Hook_GameRand (split from hooks.cpp)
+    src/hooks/hooks_game_mode.cpp  # mode detection + CheckGameModeTransition (split from hooks.cpp)
+    src/hooks/hooks_input.cpp      # SOCD + autoplay + capture/battle-diag (split from hooks.cpp)
     src/hooks/input.cpp
     src/hooks/game_patches.cpp
     src/hooks/round_events.cpp
