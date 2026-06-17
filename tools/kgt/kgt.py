@@ -191,35 +191,62 @@ class ScriptItem:
 
 @dataclass
 class SpriteFrame:
-    """20-byte header + variable-size pixel data. 010 SPRITE_FRAME."""
-    unknown_flag1: int          # int32 — origin tag (FM2K version?)
-    width: int                  # int32
-    height: int                 # int32
-    has_private_palette: int    # int32 — 1=appends 1KB palette after frame
-    size: int                   # int32 — 0 means raw width*height (+1KB if priv pal)
+    """20-byte header + variable-size pixel data. 010 SPRITE_FRAME.
+
+    Cross-ref: closercombat `kgtImageHeader` (5 int32 = 20 bytes, confirmed).
+    Header order is HEIGHT then WIDTH (offsets +4/+8), per closercombat
+    (iHeight, iWidth) -- adopted. We had width/height swapped, which fed
+    write_bmp_8bit the wrong row stride and transposed/garbled non-square
+    dumps. Byte round-trip is unaffected (same bytes); only the labels +
+    the dump dimensions change. SHARE-BACK: closercombat marks our
+    `has_private_palette` field only as "unk" -- worth sending them.
+    """
+    unknown_flag1: int          # int32 — closercombat kgtImageHeader.pAlloc:
+                                #   runtime alloc pointer, 0 on disk (not an
+                                #   "origin tag").
+    height: int                 # int32 (+4) — kgtImageHeader.iHeight. NOTE: the
+                                #   header is HEIGHT-then-WIDTH; we had these two
+                                #   swapped, which fed write_bmp_8bit the wrong
+                                #   row stride (garbled non-square dumps). Fixed
+                                #   to closercombat's order.
+    width: int                  # int32 (+8) — kgtImageHeader.iWidth
+    has_private_palette: int    # int32 — 1=appends 1KB palette after frame.
+                                #   (closercombat has this as "unk".)
+    size: int                   # int32 — kgtImageHeader.iSize. 0 = raw
+                                #   width*height (+1KB if priv pal)
     frame_content: bytes        # variable
 
     @classmethod
     def parse(cls, buf: io.BytesIO) -> "SpriteFrame":
-        uf1 = _i32(buf); w = _i32(buf); h = _i32(buf); hpp = _i32(buf); size = _i32(buf)
+        uf1 = _i32(buf); h = _i32(buf); w = _i32(buf); hpp = _i32(buf); size = _i32(buf)
         if size == 0:
             t = w * h
             n = (t + (1024 if hpp else 0)) if t > 0 else 0
         else:
             n = size
-        return cls(uf1, w, h, hpp, size, _bytes(buf, n) if n else b"")
+        return cls(uf1, h, w, hpp, size, _bytes(buf, n) if n else b"")
 
     def pack(self) -> bytes:
-        return (_pi32(self.unknown_flag1) + _pi32(self.width) + _pi32(self.height)
+        return (_pi32(self.unknown_flag1) + _pi32(self.height) + _pi32(self.width)
                 + _pi32(self.has_private_palette) + _pi32(self.size)
                 + self.frame_content)
 
 
 @dataclass
 class Palette:
-    """1024 BGRA + 32 byte gap = 1056 bytes."""
-    colors: bytes               # 256 × 4 BGRA
-    gap: bytes                  # 32B (always-zero in observed corpus)
+    """1024 BGRA + 32 byte gap = 1056 bytes.
+
+    Cross-ref: closercombat `kgtPallette` is a SINGLE entry (b, g, r,
+    field3='always 01'); the character struct holds 8 of `kgtPallette[256]`
+    back-to-back at stride 0x400 (1024B), with NO inter-palette gap. So our
+    per-entry 'A' byte == their field3 (the constant 0x01). Our 32-byte `gap`
+    is therefore FILE-format-specific (closercombat's is the editor's
+    in-memory layout, which lacks it) -- keep it; it's real on disk.
+    """
+    colors: bytes               # 256 × 4 BGRA (== 256 × kgtPallette; A byte is
+                                #   their field3, constant 0x01)
+    gap: bytes                  # 32B file-only padding (always-zero observed;
+                                #   absent from closercombat's in-memory struct)
 
     @classmethod
     def parse(cls, buf: io.BytesIO) -> "Palette":
@@ -232,17 +259,34 @@ class Palette:
 
 @dataclass
 class Sound:
-    """42-byte header + variable data. From common.h SoundData."""
-    unknown1: int               # int32 — origin tag
-    name: bytes                 # 32B
-    size: int                   # int32 — bytes of `data`
-    sound_type: int             # uint8 — packed subtype byte. Low nibble:
-                                #   0=stop, 1=WAV, 2=MIDI, 3=CDDA. High bits:
-                                #   0x10=volume-mode flag (per
-                                #   DispatchScriptSoundCommand @ 0x403430).
-                                #   Observed values: 1, 2, 3, 17 (=0x11 = WAV
-                                #   with vol flag).
-    sound_track: int            # uint8 (CDDA track only)
+    """42-byte header + variable data. From common.h SoundData.
+
+    Cross-ref: closercombat `kgtSound` (docs/kgt_filetype_definitions.h) --
+    byte-for-byte identical, 42 bytes (0x2A). Their field names + notes are
+    folded into the per-field comments below; field names kept as-is here
+    because fm2nd.py round-trips them by name into JSON.
+    """
+    unknown1: int               # int32 — closercombat kgtSound.pAlloc: the
+                                #   RUNTIME allocation pointer, 0 on disk. (Was
+                                #   guessed as an "origin tag"; it's the alloc
+                                #   slot the loader fills, hence always 0 in
+                                #   files.)
+    name: bytes                 # 32B — kgtSound.sName[32]
+    size: int                   # int32 — bytes of `data`. closercombat
+                                #   kgtSound.iSizeOrWavPtr: "the size, reused as
+                                #   the wav pointer after reading from file"
+                                #   (matches char_data_loader overwriting it
+                                #   with the sound-object ptr at +36).
+    sound_type: int             # uint8 — kgtSound.cFlags. Low nibble = what to
+                                #   do: 0=stop-all, 1=WAV, 2=MIDI, 3=CD (==
+                                #   DispatchScriptSoundCommand @0x403430 cases).
+                                #   High nibble = playing behavior. NB on 0x10:
+                                #   on the SOUND's own cFlags closercombat reads
+                                #   it as LOOP; on the SCRIPT command byte
+                                #   0x403430 reads it as the volume-mode flag --
+                                #   different bytes, both true. Observed: 1,2,3,17.
+    sound_track: int            # uint8 — kgtSound.cMciFlags (MCI flags; broader
+                                #   than just a CDDA track number).
     data: bytes                 # variable
 
     @classmethod

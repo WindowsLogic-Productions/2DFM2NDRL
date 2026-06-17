@@ -5,9 +5,6 @@
 	path = vendored/imgui
 	url = https://github.com/ocornut/imgui.git
 	branch = docking
-[submodule "vendored/GekkoNet"]
-	path = vendored/GekkoNet
-	url = https://github.com/HeatXD/GekkoNet.git
 [submodule "vendored/minhook"]
 	path = vendored/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
