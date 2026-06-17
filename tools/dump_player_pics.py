@@ -94,10 +94,10 @@ class Picture:
                  "compressed", "private_palette", "raw")
 
     def __init__(self, idx, header, payload):
-        # Sprite header order is HEIGHT then WIDTH (+4/+8), per closercombat's
-        # kgtImageHeader (iHeight, iWidth). Previously read as width,height --
-        # swapped -- which transposed the row stride for non-square pics.
-        _, h, w, has_priv, size = header
+        # Sprite header order is WIDTH(+4) then HEIGHT(+8) -- visually verified
+        # by rendering non-square sprites both ways (clean only when row stride
+        # = +4 field). closercombat mislabels these as iHeight/iWidth (swapped).
+        _, w, h, has_priv, size = header
         self.idx = idx
         self.width = w
         self.height = h

@@ -194,22 +194,22 @@ class SpriteFrame:
     """20-byte header + variable-size pixel data. 010 SPRITE_FRAME.
 
     Cross-ref: closercombat `kgtImageHeader` (5 int32 = 20 bytes, confirmed).
-    Header order is HEIGHT then WIDTH (offsets +4/+8), per closercombat
-    (iHeight, iWidth) -- adopted. We had width/height swapped, which fed
-    write_bmp_8bit the wrong row stride and transposed/garbled non-square
-    dumps. Byte round-trip is unaffected (same bytes); only the labels +
-    the dump dimensions change. SHARE-BACK: closercombat marks our
-    `has_private_palette` field only as "unk" -- worth sending them.
+    Field ORDER is WIDTH(+4) then HEIGHT(+8) -- our original labeling.
+    closercombat labels these iHeight(+4)/iWidth(+8), i.e. the OPPOSITE; we
+    VISUALLY VERIFIED ours is correct by rendering non-square sprites both
+    ways (Nogaku.player frames 298/747): row stride = +4 field gives clean,
+    coherent sprites; row stride = +8 field gives diagonal shear-smear.
+    So +4 = width. (Byte round-trip is unaffected either way -- only the
+    labels + dump dimensions change.) SHARE-BACK to closercombat: their
+    iHeight/iWidth are swapped, AND they mark our `has_private_palette`
+    field only as "unk".
     """
     unknown_flag1: int          # int32 — closercombat kgtImageHeader.pAlloc:
                                 #   runtime alloc pointer, 0 on disk (not an
                                 #   "origin tag").
-    height: int                 # int32 (+4) — kgtImageHeader.iHeight. NOTE: the
-                                #   header is HEIGHT-then-WIDTH; we had these two
-                                #   swapped, which fed write_bmp_8bit the wrong
-                                #   row stride (garbled non-square dumps). Fixed
-                                #   to closercombat's order.
-    width: int                  # int32 (+8) — kgtImageHeader.iWidth
+    width: int                  # int32 (+4) — row stride (visually verified;
+                                #   closercombat mislabels this iHeight).
+    height: int                 # int32 (+8) — closercombat mislabels iWidth.
     has_private_palette: int    # int32 — 1=appends 1KB palette after frame.
                                 #   (closercombat has this as "unk".)
     size: int                   # int32 — kgtImageHeader.iSize. 0 = raw
@@ -218,16 +218,16 @@ class SpriteFrame:
 
     @classmethod
     def parse(cls, buf: io.BytesIO) -> "SpriteFrame":
-        uf1 = _i32(buf); h = _i32(buf); w = _i32(buf); hpp = _i32(buf); size = _i32(buf)
+        uf1 = _i32(buf); w = _i32(buf); h = _i32(buf); hpp = _i32(buf); size = _i32(buf)
         if size == 0:
             t = w * h
             n = (t + (1024 if hpp else 0)) if t > 0 else 0
         else:
             n = size
-        return cls(uf1, h, w, hpp, size, _bytes(buf, n) if n else b"")
+        return cls(uf1, w, h, hpp, size, _bytes(buf, n) if n else b"")
 
     def pack(self) -> bytes:
-        return (_pi32(self.unknown_flag1) + _pi32(self.height) + _pi32(self.width)
+        return (_pi32(self.unknown_flag1) + _pi32(self.width) + _pi32(self.height)
                 + _pi32(self.has_private_palette) + _pi32(self.size)
                 + self.frame_content)
 
