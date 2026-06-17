@@ -134,6 +134,14 @@ FetchContent_MakeAvailable(SDL3_net)
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/hub
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/session
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/discovery
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/game
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/render
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/GekkoNet/include
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/imgui
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/imgui/backends
@@ -424,57 +432,57 @@ add_executable(FM2K_RollbackLauncher
     # directory — putting ours first makes it win without surgery.
     launcher.rc
     # Main launcher files
-    FM2K_RollbackClient.cpp
-    game_discovery.cpp        # scan + engine-sniff + async discovery worker (split)
-    game_discovery_cache.cpp  # games.cache binary serialization + path canon (split)
-    process_manager.cpp  # game-instance spawn/terminate + per-instance config (split from RollbackClient)
-    session_control.cpp  # offline/stress/online session start + stop (split from RollbackClient)
-    launcher_callbacks.cpp  # ui_->on_* callback wiring / WireUICallbacks (split from RollbackClient)
-    launcher_init.cpp  # FM2KLauncher ctor/dtor + Initialize/InitializeSDL/Shutdown (split from RollbackClient)
-    launcher_frame.cpp  # HandleEvent/Update/Render + small setters (split from RollbackClient)
-    launcher_cli.cpp  # CLI parse + headless probes + replay/stress/offline/direct launch modes (split from RollbackClient)
-    FM2K_GameInstance.cpp      # process mgmt: lifecycle + spawn + DLL injection (split)
-    FM2K_GameInstance_ipc.cpp  # runtime IPC: rollback ops + DLL-event pump + shared mem + debug cmds (split)
-    OnlineSession.cpp
-    LocalSession.cpp
-    FM2K_LauncherUI.cpp
-    launcher_ui_settings_io.cpp  # shared dev-flags/game-patches/settings.ini persistence (namespace lui; split from LauncherUI)
-    launcher_ui_debug.cpp  # debug/dev tools, multi-client + network test tools, console log (split from LauncherUI)
-    launcher_ui_display.cpp  # cnc-ddraw display settings panel (split from LauncherUI)
-    launcher_ui_menubar.cpp  # top menu bar (split from LauncherUI)
-    launcher_ui_settings.cpp  # settings/host-config/discord/games-folders windows (split from LauncherUI)
-    launcher_ui_gameselect.cpp  # game picker + replay browser + direct-spectate (split from LauncherUI)
-    launcher_ui_netcfg.cpp  # network config + connection status + session controls (split from LauncherUI)
-    launcher_ui_input.cpp  # input-bindings tab + SOCD/random-stage state (split from LauncherUI)
-    launcher_ui_notify.cpp  # notifications + audio-mute state (split from LauncherUI)
-    launcher_ui_hub.cpp  # hub helpers + server/recent/in-progress lists (split from LauncherUI)
-    launcher_ui_hub_match.cpp  # match-result reporting + outcome/upload polling + stats push (split from hub)
-    launcher_ui_hub_events.cpp  # HandleHubEvent: hub WS event dispatch (split from RenderHubPanel)
-    launcher_ui_hub_panel.cpp  # RenderHubPanel: lobby panel rendering (split from hub)
-    FM2K_HubClient.cpp            # core: ctor/dtor + Connect/Disconnect/Poll/queue (split)
-    FM2K_HubClient_json.cpp       # minimal JSON encode/decode helpers (split)
-    FM2K_HubClient_outbound.cpp   # Send*/Join/Challenge/MatchResult senders (split)
-    FM2K_HubClient_transport.cpp  # WinHTTP WS IoThread + CleanupHandles (split)
-    FM2K_HubClient_dispatch.cpp   # OnMessage inbound dispatch (split)
+    launcher/core/FM2K_RollbackClient.cpp
+    launcher/discovery/game_discovery.cpp  # scan + engine-sniff + async discovery worker (split)
+    launcher/discovery/game_discovery_cache.cpp  # games.cache binary serialization + path canon (split)
+    launcher/core/process_manager.cpp  # game-instance spawn/terminate + per-instance config (split from RollbackClient)
+    launcher/core/session_control.cpp  # offline/stress/online session start + stop (split from RollbackClient)
+    launcher/core/launcher_callbacks.cpp  # ui_->on_* callback wiring / WireUICallbacks (split from RollbackClient)
+    launcher/core/launcher_init.cpp  # FM2KLauncher ctor/dtor + Initialize/InitializeSDL/Shutdown (split from RollbackClient)
+    launcher/core/launcher_frame.cpp  # HandleEvent/Update/Render + small setters (split from RollbackClient)
+    launcher/core/launcher_cli.cpp  # CLI parse + headless probes + replay/stress/offline/direct launch modes (split from RollbackClient)
+    launcher/core/FM2K_GameInstance.cpp  # process mgmt: lifecycle + spawn + DLL injection (split)
+    launcher/core/FM2K_GameInstance_ipc.cpp  # runtime IPC: rollback ops + DLL-event pump + shared mem + debug cmds (split)
+    launcher/session/OnlineSession.cpp
+    launcher/session/LocalSession.cpp
+    launcher/ui/FM2K_LauncherUI.cpp
+    launcher/ui/launcher_ui_settings_io.cpp  # shared dev-flags/game-patches/settings.ini persistence (namespace lui; split from LauncherUI)
+    launcher/ui/launcher_ui_debug.cpp  # debug/dev tools, multi-client + network test tools, console log (split from LauncherUI)
+    launcher/ui/launcher_ui_display.cpp  # cnc-ddraw display settings panel (split from LauncherUI)
+    launcher/ui/launcher_ui_menubar.cpp  # top menu bar (split from LauncherUI)
+    launcher/ui/launcher_ui_settings.cpp  # settings/host-config/discord/games-folders windows (split from LauncherUI)
+    launcher/ui/launcher_ui_gameselect.cpp  # game picker + replay browser + direct-spectate (split from LauncherUI)
+    launcher/ui/launcher_ui_netcfg.cpp  # network config + connection status + session controls (split from LauncherUI)
+    launcher/ui/launcher_ui_input.cpp  # input-bindings tab + SOCD/random-stage state (split from LauncherUI)
+    launcher/ui/launcher_ui_notify.cpp  # notifications + audio-mute state (split from LauncherUI)
+    launcher/ui/launcher_ui_hub.cpp  # hub helpers + server/recent/in-progress lists (split from LauncherUI)
+    launcher/ui/launcher_ui_hub_match.cpp  # match-result reporting + outcome/upload polling + stats push (split from hub)
+    launcher/ui/launcher_ui_hub_events.cpp  # HandleHubEvent: hub WS event dispatch (split from RenderHubPanel)
+    launcher/ui/launcher_ui_hub_panel.cpp  # RenderHubPanel: lobby panel rendering (split from hub)
+    launcher/hub/FM2K_HubClient.cpp  # core: ctor/dtor + Connect/Disconnect/Poll/queue (split)
+    launcher/hub/FM2K_HubClient_json.cpp  # minimal JSON encode/decode helpers (split)
+    launcher/hub/FM2K_HubClient_outbound.cpp  # Send*/Join/Challenge/MatchResult senders (split)
+    launcher/hub/FM2K_HubClient_transport.cpp  # WinHTTP WS IoThread + CleanupHandles (split)
+    launcher/hub/FM2K_HubClient_dispatch.cpp  # OnMessage inbound dispatch (split)
     # UPnP-IGD automatic port mapping (Phase 1 NAT reachability). Launcher-
     # only: wraps the miniupnpc static lib, maps the game's UDP port on the
     # router when the hub WS connects so a peer can reach us directly.
-    FM2K_PortMapper.cpp
-    FM2K_DiscordAuth.cpp
-    FM2K_Locale.cpp
-    FM2K_Updater.cpp
-    FM2K_GameIni.cpp
-    FM2K_DDrawRedirect.cpp
-    FM2K_CncDDraw.cpp
-    FM2K_KgtParser.cpp
-    FM2K_UploadQueue.cpp
+    launcher/net/FM2K_PortMapper.cpp
+    launcher/net/FM2K_DiscordAuth.cpp
+    launcher/game/FM2K_Locale.cpp
+    launcher/net/FM2K_Updater.cpp
+    launcher/game/FM2K_GameIni.cpp
+    launcher/render/FM2K_DDrawRedirect.cpp
+    launcher/render/FM2K_CncDDraw.cpp
+    launcher/game/FM2K_KgtParser.cpp
+    launcher/net/FM2K_UploadQueue.cpp
     # Stock miniz (public domain) for in-process zip extraction. SDL_image
     # ships its own statically-scoped copy with archive APIs disabled, so
     # this independent copy gives us mz_zip_reader_* without disturbing
     # the SDL_image build.
     vendored/miniz/miniz.c
-    LocalNetworkAdapter.cpp
-    FM2K_Integration.h
+    launcher/session/LocalNetworkAdapter.cpp
+    launcher/core/FM2K_Integration.h
     # ImGui-based input binder (shared with the hook overlay) — depends only
     # on SDL3 + ImGui, no project-specific includes. Split 5-way: core +
     # gamepads + profiles + sample + ui (ImGui render isolated for Slint).
