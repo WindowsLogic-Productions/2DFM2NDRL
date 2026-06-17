@@ -42,6 +42,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay_chat.cpp     # chat ring (split from netplay)
     src/netplay/netplay_control.cpp  # HOST_CONFIG packets + OnControlMessage dispatch (split from netplay)
     src/netplay/netplay_battle.cpp   # StartBattle/StartStressBattle/EndBattle (split from netplay)
+    src/netplay/netplay_battle_phase.cpp # ProcessBattleInputPhase rollback driver (split from netplay)
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
     src/netplay/spectator_node.cpp

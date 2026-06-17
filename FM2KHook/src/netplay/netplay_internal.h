@@ -120,3 +120,6 @@ void    Netplay_EndCSSSession();
 // desync diagnostics (defined in netplay.cpp), called by the battle-phase TU:
 void HandleDesyncDetected(int frame, uint32_t local_chk, uint32_t remote_chk, bool synthetic);
 void MaybeFireSyntheticDesync();
+// cross-TU between netplay.cpp and the battle-phase TU:
+bool MaybeSwapPendingSpectator(uint32_t advanced_frame);  // defined in netplay.cpp
+void HandleFrameTime(float frames_ahead);                 // defined in netplay_battle_phase.cpp
