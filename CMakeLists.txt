@@ -445,7 +445,10 @@ add_executable(FM2K_RollbackLauncher
     launcher_ui_netcfg.cpp  # network config + connection status + session controls (split from LauncherUI)
     launcher_ui_input.cpp  # input-bindings tab + SOCD/random-stage state (split from LauncherUI)
     launcher_ui_notify.cpp  # notifications + audio-mute state (split from LauncherUI)
-    launcher_ui_hub.cpp  # hub/lobby panel + match polling + hub helpers (split from LauncherUI)
+    launcher_ui_hub.cpp  # hub helpers + server/recent/in-progress lists (split from LauncherUI)
+    launcher_ui_hub_match.cpp  # match-result reporting + outcome/upload polling + stats push (split from hub)
+    launcher_ui_hub_events.cpp  # HandleHubEvent: hub WS event dispatch (split from RenderHubPanel)
+    launcher_ui_hub_panel.cpp  # RenderHubPanel: lobby panel rendering (split from hub)
     FM2K_HubClient.cpp
     # UPnP-IGD automatic port mapping (Phase 1 NAT reachability). Launcher-
     # only: wraps the miniupnpc static lib, maps the game's UDP port on the

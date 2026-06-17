@@ -23,6 +23,8 @@
 // Forward declarations
 class FM2KGameInstance;
 class LauncherUI;
+namespace fm2k { struct HubEvent; }   // hub WS event (FM2K_HubClient.h); only a
+                                      // reference is needed for the LauncherUI::HandleHubEvent decl
 namespace fm2k { class PortMapper; }  // UPnP port mapper (Phase 1); defined
                                       // in FM2K_PortMapper.h, owned by
                                       // LauncherUI as a unique_ptr so the
@@ -1040,6 +1042,7 @@ private:
     void RenderObjectAnalysis();        // Stub
     void RenderSlotInspectionWindow();  // Stub
     void RenderHubPanel();              // Fightcade-style lobby
+    void HandleHubEvent(const fm2k::HubEvent& ev);  // hub WS event dispatch (split into launcher_ui_hub_events.cpp)
     void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
     void RenderHubServerWindow();       // Legacy floating window — kept for hot-reload paths; new path is the Settings tab.
     void RenderDiscordAuthWindow();     // Stays separate — OAuth pairing flow has its own state machine.
