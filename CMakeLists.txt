@@ -436,6 +436,7 @@ add_executable(FM2K_RollbackLauncher
     OnlineSession.cpp
     LocalSession.cpp
     FM2K_LauncherUI.cpp
+    launcher_ui_settings_io.cpp  # shared dev-flags/game-patches/settings.ini persistence (namespace lui; split from LauncherUI)
     FM2K_HubClient.cpp
     # UPnP-IGD automatic port mapping (Phase 1 NAT reachability). Launcher-
     # only: wraps the miniupnpc static lib, maps the game's UDP port on the
