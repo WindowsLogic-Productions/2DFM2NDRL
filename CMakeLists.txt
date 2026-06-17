@@ -449,7 +449,11 @@ add_executable(FM2K_RollbackLauncher
     launcher_ui_hub_match.cpp  # match-result reporting + outcome/upload polling + stats push (split from hub)
     launcher_ui_hub_events.cpp  # HandleHubEvent: hub WS event dispatch (split from RenderHubPanel)
     launcher_ui_hub_panel.cpp  # RenderHubPanel: lobby panel rendering (split from hub)
-    FM2K_HubClient.cpp
+    FM2K_HubClient.cpp            # core: ctor/dtor + Connect/Disconnect/Poll/queue (split)
+    FM2K_HubClient_json.cpp       # minimal JSON encode/decode helpers (split)
+    FM2K_HubClient_outbound.cpp   # Send*/Join/Challenge/MatchResult senders (split)
+    FM2K_HubClient_transport.cpp  # WinHTTP WS IoThread + CleanupHandles (split)
+    FM2K_HubClient_dispatch.cpp   # OnMessage inbound dispatch (split)
     # UPnP-IGD automatic port mapping (Phase 1 NAT reachability). Launcher-
     # only: wraps the miniupnpc static lib, maps the game's UDP port on the
     # router when the hub WS connects so a peer can reach us directly.
