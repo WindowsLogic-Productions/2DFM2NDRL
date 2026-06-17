@@ -4272,48 +4272,6 @@ int Netplay_GetLocalDelay() {
     return g_local_delay;
 }
 
-// -----------------------------------------------------------------------------
-// Chat ring. Small fixed-size SPSC-ish ring since both push and pop run on
-// the launcher-UI side; the only cross-thread producer is OnControlMessage
-// via the control-channel poller. Size 64 is plenty for a single match's
-// worth of unread messages.
-// -----------------------------------------------------------------------------
-static constexpr size_t CHAT_RING_CAP = 64;
-static ChatEntry g_chat_ring[CHAT_RING_CAP];
-static size_t    g_chat_head = 0;
-static size_t    g_chat_tail = 0;
-
-void Netplay_PushChatMessage(bool from_remote, const char* text) {
-    if (!text) return;
-    ChatEntry e = {};
-    e.from_remote  = from_remote;
-    e.timestamp_ms = (uint64_t)GetTickCount64();
-    std::strncpy(e.text, text, sizeof(e.text) - 1);
-    e.text[sizeof(e.text) - 1] = '\0';
-
-    size_t next = (g_chat_head + 1) % CHAT_RING_CAP;
-    if (next == g_chat_tail) {
-        // Ring full — drop oldest to keep the newest message visible.
-        g_chat_tail = (g_chat_tail + 1) % CHAT_RING_CAP;
-    }
-    g_chat_ring[g_chat_head] = e;
-    g_chat_head = next;
-}
-
-bool Netplay_PopChatMessage(ChatEntry* out) {
-    if (g_chat_tail == g_chat_head) return false;
-    if (out) *out = g_chat_ring[g_chat_tail];
-    g_chat_tail = (g_chat_tail + 1) % CHAT_RING_CAP;
-    return true;
-}
-
-void Netplay_SendChatMessage(const char* text) {
-    if (!text) return;
-    if (!Netplay_IsConnected()) return;
-    ControlChannel_SendChat(text);
-    // Echo into local ring so the sender sees their own message in the UI.
-    Netplay_PushChatMessage(/*from_remote*/ false, text);
-}
 
 GekkoNetworkStats Netplay_GetNetworkStats() {
     GekkoNetworkStats stats = {};
