@@ -70,15 +70,41 @@ save/load/...> `#endif`, around shared lifecycle/infra.
 - per_game_patches.cpp shrinks to just the shared install entry (if any) or is
   retired into the above. Largest fn ~187 lines.
 
-### 4. hooks.cpp (3850) -- biggest, mostly shared, DO LAST
-Concern-split via `hooks_internal.h` (extern ~40 original_*/g_* statics, namespace
-the generic VFS helpers). Engine differences stay INLINE (11 kIsFM95 branches):
-- hooks_vfs.cpp (~650), hooks_input.cpp (~950 after factoring Hook_GetPlayerInput's
-  645-line source-selection into static helpers -- the one function-factor here),
-  hooks_game_mode.cpp (~630), hooks_render.cpp (~680), hooks_update.cpp (~270),
-  hooks_rng.cpp (~120); hooks.cpp keeps FPU/determinism + ProcessGameInputs +
-  InitializeHooks (~650). The few FM95-only fns (Hook_LoadStageFileAlt) stay inline
-  or, if they cluster, a small hooks_fm95.cpp (decide at exec time).
+### 4. hooks.cpp (3850) -- biggest, mostly shared, DO LAST (best with FRESH context)
+Concern-split via `hooks_internal.h`. Engine differences stay INLINE (`if constexpr
+(FM2K::kIsFM95)`, 11 sites -- compile-time, no engine files needed).
+KEY DE-RISK (avoids the one risky function-factor): put **Hook_GetPlayerInput (645
+lines) in its OWN file** `hooks_getinput.cpp` -- it's already <1000 alone, so NO
+factoring of its source-selection logic is needed. Then SOCD+autoplay+capture go in
+hooks_input.cpp (~536). All clusters end up <1000 with PURE moves.
+
+`hooks_internal.h` contents (the cross-TU surface):
+  - extern the ~15 `original_*` trampoline pointers (set by InitializeHooks in the
+    hooks.cpp shell, CALLED by the Hook_* detours in the cluster TUs).
+  - declare the Hook_* detours that InitializeHooks installs by address (so the
+    shell can `MH_CreateHook(target, &Hook_X, &original_X)` across TUs).
+  - a few cross-cluster g_* (g_last_game_mode etc.) -- most statics are
+    CLUSTER-LOCAL (VFS ~18, render ~12, rng ~5) and travel with their TU (stay
+    static/anon, NOT in the header). Namespace the generic VFS helpers (VFile,
+    ends_with_asset, ReadWholeFileFresh) inside hooks_vfs.cpp's anon namespace.
+Files: hooks_vfs.cpp (~650), hooks_getinput.cpp (Hook_GetPlayerInput, 645),
+hooks_input.cpp (SOCD+autoplay+capture, ~536), hooks_game_mode.cpp (~630),
+hooks_render.cpp (~680), hooks_update.cpp (~270), hooks_rng.cpp (~120); hooks.cpp
+keeps FPU/determinism + ProcessGameInputs + InitializeHooks (~650). NO function-factor.
+Sequence: build hooks_internal.h first, then extract the self-contained leaves
+(rng, update, vfs) one commit at a time (build+harness each), GetPlayerInput +
+input + game_mode + render last. Harness gate (replay + netplay) after EACH.
+
+## STATUS (2026-06-17, committed, NOT pushed)
+DONE + harness-green (replay + netplay both 599/599 IDENTICAL after each):
+  - main_loop_trampoline.cpp 1697 -> 334 + 6 phase TUs + trampoline_internal.h.
+  - savestate.cpp 2292 -> common 299 + fm95 + fm2k_{save,load,diag} + internal.h (ENGINE SPLIT).
+  - per_game_patches.cpp 1366 -> input/modes + battle + fm95 stubs + internal.h (ENGINE SPLIT).
+REMAINING (this batch): hooks.cpp (above). Recommended fresh context -- it's the
+core hook plumbing (49 statics, ~40 detours); a context-constrained half-split is
+the one dangerous outcome. Then the non-batch leftovers (control_channel 1187,
+imgui_overlay 1080, dllmain 1030, input_binder 1592, FM2K_HubClient 1352,
+game_discovery 1191, netplay_battle_phase 1188 single-fn) per monolith_decomposition_plan.md.
 
 ## Harness gate (run after EACH file's split, before moving on)
 1. Build BOTH DLLs green: `./make_build.sh && (cd build && ninja)`.
