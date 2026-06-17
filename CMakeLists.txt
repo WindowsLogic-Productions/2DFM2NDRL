@@ -439,6 +439,13 @@ add_executable(FM2K_RollbackLauncher
     launcher_ui_settings_io.cpp  # shared dev-flags/game-patches/settings.ini persistence (namespace lui; split from LauncherUI)
     launcher_ui_debug.cpp  # debug/dev tools, multi-client + network test tools, console log (split from LauncherUI)
     launcher_ui_display.cpp  # cnc-ddraw display settings panel (split from LauncherUI)
+    launcher_ui_menubar.cpp  # top menu bar (split from LauncherUI)
+    launcher_ui_settings.cpp  # settings/host-config/discord/games-folders windows (split from LauncherUI)
+    launcher_ui_gameselect.cpp  # game picker + replay browser + direct-spectate (split from LauncherUI)
+    launcher_ui_netcfg.cpp  # network config + connection status + session controls (split from LauncherUI)
+    launcher_ui_input.cpp  # input-bindings tab + SOCD/random-stage state (split from LauncherUI)
+    launcher_ui_notify.cpp  # notifications + audio-mute state (split from LauncherUI)
+    launcher_ui_hub.cpp  # hub/lobby panel + match polling + hub helpers (split from LauncherUI)
     FM2K_HubClient.cpp
     # UPnP-IGD automatic port mapping (Phase 1 NAT reachability). Launcher-
     # only: wraps the miniupnpc static lib, maps the game's UDP port on the
