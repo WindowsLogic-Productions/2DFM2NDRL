@@ -22,7 +22,8 @@ option(FM2K_HOOK_DEBUG "Build the hook DLL unoptimized (-O0) for step-debugging;
 # tables. See CLAUDE.md and FM95_Integration.h for the engine model.
 set(FM2KHOOK_SOURCES
     # Core
-    src/core/dllmain.cpp
+    src/core/dllmain.cpp          # DllMain entry + boot patches (split)
+    src/core/dllmain_logging.cpp  # quill file logging + crash/SEH handlers (split)
     src/core/globals.cpp
     src/core/main_loop_trampoline.cpp  # trampoline shell: ClassifyPhase/PumpMessages/FrameTick/MainLoop
     src/core/trampoline_render.cpp     # render snapshot/restore + EbDiag
