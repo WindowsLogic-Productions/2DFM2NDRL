@@ -634,6 +634,7 @@ public:
 private:
     bool InitializeSDL();
     bool InitializeImGui();
+    void WireUICallbacks();  // ui_->on_* lambda wiring (split into launcher_callbacks.cpp)
     
     SDL_Window* window_;
     SDL_Renderer* renderer_;

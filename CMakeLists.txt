@@ -428,6 +428,10 @@ add_executable(FM2K_RollbackLauncher
     game_discovery.cpp  # game scan/cache/engine-sniff + async discovery (split from RollbackClient)
     process_manager.cpp  # game-instance spawn/terminate + per-instance config (split from RollbackClient)
     session_control.cpp  # offline/stress/online session start + stop (split from RollbackClient)
+    launcher_callbacks.cpp  # ui_->on_* callback wiring / WireUICallbacks (split from RollbackClient)
+    launcher_init.cpp  # FM2KLauncher ctor/dtor + Initialize/InitializeSDL/Shutdown (split from RollbackClient)
+    launcher_frame.cpp  # HandleEvent/Update/Render + small setters (split from RollbackClient)
+    launcher_cli.cpp  # CLI parse + headless probes + replay/stress/offline/direct launch modes (split from RollbackClient)
     FM2K_GameInstance.cpp
     OnlineSession.cpp
     LocalSession.cpp
