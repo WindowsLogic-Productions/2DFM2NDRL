@@ -448,4 +448,11 @@ bool     SpecUdpEnabled();
 void     SendUdpInputBatches();
 void     SendOpBaselineTo(const sockaddr_in& to, uint32_t baseline);
 
+// ---- backfill (spec_backfill.cpp) ----
+size_t   BackfillFirstIdxForFrame(uint32_t anchor_input_frame);
+void     SendSessionEventsTo(const sockaddr_in& to, size_t first_event_idx, uint32_t start_input_frame);
+void     SendSessionBackfillTo(const sockaddr_in& to);
+void     SendSessionBackfillFromFrame(const sockaddr_in& to, uint32_t anchor_input_frame);
+void     SendSnapshotTo(const sockaddr_in& to);
+
 }  // namespace specnode
