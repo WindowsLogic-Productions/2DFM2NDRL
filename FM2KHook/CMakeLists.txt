@@ -46,6 +46,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/spec_transport.cpp  # UDP/TCP/relay send + EVENT_BATCH flush (split from spectator_node)
     src/netplay/spec_backfill.cpp   # session-history + snapshot backfill to joiners (split from spectator_node)
     src/netplay/spec_health.cpp     # per-tick health + host-maintenance drivers (split from spectator_node)
+    src/netplay/spec_recv.cpp       # incoming spec-data dispatch (EVENT_BATCH/SNAPSHOT/UDP) (split from spectator_node)
     src/netplay/spectator_tcp.cpp
     src/netplay/nat_traversal.cpp
     src/netplay/game_hash.cpp
