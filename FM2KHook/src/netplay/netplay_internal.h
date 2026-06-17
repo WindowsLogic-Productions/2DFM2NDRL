@@ -15,6 +15,7 @@ struct PendingConfirmInput { uint32_t frame; uint16_t p1, p2; };
 
 // ---- compile-time constants (were file-static constexpr) ----
 inline constexpr int CSS_LOCAL_DELAY = 6;
+inline constexpr int CSS_CONFIRM_LOCKOUT = 150;   // block confirm for first N frames
 inline constexpr uint32_t PENDING_CONFIRM_RING = 128;
 
 // ---- runtime shared state (were file-static) ----
@@ -77,3 +78,17 @@ extern uint32_t           g_pending_swap_frame;
 extern LARGE_INTEGER g_perf_freq;
 extern LARGE_INTEGER g_frame_start;
 extern bool g_frame_timer_initialized;
+
+// stragglers (had parens in their comments, so the bulk generator skipped them):
+extern bool     g_css_active;
+extern uint32_t g_css_frame;
+extern uint32_t g_entry_done_ms;
+
+// ---- internal functions exposed across the split netplay_*.cpp TUs ----
+// control channel (netplay_control.cpp), called from the lifecycle/battle code:
+CtrlPacket BuildHostConfigPacket();
+void       Netplay_BroadcastHostConfig();
+void       OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from);
+// SOCD accessors (defined in hooks/input; used by control-channel host-config):
+extern "C" int  Hook_GetSOCDModePublic();
+extern "C" void Hook_SetSOCDMode(int mode);
