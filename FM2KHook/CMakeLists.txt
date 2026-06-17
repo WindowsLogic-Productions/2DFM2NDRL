@@ -36,6 +36,10 @@ set(FM2KHOOK_SOURCES
     src/hooks/hooks_rng.cpp        # RNG trace + Hook_GameRand (split from hooks.cpp)
     src/hooks/hooks_game_mode.cpp  # mode detection + CheckGameModeTransition (split from hooks.cpp)
     src/hooks/hooks_input.cpp      # SOCD + autoplay + capture/battle-diag (split from hooks.cpp)
+    src/hooks/hooks_getinput.cpp   # get_player_input (FM2K) + FM95 split-input (split from hooks.cpp)
+    src/hooks/hooks_update.cpp     # Hook_UpdateGameState (split from hooks.cpp)
+    src/hooks/hooks_render.cpp     # render path + sound/blit/sprite + diagnostics (split from hooks.cpp)
+    src/hooks/hooks_vfs.cpp        # file-I/O + FPK VFS + fast-player-load + FM95 LoadStageFileAlt (split from hooks.cpp)
     src/hooks/input.cpp
     src/hooks/game_patches.cpp
     src/hooks/round_events.cpp
