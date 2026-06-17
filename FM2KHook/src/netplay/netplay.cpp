@@ -119,27 +119,14 @@ std::atomic<bool>  g_runahead_toggle_requested{false};
 // and the game tick (process_game_inputs + update_game). Reports avg microsec
 // + count every 500 advances. Off unless the env var is set, so production
 // builds pay nothing. (#62/#63)
-namespace {
-struct PerfBucket { uint64_t ns = 0; uint32_t n = 0; };
-static const bool g_perf_on = [] {
+// PerfBucket/PerfScope/PerfNowNs/PerfQpcFreq now live in netplay_internal.h
+// (shared with the split battle-phase TU). This TU owns the data definitions.
+const bool g_perf_on = [] {
     const char* v = std::getenv("FM2K_PERF_PROFILE");
     return v && v[0] && v[0] != '0';
 }();
-static uint64_t PerfQpcFreq() {
-    static uint64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return (uint64_t)q.QuadPart; }();
-    return f;
-}
-static inline uint64_t PerfNowNs() {
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (uint64_t)((long double)c.QuadPart * 1e9L / (long double)PerfQpcFreq());
-}
-static PerfBucket g_perf_save, g_perf_load, g_perf_adv;
-struct PerfScope {
-    PerfBucket* b; uint64_t t0;
-    explicit PerfScope(PerfBucket* x) : b(g_perf_on ? x : nullptr), t0(b ? PerfNowNs() : 0) {}
-    ~PerfScope() { if (b) { b->ns += PerfNowNs() - t0; b->n++; } }
-};
-static void PerfMaybeReport() {
+PerfBucket g_perf_save, g_perf_load, g_perf_adv;
+void PerfMaybeReport() {
     if (!g_perf_on) return;
     static uint32_t ticks = 0;
     if (++ticks % 500 != 0) return;
@@ -150,7 +137,6 @@ static void PerfMaybeReport() {
         g_perf_save.n, us(g_perf_save), g_perf_load.n, us(g_perf_load),
         g_perf_adv.n, us(g_perf_adv));
 }
-}  // namespace
 
 // Rolling window for [BEAT] line. Reset every emit so the per-window
 // avg + max numbers describe the most recent ~10s, not session totals.
@@ -168,7 +154,7 @@ uint64_t g_beat_last_emit_ms    = 0;
 //
 // `synthetic` only affects log wording — the file-write + terminate
 // path is identical.
-static void HandleDesyncDetected(int frame, uint32_t local_chk,
+void HandleDesyncDetected(int frame, uint32_t local_chk,
                                  uint32_t remote_chk, bool synthetic) {
     // Phantom-checksum guard (2026-06-11 16:31, battle-2 f=1536): gekko's
     // SendSessionHealthCheck reads _storage.GetState(confirmed) and only
@@ -315,7 +301,7 @@ static void HandleDesyncDetected(int frame, uint32_t local_chk,
 int g_force_desync_at_frame = -1;
 bool g_force_desync_inited = false;
 
-static void MaybeFireSyntheticDesync() {
+void MaybeFireSyntheticDesync() {
     if (!g_force_desync_inited) {
         g_force_desync_inited = true;
         const char* e = std::getenv("FM2K_FORCE_DESYNC_AT_FRAME");

@@ -84,6 +84,26 @@ extern bool     g_css_active;
 extern uint32_t g_css_frame;
 extern uint32_t g_entry_done_ms;
 
+// ---- re-sim profiler (FM2K_PERF_PROFILE) -- shared so netplay.cpp AND the
+// split battle-phase TU can both time the rollback hot ops ----
+struct PerfBucket { uint64_t ns = 0; uint32_t n = 0; };
+extern const bool g_perf_on;
+extern PerfBucket g_perf_save, g_perf_load, g_perf_adv;
+inline uint64_t PerfQpcFreq() {
+    static uint64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return (uint64_t)q.QuadPart; }();
+    return f;
+}
+inline uint64_t PerfNowNs() {
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (uint64_t)((long double)c.QuadPart * 1e9L / (long double)PerfQpcFreq());
+}
+struct PerfScope {
+    PerfBucket* b; uint64_t t0;
+    explicit PerfScope(PerfBucket* x) : b(g_perf_on ? x : nullptr), t0(b ? PerfNowNs() : 0) {}
+    ~PerfScope() { if (b) { b->ns += PerfNowNs() - t0; b->n++; } }
+};
+void PerfMaybeReport();
+
 // ---- internal functions exposed across the split netplay_*.cpp TUs ----
 // control channel (netplay_control.cpp), called from the lifecycle/battle code:
 CtrlPacket BuildHostConfigPacket();
@@ -97,3 +117,6 @@ void AddSubscribedSpectatorsToSession();
 void ResetConfirmRing();
 uint8_t NextBarrierEpoch();
 void    Netplay_EndCSSSession();
+// desync diagnostics (defined in netplay.cpp), called by the battle-phase TU:
+void HandleDesyncDetected(int frame, uint32_t local_chk, uint32_t remote_chk, bool synthetic);
+void MaybeFireSyntheticDesync();
