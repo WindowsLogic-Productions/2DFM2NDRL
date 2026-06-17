@@ -53,7 +53,11 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay_css.cpp      # CSS lockstep + CSS session (split from netplay)
     src/netplay/netplay_spectate.cpp # spectate session + host battle-swap handoff (split from netplay)
     src/netplay/control_channel.cpp
-    src/netplay/savestate.cpp
+    src/netplay/savestate.cpp           # common: lifecycle + buffers + RNG-trace + hashing
+    src/netplay/savestate_fm95.cpp      # FM95 save/load body (#if ENGINE_FM95)
+    src/netplay/savestate_fm2k_save.cpp # FM2K SaveState_Save + save profiler (#if !ENGINE_FM95)
+    src/netplay/savestate_fm2k_load.cpp # FM2K SaveState_Load (#if !ENGINE_FM95)
+    src/netplay/savestate_fm2k_diag.cpp # FM2K snapshot/checksum/desync-diag (#if !ENGINE_FM95)
     src/netplay/spectator_node.cpp
     src/netplay/spec_wire.cpp  # SessionEvent wire codecs + zero-RLE (split from spectator_node)
     src/netplay/spec_transport.cpp  # UDP/TCP/relay send + EVENT_BATCH flush (split from spectator_node)
