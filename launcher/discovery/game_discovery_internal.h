@@ -7,6 +7,7 @@
 #include "FM2K_Integration.h"   // FM2K::Engine, FM2K::FM2KGameInfo
 #include "FM2K_KgtParser.h"     // fm2k::KgtSummary
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -33,10 +34,27 @@ struct GameCacheEntry {
     fm2k::KgtSummary kgt;
 };
 
+// Known-clean exe registry entry (engine + label keyed by xxhash). Promoted
+// from the scan TU so the sniff TU defines the table + lookups while the scan
+// reads the hit (known->engine / known->label).
+struct KnownExe {
+    uint64_t      xxh64;
+    FM2K::Engine  engine;
+    const char*   label;
+};
+
 // Helpers shared between the scan core and the cache-IO TU (were file-static).
 std::string GetCacheFilePath();                                  // core defines
 bool        StatFile(const std::string& path, uint64_t& size, int64_t& mtime);  // core
 std::string CanonicalizePath(const std::string& p);              // cache TU defines
 std::unordered_map<std::string, GameCacheEntry> LoadGameCacheMap();  // cache TU defines
+
+// Engine sniffing (game_discovery_sniff.cpp). The scan core calls these on a
+// cache miss to identify a freshly-discovered exe.
+uint64_t                    HashFileXXH64(const std::string& path);
+const KnownExe*             FindKnownExe(uint64_t hash);
+std::optional<FM2K::Engine> SniffEngineFromStrings(const std::string& path);
+FM2K::Engine                GuessEngineFromSize(uint64_t size_bytes);
+std::string                 DetectPackerFromPE(const std::string& path);
 
 }  // namespace Utils

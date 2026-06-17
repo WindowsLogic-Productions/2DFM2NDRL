@@ -435,6 +435,7 @@ add_executable(FM2K_RollbackLauncher
     launcher/core/FM2K_RollbackClient.cpp
     launcher/discovery/game_discovery.cpp  # scan + engine-sniff + async discovery worker (split)
     launcher/discovery/game_discovery_cache.cpp  # games.cache binary serialization + path canon (split)
+    launcher/discovery/game_discovery_sniff.cpp  # exe/engine identification: xxhash + registry + PE sniff (split)
     launcher/core/process_manager.cpp  # game-instance spawn/terminate + per-instance config (split from RollbackClient)
     launcher/core/session_control.cpp  # offline/stress/online session start + stop (split from RollbackClient)
     launcher/core/launcher_callbacks.cpp  # ui_->on_* callback wiring / WireUICallbacks (split from RollbackClient)
