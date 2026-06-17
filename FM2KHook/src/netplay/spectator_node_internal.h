@@ -453,6 +453,12 @@ bool     SpecUdpEnabled();
 void     SendUdpInputBatches();
 void     SendOpBaselineTo(const sockaddr_in& to, uint32_t baseline);
 
+// ---- playback apply (spec_playback.cpp) ----
+// ApplyResetInputState is also called by SpectatorNode_ApplyPendingPinRng
+// (snapshot-cache, stays in spectator_node.cpp), so it must be cross-TU visible.
+void     ApplyResetInputState();
+void     ApplySessionEvent(const SessionEvent& ev);
+
 // ---- backfill (spec_backfill.cpp) ----
 size_t   BackfillFirstIdxForFrame(uint32_t anchor_input_frame);
 void     SendSessionEventsTo(const sockaddr_in& to, size_t first_event_idx, uint32_t start_input_frame);
