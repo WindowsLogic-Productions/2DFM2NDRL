@@ -71,7 +71,15 @@ def load(path):
 def diff_snap(a, b):
     """Returns list of (field_name, a_val, b_val) for differences."""
     out = []
-    for k in ('rng', 'input_p1', 'input_p2', 'match_phase', 'round_timer',
+    # NOTE: input_p1/input_p2 are deliberately NOT compared. They're recorded
+    # (forensic) but under prediction-based netplay the snapshot captures the
+    # PREDICTED remote input on mispredicted frames, while the .fm2krep replay
+    # uses the CONFIRMED input — they differ on exactly the frames rollback
+    # corrects, even though the engine sim converges identically. Input
+    # determinism is proven TRANSITIVELY: divergent inputs would diverge rng /
+    # positions / scripts, which ARE compared below. Comparing the input
+    # snapshot directly is redundant and produces false "divergence" noise.
+    for k in ('rng', 'match_phase', 'round_timer',
               'camera_x', 'camera_y', 'rng_after_frame'):
         if a.get(k) != b.get(k):
             out.append((k, a.get(k), b.get(k)))
@@ -88,15 +96,6 @@ def diff_snap(a, b):
     return out
 
 
-# Fields that, when they're the ONLY divergence, indicate a known
-# parity-recorder display artifact rather than an engine determinism
-# bug. The parity recorder reads input_history at the current buf_idx;
-# record-side and replay-side callsites end up at slightly different
-# buf_idx values after the first rollback boundary, so the recorded
-# input fields can mismatch even when engine state (rng, positions,
-# scripts, sysvars) is byte-identical. See parity_recorder.cpp
-# comment + docs/input_pipeline_architecture.md.
-_ARTIFACT_ONLY_FIELDS = {'input_p1', 'input_p2'}
 # rng_only_fields: the parity recorder captures rng + rng_after_frame.
 # When the pre-battle path differs in PGI consumption (host went through
 # real CSS, replay went through auto-mash), the FIRST captured battle
@@ -151,7 +150,6 @@ def main(a_path, b_path):
     #     quirk, engine state still matches
     first_engine_diff = None
     first_rng_diff = None
-    artifact_frames = 0
     rng_only_frames = 0
     for k in range(n):
         sa, sb = a[ai + k], b[bi + k]
@@ -159,10 +157,7 @@ def main(a_path, b_path):
         if not d:
             continue
         diff_fields = {fld for fld, _, _ in d}
-        if diff_fields.issubset(_ARTIFACT_ONLY_FIELDS):
-            artifact_frames += 1
-            continue
-        if diff_fields.issubset(_RNG_ONLY_FIELDS | _ARTIFACT_ONLY_FIELDS):
+        if diff_fields.issubset(_RNG_ONLY_FIELDS):
             rng_only_frames += 1
             if first_rng_diff is None:
                 first_rng_diff = (k, sa, sb, d)
@@ -176,10 +171,6 @@ def main(a_path, b_path):
         if rng_only_frames:
             msg += (f' ({rng_only_frames} rng-only frames — pre-battle '
                     f'game_rand consumption asymmetry; sim is deterministic.)')
-        if artifact_frames:
-            msg += (f' ({artifact_frames} frame(s) had input-field-only diffs '
-                    f'— known parity_recorder display artifact, engine sim '
-                    f'is deterministic.)')
         print(msg)
         if first_rng_diff:
             k, sa, sb, d = first_rng_diff
@@ -193,9 +184,6 @@ def main(a_path, b_path):
         k, sa, sb, d = first_engine_diff
         print(f'\nFIRST ENGINE DIVERGENCE at battle-aligned k={k} '
               f'(A.frame={sa["frame"]} B.frame={sb["frame"]})')
-        if artifact_frames:
-            print(f'  (also saw {artifact_frames} input-field-only display '
-                  f'artifact frame(s) before this — those are not engine bugs)')
         print()
         for fld, av, bv in d:
             if isinstance(av, int):

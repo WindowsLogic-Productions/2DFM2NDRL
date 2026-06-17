@@ -74,6 +74,11 @@ constexpr uintptr_t ADDR_RNG               = 0x41FB1C;
 constexpr uintptr_t ADDR_INPUT_BUF_INDEX   = 0x447EE0;
 constexpr uintptr_t ADDR_P1_INPUT_HISTORY  = 0x4280E0;
 constexpr uintptr_t ADDR_P2_INPUT_HISTORY  = 0x4290E0;
+// Current-frame confirmed input scalars (FM2K). Overwritten once per frame in
+// update; deterministic at capture time -- unlike the ring, whose layout drifts
+// under rollback. See the input_p1/p2 capture below.
+constexpr uintptr_t ADDR_P1_INPUT_CUR      = 0x4259C0;
+constexpr uintptr_t ADDR_P2_INPUT_CUR      = 0x4259C4;
 
 constexpr uintptr_t ADDR_CHAR_DATA_BASE    = 0x4D1D90;
 constexpr size_t    CHAR_DATA_STRIDE       = 57407;
@@ -435,19 +440,20 @@ void Capture() {
     snap.frame    = Read32(ADDR_FRAME_COUNTER);
     snap.rng      = Read32(ADDR_RNG);
 
-    /* Raw input read at the current buf_idx slot. Known display artifact:
-     * record-vs-replay parity-snapshot input_p? fields diverge starting
-     * frame ~11 of stress mode (right after the first rollback boundary)
-     * even though every other field — rng, position, script, sysvars —
-     * still matches. The engines ARE deterministic; the parity recorder
-     * reads input_history[buf_idx] at a slightly different buf_idx on
-     * each side because the netplay AdvEvent callsite (record) sees a
-     * different post-update buf_idx than the SpectatorSimOneFrame
-     * callsite (replay) — likely due to rollback re-sim ordering.
-     * Diagnostic-only; doesn't affect actual replay determinism. */
-    const uint32_t idx = Read32(ADDR_INPUT_BUF_INDEX) & 0x3FFu;
-    snap.input_p1 = Read32(ADDR_P1_INPUT_HISTORY + idx * 4u);
-    snap.input_p2 = Read32(ADDR_P2_INPUT_HISTORY + idx * 4u);
+    /* Frame N's CONFIRMED p1/p2 input, read from the engine's current-frame
+     * input SCALARS (0x4259C0 / 0x4259C4 -- what Hook_ProcessGameInputs logs
+     * as "Synced: P1/P2"), NOT from input_history[buf_idx].
+     *
+     * Why not the ring: the input RING LAYOUT differs between a forward+
+     * rollback run (record) and a linear replay -- rollback re-sim advances
+     * the write cursor differently, so the same logical frame's input lands
+     * in a different ring slot, and the capture-time cursor is callsite-
+     * dependent. No ring index (buf_idx OR frame counter) gives a clean
+     * cross-run match. The current-input scalar is overwritten once per frame
+     * during update, so at capture (post-update) it holds frame N's input on
+     * BOTH sides -- byte-identical when the sim is deterministic. */
+    snap.input_p1 = Read32(ADDR_P1_INPUT_CUR);
+    snap.input_p2 = Read32(ADDR_P2_INPUT_CUR);
 
     snap.match_phase = ADDR_MATCH_PHASE ? Read32S(ADDR_MATCH_PHASE) : 0;
     snap.round_timer = ADDR_ROUND_TIMER ? Read32S(ADDR_ROUND_TIMER) : 0;
