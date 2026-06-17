@@ -3,6 +3,7 @@
 // - GekkoNet for battle mode rollback
 // - Uses game's internal timer for frame counting
 #include "netplay.h"
+#include "netplay_internal.h"  // shared file-scope state, externed for the split netplay_*.cpp TUs
 #include "../hooks/hooks.h"   // Hook_ApplySOCD_Public for SOCD-pre-apply on spec capture
 #include "../hooks/css_autoconfirm.h"  // CssAutoConfirm_OnReplayMatchStart (TEST_CSS_CHAR pin)
 #include "control_channel.h"
@@ -34,13 +35,8 @@
 // SIMPLIFIED STATE
 // =============================================================================
 
-enum class SimpleState : uint8_t {
-    DISCONNECTED,   // No connection
-    CONNECTED,      // Control channel connected
-    BATTLE          // GekkoNet active for battle
-};
-
-static SimpleState g_simple_state = SimpleState::DISCONNECTED;
+// SimpleState enum now lives in netplay_internal.h (shared with the split TUs).
+SimpleState g_simple_state = SimpleState::DISCONNECTED;
 
 static NetplayState MapToLegacyState(SimpleState s) {
     switch (s) {
@@ -63,46 +59,45 @@ static NetplayState MapToLegacyState(SimpleState s) {
 // public NetplaySessionKind enum exported from netplay.h so external callers
 // (spectator_node, hub_client) can compare against the same values.
 
-using SessionKind = NetplaySessionKind;
-static SessionKind g_session_kind = SessionKind::NONE;
+// SessionKind alias now lives in netplay_internal.h (shared with the split TUs).
+SessionKind g_session_kind = SessionKind::NONE;
 
 // CSS lockstep parameters (ported from the legacy CCCaster-style ring-buffer
 // implementation). With GekkoNet's prediction=0 mode, local_delay is the
 // per-player input commitment delay — peer A's input committed at frame F
 // becomes the input applied at frame F+local_delay, identical semantics to
 // the previous "store at frame+delay, read at frame" model.
-static constexpr int CSS_LOCAL_DELAY = 6;
 static constexpr int CSS_CONFIRM_LOCKOUT = 150;     // Block confirm for first N frames (moon selector workaround)
 
 // CSS state — input transport now lives inside the CSS GekkoSession
 static bool g_css_active        = false;  // Currently in CSS mode (game-side detection)
-static bool g_css_synced        = false;  // Both peers BATTLE_READY, CSS GekkoSession ready
-static bool g_remote_css_ready  = false;  // Remote has entered CSS
-static bool g_local_css_ready   = false;  // We've entered CSS
+bool g_css_synced        = false;  // Both peers BATTLE_READY, CSS GekkoSession ready
+bool g_remote_css_ready  = false;  // Remote has entered CSS
+bool g_local_css_ready   = false;  // We've entered CSS
 static uint32_t g_css_frame     = 0;      // Last confirmed CSS AdvanceEvent frame (+1)
 
 // Per-poll AdvanceEvent input cache. Netplay_ProcessCSS drives gekko_update_session,
 // which fires AdvanceEvent only when both peers have inputs for the current frame
 // (lockstep guarantee). The cached inputs are read by Hook_GetPlayerInput via
 // Netplay_GetCSSInput.
-static uint16_t g_css_advance_p1     = 0;
-static uint16_t g_css_advance_p2     = 0;
-static bool     g_css_advance_ready  = false;
+uint16_t g_css_advance_p1     = 0;
+uint16_t g_css_advance_p2     = 0;
+bool     g_css_advance_ready  = false;
 
 // GekkoNet session pointer + readiness flag (shared by CSS and battle —
 // only one is alive at a time, distinguished by g_session_kind).
-static GekkoSession* g_session = nullptr;
-static bool g_session_ready = false;
-static uint16_t g_p1_input = 0;
-static uint16_t g_p2_input = 0;
-static uint32_t g_netplay_frame = 0;
+GekkoSession* g_session = nullptr;
+bool g_session_ready = false;
+uint16_t g_p1_input = 0;
+uint16_t g_p2_input = 0;
+uint32_t g_netplay_frame = 0;
 
 // Rollback tracking
-static uint32_t g_rollback_count = 0;
-static uint32_t g_last_rollback_frame = 0;
-static uint32_t g_desync_count = 0;
-static uint32_t g_last_desync_log_tick = 0;
-static int g_local_delay = 1;  // Computed from RTT at battle start
+uint32_t g_rollback_count = 0;
+uint32_t g_last_rollback_frame = 0;
+uint32_t g_desync_count = 0;
+uint32_t g_last_desync_log_tick = 0;
+int g_local_delay = 1;  // Computed from RTT at battle start
 
 // Tuning knobs — set at battle session start, mirrored here so
 // Netplay_TickHeartbeat can echo the live values into [BEAT] lines.
@@ -110,14 +105,14 @@ static int g_local_delay = 1;  // Computed from RTT at battle start
 // UI default); `g_runahead_active` is the value actually applied to
 // the running session right now, which can differ when the user
 // hits F8 mid-match to toggle between 0 and user_pref.
-static int                g_pred_window               = 16;
+int                g_pred_window               = 16;
 // Runahead is DEFAULT OFF (too CPU-heavy at 100fps/10ms budget). These get
 // overwritten per battle in Netplay_StartBattle (pref = local_delay, active
 // = 0 unless FM2K_RUNAHEAD forces it); the static defaults just keep it off
 // before/between matches.
-static int                g_runahead_user_pref        = 0;
-static std::atomic<int>   g_runahead_active{0};
-static std::atomic<bool>  g_runahead_toggle_requested{false};
+int                g_runahead_user_pref        = 0;
+std::atomic<int>   g_runahead_active{0};
+std::atomic<bool>  g_runahead_toggle_requested{false};
 
 // --- re-sim profiler (FM2K_PERF_PROFILE=1) ---------------------------------
 // Times the three hot ops in the rollback loop so we can see where the 10ms
@@ -160,10 +155,10 @@ static void PerfMaybeReport() {
 
 // Rolling window for [BEAT] line. Reset every emit so the per-window
 // avg + max numbers describe the most recent ~10s, not session totals.
-static uint32_t g_beat_window_rb_sum   = 0;
-static uint32_t g_beat_window_rb_max   = 0;
-static uint32_t g_beat_window_rb_count = 0;   // real rollbacks observed
-static uint64_t g_beat_last_emit_ms    = 0;
+uint32_t g_beat_window_rb_sum   = 0;
+uint32_t g_beat_window_rb_max   = 0;
+uint32_t g_beat_window_rb_count = 0;   // real rollbacks observed
+uint64_t g_beat_last_emit_ms    = 0;
 
 // Common handler for both real (GekkoDesyncDetected) and synthetic
 // (FM2K_FORCE_DESYNC_AT_FRAME) desync events. Same diagnostic dump,
@@ -318,8 +313,8 @@ static void HandleDesyncDetected(int frame, uint32_t local_chk,
 // + cross-peer pairing pipeline.
 //
 // Set to -1 (default) to disable.
-static int g_force_desync_at_frame = -1;
-static bool g_force_desync_inited = false;
+int g_force_desync_at_frame = -1;
+bool g_force_desync_inited = false;
 
 static void MaybeFireSyntheticDesync() {
     if (!g_force_desync_inited) {
@@ -351,15 +346,15 @@ static void MaybeFireSyntheticDesync() {
 // in the bucket — a single CSS spike would slam delay to 15 on a 6 ms link.
 // Cleared on Netplay_Shutdown / Netplay_OnDisconnect so a reconnect picks
 // a fresh value next time.
-static int  g_session_delay_cached       = 0;
-static bool g_session_delay_cache_valid  = false;
+int  g_session_delay_cached       = 0;
+bool g_session_delay_cache_valid  = false;
 
 // Highest frame number we've ever recorded into the replay/spectator stream.
 // Reset on each Netplay_StartBattle (g_netplay_frame also resets to 0).
 // Gates the GekkoAdvance recording path against runahead duplicates — each
 // frame is advanced multiple times under runahead, but only the first
 // monotonic forward crossing is "the" confirmed advance.
-static uint32_t g_highest_recorded_frame = 0;
+uint32_t g_highest_recorded_frame = 0;
 
 // Confirmed-input recording ring (netplay battle sessions only). EVERY
 // non-runahead advance -- speculative first pass AND rolling_back
@@ -369,10 +364,9 @@ static uint32_t g_highest_recorded_frame = 0;
 // says ALL players' real inputs arrived for that frame. Without this,
 // a predicting peer recorded speculative inputs into .fm2krep and the
 // live spectator stream (cross-peer fork hunt, 2026-06-11).
-struct PendingConfirmInput { uint32_t frame; uint16_t p1, p2; };
-static constexpr uint32_t PENDING_CONFIRM_RING = 128;
-static PendingConfirmInput g_pending_confirm[PENDING_CONFIRM_RING];
-static uint32_t g_next_confirm_flush = 0;
+// PendingConfirmInput struct now lives in netplay_internal.h.
+PendingConfirmInput g_pending_confirm[PENDING_CONFIRM_RING];
+uint32_t g_next_confirm_flush = 0;
 static void ResetConfirmRing() {
     for (auto& pc : g_pending_confirm) pc.frame = 0xFFFFFFFFu;
     g_next_confirm_flush = 0;
@@ -384,10 +378,10 @@ static void ResetConfirmRing() {
 // BATTLE_ENTERING.data.sync.frame, and the agreed value is max(local, remote).
 // The actual gekko_destroy(css)/gekko_create(battle) deferred until the active
 // CSS session reaches g_battle_entry_swap_frame.
-static bool     g_local_battle_entered    = false;
-static bool     g_remote_battle_entered   = false;
-static bool     g_battle_synced           = false;
-static uint32_t g_battle_entry_swap_frame = 0;     // Latest agreed swap frame.
+bool     g_local_battle_entered    = false;
+bool     g_remote_battle_entered   = false;
+bool     g_battle_synced           = false;
+uint32_t g_battle_entry_swap_frame = 0;     // Latest agreed swap frame.
 
 // "Are we expecting BATTLE_ENTERING right now?" gate. Set when a new CSS
 // GekkoSession comes up (we're entering the CSS phase that will swap to
@@ -401,7 +395,7 @@ static uint32_t g_battle_entry_swap_frame = 0;     // Latest agreed swap frame.
 // echo loop never terminates (both peers latch g_local_battle_entered),
 // and eventually the battle GekkoNet sync stalls in one direction
 // → black screen on CSS->battle transition. See logs from 2026-05-09.
-static bool     g_battle_entry_armed      = false;
+bool     g_battle_entry_armed      = false;
 
 // Mirror gate for BATTLE_END to prevent the same stale-packet-poisoning
 // pattern in the battle->CSS direction.
@@ -409,11 +403,11 @@ static bool     g_battle_entry_armed      = false;
 // Battle exit sync barrier (battle-session -> CSS-session swap, for rematch
 // or return-to-menu). Mirrors the entry barrier but reads g_netplay_frame
 // instead of g_css_frame and is driven by BATTLE_END instead of BATTLE_ENTERING.
-static bool     g_local_battle_end_signaled  = false;
-static bool     g_remote_battle_end_signaled = false;
-static bool     g_battle_end_synced          = false;
-static uint32_t g_battle_end_swap_frame      = 0;
-static bool     g_battle_end_armed           = false;
+bool     g_local_battle_end_signaled  = false;
+bool     g_remote_battle_end_signaled = false;
+bool     g_battle_end_synced          = false;
+uint32_t g_battle_end_swap_frame      = 0;
+bool     g_battle_end_armed           = false;
 
 // Barrier epoch + completion records (deafness fix, 2026-06-11). The old
 // protocol had a fatal asymmetry under loss: peer B completes the barrier
@@ -431,16 +425,16 @@ static bool     g_battle_end_armed           = false;
 // the same order (CSS-session-up / battle-session-up are bilateral
 // rendezvous), so a uint8 counter stays in step; 0 is reserved for
 // legacy peers and treated as a wildcard.
-static uint8_t  g_barrier_epoch        = 0;  // last assigned instance id
-static uint8_t  g_entry_epoch          = 0;  // armed entry barrier instance
-static uint8_t  g_end_epoch            = 0;  // armed end barrier instance
-static uint8_t  g_entry_done_epoch     = 0;  // last COMPLETED entry instance
-static uint8_t  g_end_done_epoch       = 0;  // last COMPLETED end instance
+uint8_t  g_barrier_epoch        = 0;  // last assigned instance id
+uint8_t  g_entry_epoch          = 0;  // armed entry barrier instance
+uint8_t  g_end_epoch            = 0;  // armed end barrier instance
+uint8_t  g_entry_done_epoch     = 0;  // last COMPLETED entry instance
+uint8_t  g_end_done_epoch       = 0;  // last COMPLETED end instance
 static uint32_t g_entry_done_ms        = 0;  // completion wall-clock (legacy TTL)
-static uint32_t g_end_done_ms          = 0;
+uint32_t g_end_done_ms          = 0;
 // Proposal pair captured for the divergence diagnostic at completion.
-static uint32_t g_entry_local_proposal  = 0;
-static uint32_t g_entry_remote_proposal = 0;
+uint32_t g_entry_local_proposal  = 0;
+uint32_t g_entry_remote_proposal = 0;
 
 static uint8_t NextBarrierEpoch() {
     ++g_barrier_epoch;
@@ -454,8 +448,8 @@ static uint8_t NextBarrierEpoch() {
 constexpr uint32_t SWAP_FRAME_BUFFER = 8;
 
 // Handshake state
-static bool g_received_hello = false;
-static bool g_received_hello_ack = false;
+bool g_received_hello = false;
+bool g_received_hello_ack = false;
 
 // =============================================================================
 // Note: We use our own frame counter instead of game timer
@@ -478,7 +472,7 @@ extern "C" void Hook_SetSOCDMode(int mode);
 // means "random not enabled / no override" — hook passes the original
 // arg0 through unchanged. FM2K doesn't read this — its ADDR_SELECTED_STAGE
 // write goes to the canonical 0x43010c which the game reads natively.
-static uint32_t g_pending_random_stage = 0xFFFFFFFFu;
+uint32_t g_pending_random_stage = 0xFFFFFFFFu;
 extern "C" uint32_t Netplay_PeekNextRolledStage() {
     return g_pending_random_stage;
 }
@@ -2101,8 +2095,8 @@ void Netplay_EndSpectateSession() {
 //
 // pending_kind == NONE means no swap pending. Set by On* handlers, cleared
 // when the swap actually fires (or on EndSpectateSession reset).
-static NetplaySessionKind g_pending_swap_kind  = NetplaySessionKind::NONE;
-static uint32_t           g_pending_swap_frame = 0;
+NetplaySessionKind g_pending_swap_kind  = NetplaySessionKind::NONE;
+uint32_t           g_pending_swap_frame = 0;
 
 void Netplay_OnHostBattleEntering(uint32_t swap_frame) {
     if (g_session_kind != SessionKind::SPECTATE) return;
@@ -3045,9 +3039,9 @@ void Netplay_EndBattle() {
 // =============================================================================
 
 // Frame pacing state (matches GekkoNet examples' handle_frame_time)
-static LARGE_INTEGER g_perf_freq = {};
-static LARGE_INTEGER g_frame_start = {};
-static bool g_frame_timer_initialized = false;
+LARGE_INTEGER g_perf_freq = {};
+LARGE_INTEGER g_frame_start = {};
+bool g_frame_timer_initialized = false;
 
 // Called at the END of each frame to apply frame advantage throttle.
 // The game already has its OWN 10ms frame limiter (timeGetTime in WinMain).

@@ -1,0 +1,79 @@
+#pragma once
+// netplay.cpp shared state, externed so the split netplay_*.cpp TUs can share it.
+// Pure linkage move (no g_foo -> g_state.foo churn). Definitions live in netplay.cpp.
+#include "netplay.h"
+#include "control_channel.h"
+#include "gekkonet.h"
+#include <atomic>
+#include <cstdint>
+#include <windows.h>
+
+// ---- shared types (were defined in netplay.cpp) ----
+enum class SimpleState : uint8_t { DISCONNECTED, CONNECTED, BATTLE };
+using SessionKind = NetplaySessionKind;   // public enum from netplay.h
+struct PendingConfirmInput { uint32_t frame; uint16_t p1, p2; };
+
+// ---- compile-time constants (were file-static constexpr) ----
+inline constexpr int CSS_LOCAL_DELAY = 6;
+inline constexpr uint32_t PENDING_CONFIRM_RING = 128;
+
+// ---- runtime shared state (were file-static) ----
+extern SimpleState g_simple_state;
+extern SessionKind g_session_kind;
+extern bool g_css_synced;  // Both peers BATTLE_READY, CSS GekkoSession ready
+extern bool g_remote_css_ready;  // Remote has entered CSS
+extern bool g_local_css_ready;  // We've entered CSS
+extern uint16_t g_css_advance_p1;
+extern uint16_t g_css_advance_p2;
+extern bool     g_css_advance_ready;
+extern GekkoSession* g_session;
+extern bool g_session_ready;
+extern uint16_t g_p1_input;
+extern uint16_t g_p2_input;
+extern uint32_t g_netplay_frame;
+extern uint32_t g_rollback_count;
+extern uint32_t g_last_rollback_frame;
+extern uint32_t g_desync_count;
+extern uint32_t g_last_desync_log_tick;
+extern int g_local_delay;  // Computed from RTT at battle start
+extern int                g_pred_window;
+extern int                g_runahead_user_pref;
+extern std::atomic<int>   g_runahead_active;
+extern std::atomic<bool>  g_runahead_toggle_requested;
+extern uint32_t g_beat_window_rb_sum;
+extern uint32_t g_beat_window_rb_max;
+extern uint32_t g_beat_window_rb_count;   // real rollbacks observed
+extern uint64_t g_beat_last_emit_ms;
+extern int g_force_desync_at_frame;
+extern bool g_force_desync_inited;
+extern int  g_session_delay_cached;
+extern bool g_session_delay_cache_valid;
+extern uint32_t g_highest_recorded_frame;
+extern PendingConfirmInput g_pending_confirm[PENDING_CONFIRM_RING];
+extern uint32_t g_next_confirm_flush;
+extern bool     g_local_battle_entered;
+extern bool     g_remote_battle_entered;
+extern bool     g_battle_synced;
+extern uint32_t g_battle_entry_swap_frame;     // Latest agreed swap frame.
+extern bool     g_battle_entry_armed;
+extern bool     g_local_battle_end_signaled;
+extern bool     g_remote_battle_end_signaled;
+extern bool     g_battle_end_synced;
+extern uint32_t g_battle_end_swap_frame;
+extern bool     g_battle_end_armed;
+extern uint8_t  g_barrier_epoch;  // last assigned instance id
+extern uint8_t  g_entry_epoch;  // armed entry barrier instance
+extern uint8_t  g_end_epoch;  // armed end barrier instance
+extern uint8_t  g_entry_done_epoch;  // last COMPLETED entry instance
+extern uint8_t  g_end_done_epoch;  // last COMPLETED end instance
+extern uint32_t g_end_done_ms;
+extern uint32_t g_entry_local_proposal;
+extern uint32_t g_entry_remote_proposal;
+extern bool g_received_hello;
+extern bool g_received_hello_ack;
+extern uint32_t g_pending_random_stage;
+extern NetplaySessionKind g_pending_swap_kind;
+extern uint32_t           g_pending_swap_frame;
+extern LARGE_INTEGER g_perf_freq;
+extern LARGE_INTEGER g_frame_start;
+extern bool g_frame_timer_initialized;
