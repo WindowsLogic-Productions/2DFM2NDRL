@@ -5,6 +5,7 @@
 // spectator_node*.cpp set -- not a public API.
 #include "spectator_node.h"     // SessionEvent, SpecJoinMode, SnapshotMetadata, SPEC_UDP_WINDOW, SPECTATOR_DEFAULT_CAPACITY, SESSION_EVENT_MATCH_HDR_SIZE
 #include "spec_relay_queue.h"   // fm2k::spec_relay::Ring
+#include "control_channel.h"    // CtrlPacket (BuildJoinAckPacket)
 #include <winsock2.h>           // sockaddr_in
 #include <array>
 #include <set>
@@ -425,6 +426,10 @@ struct State {
 
 // The one definition lives in spectator_node.cpp; sibling TUs see it via this.
 extern State g_state;
+
+// Built in spec_join.cpp; also called by StashSnapshot (spectator_node.cpp) for
+// the battle-entry JOIN_ACK re-broadcast. Unique name -> kept at global scope.
+CtrlPacket BuildJoinAckPacket();
 
 // Internal cross-TU API for the spectator node. The implementation is split
 // across spec_*.cpp; these all share g_state above. Wrapped in `specnode` so
