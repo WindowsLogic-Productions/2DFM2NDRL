@@ -45,6 +45,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay_battle_phase.cpp # ProcessBattleInputPhase rollback driver (split from netplay)
     src/netplay/netplay_barriers.cpp # battle entry/end sync barriers (split from netplay)
     src/netplay/netplay_css.cpp      # CSS lockstep + CSS session (split from netplay)
+    src/netplay/netplay_spectate.cpp # spectate session + host battle-swap handoff (split from netplay)
     src/netplay/control_channel.cpp
     src/netplay/savestate.cpp
     src/netplay/spectator_node.cpp
