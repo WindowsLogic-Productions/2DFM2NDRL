@@ -92,3 +92,8 @@ void       OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from);
 // SOCD accessors (defined in hooks/input; used by control-channel host-config):
 extern "C" int  Hook_GetSOCDModePublic();
 extern "C" void Hook_SetSOCDMode(int mode);
+// helpers that stay in netplay.cpp but are called by the split battle TU:
+void AddSubscribedSpectatorsToSession();
+void ResetConfirmRing();
+uint8_t NextBarrierEpoch();
+void    Netplay_EndCSSSession();
