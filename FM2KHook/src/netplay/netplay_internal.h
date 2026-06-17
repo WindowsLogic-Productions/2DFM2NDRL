@@ -17,6 +17,7 @@ struct PendingConfirmInput { uint32_t frame; uint16_t p1, p2; };
 inline constexpr int CSS_LOCAL_DELAY = 6;
 inline constexpr int CSS_CONFIRM_LOCKOUT = 150;   // block confirm for first N frames
 inline constexpr uint32_t PENDING_CONFIRM_RING = 128;
+inline constexpr uint32_t SWAP_FRAME_BUFFER = 8;  // barrier swap-frame lead
 
 // ---- runtime shared state (were file-static) ----
 extern SimpleState g_simple_state;
@@ -116,6 +117,7 @@ extern "C" void Hook_SetSOCDMode(int mode);
 void AddSubscribedSpectatorsToSession();
 void ResetConfirmRing();
 uint8_t NextBarrierEpoch();
+bool    Netplay_StartCSSSession();
 void    Netplay_EndCSSSession();
 // desync diagnostics (defined in netplay.cpp), called by the battle-phase TU:
 void HandleDesyncDetected(int frame, uint32_t local_chk, uint32_t remote_chk, bool synthetic);
