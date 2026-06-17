@@ -55,9 +55,11 @@ set(FM2KHOOK_SOURCES
     src/hooks/render_simd.cpp
     # Netplay
     src/netplay/netplay.cpp
+    src/netplay/netplay_desync.cpp   # HandleDesyncDetected (split from netplay)
     src/netplay/netplay_chat.cpp     # chat ring (split from netplay)
     src/netplay/netplay_control.cpp  # HOST_CONFIG packets + OnControlMessage dispatch (split from netplay)
-    src/netplay/netplay_battle.cpp   # StartBattle/StartStressBattle/EndBattle (split from netplay)
+    src/netplay/netplay_battle.cpp   # StartBattle/StartStressBattle (split from netplay)
+    src/netplay/netplay_battle_end.cpp  # Netplay_EndBattle teardown (split from netplay_battle)
     src/netplay/netplay_battle_phase.cpp # ProcessBattleInputPhase engine-agnostic rollback driver (split from netplay)
     src/netplay/netplay_battle_events.cpp # Save/Load/Advance gekko event handlers (split from battle_phase; FM95 palette guard gated)
     src/netplay/netplay_barriers.cpp # battle entry/end sync barriers (split from netplay)
