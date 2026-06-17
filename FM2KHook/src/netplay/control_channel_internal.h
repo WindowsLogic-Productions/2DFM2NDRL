@@ -1,0 +1,68 @@
+#pragma once
+// control_channel.cpp shared state, externed so the split control_channel_*.cpp
+// TUs (io / send / gekko-adapter) can share it. Pure linkage move -- definitions
+// live in control_channel.cpp (the core). ENGINE-AGNOSTIC netcode: FM2K AND FM95
+// reuse this transport unchanged (no engine addresses anywhere in here).
+#include "control_channel.h"
+#include "gekkonet.h"
+#include <atomic>
+#include <cstdint>
+#include <chrono>
+#include <mutex>
+#include <vector>
+#include <utility>
+#include <winsock2.h>
+
+// ---- socket + sequence + connection state (defined in control_channel.cpp) --
+extern SOCKET g_socket;
+extern sockaddr_in g_local_sockaddr;
+extern sockaddr_in g_remote_sockaddr;
+extern bool g_socket_initialized;
+
+extern uint16_t g_send_seq;
+extern uint16_t g_recv_seq;
+extern uint16_t g_recv_ack;
+
+extern bool g_connected;
+extern uint32_t g_last_recv_time;
+extern uint32_t g_connected_at_ms;
+
+extern UINT g_keepalive_timer_id;
+extern std::mutex g_poll_mutex;
+extern uint32_t g_last_main_pump_ms;
+extern uint32_t g_last_ping_time;
+extern uint32_t g_rtt_ms;
+extern uint32_t g_ping_send_time;
+
+extern uint32_t g_rtt_worst_ms;
+extern uint32_t g_rtt_sample_count;
+
+extern std::atomic<int> g_delay_mode;               // 0=avg, 1=peak
+extern std::atomic<int> g_remote_delay_candidate;
+
+inline constexpr int kRttRingCap = 64;
+extern uint32_t g_rtt_ring[kRttRingCap];
+extern int      g_rtt_ring_count;
+extern int      g_rtt_ring_head;
+
+extern uint8_t g_local_player_id;
+extern ControlMsgCallback g_msg_callback;
+
+inline constexpr size_t RECV_BUFFER_SIZE = 2048;
+extern char g_recv_buffer[RECV_BUFFER_SIZE];
+
+extern std::vector<std::pair<std::vector<char>, sockaddr_in>> g_gekko_packet_queue;
+extern std::vector<GekkoNetResult*> g_gekko_result_ptrs;
+
+// ---- current time in milliseconds (steady clock) ----
+inline uint32_t GetTimeMs() {
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    return static_cast<uint32_t>(ms.count());
+}
+
+// ---- raw socket I/O (control_channel_io.cpp). Un-static'd from the original so
+// the core poll path + the gekko adapter can both drive them. CONTRACT: callers
+// must hold g_poll_mutex (RawReceive mutates g_gekko_packet_queue/g_recv_buffer). --
+void RawSend(const void* data, size_t len);
+void RawReceive();

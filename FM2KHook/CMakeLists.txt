@@ -62,7 +62,10 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay_barriers.cpp # battle entry/end sync barriers (split from netplay)
     src/netplay/netplay_css.cpp      # CSS lockstep + CSS session (split from netplay)
     src/netplay/netplay_spectate.cpp # spectate session + host battle-swap handoff (split from netplay)
-    src/netplay/control_channel.cpp
+    src/netplay/control_channel.cpp        # core: state defs + socket lifecycle + poll/accessors (split)
+    src/netplay/control_channel_io.cpp     # RawSend/RawReceive + race guard (split from control_channel)
+    src/netplay/control_channel_send.cpp   # ControlChannel_Send* packet builders (split from control_channel)
+    src/netplay/control_channel_gekko.cpp  # GekkoNet MultiplexAdapter (split from control_channel)
     src/netplay/savestate.cpp           # common: lifecycle + buffers + RNG-trace + hashing
     src/netplay/savestate_fm95.cpp      # FM95 save/load body (#if ENGINE_FM95)
     src/netplay/savestate_fm2k_save.cpp # FM2K SaveState_Save + save profiler (#if !ENGINE_FM95)
