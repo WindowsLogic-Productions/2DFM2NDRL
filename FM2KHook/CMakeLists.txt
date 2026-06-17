@@ -89,7 +89,8 @@ set(FM2KHOOK_SOURCES
     # Audio — Mike Z rollback-safe sound layer
     src/audio/sound_rollback.cpp
     # UI
-    src/ui/imgui_overlay.cpp
+    src/ui/imgui_overlay.cpp          # core: D3D9 present hook + device lifecycle + wndproc + hotkeys (split)
+    src/ui/imgui_overlay_render.cpp   # ImGui debug panel RenderDebugOverlay (Slint-replaceable, split)
     src/ui/fc_hud.cpp
     src/ui/shared_mem.cpp
     src/ui/input_binder.cpp           # core: state + defaults + lifecycle (split)
