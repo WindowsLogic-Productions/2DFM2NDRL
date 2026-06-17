@@ -1124,6 +1124,71 @@ table.sortable th.sort-desc::after { content: ' \25BC'; font-size: 0.62em; opaci
 table.sortable th.sort-th:not(.sort-asc):not(.sort-desc)::after {
   content: ' \2195'; font-size: 0.62em; opacity: 0.22;
 }
+
+/* Row exclude (table.sortable[data-hideable]): a ✕ tucked into the label
+   cell, revealed on row hover; click drops the row + re-ranks. Behaviour in
+   static/sort.js. */
+.row-hide {
+  float: right;
+  margin-left: 0.6rem;
+  padding: 0 0.25rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink-mute);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.2;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+table.grid tbody tr:hover .row-hide { opacity: 0.5; }
+.row-hide:hover, .row-hide:focus-visible { opacity: 1; color: var(--red); outline: none; }
+
+/* Excluded-rows bar above the table: status + one-click restore chips. */
+.hide-bar { display: none; }
+.hide-bar.on {
+  display: block;
+  margin: 0 0 0.7rem;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.74rem;
+  color: var(--ink-dim);
+  background: rgba(255, 184, 64, 0.06);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--amber);
+  border-radius: 2px;
+}
+.hide-status { color: var(--ink-dim); letter-spacing: 0.02em; }
+.hide-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.2rem 0.35rem 0.2rem 0;
+  padding: 0.12rem 0.5rem;
+  border: 1px solid var(--line-bright);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+.hide-chip:hover, .hide-chip:focus-visible { border-color: var(--green); color: var(--green); outline: none; }
+.hide-chip .x { color: var(--green); opacity: 0.8; font-size: 0.85em; }
+.hide-reset {
+  margin-left: 0.5rem;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  cursor: pointer;
+  font-family: var(--font-chrome);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.hide-reset:hover, .hide-reset:focus-visible { text-decoration: underline; outline: none; }
+
 table.grid .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
