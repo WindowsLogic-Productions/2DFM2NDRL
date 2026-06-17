@@ -125,3 +125,14 @@ void MaybeFireSyntheticDesync();
 // cross-TU between netplay.cpp and the battle-phase TU:
 bool MaybeSwapPendingSpectator(uint32_t advanced_frame);  // defined in netplay.cpp
 void HandleFrameTime(float frames_ahead);                 // defined in netplay_battle_phase.cpp
+
+// Rollback update-event handlers (netplay_battle_events.cpp), dispatched by the
+// engine-agnostic driver in netplay_battle_phase.cpp. Engine-agnostic in
+// STRUCTURE -- save/load route through SaveState_* (engine-split), the sim
+// ticks through the engine globals; the FM2K-specific palette-flash guard
+// inside the Advance handler is compiled out on FM95 (FM2K::kIsFM95), and the
+// remaining FM2K addresses are env-gated diagnostics ([FM2K-DIAG]).
+void Netplay_HandleSaveEvent(GekkoGameEvent* update);
+void Netplay_HandleLoadEvent(GekkoGameEvent* update, int& load_events_in_batch);
+void Netplay_HandleAdvanceEvent(GekkoGameEvent* update, bool& has_advance,
+                                uint32_t& earliest_advance);
