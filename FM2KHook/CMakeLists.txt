@@ -43,6 +43,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/savestate.cpp
     src/netplay/spectator_node.cpp
     src/netplay/spec_wire.cpp  # SessionEvent wire codecs + zero-RLE (split from spectator_node)
+    src/netplay/spec_transport.cpp  # UDP/TCP/relay send + EVENT_BATCH flush (split from spectator_node)
     src/netplay/spectator_tcp.cpp
     src/netplay/nat_traversal.cpp
     src/netplay/game_hash.cpp

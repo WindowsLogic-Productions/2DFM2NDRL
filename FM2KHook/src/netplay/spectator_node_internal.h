@@ -425,3 +425,27 @@ struct State {
 
 // The one definition lives in spectator_node.cpp; sibling TUs see it via this.
 extern State g_state;
+
+// Internal cross-TU API for the spectator node. The implementation is split
+// across spec_*.cpp; these all share g_state above. Wrapped in `specnode` so
+// generically-named helpers (Fletcher32, AddrEqual, FormatAddr) don't collide
+// with same-named functions elsewhere (e.g. savestate.cpp's Fletcher32). Each
+// spectator TU does `using namespace specnode;` so call sites stay unqualified.
+namespace specnode {
+
+// ---- transport (spec_transport.cpp) ----
+uint32_t Fletcher32(const uint8_t* data, size_t len);
+bool     AddrEqual(const sockaddr_in& a, const sockaddr_in& b);
+void     FormatAddr(const sockaddr_in& a, char* out, size_t out_sz);
+void     OutboundBroadcast(const void* buf, size_t len);
+void     OutboundSendTo(const sockaddr_in& to, const void* buf, size_t len);
+void     SendRaw(const void* buf, size_t len, const sockaddr_in& to);
+void     AppendEventToWire(std::vector<uint8_t>& out, const SessionEvent& ev,
+                           const std::vector<MatchHeader>& headers);
+uint32_t CountInputs(const std::vector<SessionEvent>& events, size_t first, size_t last);
+void     FlushBatch();
+bool     SpecUdpEnabled();
+void     SendUdpInputBatches();
+void     SendOpBaselineTo(const sockaddr_in& to, uint32_t baseline);
+
+}  // namespace specnode
