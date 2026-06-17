@@ -281,6 +281,7 @@ private:
     void RenderSlotInspectionWindow();  // Stub
     void RenderHubPanel();              // Fightcade-style lobby
     void HandleHubEvent(const fm2k::HubEvent& ev);  // hub WS event dispatch (split into launcher_ui_hub_events.cpp)
+    void HandleMatchStartEvent(const fm2k::HubEvent& ev);  // K::MatchStart handler (launcher_ui_hub_events_match.cpp)
     void RenderHostConfigWindow();      // Match-settings UI (SOCD, stage, etc.)
     void RenderHubServerWindow();       // Legacy floating window — kept for hot-reload paths; new path is the Settings tab.
     void RenderDiscordAuthWindow();     // Stays separate — OAuth pairing flow has its own state machine.
