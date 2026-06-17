@@ -470,8 +470,13 @@ add_executable(FM2K_RollbackLauncher
     LocalNetworkAdapter.cpp
     FM2K_Integration.h
     # ImGui-based input binder (shared with the hook overlay) — depends only
-    # on SDL3 + ImGui, no project-specific includes.
+    # on SDL3 + ImGui, no project-specific includes. Split 5-way: core +
+    # gamepads + profiles + sample + ui (ImGui render isolated for Slint).
     FM2KHook/src/ui/input_binder.cpp
+    FM2KHook/src/ui/input_binder_gamepads.cpp
+    FM2KHook/src/ui/input_binder_profiles.cpp
+    FM2KHook/src/ui/input_binder_sample.cpp
+    FM2KHook/src/ui/input_binder_ui.cpp
     # Shared PII scrubber — used by both the launcher's SDLCustomLogOutput
     # and the hook DLL's LogOutputFunction so anything users share (log
     # window copy, on-disk hook log) is pre-redacted.

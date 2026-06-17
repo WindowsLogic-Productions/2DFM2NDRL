@@ -92,7 +92,11 @@ set(FM2KHOOK_SOURCES
     src/ui/imgui_overlay.cpp
     src/ui/fc_hud.cpp
     src/ui/shared_mem.cpp
-    src/ui/input_binder.cpp
+    src/ui/input_binder.cpp           # core: state + defaults + lifecycle (split)
+    src/ui/input_binder_gamepads.cpp  # SDL3 gamepad discovery (split)
+    src/ui/input_binder_profiles.cpp  # INI persistence + per-game profiles (split)
+    src/ui/input_binder_sample.cpp    # SDL3 + Win32/XInput engine read (split)
+    src/ui/input_binder_ui.cpp        # ImGui render + capture FSM (Slint-replaceable, split)
     src/ui/screenshot.cpp
     # Parity — kgtengine cross-engine ground-truth recorder
     src/parity/parity_recorder.cpp
