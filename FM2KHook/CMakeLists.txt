@@ -24,7 +24,13 @@ set(FM2KHOOK_SOURCES
     # Core
     src/core/dllmain.cpp
     src/core/globals.cpp
-    src/core/main_loop_trampoline.cpp
+    src/core/main_loop_trampoline.cpp  # trampoline shell: ClassifyPhase/PumpMessages/FrameTick/MainLoop
+    src/core/trampoline_render.cpp     # render snapshot/restore + EbDiag
+    src/core/trampoline_pacing.cpp     # frame pacing + profilers
+    src/core/trampoline_battle.cpp     # RunBattleTick
+    src/core/trampoline_css.cpp        # RunCssTick
+    src/core/trampoline_native.cpp     # RunNativeTick
+    src/core/trampoline_spectator.cpp  # RunSpectatorTick + SpectatorSimOneFrame
     # Hooks
     src/hooks/hooks.cpp
     src/hooks/input.cpp

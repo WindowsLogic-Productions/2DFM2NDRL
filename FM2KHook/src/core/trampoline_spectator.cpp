@@ -1,0 +1,521 @@
+// trampoline_spectator.cpp -- spectator playback (RunSpectatorTick + SpectatorSimOneFrame + queue constants + g_spec_pop_total). Split from main_loop_trampoline.cpp.
+#include "main_loop_trampoline.h"
+#include "globals.h"
+#include "../hooks/hooks.h"
+#include "../hooks/wndproc_subclass.h"
+#include "../netplay/netplay.h"
+#include "../netplay/control_channel.h"
+#include "../netplay/game_hash.h"
+#include "../netplay/spectator_node.h"
+#include "../ui/shared_mem.h"
+#include "../parity/parity_recorder.h"
+#include <SDL3/SDL_log.h>
+#include <SDL3/SDL_timer.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <windows.h>
+#include "trampoline_internal.h"
+
+// Spectator playback — pure input-replay model.
+//
+// CONTRACT: spectator's local FM2K only advances sim when it has a confirmed
+// (p1, p2) input pair from the host for the next frame. Pop one → run one
+// frame → render → wait for the next pair. That's it.
+//
+// Why this works: every change to FM2K's state is input-driven from a
+// canonical default state at boot. Host records every confirmed (p1, p2)
+// it returns from Hook_GetPlayerInput (title-screen auto-mash, CSS cursor
+// moves, battle commands — the whole stream). Spectator drains the same
+// stream → identical state by construction.
+//
+// Three regimes by queue depth:
+//   QUEUE EMPTY                 → freeze, render last frame, wait
+//   QUEUE >= LIVE_TARGET        → pop one, run one, render (live edge)
+//   QUEUE > FF_ENTER (catch-up) → outer loop drops to 1 ms sleep so we
+//                                 burn through backfill at ~1000 Hz
+//
+// Pre-JOIN_ACK: queue is empty, no sim runs, screen holds the boot snapshot.
+// JOIN_ACK fires SendSessionBackfillTo from the host → queue fills with
+// every confirmed frame from session start → spectator drains those at
+// FF speed → catches up to live edge.
+// Jitter cushion: hold playback until this many frames are buffered,
+// and rebuild the cushion after a drain-out. 8 (80ms) was a netplay-
+// grade number -- the spec rode the live edge and every production
+// hiccup hit the picture (q racing 10 -> 1 -> 0). A spectator trades
+// 400ms of extra delay for smoothness; the starvation bypass caps any
+// hold at 250ms of silence so this can never become a freeze.
+constexpr size_t SPECTATOR_LIVE_TARGET = 40;
+constexpr size_t SPECTATOR_FF_ENTER    = 100; // ~1 sec of host frames queued
+constexpr size_t SPECTATOR_FF_EXIT     = 16;  // hysteresis: 2x live target
+
+// Fast catch-up target (C5.5). Once pb_queue depth drops to or below this,
+// we revert to one-pop-per-trampoline-tick paced render. Set higher than
+// SPECTATOR_LIVE_TARGET (jitter floor) so the catch-up loop doesn't oscillate
+// across the floor on every tick. ~1 sec at 100 Hz = 100 frames of buffered
+// headroom is enough to absorb host jitter without lagging the viewer
+// noticeably behind real-time.
+constexpr size_t SPECTATOR_LIVE_LAG_FRAMES = 100;
+
+// Broadcast delay target: the spectator deliberately sits this many
+// frames behind live (default 3s at 100fps). Riding the live edge made
+// playback arrival-limited -- every loss burst or host stall hit the
+// picture as a stall (q=0, pops=0). With the bank, any arrival gap
+// shorter than the bank is structurally invisible; drains target the
+// bank, never the edge. Single source of truth lives in spectator_node
+// (Phase G: FM2K_SPEC_DELAY floor + adaptive growth from measured
+// inter-admission gaps, so links worse than the default profile widen
+// their own cushion instead of stalling).
+inline size_t SpectatorTargetDelayFrames() {
+    return SpectatorNode_TargetDelayFrames();
+}
+
+// One sim step (popped INPUT → PGI → UG → diagnostics). Returns false if
+// the queue couldn't supply an INPUT (head non-INPUTs were drained but no
+// INPUT followed them), true if a frame was simulated. Render is the
+// caller's responsibility.
+uint32_t g_spec_pop_total = 0;
+
+static bool SpectatorSimOneFrame() {
+    uint16_t p1 = 0, p2 = 0;
+    if (!SpectatorNode_PopFrameInputs(&p1, &p2)) {
+        return false;
+    }
+    ++g_spec_pop_total;
+
+    // PER-FRAME alignment-trace log: capture RNG before PGI runs so we can
+    // pair with [HOST-TRACE] on the host. If host's bf=N rng_pre matches
+    // spectator's bf=N rng_pre, alignment is correct. If they diverge, the
+    // leak is between frame N-1 post-UG and frame N pre-PGI (inter-frame).
+    // If they match but rng_post diverges, leak is inside PGI+UG itself.
+    static uint32_t s_spec_trace_bf = 0;
+    static bool     s_spec_trace_in_battle = false;
+    const uint32_t mode_pre = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    const uint32_t rng_pre_pgi_spec = *(uint32_t*)0x41FB1C;
+    if (mode_pre >= 3000 && mode_pre < 4000) {
+        if (!s_spec_trace_in_battle) {
+            s_spec_trace_in_battle = true;
+            s_spec_trace_bf = 0;
+            // First iteration where mode_pre==3000 = first FULL battle
+            // frame on the spec side (mode_pre==3000 at iteration start,
+            // mode_pre==3000 still at end; PGI/UG ran entirely in battle
+            // context). Apply PIN_RNG + initial-sync BEFORE PGI here so
+            // host's first battle frame post-PGI rng matches replay's.
+            SaveState_DoInitialSync();
+            SpectatorNode_ApplyPendingPinRng();
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpecSim: first mode_pre==3000 iteration — applied "
+                "initial-sync + PIN_RNG pre-PGI");
+        }
+    } else {
+        s_spec_trace_in_battle = false;
+    }
+
+    if (original_process_game_inputs) original_process_game_inputs();
+    if (original_update_game)         original_update_game();
+    ++g_sim_step_count;   // sim-fps: one logic tick
+
+    ParityRecorder::Capture();
+
+    // [SPEC-TRACE] per-frame for first 100 battle frames. Routed through
+    // SDL_LOG_CATEGORY_CUSTOM so LogOutputFunction sends it to quill's
+    // backtrace ring instead of disk — captured forever-cheap, only
+    // flushed to disk on a subsequent LOG_ERROR. FM2K_SPECTATOR_DEBUG=1
+    // routes CUSTOM to disk like a normal log line for verbose sessions.
+    if (s_spec_trace_in_battle && s_spec_trace_bf < 100) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
+            "[SPEC-TRACE] bf=%u rng_pre=0x%08X rng_post=0x%08X "
+            "p1=0x%03X p2=0x%03X",
+            s_spec_trace_bf, rng_pre_pgi_spec,
+            *(uint32_t*)0x41FB1C, p1, p2);
+        s_spec_trace_bf++;
+    }
+
+    // Per-frame state fingerprint log for desync diagnosis. Counts every
+    // simulated frame (catch-up included). Logs once we're in battle
+    // (mode 3000) at battle-frame multiples of 30 (~3x per sec). Pairs
+    // with the host's matching log at netplay.cpp's AdvanceEvent recording
+    // site — grep both .log files for the same sim_frame to find first
+    // divergence.
+    {
+        static uint32_t s_pop_count = 0;
+        ++s_pop_count;
+        static uint32_t s_battle_frame_at_entry = 0;
+        static bool s_in_battle = false;
+        const uint32_t mode_now = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (mode_now >= 3000 && mode_now < 4000) {
+            if (!s_in_battle) {
+                s_in_battle = true;
+                s_battle_frame_at_entry = s_pop_count;
+            }
+            const uint32_t bf = s_pop_count - s_battle_frame_at_entry;
+            // [SPEC-FP] every 30 battle frames (~3 lines/sec). Routed
+            // through SDL_LOG_CATEGORY_CUSTOM so LogOutputFunction puts
+            // it in quill's backtrace ring rather than always-on disk.
+            // Last 4096 such lines stay in memory; auto-flushed to file
+            // when any LOG_ERROR fires (great for desync post-mortems).
+            // FM2K_SPECTATOR_DEBUG=1 routes CUSTOM to disk for live tail.
+            if ((bf % 30) == 0) {
+                const uint32_t rng     = *(uint32_t*)0x41FB1C;
+                const uint32_t buf_idx = *(uint32_t*)0x447EE0;
+                const uint32_t p1_hp   = *(uint32_t*)0x4DFC85;
+                const uint32_t p2_hp   = *(uint32_t*)0x4EDCC4;
+                const uint32_t timer   = *(uint32_t*)0x470044;
+                constexpr uintptr_t POOL = 0x4701E0;
+                constexpr size_t    SLOT = 382;
+                const int32_t p1_x = *(int32_t*)(POOL + 0 * SLOT + 0x08);
+                const int32_t p1_y = *(int32_t*)(POOL + 0 * SLOT + 0x0C);
+                const int32_t p2_x = *(int32_t*)(POOL + 1 * SLOT + 0x08);
+                const int32_t p2_y = *(int32_t*)(POOL + 1 * SLOT + 0x0C);
+                const int32_t p1_script = *(int32_t*)(POOL + 0 * SLOT + 0x30);
+                const int32_t p2_script = *(int32_t*)(POOL + 1 * SLOT + 0x30);
+                SDL_LogInfo(SDL_LOG_CATEGORY_CUSTOM,
+                    "[SPEC-FP] bf=%u (pop=%u) rng=0x%08X buf=%u "
+                    "p1_hp=%u p2_hp=%u timer=%u "
+                    "p1_pos=(%d,%d) p2_pos=(%d,%d) "
+                    "p1_script=%d p2_script=%d "
+                    "p1_in=0x%03X p2_in=0x%03X catchup=%d",
+                    bf, s_pop_count, rng, buf_idx,
+                    p1_hp, p2_hp, timer,
+                    p1_x, p1_y, p2_x, p2_y,
+                    p1_script, p2_script,
+                    p1, p2, (int)g_spectator_catchup);
+            }
+        } else {
+            s_in_battle = false;
+        }
+    }
+
+    // Advance the deterministic virtual clock per simulated frame so
+    // Hook_timeGetTime stays consistent with sim progression even when
+    // we're inside the catch-up loop.
+    extern uint32_t g_virtual_time_ms;
+    g_virtual_time_ms += 10;
+
+    return true;
+}
+
+void RunSpectatorTick() {
+    Hook_CheckGameModeTransition_Public();
+
+    // Drain UDP — control channel (0xCC: SPEC_JOIN_ACK / HEARTBEAT) and
+    // 0xCE INPUT_BATCH datagrams land on the same multiplex socket.
+    ControlChannel_Poll();
+
+    // Health: heartbeat send, silence-failover, daisy-chain reconnect.
+    SpectatorNode_TickHealth();
+
+    // Apply any deferred SNAPSHOT_END that landed before the local engine
+    // had finished its pre-WinMain init. Snapshot blobs that arrive within
+    // ms of the spectator process starting (very common with the host
+    // sitting in a fast loopback connect) will land in pb_snapshot_inbox
+    // with pending_apply=true; this drains them on the first spec tick
+    // where game_mode != 0. No-op when nothing is pending.
+    SpectatorNode_ApplyPendingSnapshot();
+
+    // Cache offline-replay mode once. Several gates downstream behave
+    // differently for replay vs. live spec — replay has no upstream so
+    // jitter-floor / catchup logic is meaningless.
+    static int s_offline_replay_cached = -1;
+    if (s_offline_replay_cached < 0) {
+        const char* rp = std::getenv("FM2K_REPLAY_FILE");
+        s_offline_replay_cached = (rp && rp[0]) ? 1 : 0;
+    }
+    const bool s_offline_replay_env_active = (s_offline_replay_cached == 1);
+
+    const size_t qd = SpectatorNode_PendingFrameCount();
+
+    // [SPEC-Q] 1Hz heartbeat: phase + queue depth + pop counters. The
+    // [SPEC-FP] trace only logs in battle (mode>=3000), leaving the
+    // match-boundary CSS walk a blind spot -- the multi-match journey
+    // stalls there and nothing said why.
+    {
+        static uint64_t s_last_q_log = 0;
+        static uint32_t s_pops_window = 0;
+        extern uint32_t g_spec_pop_total;
+        static uint32_t s_pop_last = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - s_last_q_log >= 1000) {
+            const uint32_t mode = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+            s_pops_window = g_spec_pop_total - s_pop_last;
+            s_pop_last = g_spec_pop_total;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[SPEC-Q] mode=%u q=%zu pops/s=%u total=%u catchup=%d",
+                mode, qd, s_pops_window, g_spec_pop_total,
+                (int)g_spectator_catchup);
+            s_last_q_log = now;
+        }
+    }
+    // Jitter-buffer floor only applies to LIVE spec (waiting on host's next
+    // batch). Offline replay has no upstream — the file is the entire input
+    // stream — so the last ≤8 events (typically post-match INPUTs +
+    // MATCH_END) would be stranded under the LIVE floor. Drain to zero
+    // instead, which lets MATCH_END apply and the playback finishes cleanly.
+    //
+    // Boundary bypass (Phase F): the floor must not strand a queued
+    // boundary op or freeze an active SEAM/PINNING walk. With the UDP
+    // accelerator the spec rides AT the live edge, so the stream pause at
+    // a match seam arrives with q < floor — the old unconditional freeze
+    // trapped MATCH_END behind the last tail inputs forever (q:7 zombie,
+    // 2026-06-11). If any non-INPUT op is queued, drain toward it; if a
+    // boundary is active, the synthetic feed must keep ticking even at
+    // q == 0 (it consumes nothing while walking results/CSS).
+    // Starvation bypass: the floor exists to absorb jitter, not to
+    // withhold playable frames during a genuine stream pause. q=7 (one
+    // below the floor) used to freeze the picture for the entire pause
+    // with seven frames in hand (2026-06-11). If nothing has been
+    // admitted for >250ms, play out what we hold at 1:1.
+    const bool boundary_bypass =
+        SpectatorNode_InBoundary() ||
+        SpectatorNode_InNaturalBootWalk() ||
+        (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
+         SpectatorNode_QueueHasPendingOp());
+    if (qd < SpectatorTargetDelayFrames() / 2 &&
+        !s_offline_replay_env_active && !boundary_bypass) {
+        // BANK MAINTENANCE: below half the delay bank, glide at half
+        // speed until arrivals restore it. The bank previously only
+        // existed at mirror start -- any host slow-period bled it at
+        // 1:1 playback and the next production stall hit q=0 (the
+        // mid-battle freeze, 2026-06-11 14:54). Half-speed playback
+        // during host slowdowns is a brief slow-mo the eye barely
+        // notices; a hard stall is not.
+        static bool s_glide_toggle = false;
+        s_glide_toggle = !s_glide_toggle;
+        if (qd == 0 || !s_glide_toggle) {
+            RenderFrameWithSnapshot();
+            return;
+        }
+        // fall through: sim exactly one frame this tick
+    }
+    if (qd == 0 && !boundary_bypass) {
+        // Truly empty — even offline replay has nothing left to do.
+        //
+        // For offline replay (FM2K_REPLAY_FILE set): the entire file was
+        // loaded into pb_queue at startup; queue==0 + playing_back==false
+        // means the last MATCH_END drained and there are no further
+        // events. Without an exit here the replay viewer freezes on the
+        // last rendered frame indefinitely. ExitProcess from a hook is
+        // aggressive but the launcher spawned us specifically for replay
+        // playback — when playback ends, the process is done.
+        //
+        // Live spec falls through to RenderFrameWithSnapshot — peer might
+        // still send more events (next match) and we want to stay alive.
+        if (s_offline_replay_env_active &&
+            !SpectatorNode_IsPlayingBack()) {
+            static std::atomic<bool> s_exit_armed{false};
+            if (!s_exit_armed.exchange(true)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: offline replay drained — exiting process");
+                ExitProcess(0);
+            }
+        }
+        RenderFrameWithSnapshot();
+        return;
+    }
+
+    // Catch-up inner loop (C5.5). When the queue is far ahead of the
+    // jitter floor, drain multiple sim steps per trampoline tick to close
+    // the gap to live edge — without this, late join replays from session
+    // start at 1 frame per tick and a 30k-event backlog takes 5 minutes
+    // to drain. Audio dispatch and render are gated on g_spectator_catchup
+    // so we don't blast compressed audio or burn render bandwidth during
+    // the burn-down.
+    //
+    // Network poll interleave: WITHOUT this, the inner loop holds the
+    // trampoline thread for 100s of ms processing thousands of events,
+    // and SpectatorTCP::Poll never gets called. The kernel's TCP receive
+    // buffer fills up; the host's send blocks via TCP backpressure; from
+    // the spectator's perspective the upstream goes silent.
+    //
+    // ControlChannel_Poll drains UDP control + TCP receive (which feeds
+    // new EVENT_BATCH packets into pb_queue and updates
+    // LastUpstreamRecvMs). We poll every iteration during catchup since
+    // a single SpectatorSimOneFrame can take 100s of ms when FM2K's
+    // CSS-cursor-move triggers a synchronous .player character file
+    // load — much longer than the ~10ms a normal sim tick takes.
+    //
+    // We do NOT call SpectatorNode_TickHealth here: its silence-failover
+    // would fire during legitimate catchup (we've been "silent" because
+    // we're disk-blocked, not because the upstream died) and tear down
+    // the very connection we're using to receive the backfill. The
+    // top-level RunSpectatorTick path calls TickHealth post-catchup
+    // when we're back at the live edge.
+    // Catchup policy (post-mvp tuning):
+    //
+    //   1. ONE-SHOT at join. On the first run where the queue is over the
+    //      lag target — typically right after JOIN_ACK + backfill replay —
+    //      we burn through the buffered events to reach the live edge.
+    //      After that, even if the buffer grows from network jitter,
+    //      packet loss, or a reconnect-with-backfill, we play at normal
+    //      1-frame-per-tick speed. Once you've been caught up, you stay
+    //      at whatever delay naturally accumulates from later disruption
+    //      — no jarring superspeed snap-to-live.
+    //
+    //   2. NO AUTOMATIC SAFETY DRAIN. Buffer is allowed to grow if the
+    //      spectator falls behind; the user explicitly asked us not to
+    //      speed up after lag/loss recovery. Memory cost is bounded by
+    //      the sender (host TCP send blocks via backpressure if our
+    //      kernel recv buffer fills) — not by us auto-draining.
+    //
+    //   3. ENV OVERRIDE. FM2K_SPECTATOR_ALWAYS_CATCHUP=1 keeps the
+    //      always-catch-up behaviour for users who explicitly want low-
+    //      latency live viewing.
+    //
+    // Per-tick wall-clock bound: catchup yields after CATCHUP_MAX_BURST_MS
+    // so a single SpectatorSimOneFrame blocking on a .player disk load
+    // (50–500ms cold cache) can't dominate the trampoline thread.
+    constexpr uint64_t CATCHUP_MAX_BURST_MS = 250;
+
+    static int  s_always_catchup_env = -1;
+    if (s_always_catchup_env < 0) {
+        const char* v = std::getenv("FM2K_SPECTATOR_ALWAYS_CATCHUP");
+        s_always_catchup_env = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    // Offline-replay mode: catchup is meaningless because the entire file
+    // is pre-loaded into pb_queue at startup — without this gate, the
+    // catchup loop drains the whole match at unbounded rate and battle
+    // visibly fast-forwards. We always run at 1 frame per outer tick
+    // instead, matching live-pace 100fps playback. (Offline-replay env-var
+    // detection is hoisted to the top of RunSpectatorTick — same cached
+    // value is reused here.)
+    static bool s_initial_catchup_done   = false;
+    static bool s_initial_catchup_active = false;
+    if (s_offline_replay_env_active) {
+        // Permanent disable — never engage catchup for offline replay.
+        s_initial_catchup_done = true;
+        s_initial_catchup_active = false;
+    }
+
+    // CSS catchup is now allowed. Earlier we suppressed it because catchup
+    // ran PGI+UG without render, and CSS character-preview state is heavily
+    // render-RNG dependent (cursor flicker, palette interp) — diverging there
+    // bled into battle as mirrored-character desync. Now that render fires
+    // inside the catchup loop alongside sim, RNG stays locked to host and
+    // CSS can drain like any other phase. The 250ms burst cap still bounds
+    // disk-load thrash from cold-cache .player loads (first time through
+    // each character on the roster); subsequent matches replay from warm
+    // cache and drain at full speed.
+
+    // Initial catchup state machine. Engages once when the queue first
+    // exceeds the lag target (typically right after JOIN_ACK + backfill
+    // replay), stays engaged across MANY outer ticks — bounded per-tick by
+    // CATCHUP_MAX_BURST_MS so we yield between bursts — until the queue
+    // actually drops to the live edge. Then disengages permanently for
+    // this session: later jitter or packet-loss accumulation no longer
+    // re-triggers a catchup burst (no jarring superspeed snap-to-live).
+    // The whole point is "drain backfill ONCE, smoothly". Without this,
+    // the previous one-shot semantics gave us 30 frames of drain and left
+    // the other 1100+ buffered, so first battle started 11 seconds behind
+    // host with no recovery path short of F12.
+    if (!s_initial_catchup_done && !s_initial_catchup_active &&
+        qd > SPECTATOR_LIVE_LAG_FRAMES) {
+        s_initial_catchup_active = true;
+    }
+    if (s_initial_catchup_active && qd <= SpectatorTargetDelayFrames()) {
+        s_initial_catchup_active = false;
+        s_initial_catchup_done   = true;
+    }
+    const bool needs_initial_catchup = s_initial_catchup_active;
+    const bool needs_always_catchup  = s_always_catchup_env != 0 &&
+                                       qd > SpectatorTargetDelayFrames();
+    // User-toggled FF (F12) is the explicit "speed up to live" lever.
+    const bool needs_user_ff         = g_spectator_ff_user &&
+                                       qd > SpectatorTargetDelayFrames();
+    // CSS-phase catchup: drain the backlog aggressively while the host
+    // sits in character select. Battle has no visible action to "fast-
+    // forward through" so the user can't tell catchup from steady-state,
+    // but if we let the queue accumulate across rounds we'd start the
+    // NEXT battle hundreds of frames behind. Engaging during CSS keeps
+    // the spec close to live without disrupting the in-battle viewing
+    // experience. (Render is gated on g_spectator_catchup so cursor
+    // animations still draw — see RenderFrameWithSnapshot in the loop.)
+    const uint32_t live_game_mode    = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+    // NO turbo at CSS, ever: hover-triggered .player loads are real
+    // deterministic sim work (100-500ms of CPU each) that the host paid
+    // at human pace -- any multi-pop burst stalls into a slideshow. CSS
+    // drains at a smooth 2x via the steady-state gentle drain; residual
+    // backlog clears in battle where frames cost ~0.1ms.
+    const bool needs_css_catchup     = false;
+    // Emergency battle drain: entering battle hundreds of frames behind
+    // previously had NO recovery path -- lag compounded into a perceived
+    // hang. Battle frames are cheap; turbo to the live band. NEVER for
+    // offline replay: the whole file sits in the queue from boot, so
+    // queue depth is meaningless and this turbo fast-forwarded the
+    // entire match (user report 2026-06-11). Replays play 1:1; F12 is
+    // the explicit speed lever, and the harnesses opt into fast drain
+    // via FM2K_SPECTATOR_ALWAYS_CATCHUP=1.
+    const bool needs_battle_emergency = !s_offline_replay_env_active &&
+                                        (live_game_mode >= 3000u) &&
+                                        qd > SpectatorTargetDelayFrames() + 600;
+    // Render parity is required during catchup — every phase. Render-side
+    // game_rand mutations (ProcessShakeEffect mode 4, ProcessColorInterpolation
+    // mode 3, particle FX) run on the host once per simulated frame. If the
+    // spectator's catchup loop runs PGI+UG N times but renders only once per
+    // outer tick, the host advances the RNG by N renders' worth while we
+    // advance by 1, and state diverges in proportion to catchup speedup.
+    // Symptom: F12-fast-forward in battle desynced HP/positions/scripts even
+    // with PIN_RNG synced — render mutations had been silently dropped for
+    // 50+ catchup-loop iterations. Render in the loop costs more GPU but
+    // keeps RNG locked to host across CSS, battle, and inter-match drain.
+    g_spectator_catchup = needs_initial_catchup || needs_always_catchup ||
+                          needs_user_ff       || needs_css_catchup ||
+                          needs_battle_emergency;
+
+    const uint64_t catchup_start_ms = GetTickCount64();
+    uint32_t catchup_frames = 0;
+    while (g_spectator_catchup) {
+        if (!SpectatorSimOneFrame()) break;
+        // Render only every 64th catchup frame. Per-frame render here
+        // existed for RNG parity (render-side game_rand advanced the
+        // gameplay seed), which 57b72ad made obsolete: render now has
+        // its own isolated RNG stream and never touches the gameplay
+        // seed -- proven by deep-join parity matching bit-for-bit
+        // through a 3500-frame catchup window. Skipping render turns
+        // catchup from ~10ms/frame into ~0.1ms/frame: a mid-match join
+        // drains thousands of frames in well under a second ("snapshot
+        // feel"). The sparse renders keep visual progress on screen.
+        if ((++catchup_frames & 63u) == 0) {
+            RenderFrameWithSnapshot();
+        }
+        ControlChannel_Poll();   // keeps TCP recv drained, no failover side-effects
+        if (SpectatorNode_PendingFrameCount() <= SpectatorTargetDelayFrames()) {
+            // Live edge reached. The outer-tick state machine flips
+            // s_initial_catchup_active → s_initial_catchup_done next
+            // call, so this branch only needs to bail.
+            g_spectator_catchup = false;
+            return;  // catchup-final tick already sim'd + rendered
+        }
+        if (GetTickCount64() - catchup_start_ms >= CATCHUP_MAX_BURST_MS) {
+            // Bounded — yield to the outer tick. Catchup re-engages next
+            // tick if we're still over the lag target. We've already
+            // rendered this iteration, so return without the trailing
+            // steady-state sim+render.
+            g_spectator_catchup = false;
+            return;
+        }
+    }
+    g_spectator_catchup = false;  // safety: clear before render path
+
+    // Steady-state path: one popped frame, one render. Reached when catchup
+    // never engaged (queue was already in the live band). Skip render when no
+    // INPUT was available (drained head non-INPUTs only).
+    if (!SpectatorSimOneFrame()) {
+        RenderFrameWithSnapshot();
+        return;
+    }
+    // Gentle drain: one extra sim step per tick above the live band --
+    // 2x playback, barely perceptible, converges a multi-second lag in
+    // tens of seconds. This is the ONLY drain mechanism at CSS (see
+    // needs_css_catchup above); battle additionally has the emergency
+    // turbo. Skipped for offline replay (whole file queued at boot --
+    // permanent 2x is not "playback").
+    if (!s_offline_replay_env_active &&
+        SpectatorNode_PendingFrameCount() >
+        SpectatorTargetDelayFrames() + 100) {
+        SpectatorSimOneFrame();
+    }
+
+    RenderFrameWithSnapshot();
+}
+
