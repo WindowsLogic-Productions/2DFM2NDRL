@@ -34,6 +34,21 @@
 #include <cstring>
 #include <atomic>
 
+// Battle RNG seed. Canonical pin is 0x12345678 (deterministic for tests).
+// FM2K_TEST_BATTLE_SEED overrides it so we can drive a DIFFERENT match -- and,
+// since stage selection is RNG-driven at the CSS->battle transition, a
+// different STAGE -- on host + guest + spectator alike (all read the same env
+// and the host broadcasts PIN_RNG to the spectator), to verify they still
+// agree. Cached once per process.
+uint32_t Netplay_TestBattleSeed() {
+    static uint32_t s = 0;
+    if (!s) {
+        const char* e = std::getenv("FM2K_TEST_BATTLE_SEED");
+        s = (e && *e) ? (uint32_t)std::strtoul(e, nullptr, 0) : 0x12345678u;
+    }
+    return s;
+}
+
 // GEKKONET SESSION - Battle Mode (rollback)
 // =============================================================================
 
@@ -448,8 +463,8 @@ bool Netplay_StartBattle() {
         "0<->%d, local_delay=%d)",
         prediction_window, runahead, runahead_pref, local_delay);
 
-    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
-    SpectatorNode_AppendPinRng(0x12345678);
+    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = Netplay_TestBattleSeed();
+    SpectatorNode_AppendPinRng(Netplay_TestBattleSeed());
     SaveState_Init();
     SaveState_DoInitialSync();  // eager pre-AdvEvent reset (was lazy)
     SoundRollback::Init();
@@ -471,7 +486,7 @@ bool Netplay_StartBattle() {
     // SpectatorNode_OnMatchStart, which inlines them into the
     // MATCH_START event's 96-byte payload (byte-compatible with the old
     // ReplayHeader so the wire schema stays stable).
-    const uint32_t initial_seed = 0x12345678;
+    const uint32_t initial_seed = Netplay_TestBattleSeed();
     const uint32_t initial_state_hash =
         SaveState_GetRegionChecksums().gameplay_fingerprint;
 
@@ -651,7 +666,7 @@ bool Netplay_StartStressBattle() {
     g_local_delay = 0;
 
     // Deterministic initial RNG seed (matches Netplay_StartBattle).
-    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
+    *(uint32_t*)FM2K::ADDR_RANDOM_SEED = Netplay_TestBattleSeed();
     SaveState_Init();
     SaveState_DoInitialSync();  // eager pre-AdvEvent reset
     SoundRollback::Init();
@@ -667,7 +682,7 @@ bool Netplay_StartStressBattle() {
     // runtime / boot sequence left there — and the post-sim rng on
     // frame 0 diverges from the record (~ that's the literal record vs
     // replay rng split the harness diff caught at frame 0).
-    SpectatorNode_AppendPinRng(0x12345678);
+    SpectatorNode_AppendPinRng(Netplay_TestBattleSeed());
     SpectatorNode_AppendResetInputState();
     SpectatorNode_AppendSoundInit();
     // Emit MATCH_START with zeroed CSS metadata (boot-to-battle bypasses
@@ -676,7 +691,7 @@ bool Netplay_StartStressBattle() {
     // not for the metadata to be accurate.
     SpectatorNode_OnMatchStart(
         /*game_hash*/         0,
-        /*initial_rng_seed*/  0x12345678,
+        /*initial_rng_seed*/  Netplay_TestBattleSeed(),
         /*initial_state_hash*/0,
         /*p1_char*/0, /*p1_color*/0,
         /*p2_char*/0, /*p2_color*/0,

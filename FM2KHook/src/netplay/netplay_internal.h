@@ -1,4 +1,9 @@
 #pragma once
+
+// Battle RNG seed (default 0x12345678; FM2K_TEST_BATTLE_SEED overrides) --
+// defined in netplay_battle.cpp, used by netplay_css.cpp's CSS->battle pin.
+uint32_t Netplay_TestBattleSeed();
+
 // netplay.cpp shared state, externed so the split netplay_*.cpp TUs can share it.
 // Pure linkage move (no g_foo -> g_state.foo churn). Definitions live in netplay.cpp.
 #include "netplay.h"

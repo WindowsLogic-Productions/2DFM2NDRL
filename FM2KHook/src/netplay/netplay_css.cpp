@@ -114,8 +114,8 @@ bool Netplay_ProcessCSS() {
         // frames ran unsynchronized and diverged the RNG. Stage selection
         // uses RNG during CSS->battle transition, so it MUST be identical
         // from this point forward.
-        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = 0x12345678;
-        SpectatorNode_AppendPinRng(0x12345678);
+        *(uint32_t*)FM2K::ADDR_RANDOM_SEED = Netplay_TestBattleSeed();
+        SpectatorNode_AppendPinRng(Netplay_TestBattleSeed());
 
         // Canonical CSS open (belt-and-braces for the swap-window input
         // guard in Hook_GetPlayerInput): no confirm state and no rematch
