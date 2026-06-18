@@ -801,10 +801,16 @@ void Netplay_TickHeartbeat() {
 
     const float fa = gekko_frames_ahead(g_session);
     GekkoNetworkStats stats = {};
-    // Remote handle 0 is the peer in 2p sessions. For 1p offline/stress
-    // there's no remote so stats stay zero; that's fine, BEAT still
-    // shows local state.
-    gekko_network_stats(g_session, 0, &stats);
+    // Query the REMOTE peer's handle, not a hardcoded 0. For the HOST
+    // (player_index 0) the LOCAL slot is handle 0, so querying 0 returned the
+    // host's OWN stats -- ping pinned at 0ms. That cosmetic bug made the host
+    // look latency-free while the guest (index 1, whose remote IS handle 0)
+    // showed the real RTT, masking/mimicking the genuine "last_ping pins at 0
+    // -> runs ahead -> one-sided rollback" failure. Mirror
+    // Netplay_GetNetworkStats. For 1p offline/stress there's no remote so
+    // stats stay zero; BEAT still shows local state.
+    const int beat_remote_handle = (g_player_index == 0) ? 1 : 0;
+    gekko_network_stats(g_session, beat_remote_handle, &stats);
 
     const uint32_t rb_count = g_beat_window_rb_count;
     const double   rb_avg   = rb_count ? (double)g_beat_window_rb_sum / rb_count : 0.0;
