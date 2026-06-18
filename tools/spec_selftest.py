@@ -219,7 +219,16 @@ def main():
         "FM2K_PARITY_AUTOPLAY": "1",
         "FM2K_PARITY_AUTOPLAY_BATTLE": "1",
         "FM2K_AUTO_TITLE_SKIP": "1",
-        "FM2K_TEST_AUTO_CSS": "0,0,0,0,0",
+        # p1char,p1color,p2char,p2color,STAGE -- overridable so we can test a
+        # non-zero stage (e.g. FM2K_TEST_AUTO_CSS=0,0,0,1,1) and verify the
+        # live spectator loads the SAME stage the players picked.
+        "FM2K_TEST_AUTO_CSS": os.environ.get("FM2K_TEST_AUTO_CSS", "0,0,0,0,0"),
+        # Per-frame host + spectator rng/input/script traces to disk. These
+        # feed the AUTHORITATIVE gate (host-vs-spec pairing, same run) -- the
+        # ground-truth desync check, unlike the spec-vs-replay parity diff
+        # which mis-pairs the wrong match under multi-match autoplay.
+        "FM2K_HOST_TRACE":       os.environ.get("FM2K_HOST_TRACE", "1"),
+        "FM2K_SPECTATOR_DEBUG":  os.environ.get("FM2K_SPECTATOR_DEBUG", "1"),
     }
     if args.total_frames > 0:
         common_env["FM2K_AUTO_TERMINATE_TOTAL"] = str(args.total_frames)
@@ -227,7 +236,7 @@ def main():
                               os.environ.get("FM2K_AUTOPLAY_CSS_DWELL", "8"))
     else:
         common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
@@ -488,18 +497,69 @@ def main():
     replay_m1 = OUT_DIR / "replay_m1.pty"
     n_spec   = trim_first_battle_segment(spec_pty, spec_m1)
     n_replay = trim_first_battle_segment(replay_pty, replay_m1)
-    print(f"[harness] GATE: diffing SPECTATOR vs REPLAY parity, first battle "
-          f"segment (spec={n_spec} rows, replay={n_replay} rows; both "
-          f"confirmed-stream-driven)")
+    print(f"[harness] (advisory) SPECTATOR vs REPLAY parity, first battle "
+          f"segment (spec={n_spec} rows, replay={n_replay} rows). NOT the gate: "
+          f"this compares against a SEPARATE replay process that mis-pairs the "
+          f"wrong match under multi-match autoplay and position-mis-aligns the "
+          f"spectator's catch-up cadence -- it produced false 'frame 71' alarms "
+          f"while host-vs-spec showed bit-exact sync. See the GATE below.")
     diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
                                str(spec_m1), str(replay_m1)])
 
-    if not args.keep and diff_rc == 0:
+    # AUTHORITATIVE GATE: host-vs-spec per-frame trace pairing (SAME run, same
+    # match = ground truth). Both the host and spectator here watch the
+    # identical match, so bit-for-bit (rng, inputs, scripts) at every paired
+    # battle frame proves the spectator stayed in sync. Needs FM2K_HOST_TRACE=1
+    # + FM2K_SPECTATOR_DEBUG=1 (set in common_env). [SPEC-TRACE] is dense over
+    # bf 0..99; [SPEC-FP]/[HOST-FP] checkpoint every 30 frames to match end.
+    import re as _ret
+    def _load(path, pat):
+        d = {}
+        try:
+            for ln in open(path, errors="ignore"):
+                m = _ret.search(pat, ln)
+                if m:
+                    d.setdefault(int(m.group(1)), m.groups()[1:])
+        except OSError:
+            pass
+        return d
+    host_dbg = game_dir / "logs" / "FM2K_P1_Debug.log"
+    spec_dbg = game_dir / "logs" / "FM2K_P3_Debug.log"
+    TRC = (r'(?:HOST|SPEC)-TRACE\] bf=(\d+) rng_pre=0x[0-9A-F]+ '
+           r'rng_post=0x([0-9A-F]+) p1=0x([0-9A-F]+) p2=0x([0-9A-F]+)')
+    FP  = (r'(?:HOST|SPEC)-FP\] bf=(\d+).*?rng=0x([0-9A-F]+).*?'
+           r'p1_script=(-?\d+) p2_script=(-?\d+)')
+    Ht, Hf = _load(host_dbg, TRC), _load(host_dbg, FP)
+    St, Sf = _load(spec_dbg, TRC), _load(spec_dbg, FP)
+    sh_t = sorted(set(Ht) & set(St))
+    sh_f = sorted(set(Hf) & set(Sf))
+    mm = [b for b in sh_t if Ht[b] != St[b]] + [b for b in sh_f if Hf[b] != Sf[b]]
+    paired = len(sh_t) + len(sh_f)
+    print(f"[harness] GATE (host-vs-spec trace pairing, ground truth): "
+          f"{paired} paired battle frames "
+          f"(dense 0..{max(sh_t) if sh_t else -1}, FP to "
+          f"{max(sh_f) if sh_f else -1}), {len(mm)} mismatch(es)")
+    if mm:
+        for b in sorted(mm)[:6]:
+            src = (Ht, St) if b in Ht else (Hf, Sf)
+            print(f"  bf={b} HOST={src[0].get(b)} SPEC={src[1].get(b)}")
+    gate_ok = paired > 0 and not mm
+
+    if not args.keep and gate_ok:
         for f in (p1_pty, spec_pty, replay_pty, OUT_DIR / "p1.log",
                   OUT_DIR / "p2.log", OUT_DIR / "spec.log",
                   OUT_DIR / "replay.log"):
             f.unlink(missing_ok=True)
-    return diff_rc
+    if paired == 0:
+        print("[harness] GATE INCONCLUSIVE: no paired trace frames -- falling "
+              "back to spec-vs-replay diff_rc (set FM2K_HOST_TRACE=1 + "
+              "FM2K_SPECTATOR_DEBUG=1, ensure a battle phase ran)")
+        return diff_rc
+    if gate_ok:
+        print("[harness] OVERALL PASS: spectator bit-exact with host.")
+        return 0
+    print("[harness] OVERALL FAIL: spectator desynced from host (trace pairing).")
+    return 1
 
 
 if __name__ == "__main__":
