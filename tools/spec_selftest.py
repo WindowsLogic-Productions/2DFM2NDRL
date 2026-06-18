@@ -563,15 +563,28 @@ def main():
                     first = ("field-mismatch @rng", rng, "spec", fields,
                              "host", hmap[rng])
         return len(spec_rows), not_found, field_mm, first
-    ct, mt, ftm, first_t = _check(_rows2(host_dbg, TRC), _rows2(spec_dbg, TRC))
-    cf, mf, ffm, first_f = _check(_rows2(host_dbg, FP),  _rows2(spec_dbg, FP))
+    # TRACE: rng-PRESENCE only. The p1/p2 input fields are capture-noise
+    # (predicted-vs-confirmed + different capture points on host vs spec -- the
+    # same reason parity_diff excludes inputs). rng_post IS the post-frame state
+    # fingerprint: if every spectator rng appears in the host's set, the sims
+    # produced identical state. Comparing inputs here gave false mismatches on a
+    # snapshot-join (31 of them) while rng+scripts were bit-exact.
+    trc_spec = _rows2(spec_dbg, TRC)
+    host_trc_rng = {rng for rng, _ in _rows2(host_dbg, TRC)}
+    ct = len(trc_spec)
+    mt = sum(1 for rng, _ in trc_spec if rng not in host_trc_rng)
+    first_t = next(((rng,) for rng, _ in trc_spec if rng not in host_trc_rng), None)
+    # FP: rng-presence + SCRIPT match (scripts are gameplay state -> reliable;
+    # a script mismatch at a matching rng would be a genuine desync).
+    cf, mf, ffm, first_f = _check(_rows2(host_dbg, FP), _rows2(spec_dbg, FP))
     checked = ct + cf
-    bad = mt + ftm + mf + ffm
-    print(f"[harness] GATE (rng-keyed host-vs-spec, any-join/multi-match robust): "
-          f"checked {checked} spectator frames (TRACE {ct}, FP {cf}); "
-          f"{mt + mf} rng-not-in-host, {ftm + ffm} field-mismatch")
+    bad = mt + mf + ffm
+    print(f"[harness] GATE (host-vs-spec; TRACE rng-presence, FP rng+scripts; "
+          f"any-join / multi-match robust): checked {checked} spectator frames "
+          f"(TRACE {ct}, FP {cf}); {mt + mf} rng-not-in-host, "
+          f"{ffm} FP script-mismatch")
     if first_t:
-        print(f"  TRACE first issue: {first_t}")
+        print(f"  TRACE rng-not-in-host (real state divergence): {first_t}")
     if first_f:
         print(f"  FP first issue: {first_f}")
     gate_ok = checked > 0 and bad == 0
