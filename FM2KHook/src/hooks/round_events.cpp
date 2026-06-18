@@ -227,15 +227,22 @@ static char __cdecl Hook_vs_round_function() {
         // interceptor to read.)
     }
 
-    // Only emit from the authoritative host path. Both peers + the spectator's
-    // local sim run vs_round_function; if we appended on every node we'd
-    // double-broadcast on relay nodes. Daisy-chain replay is handled in the
-    // Hop-1 relay branch of HandleSpecData::EVENT_BATCH instead.
+    // Emit from BOTH player nodes (host index 0 + guest index 1) so each
+    // player's own local .fm2krep carries ROUND_START/END (and thus
+    // round_offsets for round-level seek). Each player is the SINGLE source
+    // for its own spectator subtree -- host and guest subtrees are disjoint,
+    // so emitting on both is NOT a double-broadcast. SPECTATOR / relay nodes
+    // (index 2) are still skipped: they RECEIVE round events via the relay
+    // stream AND run vs_round_function locally, so emitting there would
+    // double-source. (Daisy-chain replay is handled in the Hop-1 relay branch
+    // of HandleSpecData::EVENT_BATCH.) Previously this was host-only
+    // (g_player_index != 0), which is why a guest's replay had no round
+    // markers -- and in real netplay the guest wrote no file at all.
     //
     // g_is_rolling_back guards against re-emit during a GekkoNet replay
-    // window — the same logical edge would fire multiple times across
+    // window -- the same logical edge would fire multiple times across
     // forward + replay sims and produce duplicate events.
-    if (g_player_index != 0 || g_is_rolling_back) {
+    if (g_player_index > 1 || g_is_rolling_back) {
         return ret;
     }
 

@@ -19,6 +19,7 @@
 #include <SDL3/SDL_log.h>
 #include <ws2tcpip.h>
 #include <cstdlib>
+#include <cstdio>   // std::snprintf -- peer-suffixed replay filename
 #include <string>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -192,20 +193,24 @@ void Netplay_EndBattle() {
     // recent MATCH_START and the just-appended MATCH_END. Same on-disk
     // shape as .fm2kset (full session); is_battle_slice flag distinguishes.
     //
-    // HOST-ONLY: round_events.cpp's vs_round_function detour gates emit
-    // on g_player_index == 0, so non-host peers' session_events lacks
-    // ROUND_START/END entries. Writing both peers' files at battle end
-    // would race on the same `replays/<ts>.fm2krep` filename and the
-    // (possibly later) non-host write would clobber the authoritative
-    // host file with one missing round events + missing session_id.
-    // The host's file is canonical. Spectators that record their own
-    // local files use a separate code path.
-    if (g_player_index == 0) {
-        char ts[64] = {};
+    // BOTH PLAYERS write their own local replay (host index 0 + guest
+    // index 1). round_events.cpp now emits ROUND_START/END on both players,
+    // so the guest's file carries round markers + round_offsets too -- the
+    // guest is no longer left with no replay at all. The filename is
+    // PEER-SUFFIXED (_p0 / _p1): on real netplay the two players are on
+    // different machines so there's never a collision, but the local
+    // 2-instance test harness has both writing the same replays/ dir in the
+    // same wall-clock second -- the suffix stops the later writer clobbering
+    // the other's file. Spectators (index 2) record via a separate path.
+    if (g_player_index == 0 || g_player_index == 1) {
+        char ts[80] = {};
         std::time_t now = std::time(nullptr);
         std::tm tm_buf{};
         localtime_s(&tm_buf, &now);
-        std::strftime(ts, sizeof(ts), "replays/%Y-%m-%d_%H%M%S.fm2krep", &tm_buf);
+        char pattern[80];
+        std::snprintf(pattern, sizeof(pattern),
+            "replays/%%Y-%%m-%%d_%%H%%M%%S_p%d.fm2krep", g_player_index);
+        std::strftime(ts, sizeof(ts), pattern, &tm_buf);
         CreateDirectoryA("replays", nullptr);
         SpectatorNode_WriteCurrentBattleFile(ts);
     }
