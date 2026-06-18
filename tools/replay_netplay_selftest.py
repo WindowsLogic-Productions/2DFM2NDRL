@@ -466,7 +466,31 @@ def main():
         print(f"[harness] FAIL: replay parity {replay_pty} missing")
         return 1
 
-    # Diff
+    # ---- PRIMARY desync gate: gekko's per-frame checksum (the live cross-peer
+    # truth). Real divergence between the two PLAYING peers logs "DESYNC #" in
+    # the per-player debug logs. The phantom zero-checksum guard logs "DESYNC
+    # ignored (phantom" -- a gekko health-slot artifact, NOT a desync. This is
+    # the authoritative "did the clients desync" signal; the parity diff below
+    # is a secondary replay-FIDELITY check (and is rollback-robust, so it only
+    # fails on a PERSISTENT divergence, never on transient speculative residue).
+    def count_live_desyncs():
+        total = 0
+        for idx in (1, 2):
+            for p in (game_dir / "logs" / f"FM2K_P{idx}_Debug.log",
+                      game_dir / f"FM2K_P{idx}_Debug.log"):
+                try:
+                    if p.exists() and p.stat().st_mtime >= start_ts:
+                        txt = p.read_text(errors="ignore")
+                        total += sum(1 for ln in txt.splitlines()
+                                     if "DESYNC #" in ln and "phantom" not in ln)
+                        break
+                except OSError:
+                    pass
+        return total
+    live_desyncs = count_live_desyncs()
+    print(f"[harness] LIVE desync gate (gekko DESYNC#, this run): {live_desyncs}")
+
+    # Diff -- replay fidelity (rollback-robust, reconvergence-aware).
     print("[harness] diffing P1 parity vs replay parity")
     diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
                                str(record_path_p1), str(replay_pty)])
@@ -478,7 +502,16 @@ def main():
         print("[harness] OVERALL FAIL: relay engagement check failed "
               f"(parity diff_rc={diff_rc})")
         return 1
-    return diff_rc
+    if live_desyncs > 0:
+        print(f"[harness] OVERALL FAIL: {live_desyncs} real live desync(s) detected "
+              f"by gekko (DESYNC#) -- the playing peers diverged.")
+        return 1
+    if diff_rc != 0:
+        print("[harness] OVERALL FAIL: persistent replay-fidelity divergence "
+              "(see parity diff above).")
+        return 1
+    print("[harness] OVERALL PASS: no live desync (gekko) and replay is faithful.")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

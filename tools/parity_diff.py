@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
-"""Diff two FM2K parity .pty captures.
+"""Diff two FM2K parity .pty captures -- rollback-robust.
 
-Aligns by KgtParitySnapshot.frame. Reports the first frame where ANY field
-differs, and prints the diverging fields side-by-side. Walk forward from the
-divergence to confirm whether it's a one-shot leak or a permanent drift.
+Aligns by KgtParitySnapshot.frame using LAST-WRITE-per-frame (not array index),
+then classifies divergences by PERSISTENCE so rollback never produces fake
+"desync" noise:
 
-Usage:
-  python3 tools/parity_diff.py path/to/parity_p1.pty path/to/parity_p3.pty
+  - index-drift          a live netplay capture has MORE snapshots than a linear
+                         replay (rollback re-sims a frame, recording it twice).
+                         An index-paired walk compares misaligned frames from the
+                         first duplicate onward -> fake divergence. Aligning by the
+                         `frame` field (last write = the confirmed value) removes it.
+  - speculative residue  even frame-aligned, the live .pty's last write for a few
+                         frames inside a rollback window can be a MISPREDICTED state
+                         the engine later corrected. It reconverges within ~rb_max
+                         frames. A diverging RUN shorter than the reconvergence
+                         window is this artifact, NOT a desync.
+  - input prediction     input_p1/input_p2 are excluded (predicted-vs-confirmed on
+                         mispredicted frames); input determinism is proven
+                         transitively via rng/pos/scripts, which ARE compared.
+
+Exit 0 = no PERSISTENT divergence (clean, or transient rollback artifacts only).
+Exit 1 = a diverging run longer than the reconvergence window (a real divergence).
+
+  python3 tools/parity_diff.py A.pty B.pty
+  FM2K_PARITY_RECONVERGE_WINDOW=32  (override the run-length threshold)
 
 Layout matches kgtengine/include/kgt/kgt_parity_snapshot.h v3.
 """
@@ -69,16 +86,16 @@ def load(path):
     return snaps
 
 def diff_snap(a, b):
-    """Returns list of (field_name, a_val, b_val) for differences."""
+    """Returns list of (field_name, a_val, b_val) for differences.
+
+    input_p1/input_p2 are deliberately NOT compared: under prediction-based
+    netplay the snapshot captures the PREDICTED remote input on mispredicted
+    frames, while the .fm2krep replay uses the CONFIRMED input -- they differ on
+    exactly the frames rollback corrects, even though the engine sim converges
+    identically. Input determinism is proven TRANSITIVELY: divergent inputs would
+    diverge rng / positions / scripts, which ARE compared below.
+    """
     out = []
-    # NOTE: input_p1/input_p2 are deliberately NOT compared. They're recorded
-    # (forensic) but under prediction-based netplay the snapshot captures the
-    # PREDICTED remote input on mispredicted frames, while the .fm2krep replay
-    # uses the CONFIRMED input — they differ on exactly the frames rollback
-    # corrects, even though the engine sim converges identically. Input
-    # determinism is proven TRANSITIVELY: divergent inputs would diverge rng /
-    # positions / scripts, which ARE compared below. Comparing the input
-    # snapshot directly is redundant and produces false "divergence" noise.
     for k in ('rng', 'match_phase', 'round_timer',
               'camera_x', 'camera_y', 'rng_after_frame'):
         if a.get(k) != b.get(k):
@@ -96,112 +113,139 @@ def diff_snap(a, b):
     return out
 
 
-# rng_only_fields: the parity recorder captures rng + rng_after_frame.
-# When the pre-battle path differs in PGI consumption (host went through
-# real CSS, replay went through auto-mash), the FIRST captured battle
-# frame's rng can lag by a few game_rand calls even though engine state
-# is otherwise byte-identical. Classify "only rng differs" as a known
-# pre-battle-path-leakage artifact so we can see if the engine sim
-# itself diverges anywhere downstream.
+# rng_only_fields: the parity recorder captures rng + rng_after_frame. When the
+# pre-battle path differs in PGI consumption (host went through real CSS, replay
+# went through auto-mash), the FIRST captured battle frame's rng can lag by a few
+# game_rand calls even though engine state is otherwise byte-identical. Classify
+# "only rng differs" as a known pre-battle-path-leakage artifact.
 _RNG_ONLY_FIELDS = {'rng', 'rng_after_frame'}
 
+# A diverging RUN shorter than this reconverges = rollback speculative-capture
+# residue, not a desync. rb_max in practice ~17; 32 gives margin. A real
+# divergence runs to match end (hundreds-thousands of frames).
+RECONVERGE_WINDOW = int(os.environ.get('FM2K_PARITY_RECONVERGE_WINDOW', '32'))
+BATTLE_PHASE = 3000
+
+def battle_snaps(snaps):
+    """Battle-phase snapshots (chars loaded), in capture order. Skips battle-init
+    snaps where chars aren't populated yet (script_idx == -1 / 0xFFFFFFFF)."""
+    return [s for s in snaps
+            if s['match_phase'] == BATTLE_PHASE
+            and s['p1']['script_idx'] != -1 and s['p2']['script_idx'] != -1]
+
+def frame_field_reliable(bsnaps):
+    """True if the `frame` field is a usable per-frame key. It is NOT in replay
+    catch-up mode, where the engine frame counter sticks low and repeats (e.g.
+    341 distinct values across 2999 sim frames) -- there we must align by capture
+    POSITION instead. A reliable field is mostly-distinct (rollback rewrites a
+    handful of frames, so a live netplay capture is still ~all-distinct)."""
+    if not bsnaps:
+        return False
+    distinct = len({s['frame'] for s in bsnaps})
+    return distinct >= 0.9 * len(bsnaps)
+
+def _runs(keys, pos):
+    """Group a sorted key list into maximal runs consecutive in the key sequence."""
+    if not keys:
+        return []
+    runs = [[keys[0]]]
+    for k in keys[1:]:
+        if pos[k] == pos[runs[-1][-1]] + 1:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    return runs
+
 def main(a_path, b_path):
-    a = load(a_path)
-    b = load(b_path)
+    A = battle_snaps(load(a_path))
+    B = battle_snaps(load(b_path))
     print()
-    # Align by "first battle-phase snapshot" (match_phase == 3000) on each
-    # side, then walk forward index-paired. The `frame` field by itself is
-    # FM2K's match-counter and shares 0..N between CSS and battle phases,
-    # so blind-merging by frame number aligns CSS-on-A with battle-on-B.
-    BATTLE_PHASE = 3000
-    def first_battle_idx(snaps):
-        # "Real" first battle frame: match_phase==3000 AND chars are
-        # actually loaded into the object pool (script_idx != 0xFFFFFFFF).
-        # During battle-init the host parity recorder catches an early
-        # window where match_phase has already flipped to 3000 but the
-        # battle-init game object hasn't yet populated character slots —
-        # those snaps have script_idx == 0xFFFFFFFF / pos == 0 / hp == 0
-        # and don't represent a real sim frame. Skip them so alignment
-        # picks the first true battle-frame on each side.
-        for i, s in enumerate(snaps):
-            if s['match_phase'] != BATTLE_PHASE:
-                continue
-            p1_si = s['p1']['script_idx']
-            p2_si = s['p2']['script_idx']
-            # script_idx is parsed as signed i32; uninitialized = -1
-            # (= 0xFFFFFFFF in unsigned). Skip those snaps.
-            if p1_si == -1 or p2_si == -1:
-                continue
-            return i
-        return None
-    ai = first_battle_idx(a)
-    bi = first_battle_idx(b)
-    if ai is None or bi is None:
-        print(f'No battle phase found: a_idx={ai} b_idx={bi}')
+    if not A or not B:
+        print(f"No battle snapshots: A={len(A)} B={len(B)}")
         return 2
-    print(f'A battle starts at index {ai} (frame={a[ai]["frame"]})')
-    print(f'B battle starts at index {bi} (frame={b[bi]["frame"]})')
-    n = min(len(a) - ai, len(b) - bi)
-    print(f'comparing {n} battle-aligned snapshots')
-    # Walk index-paired from battle start; report first divergence.
-    # Classify each frame's diff:
-    #   - ENGINE DIFF: a field outside the artifact set differs → real desync
-    #   - ARTIFACT-ONLY: only input_p1/p2 differ → parity-recorder display
-    #     quirk, engine state still matches
-    first_engine_diff = None
-    first_rng_diff = None
-    rng_only_frames = 0
-    for k in range(n):
-        sa, sb = a[ai + k], b[bi + k]
+
+    # Choose alignment. Frame-field alignment (last-write-per-frame) collapses a
+    # live netplay capture's rollback re-sim duplicates so they don't off-by-one
+    # the walk -- but it needs a reliable frame field on BOTH sides. When a side
+    # is in replay catch-up (frame field repeats), fall back to positional
+    # pairing from battle start (no rollback dups exist in that single stream,
+    # so 1:1 by position is correct -- this is the original method).
+    if frame_field_reliable(A) and frame_field_reliable(B):
+        am = {}                     # last write wins (confirmed value)
+        for s in A: am[s['frame']] = s
+        bm = {}
+        for s in B: bm[s['frame']] = s
+        keys = sorted(set(am) & set(bm))
+        get = lambda k: (am[k], bm[k])
+        prev = lambda k: (am.get(k - 1), bm.get(k - 1))
+        label = (f"frame-aligned (rollback-robust): A={len(am)} B={len(bm)} frames, "
+                 f"shared={len(keys)} (A-only {len(set(am)-set(bm))}, "
+                 f"B-only {len(set(bm)-set(am))})")
+    else:
+        n = min(len(A), len(B))
+        keys = list(range(n))
+        get = lambda k: (A[k], B[k])
+        prev = lambda k: (A[k - 1] if k > 0 else None, B[k - 1] if k > 0 else None)
+        label = (f"position-aligned (frame field unreliable -- replay catch-up): "
+                 f"A={len(A)} B={len(B)} battle snaps, paired={n}")
+    print(f"{label}; reconverge_window={RECONVERGE_WINDOW}")
+
+    div = {}            # key -> engine diff (inputs excluded)
+    rng_only = 0
+    for k in keys:
+        sa, sb = get(k)
         d = diff_snap(sa, sb)
         if not d:
             continue
-        diff_fields = {fld for fld, _, _ in d}
-        if diff_fields.issubset(_RNG_ONLY_FIELDS):
-            rng_only_frames += 1
-            if first_rng_diff is None:
-                first_rng_diff = (k, sa, sb, d)
+        if {f for f, _, _ in d}.issubset(_RNG_ONLY_FIELDS):
+            rng_only += 1
             continue
-        if first_engine_diff is None:
-            first_engine_diff = (k, sa, sb, d)
-            break
+        div[k] = d
 
-    if first_engine_diff is None:
-        msg = f'\nALL {n} ALIGNED FRAMES SHOW IDENTICAL ENGINE STATE.'
-        if rng_only_frames:
-            msg += (f' ({rng_only_frames} rng-only frames — pre-battle '
-                    f'game_rand consumption asymmetry; sim is deterministic.)')
+    if not div:
+        msg = f"\nCLEAN: all {len(keys)} aligned frames show IDENTICAL engine state."
+        if rng_only:
+            msg += (f" ({rng_only} rng-only frames -- pre-battle game_rand "
+                    f"consumption asymmetry; sim is deterministic.)")
         print(msg)
-        if first_rng_diff:
-            k, sa, sb, d = first_rng_diff
-            print(f'\nFirst rng-only divergence at k={k} '
-                  f'(A.frame={sa["frame"]} B.frame={sb["frame"]}):')
-            for fld, av, bv in d:
-                print(f'  {fld:<32}  A=0x{av:08X}  B=0x{bv:08X}  '
-                      f'delta={(bv-av)&0xFFFFFFFF}')
         return 0
-    else:
-        k, sa, sb, d = first_engine_diff
-        print(f'\nFIRST ENGINE DIVERGENCE at battle-aligned k={k} '
-              f'(A.frame={sa["frame"]} B.frame={sb["frame"]})')
-        print()
-        for fld, av, bv in d:
-            if isinstance(av, int):
-                print(f'  {fld:32s}  A=0x{av & 0xFFFFFFFF:08X}  B=0x{bv & 0xFFFFFFFF:08X}'
-                      f'  delta={bv - av}')
-            else:
-                print(f'  {fld:32s}  A={av}  B={bv}')
-        # Show 1 frame of context BEFORE divergence (last matching)
-        if k > 0:
-            pa = a[ai + k - 1]
-            pb = b[bi + k - 1]
-            print(f'\n  Last matching frame: A.frame={pa["frame"]} B.frame={pb["frame"]}')
-            print(f'    rng={pa["rng"]:#x} input_p1=0x{pa["input_p1"]:03X} input_p2=0x{pa["input_p2"]:03X}')
-            print(f'    p1.pos=({pa["p1"]["pos_x"]},{pa["p1"]["pos_y"]}) '
-                  f'p1.vel=({pa["p1"]["vel_x"]},{pa["p1"]["vel_y"]}) p1.script={pa["p1"]["script_idx"]}/{pa["p1"]["item_idx"]}')
-            print(f'    p2.pos=({pa["p2"]["pos_x"]},{pa["p2"]["pos_y"]}) '
-                  f'p2.vel=({pa["p2"]["vel_x"]},{pa["p2"]["vel_y"]}) p2.script={pa["p2"]["script_idx"]}/{pa["p2"]["item_idx"]}')
-        return 1  # non-zero = real divergence found
+
+    pos = {k: i for i, k in enumerate(keys)}
+    runs = _runs(sorted(div), pos)
+    persistent = [r for r in runs if len(r) > RECONVERGE_WINDOW]
+    transient  = [r for r in runs if len(r) <= RECONVERGE_WINDOW]
+
+    print(f"\n{len(div)} diverging frame(s) in {len(runs)} run(s): "
+          f"{len(transient)} transient (<= {RECONVERGE_WINDOW} frames, reconverges -> "
+          f"rollback speculative-capture residue), "
+          f"{len(persistent)} PERSISTENT.")
+    if transient:
+        lt = max(transient, key=len)
+        print(f"  longest transient run: frames {lt[0]}..{lt[-1]} ({len(lt)} frames), "
+              f"then engine state matches again -- the live .pty captured a "
+              f"mispredicted frame the engine later corrected. NOT a desync.")
+
+    if not persistent:
+        print("\nPASS: no persistent divergence. Replay is faithful to the live "
+              "confirmed timeline; all diffs are transient rollback artifacts.")
+        return 0
+
+    r = persistent[0]
+    k0 = r[0]
+    print(f"\nPERSISTENT ENGINE DIVERGENCE: run of {len(r)} frames from frame={k0} "
+          f"(does NOT reconverge within {RECONVERGE_WINDOW}) -- REAL divergence.")
+    for fld, av, bv in div[k0]:
+        if isinstance(av, int):
+            print(f"  {fld:32s} A=0x{av & 0xFFFFFFFF:08X} B=0x{bv & 0xFFFFFFFF:08X} "
+                  f"delta={bv - av}")
+        else:
+            print(f"  {fld:32s} A={av} B={bv}")
+    pa, pb = prev(k0)
+    if pa and pb:
+        print(f"\n  Last matching frame: rng={pa['rng']:#x} "
+              f"p1.script={pa['p1']['script_idx']}/{pa['p1']['item_idx']} "
+              f"p2.script={pa['p2']['script_idx']}/{pa['p2']['item_idx']}")
+    return 1
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
