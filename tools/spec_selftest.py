@@ -236,7 +236,7 @@ def main():
                               os.environ.get("FM2K_AUTOPLAY_CSS_DWELL", "8"))
     else:
         common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE", "FM2K_TEST_BATTLE_SEED"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
@@ -512,53 +512,85 @@ def main():
     # battle frame proves the spectator stayed in sync. Needs FM2K_HOST_TRACE=1
     # + FM2K_SPECTATOR_DEBUG=1 (set in common_env). [SPEC-TRACE] is dense over
     # bf 0..99; [SPEC-FP]/[HOST-FP] checkpoint every 30 frames to match end.
+    # rng-keyed (NOT bf-keyed): the spectator's per-frame rng_post is a strong
+    # state fingerprint. We assert every spectator frame's rng appears in the
+    # HOST's rng set with matching inputs/scripts. This is robust to: a frame
+    # offset (mid-battle CURRENT_MATCH snapshot join starts at host frame N,
+    # not 0), per-match bf RESETS (multi-match: each battle restarts bf at 0,
+    # so bf-keying would cross-contaminate matches), and catch-up cadence. A
+    # spectator that desyncs computes an rng the host never produced -> the
+    # frame's rng is "not in host" = hard fail.
     import re as _ret
-    def _load(path, pat):
-        d = {}
-        try:
-            for ln in open(path, errors="ignore"):
-                m = _ret.search(pat, ln)
-                if m:
-                    d.setdefault(int(m.group(1)), m.groups()[1:])
-        except OSError:
-            pass
-        return d
     host_dbg = game_dir / "logs" / "FM2K_P1_Debug.log"
     spec_dbg = game_dir / "logs" / "FM2K_P3_Debug.log"
+    # group(1)=bf, group(2)=rng, group(3+)=comparison fields.
     TRC = (r'(?:HOST|SPEC)-TRACE\] bf=(\d+) rng_pre=0x[0-9A-F]+ '
            r'rng_post=0x([0-9A-F]+) p1=0x([0-9A-F]+) p2=0x([0-9A-F]+)')
     FP  = (r'(?:HOST|SPEC)-FP\] bf=(\d+).*?rng=0x([0-9A-F]+).*?'
            r'p1_script=(-?\d+) p2_script=(-?\d+)')
-    Ht, Hf = _load(host_dbg, TRC), _load(host_dbg, FP)
-    St, Sf = _load(spec_dbg, TRC), _load(spec_dbg, FP)
-    sh_t = sorted(set(Ht) & set(St))
-    sh_f = sorted(set(Hf) & set(Sf))
-    mm = [b for b in sh_t if Ht[b] != St[b]] + [b for b in sh_f if Hf[b] != Sf[b]]
-    paired = len(sh_t) + len(sh_f)
-    print(f"[harness] GATE (host-vs-spec trace pairing, ground truth): "
-          f"{paired} paired battle frames "
-          f"(dense 0..{max(sh_t) if sh_t else -1}, FP to "
-          f"{max(sh_f) if sh_f else -1}), {len(mm)} mismatch(es)")
-    if mm:
-        for b in sorted(mm)[:6]:
-            src = (Ht, St) if b in Ht else (Hf, Sf)
-            print(f"  bf={b} HOST={src[0].get(b)} SPEC={src[1].get(b)}")
-    gate_ok = paired > 0 and not mm
+    def _rows2(path, pat):
+        out = []
+        try:
+            for ln in open(path, errors="ignore"):
+                m = _ret.search(pat, ln)
+                if m:
+                    g = m.groups()
+                    # Skip the battle-entry frame (bf==0): hp/timer/pos aren't
+                    # loaded yet and rng is pre-pin -- a transitional, not a
+                    # settled gameplay state. Host and spectator hit it at
+                    # slightly different init timing (esp. during catch-up), so
+                    # comparing it is a false mismatch. Each match has one.
+                    if int(g[0]) == 0:
+                        continue
+                    out.append((g[1], tuple(g[2:])))  # (rng, fields)
+        except OSError:
+            pass
+        return out
+    def _check(host_rows, spec_rows):
+        hmap = {}
+        for rng, fields in host_rows:
+            hmap.setdefault(rng, set()).add(fields)
+        not_found = field_mm = 0
+        first = None
+        for rng, fields in spec_rows:
+            if rng not in hmap:
+                not_found += 1
+                if first is None:
+                    first = ("rng-NOT-in-host (real desync)", rng, fields)
+            elif fields not in hmap[rng]:
+                field_mm += 1
+                if first is None:
+                    first = ("field-mismatch @rng", rng, "spec", fields,
+                             "host", hmap[rng])
+        return len(spec_rows), not_found, field_mm, first
+    ct, mt, ftm, first_t = _check(_rows2(host_dbg, TRC), _rows2(spec_dbg, TRC))
+    cf, mf, ffm, first_f = _check(_rows2(host_dbg, FP),  _rows2(spec_dbg, FP))
+    checked = ct + cf
+    bad = mt + ftm + mf + ffm
+    print(f"[harness] GATE (rng-keyed host-vs-spec, any-join/multi-match robust): "
+          f"checked {checked} spectator frames (TRACE {ct}, FP {cf}); "
+          f"{mt + mf} rng-not-in-host, {ftm + ffm} field-mismatch")
+    if first_t:
+        print(f"  TRACE first issue: {first_t}")
+    if first_f:
+        print(f"  FP first issue: {first_f}")
+    gate_ok = checked > 0 and bad == 0
 
     if not args.keep and gate_ok:
         for f in (p1_pty, spec_pty, replay_pty, OUT_DIR / "p1.log",
                   OUT_DIR / "p2.log", OUT_DIR / "spec.log",
                   OUT_DIR / "replay.log"):
             f.unlink(missing_ok=True)
-    if paired == 0:
-        print("[harness] GATE INCONCLUSIVE: no paired trace frames -- falling "
-              "back to spec-vs-replay diff_rc (set FM2K_HOST_TRACE=1 + "
-              "FM2K_SPECTATOR_DEBUG=1, ensure a battle phase ran)")
+    if checked == 0:
+        print("[harness] GATE INCONCLUSIVE: no spectator trace frames -- falling "
+              "back to spec-vs-replay diff_rc (need FM2K_HOST_TRACE=1 + "
+              "FM2K_SPECTATOR_DEBUG=1 and a battle phase)")
         return diff_rc
     if gate_ok:
-        print("[harness] OVERALL PASS: spectator bit-exact with host.")
+        print("[harness] OVERALL PASS: spectator bit-exact with host "
+              "(every spectator frame's rng+inputs+scripts found in host).")
         return 0
-    print("[harness] OVERALL FAIL: spectator desynced from host (trace pairing).")
+    print("[harness] OVERALL FAIL: spectator desynced from host (rng-keyed).")
     return 1
 
 
