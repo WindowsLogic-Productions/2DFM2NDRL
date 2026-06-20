@@ -40,6 +40,8 @@
 #include <fstream>
 #include <algorithm>
 #include <filesystem>
+#include <locale>    // std::locale::global -- make std::filesystem non-ASCII-path safe
+#include <codecvt>   // std::codecvt_utf8_utf16 (deprecated but present in libstdc++)
 #include <future>
 #include <unordered_map>
 #include <unordered_set>
@@ -158,6 +160,29 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     fm2k::launcher_log::Init();
     fm2k::launcher_log::InstallCrashHandler();
     SDL_SetLogOutputFunction(fm2k::launcher_log::SdlLogOutput, nullptr);
+
+    // Make std::filesystem locale-robust for non-ASCII paths. libstdc++'s
+    // path narrow<->wide conversion uses the GLOBAL locale's codecvt; the
+    // default "C" locale THROWS std::filesystem_error ("Cannot convert
+    // character sequence: Illegal byte sequence") the moment a path carries a
+    // byte >= 0x80 -- i.e. ANY install/profile path under a non-ASCII Windows
+    // username (accented or CJK). That uncaught throw on a worker thread is
+    // what silently closed the window for those users. A UTF-8<->UTF-16 codecvt
+    // makes wide->narrow (path::string()) total and narrow->wide interpret
+    // bytes as UTF-8, matching fm2k::utf8path. Guarded: never fatal.
+    try {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        std::locale::global(std::locale(std::locale::classic(),
+                                        new std::codecvt_utf8_utf16<wchar_t>()));
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    } catch (...) {
+        // Keep the classic locale; the explicit fm2k::utf8path helpers still work.
+    }
 
     // Rename the console window we get for the console-subsystem EXE.
     // Default title is the full EXE path or, on some launches, the
