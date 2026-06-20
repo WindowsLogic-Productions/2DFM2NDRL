@@ -39,9 +39,18 @@ void Shutdown();
 void SdlLogOutput(void* userdata, int category, SDL_LogPriority priority,
                   const char* message);
 
-// SetUnhandledExceptionFilter handler: writes the exception code + faulting
-// module + offset to the log (WriteFile, no heap alloc) then chains to the
-// prior top-level filter. Install once, early.
+// Install the process-wide failure handlers, each of which writes a one-line
+// breadcrumb to the log before the process dies. Covers the THREE distinct ways
+// the launcher can vanish, so a "shows then closes" report always leaves a
+// reason on disk:
+//   [CRASH]     -- SetUnhandledExceptionFilter: SEH fault (access violation),
+//                  records faulting module+offset, then chains to WER.
+//   [TERMINATE] -- std::set_terminate: an uncaught C++ exception (the SEH
+//                  filter's blind spot), records the exception's what().
+//   [CRT]       -- invalid-parameter / pure-virtual CRT fast-fail paths.
+// If a "closes" log ends with NONE of these (and no clean-shutdown line), the
+// process was killed from outside (antivirus / SmartScreen / Task Manager).
+// Install once, early.
 void InstallCrashHandler();
 
 }  // namespace fm2k::launcher_log

@@ -3,8 +3,12 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>   // std::set_terminate / current_exception / rethrow_exception
 #include <mutex>
+#include <stdexcept>
+#include <stdlib.h>    // _set_invalid_parameter_handler / _set_purecall_handler (MinGW CRT)
 #include <string>
 
 #include "version_local.h"                  // fm2k::kAppVersion / kAppBranch / kAppRevision
@@ -19,6 +23,9 @@ std::mutex g_mu;  // guards normal-path WriteFile; the crash path skips it on pu
 
 // Previous top-level filter, so the crash handler chains instead of swallowing.
 LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter = nullptr;
+
+// Previous std::terminate handler, chained after we log.
+std::terminate_handler g_prev_terminate = nullptr;
 
 const char* PriorityName(int p) {
     switch (p) {
@@ -106,6 +113,63 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return g_prev_filter ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
+// std::terminate path -- the launcher dying via an UNCAUGHT C++ EXCEPTION (the
+// big blind spot of SetUnhandledExceptionFilter: a thrown std::exception that
+// nobody catches calls std::terminate, NOT a structured exception, so it never
+// reaches CrashFilter). Re-throw the in-flight exception to recover its what()
+// so the log names the actual failure -- e.g. a std::filesystem_error on a
+// OneDrive cloud-placeholder path, a std::bad_alloc, a std::system_error.
+void TerminateHandler() {
+    char what[1024] = "(no active exception)";
+    if (std::exception_ptr e = std::current_exception()) {
+        try {
+            std::rethrow_exception(e);
+        } catch (const std::exception& ex) {
+            std::snprintf(what, sizeof(what), "%s", ex.what());
+        } catch (...) {
+            std::snprintf(what, sizeof(what), "(non-std exception type)");
+        }
+    }
+    char line[1280];
+    int n = std::snprintf(line, sizeof(line),
+                          "[TERMINATE] std::terminate -- uncaught C++ exception: %s\n",
+                          what);
+    if (n > static_cast<int>(sizeof(line))) {
+        n = static_cast<int>(sizeof(line));
+    }
+    CrashWriteRaw(line, n);
+    if (g_prev_terminate) {
+        g_prev_terminate();  // chain (usually -> abort, which our CrashFilter then sees)
+    }
+    std::abort();
+}
+
+// CRT fast-fail path -- a bad arg to a CRT function (e.g. a malformed format,
+// an out-of-range index in a checked call) routes here instead of crashing, and
+// also bypasses CrashFilter. Best-effort narrow of the wide CRT strings.
+void InvalidParamHandler(const wchar_t* expr, const wchar_t* func,
+                         const wchar_t* file, unsigned int line_no, uintptr_t) {
+    char e[256] = {0};
+    char f[256] = {0};
+    if (expr) WideCharToMultiByte(CP_UTF8, 0, expr, -1, e, sizeof(e) - 1, nullptr, nullptr);
+    if (func) WideCharToMultiByte(CP_UTF8, 0, func, -1, f, sizeof(f) - 1, nullptr, nullptr);
+    char line[640];
+    int n = std::snprintf(line, sizeof(line),
+                          "[CRT] invalid parameter: expr='%s' func='%s' line=%u\n",
+                          e[0] ? e : "?", f[0] ? f : "?", line_no);
+    if (n > static_cast<int>(sizeof(line))) {
+        n = static_cast<int>(sizeof(line));
+    }
+    CrashWriteRaw(line, n);
+}
+
+// Pure virtual call (calling a virtual through a partially-destroyed object).
+void PurecallHandler() {
+    static const char msg[] = "[CRT] pure virtual function call\n";
+    CrashWriteRaw(msg, static_cast<int>(sizeof(msg) - 1));
+    std::abort();
+}
+
 }  // namespace
 
 void Init() {
@@ -170,7 +234,14 @@ void SdlLogOutput(void* /*userdata*/, int /*category*/, SDL_LogPriority priority
 }
 
 void InstallCrashHandler() {
+    // SEH faults (access violation, etc.).
     g_prev_filter = SetUnhandledExceptionFilter(CrashFilter);
+    // Uncaught C++ exceptions -- the SetUnhandledExceptionFilter blind spot
+    // and the most likely "window shows then silently vanishes" cause.
+    g_prev_terminate = std::set_terminate(TerminateHandler);
+    // CRT fast-fail paths (also invisible to the SEH filter).
+    _set_invalid_parameter_handler(InvalidParamHandler);
+    _set_purecall_handler(PurecallHandler);
 }
 
 }  // namespace fm2k::launcher_log

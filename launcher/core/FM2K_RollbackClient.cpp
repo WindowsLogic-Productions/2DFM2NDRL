@@ -484,6 +484,12 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 }
 
 void SDL_AppQuit(void* appstate SDL_UNUSED, SDL_AppResult result SDL_UNUSED) {
+    // Clean-exit marker: if launcher.log ends with this line, the process shut
+    // down normally (window closed / SDL_APP_SUCCESS|FAILURE returned) -- NOT a
+    // crash. Its absence (no [CRASH]/[TERMINATE]/[CRT] either) means the process
+    // was killed from outside. This routes through SDLCustomLogOutput -> the
+    // file sink, which is still installed at AppQuit entry.
+    SDL_Log("SDL_AppQuit: clean shutdown (result=%d)", static_cast<int>(result));
     std::cout << "Shutting down FM2K launcher...\n";
     
     if (g_launcher) {
