@@ -9,6 +9,8 @@
 #include "MinHook.h"
 #include "FM2K_GameInstance.h"
 #include "FM2K_Integration.h"
+#include "launcher_log.h"  // always-on launcher.log disk sink + crash breadcrumb
+#include "FM2KHook/src/util/pii_scrub.h"  // fm2k::pii::Init -- redact before first log line
 #include "FM2K_GameIni.h"
 #include "FM2K_Utf8Path.h"
 #include "FM2KHook/src/ui/shared_mem.h"
@@ -35,6 +37,8 @@
 #include <fstream>
 #include <algorithm>
 #include <filesystem>
+#include <locale>    // std::locale::global -- make std::filesystem non-ASCII-path safe
+#include <codecvt>   // std::codecvt_utf8_utf16 (deprecated but present in libstdc++)
 #include <future>
 #include <unordered_map>
 #include <unordered_set>
@@ -869,6 +873,43 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             SetConsoleTitleA("FM2K Rollback Launcher (DEV)");
         }
     }
+
+    // Always-on launcher-side disk log next to the EXE (launcher.log). Opened
+    // HERE -- before the window/renderer/launcher object -- so a crash anywhere
+    // in startup (the "opens, shows the window, then closes" reports) still
+    // leaves a file to ask testers for. pii::Init() first so even these earliest
+    // lines are redacted. SDL_SetLogOutputFunction routes every SDL_Log to the
+    // file; LauncherUI::Init later chains its scrubbed in-UI logger to this sink
+    // (SDL_GetLogOutputFunction captures it as the "original"). The crash filter
+    // records the faulting module+offset into the same file.
+    fm2k::pii::Init();
+    fm2k::launcher_log::Init();
+    fm2k::launcher_log::InstallCrashHandler();
+    SDL_SetLogOutputFunction(fm2k::launcher_log::SdlLogOutput, nullptr);
+
+    // Make std::filesystem locale-robust for non-ASCII paths. libstdc++'s
+    // path narrow<->wide conversion uses the GLOBAL locale's codecvt; the
+    // default "C" locale THROWS std::filesystem_error ("Cannot convert
+    // character sequence: Illegal byte sequence") the moment a path carries a
+    // byte >= 0x80 -- i.e. ANY install/profile path under a non-ASCII Windows
+    // username (accented or CJK). That uncaught throw on a worker thread is
+    // what silently closed the window for those users. A UTF-8<->UTF-16 codecvt
+    // makes wide->narrow (path::string()) total and narrow->wide interpret
+    // bytes as UTF-8, matching fm2k::utf8path. Guarded: never fatal.
+    try {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        std::locale::global(std::locale(std::locale::classic(),
+                                        new std::codecvt_utf8_utf16<wchar_t>()));
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    } catch (...) {
+        // Keep the classic locale; the explicit fm2k::utf8path helpers still work.
+    }
+
     // Rename the console window we get for the console-subsystem EXE.
     // Default title is the full EXE path or, on some launches, the
     // MinGW-w64 toolchain string ("POSIX WinThreads") inherited from
@@ -1411,6 +1452,12 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 }
 
 void SDL_AppQuit(void* appstate SDL_UNUSED, SDL_AppResult result SDL_UNUSED) {
+    // Clean-exit marker: if launcher.log ends with this line, the process shut
+    // down normally (window closed / SDL_APP_SUCCESS|FAILURE returned) -- NOT a
+    // crash. Its absence (no [CRASH]/[TERMINATE]/[CRT] either) means the process
+    // was killed from outside. This routes through SDLCustomLogOutput -> the
+    // file sink, which is still installed at AppQuit entry.
+    SDL_Log("SDL_AppQuit: clean shutdown (result=%d)", static_cast<int>(result));
     std::cout << "Shutting down FM2K launcher...\n";
     
     if (g_launcher) {
@@ -1418,8 +1465,13 @@ void SDL_AppQuit(void* appstate SDL_UNUSED, SDL_AppResult result SDL_UNUSED) {
         g_launcher->Shutdown();
         g_launcher.reset();
     }
-    
+
     std::cout << "LauncherUI shutdown\n";
+
+    // Close launcher.log last: g_launcher->Shutdown() restores the SDL log sink
+    // to ours (LauncherUI::Shutdown's SDL_SetLogOutputFunction), so teardown
+    // lines still reach the file up to this point.
+    fm2k::launcher_log::Shutdown();
 }
 
 } // extern "C"

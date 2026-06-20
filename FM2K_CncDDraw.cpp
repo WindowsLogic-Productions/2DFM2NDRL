@@ -1,6 +1,7 @@
 // FM2K_CncDDraw — see header for rationale.
 
 #include "FM2K_CncDDraw.h"
+#include "FM2K_Utf8Path.h"  // WideToUtf8 -- keep the module path UTF-8, not ANSI
 
 #include <SDL3/SDL_log.h>
 
@@ -302,10 +303,15 @@ std::string StripLeadingV(const std::string& tag) {
 // ---------------------------------------------------------------------------
 
 std::string AppDir() {
-    char buf[MAX_PATH] = {};
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    // Wide module path -> UTF-8. GetModuleFileNameA would hand back ANSI bytes
+    // for a non-ASCII username (e.g. C:\Users\Jose\...), and the std::string
+    // then flows into std::filesystem::path(...) below, whose narrow->wide
+    // conversion THROWS "illegal byte sequence" -- the crash that closed the
+    // launcher for those users. UTF-8 + the global UTF-8 locale converts cleanly.
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n == 0) return ".";
-    std::string s(buf);
+    std::string s = fm2k::utf8path::WideToUtf8(std::wstring(buf, n));
     size_t slash = s.find_last_of("/\\");
     return (slash == std::string::npos) ? "." : s.substr(0, slash);
 }
@@ -401,7 +407,7 @@ bool ExtractZip(const std::string& zip_path, const std::string& dst_dir) {
 // remote != local. `force` skips the version compare and always
 // installs. On success, ends in State::Ready (newly installed) or
 // State::UpToDate (no work needed). On failure, ends in State::Failed.
-void InstallWorker(bool force) {
+void InstallWorkerImpl(bool force) {
     SetState(State::Checking);
 
     // 1. Resolve latest tag from GitHub API.
@@ -608,6 +614,22 @@ void InstallWorker(bool force) {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "CncDDraw: installed v%s at %s", remote.c_str(), install_dir.c_str());
     g_st.busy.store(false);
+}
+
+// Safety net: cnc-ddraw is a COSMETIC display upgrade and runs on its own
+// worker thread, so an uncaught exception here (e.g. a residual std::filesystem
+// path conversion on an exotic path) must never call std::terminate and take
+// the whole launcher down with it. Catch, log, fail the install, keep running.
+void InstallWorker(bool force) {
+    try {
+        InstallWorkerImpl(force);
+    } catch (const std::exception& e) {
+        SetFail(std::string("cnc-ddraw install aborted (exception): ") + e.what());
+        g_st.busy.store(false);
+    } catch (...) {
+        SetFail("cnc-ddraw install aborted (unknown exception)");
+        g_st.busy.store(false);
+    }
 }
 
 void JoinWorker() {
