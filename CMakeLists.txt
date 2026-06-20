@@ -433,6 +433,7 @@ add_executable(FM2K_RollbackLauncher
     launcher.rc
     # Main launcher files
     launcher/core/FM2K_RollbackClient.cpp
+    launcher/core/launcher_log.cpp  # always-on launcher.log disk sink + crash breadcrumb (next to the EXE)
     launcher/discovery/game_discovery.cpp  # scan + engine-sniff + async discovery worker (split)
     launcher/discovery/game_discovery_cache.cpp  # games.cache binary serialization + path canon (split)
     launcher/discovery/game_discovery_sniff.cpp  # exe/engine identification: xxhash + registry + PE sniff (split)

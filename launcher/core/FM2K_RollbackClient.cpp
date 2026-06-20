@@ -11,6 +11,8 @@
 #include "FM2K_Integration.h"
 #include "game_discovery.h"  // game scan/cache/sniff + async discovery (moved out of this file)
 #include "launcher_cli.h"  // CLI parse + headless probes + launch-mode application
+#include "launcher_log.h"  // always-on launcher.log disk sink + crash breadcrumb
+#include "FM2KHook/src/util/pii_scrub.h"  // fm2k::pii::Init -- redact before first log line
 #include "FM2K_GameIni.h"
 #include "FM2K_Utf8Path.h"
 #include "FM2KHook/src/ui/shared_mem.h"
@@ -143,6 +145,20 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             SetConsoleTitleA("FM2K Rollback Launcher (DEV)");
         }
     }
+
+    // Always-on launcher-side disk log next to the EXE (launcher.log). Opened
+    // HERE -- before the window/renderer/launcher object -- so a crash anywhere
+    // in startup (the "opens, shows the window, then closes" reports) still
+    // leaves a file to ask testers for. pii::Init() first so even these earliest
+    // lines are redacted. SDL_SetLogOutputFunction routes every SDL_Log to the
+    // file; LauncherUI::Init later chains its scrubbed in-UI logger to this sink
+    // (SDL_GetLogOutputFunction captures it as the "original"). The crash filter
+    // records the faulting module+offset into the same file.
+    fm2k::pii::Init();
+    fm2k::launcher_log::Init();
+    fm2k::launcher_log::InstallCrashHandler();
+    SDL_SetLogOutputFunction(fm2k::launcher_log::SdlLogOutput, nullptr);
+
     // Rename the console window we get for the console-subsystem EXE.
     // Default title is the full EXE path or, on some launches, the
     // MinGW-w64 toolchain string ("POSIX WinThreads") inherited from
@@ -475,8 +491,13 @@ void SDL_AppQuit(void* appstate SDL_UNUSED, SDL_AppResult result SDL_UNUSED) {
         g_launcher->Shutdown();
         g_launcher.reset();
     }
-    
+
     std::cout << "LauncherUI shutdown\n";
+
+    // Close launcher.log last: g_launcher->Shutdown() restores the SDL log sink
+    // to ours (LauncherUI::Shutdown's SDL_SetLogOutputFunction), so teardown
+    // lines still reach the file up to this point.
+    fm2k::launcher_log::Shutdown();
 }
 
 } // extern "C"
