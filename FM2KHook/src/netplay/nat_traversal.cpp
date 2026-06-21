@@ -56,6 +56,14 @@ std::atomic<bool> g_punching{false};
 std::atomic<bool> g_peer_authenticated{false};
 std::thread       g_punch_thread;
 sockaddr_in       g_punch_peer{};
+// Optional same-LAN candidate: the peer's PRIVATE addr (192.168/10/172.16),
+// learned via the hub's local_ip exchange. When set, the burst ALSO punches
+// here so two players behind the SAME router connect directly over the LAN
+// instead of hairpinning their shared public IP (which most routers refuse)
+// and falling to the hub relay. Harmless off-LAN: a 192.168.x.x that isn't the
+// peer never authenticates (the 0xCC handshake + match_token gate adoption).
+sockaddr_in       g_punch_peer_lan{};
+bool              g_have_lan_peer = false;
 
 constexpr int PUNCH_PACKETS  = 30;
 constexpr int PUNCH_PERIOD_MS = 10;   // ~300 ms total burst
@@ -149,7 +157,8 @@ bool SendStunProbe() {
 }
 
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
-                const uint8_t match_token[16]) {
+                const uint8_t match_token[16],
+                uint32_t lan_ip_be, uint16_t lan_port) {
     char ip_str[INET_ADDRSTRLEN] = {};
     in_addr ia{};
     ia.s_addr = peer_ip_be;
@@ -171,6 +180,25 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
     g_punch_peer.sin_family      = AF_INET;
     g_punch_peer.sin_addr.s_addr = peer_ip_be;
     g_punch_peer.sin_port        = htons(peer_port);
+
+    // Same-LAN candidate (peer's private addr). Punched alongside the reflexive
+    // addr below so same-router pairs go direct over the LAN. Skip if it equals
+    // the reflexive addr (nothing gained) or is zero (not provided).
+    g_have_lan_peer = false;
+    if (lan_ip_be != 0 && lan_ip_be != peer_ip_be) {
+        g_punch_peer_lan = {};
+        g_punch_peer_lan.sin_family      = AF_INET;
+        g_punch_peer_lan.sin_addr.s_addr = lan_ip_be;
+        g_punch_peer_lan.sin_port        = htons(lan_port ? lan_port : peer_port);
+        g_have_lan_peer = true;
+        char lan_str[INET_ADDRSTRLEN] = {};
+        in_addr la{};
+        la.s_addr = lan_ip_be;
+        inet_ntop(AF_INET, &la, lan_str, sizeof(lan_str));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: same-LAN candidate %s:%u — burst will also punch direct over LAN",
+            lan_str, (unsigned)ntohs(g_punch_peer_lan.sin_port));
+    }
 
     // Loopback shortcut: same-machine peers don't need NAT punch. Two
     // FM2K instances on 127.0.0.1 were eating ~2.4s each on the
@@ -247,6 +275,16 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                               reinterpret_cast<sockaddr*>(&g_punch_peer),
                               sizeof(g_punch_peer));
             if (sent == (int)sizeof(pkt)) ++sent_ok;
+            // Same-LAN candidate gets the same burst. Whichever address answers
+            // first authenticates and control_channel peer-learning adopts it
+            // (one socket carries control + gekko), so a successful LAN punch
+            // routes the whole match over the LAN with zero further config.
+            if (g_have_lan_peer) {
+                sendto(sock,
+                       reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                       reinterpret_cast<sockaddr*>(&g_punch_peer_lan),
+                       sizeof(g_punch_peer_lan));
+            }
             Sleep(PUNCH_PERIOD_MS);
         }
 

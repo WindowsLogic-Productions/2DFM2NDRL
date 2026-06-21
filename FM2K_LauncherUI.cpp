@@ -41,6 +41,38 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// Primary LAN IPv4 of this machine, for the hub's same-LAN candidate exchange:
+// UDP-connect a throwaway socket toward a public addr (connect() sends nothing
+// on a datagram socket -- it just makes the OS pick the source interface) then
+// read that source back with getsockname(). RFC1918-gated so only a real
+// private LAN address is ever advertised; "" otherwise (same-LAN path skipped).
+static std::string LocalLanIp() {
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return "";
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(53);
+    ::inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);  // route hint only; no traffic
+    std::string out;
+    if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+        sockaddr_in local{};
+        int len = static_cast<int>(sizeof(local));
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            uint32_t h = ntohl(local.sin_addr.s_addr);
+            uint8_t a = (h >> 24) & 0xFF, b = (h >> 16) & 0xFF;
+            bool priv = (a == 10) || (a == 172 && b >= 16 && b <= 31) ||
+                        (a == 192 && b == 168);
+            if (priv) {
+                char ip[INET_ADDRSTRLEN] = {};
+                ::inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+                out = ip;
+            }
+        }
+    }
+    ::closesocket(s);
+    return out;
+}
+
 // Local-only state owned by LauncherUI for the Hub panel. Defined here
 // rather than in the header to keep FM2K_HubClient.h out of the public
 // integration surface. unique_ptr<HubState> destructor needs the full
@@ -5311,7 +5343,8 @@ void LauncherUI::RenderHubPanel() {
                 // both so the hub can forward spec_tcp_port in the
                 // spectator_incoming event for the host's TCP punch.
                 hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port,
-                                      network_config_.local_port);
+                                      network_config_.local_port,
+                                      LocalLanIp());
                 // Pre-match STUN. The in-game hook does its own STUN at
                 // launch but match_start fires immediately on accept and
                 // the hook's STUN doesn't arrive at the hub for several
@@ -5792,6 +5825,22 @@ void LauncherUI::RenderHubPanel() {
                     } else {
                         ::SetEnvironmentVariableA("FM2K_HUB_RELAY_ADDR",    nullptr);
                         ::SetEnvironmentVariableA("FM2K_HUB_RELAY_SESSION", nullptr);
+                    }
+
+                    // Same-LAN candidate: the peer's private addr (hub forwards
+                    // it from the peer's local_ip). The hook also-punches it so
+                    // same-router pairs connect directly over the LAN instead of
+                    // hairpinning + relaying. Cleared when the peer didn't report
+                    // one (different networks / older client).
+                    if (!ev.match.peer_lan_ip.empty() && ev.match.peer_lan_port > 0) {
+                        std::string peer_lan = ev.match.peer_lan_ip + ":" +
+                                               std::to_string(ev.match.peer_lan_port);
+                        ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", peer_lan.c_str());
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: peer same-LAN candidate %s -> FM2K_PEER_LAN_ADDR",
+                            peer_lan.c_str());
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", nullptr);
                     }
 
                     NetworkConfig cfg = network_config_;

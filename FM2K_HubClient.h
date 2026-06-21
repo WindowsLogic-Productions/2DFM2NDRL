@@ -150,6 +150,11 @@ struct HubEvent {
         std::string peer_udp_ip;
         int peer_udp_port = 0;
         std::string peer_ws_addr;
+        // Peer's same-LAN candidate (its private 192.168/10/172.16 addr),
+        // forwarded by the hub from the peer's local_ip. Set FM2K_PEER_LAN_ADDR
+        // so the hook also punches it -- same-house pairs go direct over the LAN.
+        std::string peer_lan_ip;
+        int peer_lan_port = 0;
         // Relay fallback. Hub fills these on match_start so the hook
         // can switch to relay mode if direct punch fails. Empty/zero
         // means hub didn't advertise a relay (older hub or disabled).
@@ -330,7 +335,10 @@ public:
 
     // Outbound. Safe to call any time after Connect; queued if not yet
     // connected, sent in order once the upgrade completes.
-    void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1);
+    // local_ip (optional): this machine's LAN IPv4. The hub relays it as the
+    // peer's same-LAN candidate so same-router pairs connect over the LAN.
+    void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1,
+                     const std::string& local_ip = "");
 
     // External TCP addr discovered by the spec hook via hub TCP-STUN
     // (see FM2KHook/src/netplay/spectator_tcp.cpp PerformTcpStun). Sent

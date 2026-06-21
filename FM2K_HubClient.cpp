@@ -373,7 +373,8 @@ void HubClient::SetStealth(bool on) {
     }
 }
 
-void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
+void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port,
+                            const std::string& local_ip) {
     // tcp_port < 0 → omit; spec hook listens on the same number as UDP by
     // convention (launcher passes the same value for both bind ports). Hub
     // stores it as `user.local_tcp_port` and forwards it in
@@ -382,6 +383,10 @@ void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
                   + "\",\"port\":" + std::to_string(port);
     if (tcp_port > 0) {
         m += ",\"tcp_port\":" + std::to_string(tcp_port);
+    }
+    // local_ip: same-LAN candidate. Old hubs ignore the unknown key.
+    if (!local_ip.empty()) {
+        m += ",\"local_ip\":\"" + EscapeJsonString(local_ip) + "\"";
     }
     m += "}";
     EnqueueOut(std::move(m));
@@ -1052,6 +1057,21 @@ void HubClient::OnMessage(const std::string& msg) {
                 if (c != std::string::npos) ev.match.peer_udp_port = std::atoi(udp.c_str() + c + 1);
             }
         }
+        // Peer's same-LAN candidate: hub forwards "local": [ip, port] when the
+        // peer self-reported a LAN IP (same array shape as udp_addr).
+        std::string loc = GetSub(peer_obj, "local");
+        if (!loc.empty() && (loc.front() == '[' || loc.front() == '"')) {
+            size_t a = loc.find('"');
+            size_t b = (a == std::string::npos) ? a : loc.find('"', a + 1);
+            if (a != std::string::npos && b != std::string::npos) {
+                ev.match.peer_lan_ip = loc.substr(a + 1, b - a - 1);
+            }
+            size_t c = loc.find(',');
+            if (c != std::string::npos) {
+                ev.match.peer_lan_port = std::atoi(loc.c_str() + c + 1);
+            }
+        }
+
         std::string ws_addr = GetSub(peer_obj, "ws_addr");
         ev.match.peer_ws_addr = ws_addr;
 
