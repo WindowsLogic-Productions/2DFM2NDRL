@@ -53,7 +53,8 @@ void HubClient::SetStealth(bool on) {
     }
 }
 
-void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
+void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port,
+                            const std::string& local_ip) {
     // tcp_port < 0 → omit; spec hook listens on the same number as UDP by
     // convention (launcher passes the same value for both bind ports). Hub
     // stores it as `user.local_tcp_port` and forwards it in
@@ -63,13 +64,17 @@ void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port) {
     if (tcp_port > 0) {
         m += ",\"tcp_port\":" + std::to_string(tcp_port);
     }
+    // local_ip: same-LAN candidate. Old hubs ignore the unknown key.
+    if (!local_ip.empty()) {
+        m += ",\"local_ip\":\"" + EscapeJsonString(local_ip) + "\"";
+    }
     m += "}";
     EnqueueOut(std::move(m));
 }
 
 void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
                                const std::string& ext_ip, int ext_udp_port,
-                               bool upnp) {
+                               bool upnp, const std::string& local_ip) {
     // Same base shape as SendUdpAddr (ip/port[/tcp_port]) plus the optional
     // UPnP fields. Kept as a separate method so the 3-arg call sites stay
     // untouched and the wire payload only grows the ext_* keys on the
@@ -85,6 +90,11 @@ void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
     }
     if (ext_udp_port > 0) {
         m += ",\"ext_udp_port\":" + std::to_string(ext_udp_port);
+    }
+    // local_ip persists across the UPnP re-send (the hub would otherwise keep
+    // the value from the first SendUdpAddr, but include it for robustness).
+    if (!local_ip.empty()) {
+        m += ",\"local_ip\":\"" + EscapeJsonString(local_ip) + "\"";
     }
     m += ",\"upnp\":";
     m += (upnp ? "true" : "false");

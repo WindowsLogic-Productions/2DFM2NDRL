@@ -198,6 +198,22 @@ void HubClient::OnMessage(const std::string& msg) {
                 if (c != std::string::npos) ev.match.peer_udp_port = std::atoi(udp.c_str() + c + 1);
             }
         }
+        // Peer's same-LAN candidate: hub forwards "local": [ip, port] when the
+        // peer self-reported a LAN IP (same array shape as udp_addr). Used to
+        // also-punch the peer's private addr for same-router pairs.
+        std::string loc = GetSub(peer_obj, "local");
+        if (!loc.empty() && (loc.front() == '[' || loc.front() == '"')) {
+            size_t a = loc.find('"');
+            size_t b = (a == std::string::npos) ? a : loc.find('"', a + 1);
+            if (a != std::string::npos && b != std::string::npos) {
+                ev.match.peer_lan_ip = loc.substr(a + 1, b - a - 1);
+            }
+            size_t c = loc.find(',');
+            if (c != std::string::npos) {
+                ev.match.peer_lan_port = std::atoi(loc.c_str() + c + 1);
+            }
+        }
+
         std::string ws_addr = GetSub(peer_obj, "ws_addr");
         ev.match.peer_ws_addr = ws_addr;
 

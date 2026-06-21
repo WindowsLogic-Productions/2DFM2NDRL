@@ -150,6 +150,11 @@ struct HubEvent {
         std::string peer_udp_ip;
         int peer_udp_port = 0;
         std::string peer_ws_addr;
+        // Peer's same-LAN candidate (its private 192.168/10/172.16 addr),
+        // forwarded by the hub from the peer's local_ip. Set FM2K_PEER_LAN_ADDR
+        // so the hook also punches it -- same-house pairs go direct over the LAN.
+        std::string peer_lan_ip;
+        int peer_lan_port = 0;
         // Relay fallback. Hub fills these on match_start so the hook
         // can switch to relay mode if direct punch fails. Empty/zero
         // means hub didn't advertise a relay (older hub or disabled).
@@ -330,7 +335,11 @@ public:
 
     // Outbound. Safe to call any time after Connect; queued if not yet
     // connected, sent in order once the upgrade completes.
-    void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1);
+    // local_ip (optional): this machine's LAN IPv4 (fm2k::LocalLanIp()). The
+    // hub relays it as the peer's same-LAN candidate so two players behind the
+    // same router connect directly over the LAN. Empty = omit (backward-compat).
+    void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1,
+                     const std::string& local_ip = "");
 
     // UPnP-extended udp_addr (Phase 1 NAT reachability). Sent as a SECOND
     // udp_addr after the PortMapper completes a router mapping: carries the
@@ -347,7 +356,7 @@ public:
     // (D6) before honoring the port.
     void SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
                          const std::string& ext_ip, int ext_udp_port,
-                         bool upnp);
+                         bool upnp, const std::string& local_ip = "");
 
     // NAT classification report (Phase 2a). Sent as a small udp_addr update
     // carrying just the nat_type string once the launcher's dual STUN probe

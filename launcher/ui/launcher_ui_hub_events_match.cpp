@@ -348,6 +348,22 @@ void LauncherUI::HandleMatchStartEvent(const fm2k::HubEvent& ev) {
                         ::SetEnvironmentVariableA("FM2K_HUB_RELAY_SESSION", nullptr);
                     }
 
+                    // Same-LAN candidate: the peer's private addr (hub forwards
+                    // it from the peer's local_ip). The hook also-punches it so
+                    // same-router pairs connect directly over the LAN instead of
+                    // hairpinning + relaying. Cleared when the peer didn't
+                    // report one (different networks / older client).
+                    if (!ev.match.peer_lan_ip.empty() && ev.match.peer_lan_port > 0) {
+                        std::string peer_lan = ev.match.peer_lan_ip + ":" +
+                                               std::to_string(ev.match.peer_lan_port);
+                        ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", peer_lan.c_str());
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: peer same-LAN candidate %s -> FM2K_PEER_LAN_ADDR",
+                            peer_lan.c_str());
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", nullptr);
+                    }
+
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");

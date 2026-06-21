@@ -60,6 +60,13 @@ NatClassifyResult LauncherStunClassify(uint16_t local_port,
                                        const std::string& hub_host,
                                        uint16_t hub_udp_port,
                                        const std::string& user_id);
+
+// Best-effort primary LAN IPv4 (e.g. "192.168.1.42") of this machine, via the
+// UDP-connect-to-public + getsockname trick (no packet is sent). Used as the
+// same-LAN candidate in the hub's local_ip exchange so two players behind the
+// same router connect directly over the LAN. Returns "" if it can't resolve a
+// private address (then the same-LAN path is simply skipped).
+std::string LocalLanIp();
 }  // namespace fm2k
 
 // FM2K Memory addresses and structures (from research)

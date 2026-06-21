@@ -39,10 +39,13 @@ bool SendStunProbe();
 // ~300 ms with priority boost. Idempotent — if Punch_Tick has
 // already latched the peer for this match_token, returns immediately.
 //
-// Phase-1 stub: this currently only logs intent. The actual burst
-// driver (port from bbbr_holepunch.cpp) lands in a follow-up.
+// lan_ip_be/lan_port (optional, 0 = none): the peer's PRIVATE same-LAN
+// candidate from the hub's local_ip exchange. When non-zero the burst also
+// punches there so same-router pairs connect directly over the LAN instead of
+// hairpinning their public IP. Safe off-LAN (never authenticates if wrong).
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
-                const uint8_t match_token[16]);
+                const uint8_t match_token[16],
+                uint32_t lan_ip_be = 0, uint16_t lan_port = 0);
 
 // Called once per call to control_channel.cpp::RawReceive when the
 // first byte of an inbound packet is 0xCD. `data`/`len` is the full

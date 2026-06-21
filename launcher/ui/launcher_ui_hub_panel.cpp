@@ -110,7 +110,8 @@ void LauncherUI::RenderHubPanel() {
                     network_config_.local_port,
                     st.ext_ip,
                     static_cast<int>(st.ext_udp_port),
-                    /*upnp=*/true);
+                    /*upnp=*/true,
+                    fm2k::LocalLanIp());
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "[upnp] mapping live -- re-sent udp_addr ext=%s:%u to hub",
                     st.ext_ip.c_str(),

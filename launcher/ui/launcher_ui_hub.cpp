@@ -162,6 +162,38 @@ bool HubPreflightPunch(uint16_t local_port,
     return peer_seen;
 }
 
+// Primary LAN IPv4 of this machine (see FM2K_Integration.h). UDP-connect a
+// throwaway socket toward a public addr -- connect() on a datagram socket sends
+// nothing, it just makes the OS pick the source interface it would route
+// through -- then getsockname() reads that source back. RFC1918-gated so we
+// only ever advertise a real private LAN address as the same-LAN candidate.
+std::string fm2k::LocalLanIp() {
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return "";
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(53);
+    ::inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);  // route hint only; no traffic
+    std::string out;
+    if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+        sockaddr_in local{};
+        int len = static_cast<int>(sizeof(local));
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            uint32_t h = ntohl(local.sin_addr.s_addr);
+            uint8_t a = (h >> 24) & 0xFF, b = (h >> 16) & 0xFF;
+            bool priv = (a == 10) || (a == 172 && b >= 16 && b <= 31) ||
+                        (a == 192 && b == 168);
+            if (priv) {
+                char ip[INET_ADDRSTRLEN] = {};
+                ::inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+                out = ip;
+            }
+        }
+    }
+    ::closesocket(s);
+    return out;
+}
+
 // Pre-match launcher STUN + NAT classification (Phase 2a). Binds the UDP
 // port the game will reuse, then sends TWO 0xCD 0x01 probes from the SAME
 // socket:

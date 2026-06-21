@@ -106,7 +106,8 @@ void LauncherUI::HandleHubEvent(const fm2k::HubEvent& ev) {
                 // both so the hub can forward spec_tcp_port in the
                 // spectator_incoming event for the host's TCP punch.
                 hs.client.SendUdpAddr("127.0.0.1", network_config_.local_port,
-                                      network_config_.local_port);
+                                      network_config_.local_port,
+                                      fm2k::LocalLanIp());
 
                 // UPnP automatic port mapping (Phase 1 NAT reachability).
                 // Kick off an asynchronous router mapping of our game UDP

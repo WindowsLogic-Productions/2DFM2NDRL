@@ -453,9 +453,28 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
                 in_addr peer_ia{};
                 if (inet_pton(AF_INET, ip_s.c_str(), &peer_ia) == 1 &&
                     port_i > 0 && port_i <= 65535) {
+                    // Same-LAN candidate: the peer's private addr, passed by the
+                    // launcher (FM2K_PEER_LAN_ADDR) from the hub's local_ip
+                    // exchange. Punched alongside the reflexive addr so two
+                    // players behind the same router go direct over the LAN.
+                    uint32_t lan_ip_be = 0;
+                    uint16_t lan_port  = 0;
+                    if (const char* lan = std::getenv("FM2K_PEER_LAN_ADDR")) {
+                        std::string ls(lan);
+                        auto lc = ls.rfind(':');
+                        if (lc != std::string::npos) {
+                            in_addr lia{};
+                            int lp = std::atoi(ls.c_str() + lc + 1);
+                            if (inet_pton(AF_INET, ls.substr(0, lc).c_str(), &lia) == 1 &&
+                                lp > 0 && lp <= 65535) {
+                                lan_ip_be = lia.s_addr;
+                                lan_port  = static_cast<uint16_t>(lp);
+                            }
+                        }
+                    }
                     ::fm2k::nat::StartPunch(peer_ia.s_addr,
                                              static_cast<uint16_t>(port_i),
-                                             token_bytes);
+                                             token_bytes, lan_ip_be, lan_port);
                 }
             }
         }
