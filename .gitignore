@@ -102,3 +102,6 @@ tools/.netplay_manual/
 # named "5s"). Don't bother committing.
 /5s
 tools/.spec_selftest/
+
+# project Claude instructions -- local only, not published
+CLAUDE.md
