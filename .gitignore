@@ -105,3 +105,6 @@ tools/.spec_selftest/
 
 # project Claude instructions -- local only, not published
 CLAUDE.md
+
+# release runbook -- local only, not published
+RELEASING.md
