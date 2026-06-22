@@ -1,3 +1,5 @@
+Comment: There are no proper links to each notice and no copyright information, this does not cut in it terms of usage, but obviously the AI didn't know how to actually make third-party notices and link them to the correct license or copyright information.
+
 # Third-Party Notices
 
 This product (the FM2K Rollback launcher and `FM2KHook`/`FM95Hook` DLLs) bundles
