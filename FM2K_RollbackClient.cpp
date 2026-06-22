@@ -17,6 +17,11 @@
 #include "LocalSession.h"
 #include "OnlineSession.h"
 
+// Forward-declare the shell-side globals we read in the hit-test.
+namespace fm2k::shell {
+extern float g_titlebar_tabs_end_logical_x;
+}
+
 #include <chrono>
 #include <string>
 #include <cstring>
@@ -1409,7 +1414,9 @@ bool FM2KLauncher::Initialize() {
 void FM2KLauncher::HandleEvent(SDL_Event* event) {
     if (!event) return;
 
-    // Let ImGui handle events first
+    // Let ImGui handle events first. SDL events arrive in window pixels;
+    // since we no longer use SDL logical presentation, no coordinate
+    // translation is needed — ImGui draws at native pixels too.
     ImGui_ImplSDL3_ProcessEvent(event);
 
     // Handle window events - just log them, don't interfere
@@ -1537,28 +1544,106 @@ bool FM2KLauncher::InitializeSDL() {
     // Without this enabled, polled state never refreshes on Windows.
     SDL_SetGamepadEventsEnabled(true);
     
-    // Create window with SDL_Renderer graphics context
-    float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-    SDL_WindowFlags window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    
-    window_ = SDL_CreateWindow("FM2K Rollback Launcher", 
-        (int)(1280 * main_scale), (int)(720 * main_scale), 
+    // Create window with SDL_Renderer graphics context.
+    // Default size = 640×450 — the design canvas now includes a custom
+    // 32-px titlebar (rendered by fm2k::shell::DrawShellTitlebar) so we
+    // request 32 px more vertical than the bare design content area
+    // (640×418). SDL_WINDOW_BORDERLESS removes the OS chrome; the
+    // titlebar lives inside the client area. SDL_SetWindowHitTest below
+    // restores drag + resize behavior since BORDERLESS also nukes those.
+    SDL_WindowFlags window_flags = SDL_WINDOW_RESIZABLE
+                                 | SDL_WINDOW_HIDDEN
+                                 | SDL_WINDOW_HIGH_PIXEL_DENSITY
+                                 | SDL_WINDOW_BORDERLESS;
+
+    // Default to ×2 (1280×900) so users land on a clean integer scale
+    // regardless of display DPI. INTEGER_SCALE clamps to the largest
+    // multiple of 640×450 that fits — going smaller letterboxes; going
+    // larger picks the next clean step (×3 at ≥1920×1350, etc.).
+    window_ = SDL_CreateWindow("FM2K Rollback Launcher",
+        1280, 900,
         window_flags);
-        
+
     if (!window_) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow failed: %s", SDL_GetError());
         return false;
     }
-    
+
+    // Minimum window size: 640×450 — matches the default-create size
+    // above. Vertical is unbounded upward so users can stretch the
+    // window. Horizontal locked at 640 because layouts assume it.
+    SDL_SetWindowMinimumSize(window_, 640, 450);
+
+    // Hit-test for the borderless window. Returns DRAGGABLE for the
+    // titlebar's empty middle (so users can move the window by grabbing
+    // it), RESIZE_* for the 4-px edge frames, NORMAL elsewhere.
+    //
+    // We render at native pixels and scale layout in code via
+    // kUiScale = window_w / kBaseDesignW (1280). The titlebar is 32
+    // base-pixels tall scaled by kUiScale; brand / tabs / buttons
+    // regions scale identically. Resize bands stay at 4 window pixels
+    // so the edge feel doesn't grow with the visual scale.
+    SDL_SetWindowHitTest(window_,
+        +[](SDL_Window* win, const SDL_Point* pt, void* /*udata*/)
+            -> SDL_HitTestResult {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(win, &w, &h);
+        constexpr int   kEdge        = 4;          // resize border, window pixels
+        // Must match Theme.h kBaseDesignW.
+        constexpr float kBaseDesignW = 640.0f;
+        const float ui_scale = (float)w / kBaseDesignW;
+        const int   kTitleH    = (int)(32.0f  * ui_scale);
+        const int   kButtonsW  = (int)(78.0f  * ui_scale);
+        const int   kBrandEnd  = (int)(100.0f * ui_scale);
+        // Tabs zone end — published by DrawShellTitlebar each frame
+        // (logical x where the last tab visually ends). Empty space
+        // PAST this is DRAGGABLE (window can be moved by grabbing it),
+        // tab regions stay NORMAL (clickable). One frame of latency
+        // is fine — clicks correspond to the rendered layout from
+        // the previous frame.
+        const int   kTabsEnd = (int)(fm2k::shell::g_titlebar_tabs_end_logical_x
+                                     * ui_scale);
+
+        // Corners + edges in window pixels.
+        if (pt->x < kEdge && pt->y < kEdge)
+            return SDL_HITTEST_RESIZE_TOPLEFT;
+        if (pt->x > w - kEdge && pt->y < kEdge)
+            return SDL_HITTEST_RESIZE_TOPRIGHT;
+        if (pt->x < kEdge && pt->y > h - kEdge)
+            return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        if (pt->x > w - kEdge && pt->y > h - kEdge)
+            return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        if (pt->x < kEdge)         return SDL_HITTEST_RESIZE_LEFT;
+        if (pt->x > w - kEdge)     return SDL_HITTEST_RESIZE_RIGHT;
+        if (pt->y > h - kEdge)     return SDL_HITTEST_RESIZE_BOTTOM;
+        if (pt->y < kEdge)         return SDL_HITTEST_RESIZE_TOP;
+
+        if (pt->y < kTitleH) {
+            if (pt->x < kBrandEnd)         return SDL_HITTEST_DRAGGABLE;
+            if (pt->x < kTabsEnd)          return SDL_HITTEST_NORMAL;
+            if (pt->x > w - kButtonsW)     return SDL_HITTEST_NORMAL;
+            return SDL_HITTEST_DRAGGABLE;
+        }
+        return SDL_HITTEST_NORMAL;
+    }, nullptr);
+
     renderer_ = SDL_CreateRenderer(window_, nullptr);
     SDL_SetRenderVSync(renderer_, 1);
-    
+
     if (!renderer_) {
         SDL_LogError(SDL_LOG_CATEGORY_RENDER, "SDL_CreateRenderer failed: %s", SDL_GetError());
         SDL_DestroyWindow(window_);
         SDL_Quit();
         return false;
     }
+
+    // No SDL logical presentation — we render at native window pixels
+    // and scale layout in code via kUiScale (= window_w / kBaseDesignW).
+    // ImGui's dynamic font baking rasterizes glyphs at the per-call
+    // size we pass, so multiplying that size by kUiScale gives sharp
+    // text at any window size. Logical presentation upscales the
+    // logical render-target bilinearly, which is what made fonts read
+    // soft at non-1× windows.
 
     // App icon. We try paths first (so a future assets/icon.bmp drop-in
     // overrides without a rebuild), then fall back to an embedded

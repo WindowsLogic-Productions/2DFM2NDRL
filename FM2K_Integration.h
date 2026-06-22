@@ -9,6 +9,7 @@
 #include "ISession.h"
 #include "FM2K_CncDDraw.h"   // IniConfig used as a member of LauncherUI
 #include "FM2K_KgtParser.h"  // KgtSummary stored on FM2KGameInfo
+#include "FM2K_HubClient.h"  // fm2k::HubRoom / HubUser / HubEvent — exposed by LauncherUI accessors for the new fm2k::shell render path
 
 #include <string>
 #include <vector>
@@ -842,6 +843,131 @@ public:
     void SetScanning(bool scanning);
     void SetGamesRootPaths(const std::vector<std::string>& paths);
 
+    // ── Read-only accessors for fm2k::shell render path (M1+) ────────
+    // HubState stays an impl-internal nested struct in FM2K_LauncherUI.cpp;
+    // these accessors expose only the bits the new shell reads. Returning
+    // const& means the shell renders against live state without copies.
+    // Inline accessors touch members directly visible here; the hub_*
+    // ones are defined in FM2K_LauncherUI.cpp where HubState is complete.
+    const std::vector<FM2K::FM2KGameInfo>& games() const             { return games_; }
+    const std::vector<std::string>&        games_root_paths() const  { return games_root_paths_; }
+    LauncherState                          launcher_state() const    { return launcher_state_; }
+    int                                    selected_game_index() const { return selected_game_index_; }
+    bool                                   scanning_games() const    { return scanning_games_; }
+    bool                                   discord_signed_in() const { return discord_signed_in_; }
+    const std::string&                     discord_nick() const      { return discord_nick_; }
+
+    bool                                                  hub_connected() const;
+    const std::string&                                    hub_room_id() const;
+    const std::string&                                    hub_my_id() const;
+    const std::string&                                    hub_my_nick() const;
+    const std::vector<fm2k::HubRoom>&                     hub_rooms() const;
+    const std::unordered_map<std::string, fm2k::HubUser>& hub_users() const;
+    const std::vector<fm2k::HubEvent::MatchInProgress>&   hub_current_matches() const;
+    const std::vector<fm2k::HubEvent::MatchRow>&          hub_recent_matches() const;
+    int                                                   my_wins() const;
+    int                                                   my_losses() const;
+    int                                                   my_draws() const;
+
+    // Trigger an active-room switch from the shell. LeaveRoom + JoinRoom
+    // pair when room_id differs from the current one; no-op otherwise.
+    // Mirrors the pattern at FM2K_LauncherUI.cpp:3140.
+    void                                   SetActiveRoom(const std::string& room_id,
+                                                         const std::string& display_name);
+
+    // Open the Discord OAuth pairing modal. Called from the shell's
+    // statusbar "SIGN IN" affordance and from the auto-nudge in
+    // Render(). Idempotent — flipping the flag while it's already true
+    // is fine.
+    void                                   OpenDiscordAuth() { show_discord_auth_ = true; }
+    bool                                   discord_auth_open() const { return show_discord_auth_; }
+
+    // Tell LauncherUI that the on-disk discord_auth cache changed so
+    // it can refresh its mirror state (discord_signed_in_, discord_nick_).
+    // Used by the inline OAuth flow in fm2k::shell::RenderLoginV2 so
+    // the legacy floating modal doesn't have to be the source of
+    // truth for cache invalidation. Defined out-of-line in
+    // FM2K_LauncherUI.cpp to keep this header free of DiscordAuth.h.
+    void                                   NotifyDiscordCachePopulated();
+
+    // Build the HTTP(S) base URL for the configured hub (https for the
+    // new public hostname, legacy http://*:7700 for sytes.net or
+    // explicit ports). Out-of-line for the same reason.
+    std::string                            hub_base_url() const;
+
+    // Direct SDL window handle for the shell's custom titlebar (M5).
+    // Lets the title-bar's window glyphs call SDL_MinimizeWindow /
+    // SDL_MaximizeWindow / SDL_RestoreWindow without re-plumbing
+    // through callbacks. Returned ptr stays valid for the lifetime of
+    // the LauncherUI instance.
+    SDL_Window*                            window() const { return window_; }
+
+    // ── M3 challenge / match flow ─────────────────────────────────────
+    // Shell entry points wrapping HubClient's challenge state machine.
+    // Mirror the legacy hub panel actions at FM2K_LauncherUI.cpp:5389+.
+
+    // Inbound — set when ChallengeReceived event arrives.
+    bool                                   incoming_challenge_pending() const;
+    const std::string&                     incoming_challenger_nick()   const;
+    const std::string&                     incoming_challenger_id()     const;
+    void                                   AcceptIncomingChallenge();
+    void                                   DeclineIncomingChallenge();
+
+    // Outbound — set when ChallengeUser is called; cleared by hub
+    // events (failed/cancelled/declined/MatchStart).
+    bool                                   outgoing_challenge_pending() const;
+    const std::string&                     outgoing_challenge_nick()    const;
+
+    // Fire a challenge with default match settings (hub fills sentinels
+    // with its own defaults). M3 first ship — full settings UI lands later.
+    void                                   ChallengeUser(const std::string& target_id,
+                                                         const std::string& target_nick);
+    void                                   CancelOutgoingChallenge();
+
+    // Active hub-driven match — populated on K::MatchStart, cleared
+    // when match_result is published. Empty token = not in a match.
+    const std::string&                     current_match_token()     const;
+    const std::string&                     current_match_peer_nick() const;
+    const std::string&                     current_match_role()      const;  // "host" / "guest"
+
+    // Hash-mismatch popup. Set when the hook publishes
+    // FM2K_MATCH_OUTCOME_HASH_MISMATCH; cleared by DismissHashMismatch.
+    bool                                   show_hash_mismatch()      const;
+    const std::string&                     hash_mismatch_excerpt()   const;
+    void                                   DismissHashMismatch();
+
+    // Body of the unified Settings window (input bindings / host config
+    // / hub server / games folders / display) without owning the
+    // window chrome. The shell embeds this inside HubView::Config so
+    // the legacy Settings window and the shell view share one render
+    // path — anything you change in either is reflected in the other.
+    void RenderConfigBody();
+
+    // Ask the hub to introduce us as a spectator to user `target_id`'s
+    // current match. Hub answers with K::SpectateGranted / SpectateDenied;
+    // the existing handlers in PollHubEvents fire on_spectate_match (or
+    // surface the deny reason on hs.status_line). No-op when not connected.
+    void SpectateUser(const std::string& target_id);
+
+    // Local in-launcher ignore list (M3.5). Per-session, not persisted —
+    // first ship is the simplest workable model. Ignored users are
+    // skipped in chat render and roster rendering.
+    void                         IgnoreUser(const std::string& user_id);
+    void                         UnignoreUser(const std::string& user_id);
+    bool                         IsUserIgnored(const std::string& user_id) const;
+
+    // ── chat (docs/hub_protocol_v2.md §4.2) ───────────────────────────
+    // Hub advertises chat_v1 in hello_ack capabilities; until Connected
+    // fires this returns false. Shell branches on this to gate the
+    // chat send button + drop the [MOCK] badge.
+    bool                                   hub_has_chat() const;
+    // Send `text` to `room_id`. Caller is responsible for matching the
+    // room to the user's currently joined room — single-room model
+    // until §4.1 lands. No-op when not connected. Own messages echo
+    // back as ChatReceived events; do not push locally.
+    void                                   SendChat(const std::string& room_id,
+                                                    const std::string& text);
+
 private:
     // Logging
     void AddLog(const char* message);
@@ -876,6 +1002,20 @@ private:
     bool scroll_to_bottom_;
     SDL_LogOutputFunction original_log_function_;
     void* original_log_userdata_;
+
+    // Drain queued hub events + run the periodic STUN refresh. Extracted
+    // from RenderHubPanel so the new fm2k::shell render path can drive
+    // the hub state machine without going through the legacy UI body.
+    // RenderHubPanel still calls this at its top — both paths share one
+    // implementation. Safe to call when hub_state_ isn't initialized.
+    void PollHubEvents();
+
+    // Auto-connect to the hub once Discord OAuth is cached. Called from
+    // the new shell render path so signing in actually transitions the
+    // shell from OFFLINE to ONLINE. Legacy DockSpace UI keeps its
+    // explicit "Connect" button; this wrapper is shell-only. Idempotent
+    // — no-ops when already connected or while we're already attempting.
+    void EnsureHubConnection();
 
     // UI components
     void RenderGameSelection();

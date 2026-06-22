@@ -157,12 +157,18 @@ set(IMGUI_SDL_SOURCES
     ${IMGUI_CORE_SOURCES}
     vendored/imgui/backends/imgui_impl_sdl3.cpp
     vendored/imgui/backends/imgui_impl_sdlrenderer3.cpp
+    # ImAnim — anime.js-style tweens for ImGui (vendored from
+    # github.com/soufianekhiat/ImAnim). Depends on imgui_internal.h so
+    # it has to live inside the imgui_sdl static lib, not alongside the
+    # launcher sources. Hook DLL doesn't need it (imgui_dx is separate).
+    vendored/imanim/im_anim.cpp
 )
 
 add_library(imgui_sdl STATIC ${IMGUI_SDL_SOURCES})
-target_include_directories(imgui_sdl PUBLIC 
+target_include_directories(imgui_sdl PUBLIC
     vendored/imgui
     vendored/imgui/backends
+    vendored/imanim
 )
 target_link_libraries(imgui_sdl PUBLIC SDL3::SDL3-static)
 
@@ -339,6 +345,17 @@ add_executable(FM2K_RollbackLauncher
     OnlineSession.cpp
     LocalSession.cpp
     FM2K_LauncherUI.cpp
+    # Opt-in design-handoff sandbox (View → Design Sandbox). Throwaway
+    # surface for porting claude.ai/design mockups into ImGui+ImAnim;
+    # delete this line and the file when the port is settled.
+    FM2K_LauncherUI_DesignSandbox.cpp
+    # New AppShell render path — fm2k::shell. Replaces the legacy
+    # DockSpace UI in FM2K_LauncherUI.cpp::Render unless FM2K_LEGACY_UI=1
+    # or settings.ini `legacy_ui=1`. M1: skeleton w/ real games + roster.
+    frontend/AppShell.cpp
+    frontend/ShellState.cpp
+    frontend/Theme.cpp
+    frontend/Settings.cpp
     FM2K_HubClient.cpp
     FM2K_DiscordAuth.cpp
     FM2K_Locale.cpp
@@ -357,6 +374,10 @@ add_executable(FM2K_RollbackLauncher
     # ImGui-based input binder (shared with the hook overlay) — depends only
     # on SDL3 + ImGui, no project-specific includes.
     FM2KHook/src/ui/input_binder.cpp
+    # Shared PII scrubber — used by both the launcher's SDLCustomLogOutput
+    # and the hook DLL's LogOutputFunction so anything users share (log
+    # window copy, on-disk hook log) is pre-redacted.
+    FM2KHook/src/util/pii_scrub.cpp
     # DLL injection approach - hooks are in FM2KHook DLL
 )
 
@@ -373,6 +394,19 @@ target_link_options(FM2K_RollbackLauncher PRIVATE
 
 # Add FM2KHook as dependency
 add_dependencies(FM2K_RollbackLauncher FM2KHook fm2k_version libwinpthread_no_rsrc)
+
+# Copy assets/ into the build dir after every relink. The launcher's
+# default font + icon resolution paths look at <cwd>/assets/... and
+# Windows sets cwd to the exe's directory when the user double-clicks
+# from Explorer. Without this copy, design fonts (VT323/Silkscreen/etc.)
+# silently fall back to system Segoe UI and the chrome looks generic.
+# Cheap because copy_directory is no-op when already up-to-date.
+add_custom_command(TARGET FM2K_RollbackLauncher POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:FM2K_RollbackLauncher>/assets"
+    COMMENT "Mirroring assets/ next to FM2K_RollbackLauncher.exe"
+    VERBATIM)
 
 # FM2KUpdater.exe — companion process spawned by the launcher to
 # perform the actual EXE/DLL replacement after launcher exit. Tiny

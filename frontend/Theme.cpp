@@ -1,0 +1,604 @@
+// frontend/Theme.cpp — see header. Lifted from
+// FM2K_LauncherUI_DesignSandbox.cpp; sandbox stays in the build for
+// now (it'll be retired in M5).
+#include "Theme.h"
+#include "IconsFontAwesome6.h"
+
+#include <SDL3/SDL.h>
+#include <cmath>
+#include <cstdio>
+#include <string>
+
+namespace fm2k::shell {
+
+// ── Theme palettes ────────────────────────────────────────────────────
+// Indexed by Theme enum; SetTheme(t) copies one of these into kNerv.
+// Designed for "base + raised + accent" simplicity — same 12 roles but
+// different hue families. Drop a new entry here + bump
+// Theme::kCount + add a ThemeName() case to register a new theme.
+static const NervPalette kThemes[(int)Theme::kCount] = {
+    // NERV — Eva orange / purple / phosphor (legacy default).
+    {
+        IM_COL32(0x0a, 0x0a, 0x0a, 0xff),  // bg
+        IM_COL32(0x12, 0x12, 0x12, 0xff),  // bg2
+        IM_COL32(0xff, 0xf8, 0xe7, 0xff),  // ink
+        IM_COL32(0xcf, 0xc8, 0xb8, 0xff),  // ink2
+        IM_COL32(0x7a, 0x74, 0x68, 0xff),  // dim
+        IM_COL32(0x4a, 0x46, 0x40, 0xff),  // faint
+        IM_COL32(0x2a, 0x2a, 0x2a, 0xff),  // line
+        IM_COL32(0xff, 0xff, 0xff, 0x10),  // hr
+        IM_COL32(0xff, 0x6a, 0x00, 0xff),  // acc
+        IM_COL32(0x00, 0xd9, 0x6b, 0xff),  // phos
+        IM_COL32(0xff, 0xb0, 0x00, 0xff),  // amber
+        IM_COL32(0xff, 0x30, 0x30, 0xff),  // red
+    },
+    // TERMINAL — CRT green-on-black. Single hue (acc + phos same).
+    {
+        IM_COL32(0x06, 0x0a, 0x06, 0xff),  // bg
+        IM_COL32(0x0d, 0x14, 0x0d, 0xff),  // bg2
+        IM_COL32(0xc8, 0xff, 0xc8, 0xff),  // ink
+        IM_COL32(0x88, 0xcc, 0x88, 0xff),  // ink2
+        IM_COL32(0x4d, 0x80, 0x4d, 0xff),  // dim
+        IM_COL32(0x2a, 0x50, 0x2a, 0xff),  // faint
+        IM_COL32(0x1a, 0x33, 0x1a, 0xff),  // line
+        IM_COL32(0x99, 0xff, 0x99, 0x10),  // hr
+        IM_COL32(0x4a, 0xff, 0x4a, 0xff),  // acc
+        IM_COL32(0x4a, 0xff, 0x4a, 0xff),  // phos
+        IM_COL32(0xe8, 0xff, 0x4a, 0xff),  // amber
+        IM_COL32(0xff, 0x55, 0x55, 0xff),  // red
+    },
+    // AMBER — VT220 amber-on-black.
+    {
+        IM_COL32(0x0a, 0x07, 0x03, 0xff),  // bg
+        IM_COL32(0x14, 0x0e, 0x06, 0xff),  // bg2
+        IM_COL32(0xff, 0xd9, 0x80, 0xff),  // ink
+        IM_COL32(0xcc, 0xa0, 0x55, 0xff),  // ink2
+        IM_COL32(0x80, 0x60, 0x33, 0xff),  // dim
+        IM_COL32(0x50, 0x3c, 0x20, 0xff),  // faint
+        IM_COL32(0x33, 0x25, 0x14, 0xff),  // line
+        IM_COL32(0xff, 0xc8, 0x80, 0x10),  // hr
+        IM_COL32(0xff, 0xb0, 0x00, 0xff),  // acc
+        IM_COL32(0x66, 0xff, 0xcc, 0xff),  // phos
+        IM_COL32(0xff, 0xe5, 0x99, 0xff),  // amber
+        IM_COL32(0xff, 0x55, 0x33, 0xff),  // red
+    },
+    // ICE — cool cyan on blue-grey.
+    {
+        IM_COL32(0x07, 0x0c, 0x12, 0xff),  // bg
+        IM_COL32(0x10, 0x18, 0x22, 0xff),  // bg2
+        IM_COL32(0xe6, 0xee, 0xff, 0xff),  // ink
+        IM_COL32(0xa0, 0xb4, 0xcc, 0xff),  // ink2
+        IM_COL32(0x66, 0x7a, 0x99, 0xff),  // dim
+        IM_COL32(0x3a, 0x48, 0x5e, 0xff),  // faint
+        IM_COL32(0x22, 0x2c, 0x3a, 0xff),  // line
+        IM_COL32(0x99, 0xc8, 0xff, 0x10),  // hr
+        IM_COL32(0x55, 0xc8, 0xff, 0xff),  // acc — cyan
+        IM_COL32(0x66, 0xff, 0xb3, 0xff),  // phos — mint
+        IM_COL32(0xff, 0xc6, 0x66, 0xff),  // amber
+        IM_COL32(0xff, 0x5e, 0x7a, 0xff),  // red
+    },
+    // BLOOD — red on near-black.
+    {
+        IM_COL32(0x0a, 0x05, 0x06, 0xff),  // bg
+        IM_COL32(0x14, 0x09, 0x0b, 0xff),  // bg2
+        IM_COL32(0xff, 0xe6, 0xe6, 0xff),  // ink
+        IM_COL32(0xcc, 0x99, 0x99, 0xff),  // ink2
+        IM_COL32(0x80, 0x55, 0x55, 0xff),  // dim
+        IM_COL32(0x50, 0x33, 0x33, 0xff),  // faint
+        IM_COL32(0x33, 0x1f, 0x1f, 0xff),  // line
+        IM_COL32(0xff, 0x99, 0x99, 0x10),  // hr
+        IM_COL32(0xff, 0x33, 0x55, 0xff),  // acc — red
+        IM_COL32(0xff, 0xb0, 0xb0, 0xff),  // phos — soft pink
+        IM_COL32(0xff, 0xc6, 0x66, 0xff),  // amber
+        IM_COL32(0xff, 0x55, 0x55, 0xff),  // red
+    },
+    // MONO — pure grayscale, no chromatic accent.
+    {
+        IM_COL32(0x0a, 0x0a, 0x0a, 0xff),  // bg
+        IM_COL32(0x14, 0x14, 0x14, 0xff),  // bg2
+        IM_COL32(0xf2, 0xf2, 0xf2, 0xff),  // ink
+        IM_COL32(0xb8, 0xb8, 0xb8, 0xff),  // ink2
+        IM_COL32(0x80, 0x80, 0x80, 0xff),  // dim
+        IM_COL32(0x55, 0x55, 0x55, 0xff),  // faint
+        IM_COL32(0x33, 0x33, 0x33, 0xff),  // line
+        IM_COL32(0xff, 0xff, 0xff, 0x10),  // hr
+        IM_COL32(0xff, 0xff, 0xff, 0xff),  // acc — pure white
+        IM_COL32(0xcc, 0xcc, 0xcc, 0xff),  // phos
+        IM_COL32(0xb8, 0xb8, 0xb8, 0xff),  // amber
+        IM_COL32(0xff, 0x80, 0x80, 0xff),  // red (only colored hint)
+    },
+    // SYNTHWAVE — magenta + cyan over deep purple grid.
+    {
+        IM_COL32(0x10, 0x06, 0x1c, 0xff), IM_COL32(0x1a, 0x0c, 0x2e, 0xff),
+        IM_COL32(0xff, 0xe0, 0xff, 0xff), IM_COL32(0xc8, 0x9c, 0xe6, 0xff),
+        IM_COL32(0x88, 0x66, 0xb0, 0xff), IM_COL32(0x55, 0x3d, 0x80, 0xff),
+        IM_COL32(0x33, 0x22, 0x55, 0xff), IM_COL32(0xff, 0x99, 0xff, 0x10),
+        IM_COL32(0xff, 0x33, 0xaa, 0xff), IM_COL32(0x33, 0xe8, 0xff, 0xff),
+        IM_COL32(0xff, 0xc6, 0x66, 0xff), IM_COL32(0xff, 0x55, 0x77, 0xff),
+    },
+    // VAPORWAVE — pastel pink + cyan, low contrast on lavender.
+    {
+        IM_COL32(0x1a, 0x10, 0x24, 0xff), IM_COL32(0x26, 0x1a, 0x33, 0xff),
+        IM_COL32(0xff, 0xe0, 0xf0, 0xff), IM_COL32(0xd9, 0xb0, 0xd9, 0xff),
+        IM_COL32(0xa0, 0x80, 0xb0, 0xff), IM_COL32(0x70, 0x55, 0x80, 0xff),
+        IM_COL32(0x44, 0x33, 0x55, 0xff), IM_COL32(0xff, 0xb0, 0xe0, 0x10),
+        IM_COL32(0xff, 0x9e, 0xc8, 0xff), IM_COL32(0x80, 0xe5, 0xff, 0xff),
+        IM_COL32(0xff, 0xd9, 0x99, 0xff), IM_COL32(0xff, 0x77, 0x99, 0xff),
+    },
+    // MATRIX — bright Matrix green, near-black bg.
+    {
+        IM_COL32(0x00, 0x06, 0x00, 0xff), IM_COL32(0x05, 0x0c, 0x05, 0xff),
+        IM_COL32(0xa0, 0xff, 0xa0, 0xff), IM_COL32(0x55, 0xcc, 0x55, 0xff),
+        IM_COL32(0x33, 0x99, 0x33, 0xff), IM_COL32(0x1a, 0x66, 0x1a, 0xff),
+        IM_COL32(0x14, 0x33, 0x14, 0xff), IM_COL32(0x55, 0xff, 0x55, 0x10),
+        IM_COL32(0x00, 0xff, 0x33, 0xff), IM_COL32(0x55, 0xff, 0x55, 0xff),
+        IM_COL32(0xff, 0xff, 0x66, 0xff), IM_COL32(0xff, 0x55, 0x33, 0xff),
+    },
+    // CYBERPUNK — neon yellow + magenta.
+    {
+        IM_COL32(0x07, 0x08, 0x12, 0xff), IM_COL32(0x10, 0x12, 0x1f, 0xff),
+        IM_COL32(0xff, 0xff, 0xe0, 0xff), IM_COL32(0xcc, 0xcc, 0xa6, 0xff),
+        IM_COL32(0x88, 0x88, 0x66, 0xff), IM_COL32(0x4d, 0x4d, 0x40, 0xff),
+        IM_COL32(0x2a, 0x2c, 0x40, 0xff), IM_COL32(0xff, 0xee, 0x55, 0x10),
+        IM_COL32(0xff, 0xee, 0x14, 0xff), IM_COL32(0xff, 0x33, 0xb3, 0xff),
+        IM_COL32(0xff, 0xb3, 0x33, 0xff), IM_COL32(0xff, 0x33, 0x55, 0xff),
+    },
+    // PLASMA — purple/magenta saturated.
+    {
+        IM_COL32(0x0d, 0x05, 0x14, 0xff), IM_COL32(0x18, 0x09, 0x22, 0xff),
+        IM_COL32(0xff, 0xe6, 0xff, 0xff), IM_COL32(0xcc, 0xa0, 0xe6, 0xff),
+        IM_COL32(0x88, 0x55, 0xb0, 0xff), IM_COL32(0x55, 0x33, 0x77, 0xff),
+        IM_COL32(0x33, 0x1f, 0x4d, 0xff), IM_COL32(0xee, 0x99, 0xff, 0x10),
+        IM_COL32(0xcc, 0x33, 0xff, 0xff), IM_COL32(0xff, 0x66, 0xee, 0xff),
+        IM_COL32(0xff, 0xb3, 0x66, 0xff), IM_COL32(0xff, 0x55, 0x77, 0xff),
+    },
+    // NEON — hot pink + cyan saturated.
+    {
+        IM_COL32(0x06, 0x06, 0x10, 0xff), IM_COL32(0x0d, 0x0d, 0x1f, 0xff),
+        IM_COL32(0xff, 0xff, 0xff, 0xff), IM_COL32(0xc8, 0xc8, 0xe6, 0xff),
+        IM_COL32(0x80, 0x80, 0xa6, 0xff), IM_COL32(0x4d, 0x4d, 0x6b, 0xff),
+        IM_COL32(0x26, 0x26, 0x40, 0xff), IM_COL32(0xff, 0x99, 0xff, 0x10),
+        IM_COL32(0xff, 0x14, 0xa0, 0xff), IM_COL32(0x14, 0xee, 0xff, 0xff),
+        IM_COL32(0xff, 0xd9, 0x33, 0xff), IM_COL32(0xff, 0x33, 0x55, 0xff),
+    },
+    // FOREST — deep greens, organic.
+    {
+        IM_COL32(0x08, 0x0e, 0x08, 0xff), IM_COL32(0x12, 0x1a, 0x12, 0xff),
+        IM_COL32(0xe6, 0xf2, 0xd9, 0xff), IM_COL32(0xa6, 0xcc, 0x99, 0xff),
+        IM_COL32(0x6b, 0x8c, 0x60, 0xff), IM_COL32(0x40, 0x5a, 0x3d, 0xff),
+        IM_COL32(0x26, 0x33, 0x22, 0xff), IM_COL32(0x99, 0xcc, 0x77, 0x10),
+        IM_COL32(0x99, 0xc8, 0x4a, 0xff), IM_COL32(0x66, 0xee, 0x99, 0xff),
+        IM_COL32(0xe6, 0xc8, 0x66, 0xff), IM_COL32(0xcc, 0x55, 0x33, 0xff),
+    },
+    // OCEAN — teal + deep blue.
+    {
+        IM_COL32(0x05, 0x0e, 0x14, 0xff), IM_COL32(0x0c, 0x1a, 0x22, 0xff),
+        IM_COL32(0xe0, 0xf2, 0xff, 0xff), IM_COL32(0x99, 0xc6, 0xd9, 0xff),
+        IM_COL32(0x60, 0x88, 0xa0, 0xff), IM_COL32(0x33, 0x55, 0x6b, 0xff),
+        IM_COL32(0x1f, 0x33, 0x40, 0xff), IM_COL32(0x99, 0xd9, 0xff, 0x10),
+        IM_COL32(0x33, 0xc8, 0xc8, 0xff), IM_COL32(0x99, 0xff, 0xcc, 0xff),
+        IM_COL32(0xff, 0xc6, 0x99, 0xff), IM_COL32(0xff, 0x66, 0x77, 0xff),
+    },
+    // SUNSET — warm gold/orange on charcoal.
+    {
+        IM_COL32(0x10, 0x0a, 0x06, 0xff), IM_COL32(0x1f, 0x14, 0x0c, 0xff),
+        IM_COL32(0xff, 0xee, 0xd9, 0xff), IM_COL32(0xe6, 0xc6, 0x99, 0xff),
+        IM_COL32(0xa6, 0x88, 0x60, 0xff), IM_COL32(0x6b, 0x55, 0x3a, 0xff),
+        IM_COL32(0x40, 0x33, 0x22, 0xff), IM_COL32(0xff, 0xcc, 0x99, 0x10),
+        IM_COL32(0xff, 0x99, 0x33, 0xff), IM_COL32(0xff, 0xc6, 0x66, 0xff),
+        IM_COL32(0xff, 0xd9, 0x66, 0xff), IM_COL32(0xff, 0x55, 0x55, 0xff),
+    },
+    // SAKURA — soft pink + cream.
+    {
+        IM_COL32(0x1f, 0x14, 0x1c, 0xff), IM_COL32(0x2e, 0x1f, 0x2a, 0xff),
+        IM_COL32(0xff, 0xee, 0xf2, 0xff), IM_COL32(0xe6, 0xb3, 0xcc, 0xff),
+        IM_COL32(0xa6, 0x77, 0x8c, 0xff), IM_COL32(0x6b, 0x4d, 0x5a, 0xff),
+        IM_COL32(0x40, 0x2e, 0x36, 0xff), IM_COL32(0xff, 0xc6, 0xd9, 0x10),
+        IM_COL32(0xff, 0x9e, 0xc6, 0xff), IM_COL32(0xff, 0xc6, 0x99, 0xff),
+        IM_COL32(0xff, 0xd9, 0x99, 0xff), IM_COL32(0xff, 0x66, 0x88, 0xff),
+    },
+    // COPPER — bronze + warm patina.
+    {
+        IM_COL32(0x0f, 0x09, 0x06, 0xff), IM_COL32(0x1c, 0x12, 0x0c, 0xff),
+        IM_COL32(0xff, 0xe6, 0xcc, 0xff), IM_COL32(0xcc, 0xa0, 0x80, 0xff),
+        IM_COL32(0x99, 0x70, 0x55, 0xff), IM_COL32(0x66, 0x4a, 0x33, 0xff),
+        IM_COL32(0x3d, 0x2a, 0x1c, 0xff), IM_COL32(0xff, 0xcc, 0x99, 0x10),
+        IM_COL32(0xe6, 0x83, 0x33, 0xff), IM_COL32(0xa6, 0xc6, 0x80, 0xff),
+        IM_COL32(0xff, 0xc6, 0x77, 0xff), IM_COL32(0xff, 0x66, 0x55, 0xff),
+    },
+    // EMERALD — deep emerald + teal accent.
+    {
+        IM_COL32(0x05, 0x0e, 0x0a, 0xff), IM_COL32(0x0a, 0x1a, 0x14, 0xff),
+        IM_COL32(0xd9, 0xff, 0xee, 0xff), IM_COL32(0x99, 0xd9, 0xb8, 0xff),
+        IM_COL32(0x60, 0xa0, 0x80, 0xff), IM_COL32(0x33, 0x66, 0x4d, 0xff),
+        IM_COL32(0x1f, 0x40, 0x33, 0xff), IM_COL32(0x99, 0xff, 0xc6, 0x10),
+        IM_COL32(0x2a, 0xcc, 0x88, 0xff), IM_COL32(0x55, 0xee, 0xb3, 0xff),
+        IM_COL32(0xff, 0xc6, 0x77, 0xff), IM_COL32(0xff, 0x66, 0x66, 0xff),
+    },
+    // CRIMSON — dark red + gold accent.
+    {
+        IM_COL32(0x0d, 0x03, 0x05, 0xff), IM_COL32(0x1a, 0x07, 0x0a, 0xff),
+        IM_COL32(0xff, 0xe6, 0xd9, 0xff), IM_COL32(0xd9, 0xa6, 0x99, 0xff),
+        IM_COL32(0x99, 0x66, 0x60, 0xff), IM_COL32(0x66, 0x40, 0x3a, 0xff),
+        IM_COL32(0x40, 0x22, 0x1f, 0xff), IM_COL32(0xff, 0x99, 0x99, 0x10),
+        IM_COL32(0xd9, 0x1a, 0x2a, 0xff), IM_COL32(0xff, 0xc6, 0x66, 0xff),
+        IM_COL32(0xff, 0xd9, 0x77, 0xff), IM_COL32(0xff, 0x55, 0x55, 0xff),
+    },
+    // NAVY — deep navy + light blue accent.
+    {
+        IM_COL32(0x05, 0x08, 0x14, 0xff), IM_COL32(0x0c, 0x10, 0x22, 0xff),
+        IM_COL32(0xe6, 0xee, 0xff, 0xff), IM_COL32(0xa0, 0xb3, 0xd9, 0xff),
+        IM_COL32(0x66, 0x77, 0xa0, 0xff), IM_COL32(0x3a, 0x44, 0x66, 0xff),
+        IM_COL32(0x22, 0x2a, 0x40, 0xff), IM_COL32(0x99, 0xb3, 0xff, 0x10),
+        IM_COL32(0x55, 0x99, 0xff, 0xff), IM_COL32(0x66, 0xee, 0xcc, 0xff),
+        IM_COL32(0xff, 0xc6, 0x99, 0xff), IM_COL32(0xff, 0x66, 0x77, 0xff),
+    },
+    // DRACULA — purple + pink dev theme.
+    {
+        IM_COL32(0x28, 0x2a, 0x36, 0xff), IM_COL32(0x33, 0x37, 0x47, 0xff),
+        IM_COL32(0xf8, 0xf8, 0xf2, 0xff), IM_COL32(0xc0, 0xc4, 0xd9, 0xff),
+        IM_COL32(0x88, 0x90, 0xb0, 0xff), IM_COL32(0x55, 0x5c, 0x77, 0xff),
+        IM_COL32(0x44, 0x47, 0x5a, 0xff), IM_COL32(0xbd, 0x93, 0xf9, 0x10),
+        IM_COL32(0xbd, 0x93, 0xf9, 0xff), IM_COL32(0x50, 0xfa, 0x7b, 0xff),
+        IM_COL32(0xf1, 0xfa, 0x8c, 0xff), IM_COL32(0xff, 0x55, 0x55, 0xff),
+    },
+    // GRUVBOX — retro warm dev palette.
+    {
+        IM_COL32(0x28, 0x28, 0x28, 0xff), IM_COL32(0x32, 0x30, 0x2f, 0xff),
+        IM_COL32(0xeb, 0xdb, 0xb2, 0xff), IM_COL32(0xd5, 0xc4, 0xa1, 0xff),
+        IM_COL32(0xa8, 0x99, 0x84, 0xff), IM_COL32(0x7c, 0x6f, 0x64, 0xff),
+        IM_COL32(0x50, 0x49, 0x45, 0xff), IM_COL32(0xfa, 0xbd, 0x2f, 0x10),
+        IM_COL32(0xfa, 0xbd, 0x2f, 0xff), IM_COL32(0xb8, 0xbb, 0x26, 0xff),
+        IM_COL32(0xfe, 0x80, 0x19, 0xff), IM_COL32(0xfb, 0x49, 0x34, 0xff),
+    },
+    // NORD — cool muted blue/slate dev palette.
+    {
+        IM_COL32(0x2e, 0x34, 0x40, 0xff), IM_COL32(0x3b, 0x42, 0x52, 0xff),
+        IM_COL32(0xec, 0xef, 0xf4, 0xff), IM_COL32(0xd8, 0xde, 0xe9, 0xff),
+        IM_COL32(0x99, 0xa3, 0xb4, 0xff), IM_COL32(0x6b, 0x73, 0x84, 0xff),
+        IM_COL32(0x4c, 0x56, 0x6a, 0xff), IM_COL32(0x88, 0xc0, 0xd0, 0x10),
+        IM_COL32(0x88, 0xc0, 0xd0, 0xff), IM_COL32(0xa3, 0xbe, 0x8c, 0xff),
+        IM_COL32(0xeb, 0xcb, 0x8b, 0xff), IM_COL32(0xbf, 0x61, 0x6a, 0xff),
+    },
+    // TOKYO NIGHT — dark with neon blue/purple.
+    {
+        IM_COL32(0x1a, 0x1b, 0x26, 0xff), IM_COL32(0x24, 0x28, 0x3b, 0xff),
+        IM_COL32(0xc0, 0xca, 0xf5, 0xff), IM_COL32(0xa9, 0xb1, 0xd6, 0xff),
+        IM_COL32(0x6b, 0x73, 0x8e, 0xff), IM_COL32(0x44, 0x4e, 0x69, 0xff),
+        IM_COL32(0x33, 0x3a, 0x4f, 0xff), IM_COL32(0x7a, 0xa2, 0xf7, 0x10),
+        IM_COL32(0x7a, 0xa2, 0xf7, 0xff), IM_COL32(0x9e, 0xce, 0x6a, 0xff),
+        IM_COL32(0xe0, 0xaf, 0x68, 0xff), IM_COL32(0xf7, 0x76, 0x8e, 0xff),
+    },
+    // CATPPUCCIN MOCHA — soft dark pastel.
+    {
+        IM_COL32(0x1e, 0x1e, 0x2e, 0xff), IM_COL32(0x28, 0x28, 0x39, 0xff),
+        IM_COL32(0xcd, 0xd6, 0xf4, 0xff), IM_COL32(0xba, 0xc2, 0xde, 0xff),
+        IM_COL32(0x8b, 0x93, 0xb0, 0xff), IM_COL32(0x55, 0x5c, 0x7c, 0xff),
+        IM_COL32(0x3e, 0x44, 0x60, 0xff), IM_COL32(0xcb, 0xa6, 0xf7, 0x10),
+        IM_COL32(0xcb, 0xa6, 0xf7, 0xff), IM_COL32(0xa6, 0xe3, 0xa1, 0xff),
+        IM_COL32(0xf9, 0xe2, 0xaf, 0xff), IM_COL32(0xf3, 0x8b, 0xa8, 0xff),
+    },
+    // ROSE PINE — rose / gold / muted.
+    {
+        IM_COL32(0x19, 0x17, 0x24, 0xff), IM_COL32(0x26, 0x21, 0x36, 0xff),
+        IM_COL32(0xe0, 0xde, 0xf4, 0xff), IM_COL32(0xc4, 0xa7, 0xe7, 0xff),
+        IM_COL32(0x90, 0x7a, 0xa9, 0xff), IM_COL32(0x55, 0x4e, 0x7c, 0xff),
+        IM_COL32(0x40, 0x36, 0x5a, 0xff), IM_COL32(0xeb, 0xbc, 0xba, 0x10),
+        IM_COL32(0xeb, 0xbc, 0xba, 0xff), IM_COL32(0x9c, 0xcf, 0xd8, 0xff),
+        IM_COL32(0xf6, 0xc1, 0x77, 0xff), IM_COL32(0xeb, 0x6f, 0x92, 0xff),
+    },
+    // SOLARIZED DARK.
+    {
+        IM_COL32(0x00, 0x2b, 0x36, 0xff), IM_COL32(0x07, 0x36, 0x42, 0xff),
+        IM_COL32(0xfd, 0xf6, 0xe3, 0xff), IM_COL32(0xee, 0xe8, 0xd5, 0xff),
+        IM_COL32(0x93, 0xa1, 0xa1, 0xff), IM_COL32(0x58, 0x6e, 0x75, 0xff),
+        IM_COL32(0x07, 0x36, 0x42, 0xff), IM_COL32(0xb5, 0x89, 0x00, 0x10),
+        IM_COL32(0xb5, 0x89, 0x00, 0xff), IM_COL32(0x85, 0x99, 0x00, 0xff),
+        IM_COL32(0xcb, 0x4b, 0x16, 0xff), IM_COL32(0xdc, 0x32, 0x2f, 0xff),
+    },
+    // PAPER WHITE — light mode, dark text on warm white.
+    {
+        IM_COL32(0xfa, 0xf7, 0xee, 0xff), IM_COL32(0xee, 0xe9, 0xd9, 0xff),
+        IM_COL32(0x1c, 0x18, 0x10, 0xff), IM_COL32(0x40, 0x3a, 0x30, 0xff),
+        IM_COL32(0x80, 0x77, 0x66, 0xff), IM_COL32(0xb0, 0xa6, 0x95, 0xff),
+        IM_COL32(0xd0, 0xc6, 0xb2, 0xff), IM_COL32(0x33, 0x33, 0x33, 0x10),
+        IM_COL32(0xc6, 0x4a, 0x14, 0xff), IM_COL32(0x2a, 0x88, 0x4a, 0xff),
+        IM_COL32(0xc6, 0x88, 0x14, 0xff), IM_COL32(0xc0, 0x33, 0x2f, 0xff),
+    },
+    // SOLARIZED LIGHT.
+    {
+        IM_COL32(0xfd, 0xf6, 0xe3, 0xff), IM_COL32(0xee, 0xe8, 0xd5, 0xff),
+        IM_COL32(0x00, 0x2b, 0x36, 0xff), IM_COL32(0x07, 0x36, 0x42, 0xff),
+        IM_COL32(0x65, 0x7b, 0x83, 0xff), IM_COL32(0x83, 0x94, 0x96, 0xff),
+        IM_COL32(0x93, 0xa1, 0xa1, 0xff), IM_COL32(0xb5, 0x89, 0x00, 0x10),
+        IM_COL32(0xb5, 0x89, 0x00, 0xff), IM_COL32(0x85, 0x99, 0x00, 0xff),
+        IM_COL32(0xcb, 0x4b, 0x16, 0xff), IM_COL32(0xdc, 0x32, 0x2f, 0xff),
+    },
+};
+
+// Live palette — all view code reads kNerv.<field>. SetTheme() copies
+// one of kThemes[] into it; init defaults to Nerv until LoadTune /
+// SetTheme decides otherwise.
+NervPalette kNerv  = kThemes[(int)Theme::Nerv];
+static Theme g_theme = Theme::Nerv;
+
+const char* ThemeName(Theme t) {
+    switch (t) {
+    case Theme::Nerv:           return "NERV";
+    case Theme::Terminal:       return "TERMINAL";
+    case Theme::Amber:          return "AMBER";
+    case Theme::Ice:            return "ICE";
+    case Theme::Blood:          return "BLOOD";
+    case Theme::Mono:           return "MONO";
+    case Theme::Synthwave:      return "SYNTHWAVE";
+    case Theme::Vaporwave:      return "VAPORWAVE";
+    case Theme::Matrix:         return "MATRIX";
+    case Theme::Cyberpunk:      return "CYBERPUNK";
+    case Theme::Plasma:         return "PLASMA";
+    case Theme::Neon:           return "NEON";
+    case Theme::Forest:         return "FOREST";
+    case Theme::Ocean:          return "OCEAN";
+    case Theme::Sunset:         return "SUNSET";
+    case Theme::Sakura:         return "SAKURA";
+    case Theme::Copper:         return "COPPER";
+    case Theme::Emerald:        return "EMERALD";
+    case Theme::Crimson:        return "CRIMSON";
+    case Theme::Navy:           return "NAVY";
+    case Theme::Dracula:        return "DRACULA";
+    case Theme::Gruvbox:        return "GRUVBOX";
+    case Theme::Nord:           return "NORD";
+    case Theme::TokyoNight:     return "TOKYO NIGHT";
+    case Theme::Catppuccin:     return "CATPPUCCIN";
+    case Theme::RosePine:       return "ROSE PINE";
+    case Theme::SolarizedDark:  return "SOLARIZED DARK";
+    case Theme::PaperWhite:     return "PAPER WHITE";
+    case Theme::SolarizedLight: return "SOLARIZED LIGHT";
+    default:                    return "?";
+    }
+}
+
+void SetTheme(Theme t) {
+    if ((int)t < 0 || (int)t >= (int)Theme::kCount) return;
+    g_theme = t;
+    kNerv   = kThemes[(int)t];
+}
+
+void CycleTheme() {
+    SetTheme(static_cast<Theme>(((int)g_theme + 1) % (int)Theme::kCount));
+}
+
+Theme CurrentTheme() { return g_theme; }
+
+ImFont* g_font_display       = nullptr;  // DM Serif Display
+ImFont* g_font_body          = nullptr;  // JetBrains Mono
+ImFont* g_font_label         = nullptr;  // JetBrains Mono (smaller bake)
+ImFont* g_font_micro         = nullptr;  // JetBrains Mono (smallest bake)
+ImFont* g_font_pixel_display = nullptr;  // DotGothic16
+ImFont* g_font_pixel_body    = nullptr;  // VT323
+ImFont* g_font_pixel_label   = nullptr;  // Silkscreen
+ImFont* g_font_pixel_micro   = nullptr;  // Press Start 2P
+
+void PushFontIf(ImFont* f) { if (f) ImGui::PushFont(f); }
+void PopFontIf (ImFont* f) { if (f) ImGui::PopFont();   }
+
+void LoadFonts() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Resolve relative to the exe's actual directory. SDL3
+    // SDL_GetBasePath returns a SDL-owned `const char*` (no free) with
+    // trailing path separator. Robust against whatever CWD the user
+    // launched from.
+    const char* base_raw = SDL_GetBasePath();
+    const std::string base = base_raw ? base_raw : "";
+
+    // Candidate dirs, tried in order. base+assets/fonts/ is the
+    // post-build-copied location; the legacy CWD-relative paths stay
+    // as a final safety net for deployed installs that ship the fonts
+    // alongside the exe but in a parent.
+    const std::string base_assets   = base + "assets\\fonts\\";
+    const std::string base_assets_p = base + "..\\assets\\fonts\\";
+    const char* kFontDirs[] = {
+        base_assets.c_str(),
+        base_assets_p.c_str(),
+        "assets/fonts/",
+        "../assets/fonts/",
+        "../../assets/fonts/",
+    };
+
+    auto file_exists = [](const char* path) -> bool {
+        // SDL3 has SDL_GetPathInfo; use it to gate the AddFont call so
+        // ImGui's UserError noise only fires when we actually try to
+        // load a present-but-invalid file. Otherwise our path-search
+        // would log 4 'Could not load font file!' errors per attempt.
+        // NB: SDL3 returns bool (true on success); SDL2 returned int
+        // 0 on success — flipped between versions.
+        SDL_PathInfo info{};
+        return SDL_GetPathInfo(path, &info);
+    };
+
+    auto load = [&](const char* fname,
+                    float size,
+                    bool pixel,
+                    const ImWchar* range) -> ImFont* {
+        ImFontConfig cfg;
+        if (pixel) {
+            // Pixel fonts: integer pixel grid, no subpixel shift, no AA.
+            cfg.OversampleH = 1;
+            cfg.OversampleV = 1;
+            cfg.PixelSnapH  = true;
+        } else {
+            // Smooth fonts: oversample for crisp anti-aliased rendering.
+            cfg.OversampleH = 2;
+            cfg.OversampleV = 2;
+            cfg.PixelSnapH  = false;
+        }
+        cfg.MergeMode = false;
+        char buf[512];
+        for (const char* dir : kFontDirs) {
+            std::snprintf(buf, sizeof(buf), "%s%s", dir, fname);
+            if (!file_exists(buf)) continue;
+            ImFont* f = io.Fonts->AddFontFromFileTTF(buf, size, &cfg, range);
+            if (f) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "shell: loaded design font %s @ %.0fpx (%s)",
+                            buf, size, pixel ? "pixel" : "smooth");
+                return f;
+            }
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "shell: design font NOT FOUND: %s (base=%s)",
+                    fname, base.c_str());
+        return nullptr;
+    };
+
+    // Merge Font Awesome 6 Free (Solid) into a freshly-loaded base font
+    // so ICON_FA_* macros render inline next to plain text. Per ImGui's
+    // FONTS.md: MergeMode=true on the FA load attaches its glyph range
+    // (0xe005..0xf8ff) to the most recently loaded font, which means
+    // we add it RIGHT AFTER each base font load. Pixel fonts skip the
+    // merge — icons are anti-aliased and would clash with the bitmap
+    // art direction. Range stored as a static so ImGui can keep its
+    // pointer past LoadFonts return.
+    static const ImWchar kIconRanges[] = { ICON_MIN_FA, ICON_MAX_16_FA, 0 };
+    auto merge_icons = [&](float size) {
+        ImFontConfig icfg;
+        icfg.MergeMode        = true;
+        icfg.PixelSnapH       = true;
+        icfg.GlyphMinAdvanceX = size; // monospaced advance so icons line up
+        icfg.OversampleH      = 2;
+        icfg.OversampleV      = 2;
+        char buf[512];
+        for (const char* dir : kFontDirs) {
+            std::snprintf(buf, sizeof(buf), "%sfa-solid-900.ttf", dir);
+            if (!file_exists(buf)) continue;
+            if (io.Fonts->AddFontFromFileTTF(buf, size, &icfg, kIconRanges)) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "shell: merged FA6 icons @ %.0fpx", size);
+                return;
+            }
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "shell: FA6 icon font NOT FOUND (fa-solid-900.ttf)");
+    };
+
+    // ── Eva-pass primary set — nerv.css defaults ──
+    // DM Serif Display Italic for big numerals + headings; JetBrains
+    // Mono Regular for body/label/micro across multiple sizes. Icons
+    // get merged after each base load so any font with FA glyphs in
+    // its glyph range will fall through to FA's atlas.
+    g_font_display = load("DMSerifDisplay-Italic.ttf",  28.0f, false, nullptr);
+    if (g_font_display) merge_icons(28.0f);
+    g_font_body    = load("JetBrainsMono-Regular.ttf",  14.0f, false, nullptr);
+    if (g_font_body)    merge_icons(14.0f);
+    g_font_label   = load("JetBrainsMono-Regular.ttf",  11.0f, false, nullptr);
+    if (g_font_label)   merge_icons(11.0f);
+    g_font_micro   = load("JetBrainsMono-Regular.ttf",   9.0f, false, nullptr);
+    if (g_font_micro)   merge_icons(9.0f);
+
+    // ── Pixel set — `nv-bitmap` art direction, used by BootCrawl ──
+    g_font_pixel_display = load("DotGothic16-Regular.ttf",  28.0f, true, nullptr);
+    g_font_pixel_body    = load("VT323-Regular.ttf",        17.0f, true, nullptr);
+    g_font_pixel_label   = load("Silkscreen-Regular.ttf",    9.0f, true, nullptr);
+    g_font_pixel_micro   = load("PressStart2P-Regular.ttf",  9.0f, true, nullptr);
+}
+
+ImU32 MixCol(ImU32 ca, ImU32 cb, float t) {
+    ImVec4 a = ImGui::ColorConvertU32ToFloat4(ca);
+    ImVec4 b = ImGui::ColorConvertU32ToFloat4(cb);
+    ImVec4 r(a.x + (b.x - a.x) * t,
+             a.y + (b.y - a.y) * t,
+             a.z + (b.z - a.z) * t,
+             a.w + (b.w - a.w) * t);
+    return ImGui::ColorConvertFloat4ToU32(r);
+}
+
+namespace {
+struct RegionFlag { const char* code; ImU32 a; ImU32 b; };
+constexpr RegionFlag kFlags[] = {
+    { "JP", IM_COL32(0xff,0xff,0xff,0xff), IM_COL32(0xff,0x30,0x30,0xff) },
+    { "US", IM_COL32(0x00,0x40,0xa0,0xff), IM_COL32(0xff,0x30,0x30,0xff) },
+    { "FR", IM_COL32(0x00,0x40,0xa0,0xff), IM_COL32(0xff,0x30,0x30,0xff) },
+    { "DE", IM_COL32(0x00,0x00,0x00,0xff), IM_COL32(0xff,0xb9,0x38,0xff) },
+    { "KR", IM_COL32(0xff,0xff,0xff,0xff), IM_COL32(0x00,0x40,0xa0,0xff) },
+    { "BR", IM_COL32(0x0d,0x8a,0x3a,0xff), IM_COL32(0xff,0xd0,0x00,0xff) },
+    { "MX", IM_COL32(0x0d,0x8a,0x3a,0xff), IM_COL32(0xff,0x30,0x30,0xff) },
+    { "ES", IM_COL32(0xff,0xd0,0x00,0xff), IM_COL32(0xff,0x30,0x30,0xff) },
+    { "AR", IM_COL32(0x7e,0xc0,0xee,0xff), IM_COL32(0xff,0xff,0xff,0xff) },
+};
+}  // namespace
+
+void DrawFlagDot(ImDrawList* dl, ImVec2 p, const char* region) {
+    ImU32 a = IM_COL32(0x3d,0x3d,0x3d,0xff);
+    ImU32 b = IM_COL32(0x88,0x88,0x88,0xff);
+    if (region && region[0] && region[1]) {
+        for (const auto& f : kFlags) {
+            if (region[0] == f.code[0] && region[1] == f.code[1]) {
+                a = f.a; b = f.b; break;
+            }
+        }
+    }
+    dl->AddRectFilled(ImVec2(p.x, p.y),     ImVec2(p.x + 12, p.y + 4), a);
+    dl->AddRectFilled(ImVec2(p.x, p.y + 4), ImVec2(p.x + 12, p.y + 8), b);
+    dl->AddRect(ImVec2(p.x - 0.5f, p.y - 0.5f),
+                ImVec2(p.x + 12, p.y + 8),
+                IM_COL32(0,0,0,160));
+}
+
+void DrawPingWave(ImDrawList* dl, ImVec2 p, int ping, float w, float h) {
+    float t = (float)ImGui::GetTime();
+    float amp  = std::min(h * 0.4f, 0.6f + ping * 0.04f);
+    float freq = 0.6f + std::min(0.8f, ping * 0.02f);
+    float jit  = std::min(0.6f, ping * 0.012f);
+    ImU32 col  = (ping < 30) ? IM_COL32(0x5f,0xff,0x95,0xff)
+               : (ping < 80) ? IM_COL32(0xff,0xb9,0x38,0xff)
+               :                IM_COL32(0xff,0x5a,0x3c,0xff);
+    ImVec2 prev(p.x, p.y + h * 0.5f);
+    for (int x = 1; x <= (int)w; ++x) {
+        float phase = t * freq * 4.0f + (float)x * 0.5f;
+        float j = std::sin(phase * 7.0f + (float)ping) * jit;
+        float y = h * 0.5f + std::sin(phase) * amp + j;
+        ImVec2 cur(p.x + (float)x, p.y + y);
+        dl->AddLine(prev, cur, col, 1.0f);
+        prev = cur;
+    }
+}
+
+// ── Font scale globals ───────────────────────────────────────────────
+// Default 1.0 — pt sizes at the call sites were authored against 1×.
+// Dev tune panel writes here; LoadTune reads on shell init.
+float g_font_display_scale = 1.0f;
+float g_font_body_scale    = 1.0f;
+float g_font_label_scale   = 1.0f;
+float g_font_micro_scale   = 1.0f;
+
+// Per-frame UI scale — fm2k::shell::Render() sets this each frame.
+// 1.0 means "design canvas at full size"; > 1.0 = bigger window =
+// fonts/layout grow proportionally. ImGui rasterizes glyphs at the
+// scaled size so text stays sharp at any window size.
+float g_ui_scale = 1.0f;
+
+// Updated each frame by DrawShellTitlebar; read by SDL hit-test.
+// Default 100 = right edge of brand sigil; titlebar renderer bumps
+// this past the last tab when tabs are present.
+float g_titlebar_tabs_end_logical_x = 100.0f;
+
+void DrawTextF(ImDrawList* dl, ImFont* f, float size,
+               ImVec2 pos, ImU32 col, const char* s) {
+    if (f) {
+        // Scale by the matching font-class multiplier × the per-frame
+        // ui scale, so glyph rasterization tracks the visual layout.
+        // Pixel fonts share the same scales as their non-pixel
+        // siblings (BootCrawl is deprecated; if it ever returns we
+        // can split the scales).
+        float scale = g_ui_scale;
+        if      (f == g_font_display || f == g_font_pixel_display) scale *= g_font_display_scale;
+        else if (f == g_font_body    || f == g_font_pixel_body)    scale *= g_font_body_scale;
+        else if (f == g_font_label   || f == g_font_pixel_label)   scale *= g_font_label_scale;
+        else if (f == g_font_micro   || f == g_font_pixel_micro)   scale *= g_font_micro_scale;
+        dl->AddText(f, size * scale, pos, col, s);
+    } else {
+        dl->AddText(pos, col, s);
+    }
+}
+
+}  // namespace fm2k::shell

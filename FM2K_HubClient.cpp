@@ -248,6 +248,50 @@ std::vector<std::string> SplitObjectArray(const std::string& arr) {
     return out;
 }
 
+// Split a JSON array of bare strings into the unescaped values. Tiny
+// counterpart to SplitObjectArray; used for capabilities lists where
+// the elements are short ASCII identifiers — we don't need the full
+// \u-decode dance, so a literal scan is fine. Anything tricky just
+// gets dropped.
+std::vector<std::string> SplitStringArray(const std::string& arr) {
+    std::vector<std::string> out;
+    if (arr.size() < 2 || arr.front() != '[') return out;
+    size_t i = 1;
+    while (i + 1 < arr.size()) {
+        while (i + 1 < arr.size() && arr[i] != '"') ++i;
+        if (i + 1 >= arr.size()) break;
+        ++i;  // past opening quote
+        size_t start = i;
+        while (i + 1 < arr.size() && arr[i] != '"') {
+            if (arr[i] == '\\' && i + 1 < arr.size()) i += 2;
+            else                                       ++i;
+        }
+        if (i + 1 >= arr.size()) break;
+        out.emplace_back(arr.substr(start, i - start));
+        ++i;  // past closing quote
+    }
+    return out;
+}
+
+// 64-bit equivalent of GetInt — chat ts is unix seconds and we want
+// to be honest about width even though int holds it through 2038.
+int64_t GetInt64(const std::string& s, const std::string& key, int64_t def = 0) {
+    size_t p = FindKey(s, key);
+    if (p == std::string::npos) return def;
+    if (p + 4 <= s.size() && s.compare(p, 4, "null") == 0) return def;
+    return std::atoll(s.c_str() + p);
+}
+
+// Lightweight bool reader — looks for the literal `true` / `false`
+// after the colon. Anything else returns def.
+bool GetBool(const std::string& s, const std::string& key, bool def = false) {
+    size_t p = FindKey(s, key);
+    if (p == std::string::npos) return def;
+    if (p + 4 <= s.size() && s.compare(p, 4, "true")  == 0) return true;
+    if (p + 5 <= s.size() && s.compare(p, 5, "false") == 0) return false;
+    return def;
+}
+
 HubUser ParseUser(const std::string& obj) {
     HubUser u;
     u.id          = GetStr(obj, "id");
@@ -620,6 +664,14 @@ void HubClient::RequestSpectate(const std::string& target_id) {
                EscapeJsonString(target_id) + "\"}");
 }
 
+void HubClient::SendChat(const std::string& room_id, const std::string& text) {
+    if (room_id.empty() || text.empty()) return;
+    std::string m = "{\"type\":\"chat_send\",\"room_id\":\"" +
+                    EscapeJsonString(room_id) + "\",\"text\":\"" +
+                    EscapeJsonString(text) + "\"}";
+    EnqueueOut(std::move(m));
+}
+
 // ----- transport: I/O thread -----
 
 void HubClient::IoThread(std::string host, uint16_t port,
@@ -802,6 +854,13 @@ void HubClient::OnMessage(const std::string& msg) {
         std::string rooms_arr = GetSub(msg, "rooms");
         if (!rooms_arr.empty()) {
             for (auto& obj : SplitObjectArray(rooms_arr)) ev.rooms.push_back(ParseRoom(obj));
+        }
+        // Capabilities advertised by hub (docs/hub_protocol_v2.md §5).
+        // Older hubs omit the field — treat absence as "feature off",
+        // launcher branches on capability presence.
+        std::string caps_arr = GetSub(msg, "capabilities");
+        if (!caps_arr.empty()) {
+            ev.capabilities = SplitStringArray(caps_arr);
         }
         EmitEvent(std::move(ev));
         return;
@@ -1141,6 +1200,26 @@ void HubClient::OnMessage(const std::string& msg) {
     if (type == "match_in_progress_ended") {
         ev.kind = HubEvent::Kind::MatchInProgressEnded;
         ev.current_match_token = GetStr(msg, "token");
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "chat") {
+        ev.kind         = HubEvent::Kind::ChatReceived;
+        ev.chat.room_id = GetStr(msg, "room_id");
+        ev.chat.user_id = GetStr(msg, "user_id");
+        ev.chat.nick    = GetStr(msg, "nick");
+        ev.chat.text    = GetStr(msg, "text");
+        ev.chat.ts      = GetInt64(msg, "ts", 0);
+        ev.chat.system  = GetBool(msg, "system", false);
+        EmitEvent(std::move(ev));
+        return;
+    }
+
+    if (type == "chat_rate_limited") {
+        ev.kind                    = HubEvent::Kind::ChatRateLimited;
+        ev.chat_rate.last_send_ts  = GetInt64(msg, "last_send_ts", 0);
+        ev.chat_rate.retry_after_ms= GetInt(msg, "retry_after_ms", 0);
         EmitEvent(std::move(ev));
         return;
     }

@@ -23,6 +23,11 @@
 #include <array>
 #include <filesystem>
 #include "vendored/imgui/imgui.h"
+#include "im_anim.h"
+#include "FM2K_LauncherUI_DesignSandbox.h"
+#include "frontend/AppShell.h"
+#include "frontend/Settings.h"
+#include "frontend/Theme.h"
 #include "imgui_internal.h"
 #include "vendored/GekkoNet/GekkoLib/include/gekkonet.h"
 #include <chrono>
@@ -160,6 +165,22 @@ struct LauncherUI::HubState {
     // port stays alive — most home NATs idle-time UDP mappings out
     // around 30 s, so 20 s gives one re-bind worth of headroom.
     uint32_t    last_stun_refresh_ms = 0;
+
+    // Capabilities advertised by the hub on hello_ack (docs/hub_protocol_v2.md
+    // §5). Empty until Connected fires. Use HasCapability() rather than
+    // poking the vector directly so the lookup stays consistent.
+    std::vector<std::string> capabilities;
+    bool HasCapability(const char* name) const {
+        for (const auto& c : capabilities) if (c == name) return true;
+        return false;
+    }
+
+    // Local ignore list (M3.5). Hub user ids the user has chosen to
+    // hide locally — chat lines and roster entries from these users
+    // are filtered out at render time. Per-session only; intentionally
+    // not persisted in the v1 ship. Set membership is the canonical
+    // truth; nicks are display-only.
+    std::unordered_set<std::string> ignored_user_ids;
 };
 
 // Case-insensitive match of `room_id` against installed games. A
@@ -731,6 +752,16 @@ bool LauncherUI::Initialize(SDL_Window* window, SDL_Renderer* renderer) {
         }
     }
 
+    // Design fonts — VT323 / Silkscreen / DotGothic16 / Press Start 2P.
+    // Two distinct loaders today, both hitting the same atlas (M5
+    // unifies them). The shell loader populates frontend/Theme's
+    // g_font_* used by the new fm2k::shell render path; the sandbox
+    // loader stays for the legacy `View → Design Sandbox` panels which
+    // use their own static globals. Atlas absorbs duplicate entries
+    // (same TTF, same size) cheaply.
+    fm2k::shell::LoadFonts();
+    fm2k::sandbox::LoadDesignFonts();
+
     // Locale: load translation tables and pick the active language. Must
     // happen AFTER the font is configured (so ImGui has glyphs ready when
     // the first frame renders) but BEFORE any T() call.
@@ -782,17 +813,41 @@ void LauncherUI::NewFrame() {
     // Start the Dear ImGui frame
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
+
+    // No DisplaySize / mouse-coord override — we render at native
+    // window pixels now (no SDL logical presentation). The SDL3
+    // backend's NewFrame already set DisplaySize correctly.
+
     ImGui::NewFrame();
+    // ImAnim wants exactly one begin_frame per ImGui frame, before any
+    // tweens fire. Cheap when no tween channels are live.
+    iam_update_begin_frame();
 }
 
 void LauncherUI::Render() {
-    // First-run nudge: if no cached Discord session and we haven't
-    // shown the prompt yet this run, auto-open the sign-in window.
-    // Hub auth is mandatory for online play during testing; users
-    // landing on the launcher should see the path forward right away
-    // rather than discovering it via "auth_required" after a failed
-    // Connect.
-    {
+    // Shell vs legacy gate. Computed once on first call — switching at
+    // runtime mid-render would corrupt state. Honors:
+    //   1. FM2K_LEGACY_UI=1   env var (highest priority)
+    //   2. settings.ini key `legacy_ui=1`
+    //   3. otherwise default to the new shell.
+    // The non-UI bookkeeping below (PollMatchOutcome) runs in BOTH
+    // paths — it processes outcomes published by the hook DLL and
+    // doesn't care which UI is on top.
+    static const bool kUseShell = []() -> bool {
+        const char* e = std::getenv("FM2K_LEGACY_UI");
+        if (e && *e && *e != '0') return false;
+        const std::string p = fm2k::shell::SettingsPath();
+        if (!p.empty() && fm2k::shell::ReadBool(p, "legacy_ui", false)) return false;
+        return true;
+    }();
+
+    // First-run nudge — legacy DockSpace path only. The shell has its
+    // own LoginV2 route (M6.1) that explicitly drives the OAuth flow,
+    // so auto-popping the legacy floating modal on top of Splash would
+    // be the worst of both worlds. Shell users sign in via the Login
+    // route's "AUTHORIZE" button, which opens the legacy modal on
+    // demand.
+    if (!kUseShell) {
         static bool s_did_first_run_nudge = false;
         if (!s_did_first_run_nudge) {
             s_did_first_run_nudge = true;
@@ -802,6 +857,29 @@ void LauncherUI::Render() {
             }
         }
     }
+
+    if (kUseShell) {
+        // Polling lives BEFORE the shell render so a same-frame outcome
+        // bake reaches the hub roster the shell paints from.
+        PollMatchOutcome();
+        // Drain hub events into hub_state_ so users/rooms/matches stay
+        // current. Without this the shell would render an empty roster
+        // forever once we leave the legacy DockSpace path.
+        PollHubEvents();
+        // Once Discord OAuth is cached, transition OFFLINE -> ONLINE
+        // automatically. Legacy UI gates this behind a "Connect" button.
+        EnsureHubConnection();
+        fm2k::shell::Render(*this);
+        // Discord OAuth modal still uses the legacy floating window for
+        // M1 — it's self-contained, dockspace-free, and renders fine on
+        // top of the shell. M2's SetupIdentity wizard step replaces this.
+        if (show_discord_auth_) {
+            RenderDiscordAuthWindow();
+        }
+        return;
+    }
+
+    // ── Legacy DockSpace path ──────────────────────────────────────
 
     // Drain any new outcome the hook published into a hub match_result.
     // Lives at the top of Render so it fires regardless of whether the
@@ -904,6 +982,10 @@ void LauncherUI::Render() {
     
     ImGui::End(); // End DockSpace
 
+    // Design-handoff sandbox panels — opt-in via View menu, not part of
+    // shipping UX. See FM2K_LauncherUI_DesignSandbox.cpp.
+    fm2k::sandbox::RenderPanels();
+
     // Render connection status popups
     RenderConnectionStatus();
 }
@@ -934,6 +1016,8 @@ void LauncherUI::RenderMenuBar() {
             if (ImGui::MenuItem(T("menu_developer_mode"), nullptr, developer_mode_)) {
                 developer_mode_ = !developer_mode_;
             }
+            ImGui::Separator();
+            fm2k::sandbox::RenderViewMenuItems();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu(T("menu_settings"))) {
@@ -1277,6 +1361,12 @@ void LauncherUI::RenderSettingsWindow() {
         return;
     }
 
+    RenderConfigBody();
+
+    ImGui::End();
+}
+
+void LauncherUI::RenderConfigBody() {
     if (ImGui::BeginTabBar("##settings_tabs",
                            ImGuiTabBarFlags_Reorderable)) {
         // Input Bindings — single tab with a nested P1/P2 sub-tabbar so
@@ -1323,8 +1413,6 @@ void LauncherUI::RenderSettingsWindow() {
         // configuration concern, it's session data.
         ImGui::EndTabBar();
     }
-
-    ImGui::End();
 }
 
 // Settings → Games Folders… window. Multi-root editor for the launcher's
@@ -2034,123 +2122,25 @@ void LauncherUI::SaveAudioMuteState() {
 // a challenge while tabbed out — they can dial it back per-channel from
 // Settings → Notifications.
 
+// M2.0: these helpers used to inline their settings.ini parsing here;
+// M2 promoted that into frontend/Settings so legacy + shell share one
+// implementation. Wrappers stay (with the same names + signatures) so
+// existing callers throughout this file don't churn. Body is one line.
 static std::string NotifySettingsPath() {
-    const char* a = std::getenv("APPDATA");
-    if (!a || !*a) return "";
-    std::string dir = std::string(a) + "\\FM2K_Rollback";
-    CreateDirectoryA(dir.c_str(), nullptr);
-    return dir + "\\settings.ini";
+    return fm2k::shell::SettingsPath();
 }
-
 static bool ReadBoolSetting(const std::string& path, const char* key, bool dflt) {
-    FILE* f = std::fopen(path.c_str(), "r");
-    if (!f) return dflt;
-    char line[256];
-    bool out = dflt;
-    while (std::fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n') continue;
-        char* eq = std::strchr(p, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char* k = p;
-        size_t klen = std::strlen(k);
-        while (klen > 0 && (k[klen-1] == ' ' || k[klen-1] == '\t')) k[--klen] = '\0';
-        if (std::strcmp(k, key) != 0) continue;
-        char* v = eq + 1;
-        while (*v == ' ' || *v == '\t') ++v;
-        size_t vlen = std::strlen(v);
-        while (vlen > 0 && (v[vlen-1] == '\n' || v[vlen-1] == '\r' ||
-                            v[vlen-1] == ' '  || v[vlen-1] == '\t')) v[--vlen] = '\0';
-        out = (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0
-            || std::strcmp(v, "yes") == 0 || std::strcmp(v, "on") == 0);
-        break;
-    }
-    std::fclose(f);
-    return out;
+    return fm2k::shell::ReadBool(path, key, dflt);
 }
-
-// Tiny int-keyed setting reader/writer — same flat key=value format as
-// the bool helpers; integers like SOCD mode use this. Default returned
-// when the key is missing or the value isn't a valid int.
 static int ReadIntSetting(const std::string& path, const char* key, int dflt) {
-    FILE* f = std::fopen(path.c_str(), "r");
-    if (!f) return dflt;
-    char line[256];
-    int out = dflt;
-    while (std::fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n') continue;
-        char* eq = std::strchr(p, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char* k = p;
-        size_t klen = std::strlen(k);
-        while (klen > 0 && (k[klen-1] == ' ' || k[klen-1] == '\t')) k[--klen] = '\0';
-        if (std::strcmp(k, key) != 0) continue;
-        char* v = eq + 1;
-        while (*v == ' ' || *v == '\t') ++v;
-        char* endp = nullptr;
-        long parsed = std::strtol(v, &endp, 10);
-        if (endp && endp != v) out = (int)parsed;
-        break;
-    }
-    std::fclose(f);
-    return out;
+    return fm2k::shell::ReadInt(path, key, dflt);
 }
-
 static void WriteIntSetting(const std::string& path, const char* key, int value) {
-    std::vector<std::pair<std::string, std::string>> kv;
-    if (FILE* f = std::fopen(path.c_str(), "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), f)) {
-            std::string s = line;
-            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
-                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
-            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
-            const size_t eq = s.find('=');
-            if (eq == std::string::npos) continue;
-            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
-        }
-        std::fclose(f);
-    }
-    bool found = false;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%d", value);
-    for (auto& p : kv) if (p.first == key) { p.second = buf; found = true; }
-    if (!found) kv.emplace_back(key, buf);
-    if (FILE* f = std::fopen(path.c_str(), "w")) {
-        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
-        std::fclose(f);
-    }
+    fm2k::shell::WriteInt(path, key, value);
 }
 
 static void WriteBoolSetting(const std::string& path, const char* key, bool value) {
-    // Read all keys, replace ours, rewrite. Tiny file, tiny number of keys —
-    // brute force is fine and keeps the format stable.
-    std::vector<std::pair<std::string, std::string>> kv;
-    if (FILE* f = std::fopen(path.c_str(), "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), f)) {
-            std::string s = line;
-            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
-                                  s.back() == ' '  || s.back() == '\t')) s.pop_back();
-            if (s.empty() || s[0] == '#' || s[0] == ';') continue;
-            const size_t eq = s.find('=');
-            if (eq == std::string::npos) continue;
-            kv.emplace_back(s.substr(0, eq), s.substr(eq + 1));
-        }
-        std::fclose(f);
-    }
-    bool found = false;
-    for (auto& p : kv) if (p.first == key) { p.second = (value ? "1" : "0"); found = true; }
-    if (!found) kv.emplace_back(key, value ? "1" : "0");
-    if (FILE* f = std::fopen(path.c_str(), "w")) {
-        for (const auto& p : kv) std::fprintf(f, "%s=%s\n", p.first.c_str(), p.second.c_str());
-        std::fclose(f);
-    }
+    fm2k::shell::WriteBool(path, key, value);
 }
 
 void LauncherUI::LoadNotifyState() {
@@ -3042,6 +3032,192 @@ void LauncherUI::SetGamesRootPaths(const std::vector<std::string>& paths) {
 
 void LauncherUI::SetFramesAhead(float frames_ahead) {
     frames_ahead_ = frames_ahead;
+}
+
+// ── Read-only accessors for the new fm2k::shell render path ──────────
+// HubState is impl-internal (defined at the top of this file); these
+// accessors are out-of-line because their return types touch HubState
+// members. Static empty defaults guard the rare case where hub_state_
+// hasn't been constructed (Initialize() always builds it, so this is
+// belt-and-suspenders for ordering bugs during shutdown).
+namespace {
+    const std::string& EmptyString() {
+        static const std::string s;
+        return s;
+    }
+}
+
+bool LauncherUI::hub_connected() const {
+    return hub_state_ && hub_state_->client.IsConnected();
+}
+const std::string& LauncherUI::hub_room_id() const {
+    return hub_state_ ? hub_state_->current_room_id : EmptyString();
+}
+const std::string& LauncherUI::hub_my_id() const {
+    return hub_state_ ? hub_state_->my_id : EmptyString();
+}
+const std::string& LauncherUI::hub_my_nick() const {
+    return hub_state_ ? hub_state_->my_nick : EmptyString();
+}
+const std::vector<fm2k::HubRoom>& LauncherUI::hub_rooms() const {
+    static const std::vector<fm2k::HubRoom> empty;
+    return hub_state_ ? hub_state_->rooms : empty;
+}
+const std::unordered_map<std::string, fm2k::HubUser>& LauncherUI::hub_users() const {
+    static const std::unordered_map<std::string, fm2k::HubUser> empty;
+    return hub_state_ ? hub_state_->users : empty;
+}
+const std::vector<fm2k::HubEvent::MatchInProgress>& LauncherUI::hub_current_matches() const {
+    static const std::vector<fm2k::HubEvent::MatchInProgress> empty;
+    return hub_state_ ? hub_state_->current_matches : empty;
+}
+const std::vector<fm2k::HubEvent::MatchRow>& LauncherUI::hub_recent_matches() const {
+    static const std::vector<fm2k::HubEvent::MatchRow> empty;
+    return hub_state_ ? hub_state_->recent_matches : empty;
+}
+int LauncherUI::my_wins()   const { return hub_state_ ? hub_state_->my_wins   : -1; }
+int LauncherUI::my_losses() const { return hub_state_ ? hub_state_->my_losses : -1; }
+int LauncherUI::my_draws()  const { return hub_state_ ? hub_state_->my_draws  : -1; }
+
+void LauncherUI::SetActiveRoom(const std::string& room_id,
+                               const std::string& display_name) {
+    if (!hub_state_ || !hub_state_->client.IsConnected()) return;
+    if (hub_state_->current_room_id == room_id) return;
+    if (!hub_state_->current_room_id.empty()) {
+        hub_state_->client.LeaveRoom();
+    }
+    hub_state_->client.JoinRoom(room_id, display_name);
+}
+
+void LauncherUI::NotifyDiscordCachePopulated() {
+    const auto c = fm2k::discord_auth::LoadCached();
+    discord_signed_in_ = c.valid;
+    discord_nick_      = c.use_discord_name ? c.discord_global_name : c.nick;
+    discord_state_loaded_ = true;
+}
+
+std::string LauncherUI::hub_base_url() const {
+    const char* host = hub_host_[0] ? hub_host_ : "hub.2dfm.org";
+    std::string base;
+    if (std::strstr(host, "sytes.net") || std::strchr(host, ':')) {
+        base = "http://";
+        base += host;
+        if (!std::strchr(host, ':')) base += ":7700";
+    } else {
+        base = "https://";
+        base += host;
+    }
+    return base;
+}
+
+// ── M3 challenge flow accessors / mutators ─────────────────────────
+bool LauncherUI::incoming_challenge_pending() const {
+    return hub_state_ && hub_state_->show_challenge_modal;
+}
+const std::string& LauncherUI::incoming_challenger_nick() const {
+    return hub_state_ ? hub_state_->pending_challenge_from_nick : EmptyString();
+}
+const std::string& LauncherUI::incoming_challenger_id() const {
+    return hub_state_ ? hub_state_->pending_challenge_from_id : EmptyString();
+}
+void LauncherUI::AcceptIncomingChallenge() {
+    if (!hub_state_ || !hub_state_->show_challenge_modal) return;
+    hub_state_->client.AcceptChallenge(hub_state_->pending_challenge_from_id);
+    hub_state_->show_challenge_modal = false;
+    // pending_challenge_settings becomes current_match_settings on K::MatchStart
+}
+void LauncherUI::DeclineIncomingChallenge() {
+    if (!hub_state_ || !hub_state_->show_challenge_modal) return;
+    hub_state_->client.DeclineChallenge(hub_state_->pending_challenge_from_id);
+    hub_state_->show_challenge_modal = false;
+    hub_state_->pending_challenge_from_id.clear();
+    hub_state_->pending_challenge_from_nick.clear();
+}
+
+bool LauncherUI::outgoing_challenge_pending() const {
+    return hub_state_ && hub_state_->show_outgoing_challenge_modal;
+}
+const std::string& LauncherUI::outgoing_challenge_nick() const {
+    return hub_state_ ? hub_state_->outgoing_challenge_to_nick : EmptyString();
+}
+void LauncherUI::ChallengeUser(const std::string& target_id,
+                               const std::string& target_nick) {
+    if (!hub_state_ || !hub_state_->client.IsConnected()) return;
+    if (target_id.empty()) return;
+    // M3 first ship — default-constructed MatchSettings (sentinel -1
+    // across the struct). Hub fills its own defaults; full per-host
+    // settings UI lands later. Mirrors the legacy pattern at
+    // FM2K_LauncherUI.cpp:5389 minus the SOCD/random-stage builder.
+    fm2k::MatchSettings ms;
+    hub_state_->client.Challenge(target_id, ms);
+    hub_state_->outgoing_challenge_to_id   = target_id;
+    hub_state_->outgoing_challenge_to_nick = target_nick;
+    hub_state_->show_outgoing_challenge_modal = true;
+    hub_state_->status_line = "challenged " + target_nick + " \xe2\x80\x94 waiting";
+}
+void LauncherUI::CancelOutgoingChallenge() {
+    if (!hub_state_ || !hub_state_->show_outgoing_challenge_modal) return;
+    hub_state_->client.CancelChallenge(hub_state_->outgoing_challenge_to_id);
+    hub_state_->show_outgoing_challenge_modal = false;
+    hub_state_->outgoing_challenge_to_id.clear();
+    hub_state_->outgoing_challenge_to_nick.clear();
+}
+
+const std::string& LauncherUI::current_match_token() const {
+    return hub_state_ ? hub_state_->current_match_token : EmptyString();
+}
+const std::string& LauncherUI::current_match_peer_nick() const {
+    return hub_state_ ? hub_state_->current_match_peer_nick : EmptyString();
+}
+const std::string& LauncherUI::current_match_role() const {
+    return hub_state_ ? hub_state_->current_match_role : EmptyString();
+}
+bool LauncherUI::show_hash_mismatch() const {
+    return hub_state_ && hub_state_->show_hash_mismatch_modal;
+}
+const std::string& LauncherUI::hash_mismatch_excerpt() const {
+    return hub_state_ ? hub_state_->hash_mismatch_log_excerpt : EmptyString();
+}
+void LauncherUI::DismissHashMismatch() {
+    if (!hub_state_) return;
+    hub_state_->show_hash_mismatch_modal = false;
+    hub_state_->hash_mismatch_log_excerpt.clear();
+}
+
+bool LauncherUI::hub_has_chat() const {
+    return hub_state_ && hub_state_->HasCapability("chat_v1");
+}
+
+void LauncherUI::SendChat(const std::string& room_id, const std::string& text) {
+    if (!hub_state_) return;
+    if (!hub_state_->client.IsConnected()) return;
+    hub_state_->client.SendChat(room_id, text);
+}
+
+void LauncherUI::SpectateUser(const std::string& target_id) {
+    if (!hub_state_) return;
+    if (!hub_state_->client.IsConnected()) return;
+    if (target_id.empty()) return;
+    hub_state_->client.RequestSpectate(target_id);
+    hub_state_->status_line = "spectating " + target_id + " ...";
+}
+
+void LauncherUI::IgnoreUser(const std::string& user_id) {
+    if (!hub_state_ || user_id.empty()) return;
+    hub_state_->ignored_user_ids.insert(user_id);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Hub: locally ignored user_id=%s (session-only)",
+                user_id.c_str());
+}
+
+void LauncherUI::UnignoreUser(const std::string& user_id) {
+    if (!hub_state_ || user_id.empty()) return;
+    hub_state_->ignored_user_ids.erase(user_id);
+}
+
+bool LauncherUI::IsUserIgnored(const std::string& user_id) const {
+    if (!hub_state_ || user_id.empty()) return false;
+    return hub_state_->ignored_user_ids.count(user_id) != 0;
 }
 
 // Simplified theme - always use Dark
@@ -4040,7 +4216,87 @@ void LauncherUI::PollMatchOutcome() {
     try_pid(pid2);
 }
 
-void LauncherUI::RenderHubPanel() {
+// Auto-connect for the new fm2k::shell path. Legacy UI has an explicit
+// "Connect" button at FM2K_LauncherUI.cpp:5108; the shell skips that
+// view entirely so we mirror its body here. One-shot per session — if
+// the first attempt fails the user can re-issue via the SIGN IN
+// affordance (which re-opens the OAuth modal and bumps the cache).
+void LauncherUI::EnsureHubConnection() {
+    if (!hub_state_) return;
+    auto& hs = *hub_state_;
+    if (hs.client.IsConnected()) return;
+
+    // Lock so we issue Connect at most once per launcher session. Reset
+    // state if the user signs out (cached.valid flips false) or if we
+    // explicitly trigger a retry — neither path lives in M1.
+    static bool s_attempted = false;
+    if (s_attempted) return;
+
+    const auto cached = fm2k::discord_auth::LoadCached();
+    if (!cached.valid) return;  // not signed in yet — nothing to do
+
+    // Lazy-initialize hub_host_ from FM2K_HUB_HOST env / default. The
+    // legacy path does this on first hub-panel render; we replicate it.
+    if (!hub_host_initialized_) {
+        hub_host_initialized_ = true;
+        const char* env_h = std::getenv("FM2K_HUB_HOST");
+        const char* def = (env_h && env_h[0]) ? env_h : "hub.2dfm.org";
+        std::snprintf(hub_host_, sizeof(hub_host_), "%s", def);
+    }
+
+    const std::string nick = cached.use_discord_name
+                           ? cached.discord_global_name
+                           : cached.nick;
+    if (nick.empty()) return;
+    hs.my_nick = nick;
+
+    // Auto-pick a free UDP port — same logic as legacy connect button.
+    int picked = 7000;
+    WSADATA wsa{};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s != INVALID_SOCKET) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            sockaddr_in bound{};
+            int len = sizeof(bound);
+            if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
+                picked = ntohs(bound.sin_port);
+            }
+        }
+        closesocket(s);
+    }
+    network_config_.local_port = picked;
+
+    const std::string hub_host = (hub_host_[0] != '\0') ? hub_host_ : "hub.2dfm.org";
+    ::SetEnvironmentVariableA("FM2K_HUB_HOST", hub_host.c_str());
+
+    const bool use_legacy = (hub_host.find("sytes.net") != std::string::npos);
+    const uint16_t ws_port = use_legacy ? 7711 : 443;
+    const char*    ws_path = use_legacy ? "/"  : "/ws";
+    const bool     ws_tls  = !use_legacy;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Shell: auto-connecting to %s%s:%u (%sWS, port=%d)",
+        hub_host.c_str(), ws_path, (unsigned)ws_port,
+        ws_tls ? "WSS via " : "", picked);
+
+    hs.client.Connect(hub_host, ws_port, ws_path, hs.my_nick,
+                      cached.hub_token, ws_tls);
+    hs.status_line = "connecting to " + hub_host + " ...";
+    s_attempted = true;
+}
+
+// Drains queued hub events + runs the periodic STUN refresh. Body
+// extracted from RenderHubPanel so the new fm2k::shell path (which
+// doesn't call the legacy hub UI) still drives the hub state machine.
+// Both paths call this exactly once per frame; legacy via the wrapper
+// below, shell via LauncherUI::Render directly.
+void LauncherUI::PollHubEvents() {
+    if (!hub_state_) return;
     auto& hs = *hub_state_;
 
     // Periodic pre-match STUN refresh (every 20 s while connected) so
@@ -4072,6 +4328,7 @@ void LauncherUI::RenderHubPanel() {
             case K::Connected:
                 hs.my_id = ev.user_id;
                 hs.rooms = ev.rooms;
+                hs.capabilities = ev.capabilities;
                 hs.status_line = "connected";
                 // Tell the hub our planned UDP listen so it can relay
                 // it to a peer in match_start. Both launchers register
@@ -4148,6 +4405,7 @@ void LauncherUI::RenderHubPanel() {
                     }
                 }
                 hs.users.clear();
+                hs.capabilities.clear();
                 hs.current_room_id.clear();
                 hs.my_id.clear();
                 hs.status_line = ev.error.empty() ? "disconnected" : ("disconnected: " + ev.error);
@@ -4767,6 +5025,27 @@ void LauncherUI::RenderHubPanel() {
                     hs.current_matches.end());
                 break;
             }
+            case K::ChatReceived: {
+                // Forward into the shell's per-room chat ring buffer.
+                // System lines (hub-generated) and user lines share the
+                // same path; the shell renders them with different
+                // styling based on the `system` flag.
+                fm2k::shell::PushIncomingChat(
+                    ev.chat.room_id,
+                    ev.chat.user_id,
+                    ev.chat.nick,
+                    ev.chat.text,
+                    ev.chat.ts,
+                    ev.chat.system);
+                break;
+            }
+            case K::ChatRateLimited:
+                // Surface in the shared status line so the user has a
+                // hint why their message didn't appear. Subtle — no
+                // modal, no toast.
+                hs.status_line = "chat throttled — wait " +
+                    std::to_string(ev.chat_rate.retry_after_ms) + " ms";
+                break;
             case K::Error:
                 hs.status_line = "error: " + ev.error;
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -4780,6 +5059,11 @@ void LauncherUI::RenderHubPanel() {
                 break;
         }
     });
+}
+
+void LauncherUI::RenderHubPanel() {
+    PollHubEvents();
+    auto& hs = *hub_state_;
 
     // ---- UI ----
     ImGui::SeparatorText(T("hub_section_header"));

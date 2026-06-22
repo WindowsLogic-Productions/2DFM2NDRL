@@ -108,6 +108,8 @@ struct HubEvent {
         MatchInProgressStarted,// public broadcast: an in-flight match began
         MatchInProgressUpdated,// public broadcast: chars/stage filled in
         MatchInProgressEnded,  // public broadcast: in-flight match resolved
+        ChatReceived,          // §4.2 — room chat broadcast (own messages echo too)
+        ChatRateLimited,       // §4.2 — local send was throttled hub-side
         Error,
     };
 
@@ -237,6 +239,32 @@ struct HubEvent {
     std::vector<MatchInProgress> current_matches;
     MatchInProgress              current_match_update;
     std::string                  current_match_token;
+
+    // ChatReceived payload (§4.2). `system=true` is reserved for hub-
+    // generated lines (joins/leaves/announcements) — v1 hub doesn't
+    // emit any yet, but the launcher should style them dimmed when it
+    // does. `ts` is hub-authoritative unix seconds.
+    struct {
+        std::string room_id;
+        std::string user_id;
+        std::string nick;
+        std::string text;
+        int64_t     ts     = 0;
+        bool        system = false;
+    } chat;
+
+    // ChatRateLimited payload — only sent to the offender. Render a
+    // subtle hint ("slow down — N ms") in the chat UI; never echoed
+    // to other users.
+    struct {
+        int64_t last_send_ts   = 0;
+        int     retry_after_ms = 0;
+    } chat_rate;
+
+    // Connected payload — capabilities advertised by hub.hello_ack,
+    // see docs/hub_protocol_v2.md §5. Empty on hubs that predate the
+    // capability field; launcher must treat absence as "feature off".
+    std::vector<std::string> capabilities;
 };
 
 class HubClient {
@@ -383,6 +411,13 @@ public:
     // target_id is the host user's id (the user we want to spectate).
     // Hub responds with SpectateGranted / SpectateDenied.
     void RequestSpectate(const std::string& target_id);
+
+    // §4.2 chat send. room_id must be a room the user is currently
+    // joined to (single-room model until §4.1 ships). `text` is sent
+    // as-is; hub strips control chars and trims to 500 chars. Excess
+    // is silently throttled hub-side and surfaces as ChatRateLimited.
+    // Own message echoes back as ChatReceived — do NOT push locally.
+    void SendChat(const std::string& room_id, const std::string& text);
 
 private:
     void EnqueueOut(std::string msg);

@@ -59,3 +59,7 @@ FM-Variables.CT
 __pycache__/
 
 /tests/build/
+
+# UI design handoff bundle from claude.ai/design — local reference
+# only, not for distribution.
+/ui-design/
