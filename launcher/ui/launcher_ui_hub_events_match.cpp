@@ -353,7 +353,18 @@ void LauncherUI::HandleMatchStartEvent(const fm2k::HubEvent& ev) {
                     // same-router pairs connect directly over the LAN instead of
                     // hairpinning + relaying. Cleared when the peer didn't
                     // report one (different networks / older client).
-                    if (!ev.match.peer_lan_ip.empty() && ev.match.peer_lan_port > 0) {
+                    //
+                    // SAME-MACHINE guard: if the peer's LAN IP == OUR LAN IP,
+                    // both instances are on this box (self-connect / local
+                    // 2-instance test, sharing one 192.168.x.x). The same-house
+                    // punch goes asymmetric there (one side locks the LAN addr,
+                    // the other the public addr) and the battle wedges. Skip it
+                    // and let the normal relay/loopback path handle the self-
+                    // test. No-op for real same-house: two machines have
+                    // distinct LAN IPs.
+                    std::string my_lan = fm2k::LocalLanIp();
+                    if (!ev.match.peer_lan_ip.empty() && ev.match.peer_lan_port > 0 &&
+                        ev.match.peer_lan_ip != my_lan) {
                         std::string peer_lan = ev.match.peer_lan_ip + ":" +
                                                std::to_string(ev.match.peer_lan_port);
                         ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", peer_lan.c_str());
@@ -361,6 +372,13 @@ void LauncherUI::HandleMatchStartEvent(const fm2k::HubEvent& ev) {
                             "Hub: peer same-LAN candidate %s -> FM2K_PEER_LAN_ADDR",
                             peer_lan.c_str());
                     } else {
+                        if (!ev.match.peer_lan_ip.empty() &&
+                            ev.match.peer_lan_ip == my_lan) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Hub: peer LAN IP %s == ours — same-machine "
+                                "self-connect, skipping same-house punch",
+                                ev.match.peer_lan_ip.c_str());
+                        }
                         ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", nullptr);
                     }
 

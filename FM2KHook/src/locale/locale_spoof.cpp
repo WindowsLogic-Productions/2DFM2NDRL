@@ -15,9 +15,13 @@
 //        SetWindowTextW directly. Without this, the system-ANSI codepage (1252
 //        on US Windows) is used to interpret SJIS bytes -> mojibake titlebar.
 //
-// This is a minimal port of the relevant pieces of Locale-Emulator's
-// LoaderDll.dll (https://github.com/xupefei/Locale-Emulator). LE hooks ~20
-// APIs total; we add more as we find games that need them.
+// This independently reimplements the locale-spoofing TECHNIQUE (which Win32
+// APIs to intercept and what each must return for a CP932 / ja-JP environment)
+// in C++. The API set was derived from our own IDA traces of CPW.exe (above)
+// plus general knowledge of how locale shims work. Locale-Emulator
+// (https://github.com/xupefei/Locale-Emulator) was a conceptual reference for
+// WHICH APIs matter, but no LE code is copied, translated, or linked -- LE is
+// C#/GPL; this is original C#-free C++. We add more APIs as games need them.
 //
 // Hook timing: must run BEFORE the host CRT initializes its locale cache. We
 // inject pre-ResumeThread (CreateProcess with CREATE_SUSPENDED + LoadLibrary
