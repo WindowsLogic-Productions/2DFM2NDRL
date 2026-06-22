@@ -40,3 +40,13 @@ deeper notes in docs/.
 go.sh builds then copies into my local windows games tree (/mnt/c/games). that
 half skips itself on any machine without that tree, so go.sh just builds for
 everyone else. the normal flow is make_build.sh && build.sh.
+
+## license
+
+source-available, NOT open source. the launcher + hooks (my own code) are under
+the PolyForm Noncommercial License 1.0.0 with a revocation addendum -- see
+[LICENSE](LICENSE). short version: personal/noncommercial use, modification and
+noncommercial redistribution are fine; commercial use needs a separate license;
+the grant is revocable. bundled third-party components keep their own (permissive)
+licenses -- see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). the native
+frontend uses Slint under its royalty-free license.
