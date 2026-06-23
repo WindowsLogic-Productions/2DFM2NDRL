@@ -81,6 +81,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/spec_backfill.cpp   # session-history + snapshot backfill to joiners (split from spectator_node)
     src/netplay/spec_health.cpp     # per-tick health + host-maintenance drivers (split from spectator_node)
     src/netplay/spec_recv.cpp       # incoming spec-data dispatch (EVENT_BATCH/SNAPSHOT/UDP) (split from spectator_node)
+    src/netplay/spec_impair.cpp     # test-only spectator-downlink loss shim (FM2K_SPEC_DROP)
     src/netplay/spec_host_events.cpp # host-side event recording + fingerprint (split from spectator_node)
     src/netplay/spec_join.cpp        # join/redirect protocol + GekkoSpectator dedup (split from spectator_node)
     src/netplay/spec_session_file.cpp # .fm2kset/.fm2krep write + load/seek (split from spectator_node)

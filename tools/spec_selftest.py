@@ -248,8 +248,14 @@ def main():
               "FM2K_LOCAL_PORT": str(P2_PORT),
               "FM2K_REMOTE_ADDR": f"127.0.0.1:{P1_PORT}"}
     # Spectator: no autoplay -- it is driven entirely by the host's event
-    # stream. Only the parity recorder env matters.
+    # stream. Only the parity recorder env matters... PLUS the test-only
+    # downlink-loss shim: the impair knobs must reach the SPECTATOR (the path
+    # that matters), else a "loss" run silently impairs nothing. Kept minimal
+    # (no common_env merge) so the spec never gains autoplay inputs.
     spec_env = {"FM2K_PARITY_RECORD_PATH": to_win(spec_pty)}
+    for k in ("FM2K_SPEC_DROP", "FM2K_SPEC_DROP_SEED"):
+        if os.environ.get(k):
+            spec_env[k] = os.environ[k]
 
     start_ts = time.time()
 
@@ -526,8 +532,16 @@ def main():
     # spectator that desyncs computes an rng the host never produced -> the
     # frame's rng is "not in host" = hard fail.
     import re as _ret
-    host_dbg = game_dir / "logs" / "FM2K_P1_Debug.log"
-    spec_dbg = game_dir / "logs" / "FM2K_P3_Debug.log"
+    # CRITICAL: read the PRESERVED spectator log, not game_dir/logs/FM2K_P3.
+    # The REPLAY process (launched after the spec, with ALWAYS_CATCHUP=1)
+    # overwrites game_dir/logs/FM2K_P3_Debug.log -- so the live game_dir P3
+    # holds the replay's traces, which re-sim the host's CONFIRMED inputs and
+    # match the host BY CONSTRUCTION (0 misses = guaranteed false PASS). The
+    # live_ copies are snapshotted before the replay runs and hold the ACTUAL
+    # spectator's traces. (2026-06-23: this masked a real bf=77 spectator
+    # desync under loss -- the spec computed an rng no player ever produced.)
+    host_dbg = OUT_DIR / "live_FM2K_P1_Debug.log"
+    spec_dbg = OUT_DIR / "live_FM2K_P3_Debug.log"
     # group(1)=bf, group(2)=rng, group(3+)=comparison fields.
     TRC = (r'(?:HOST|SPEC)-TRACE\] bf=(\d+) rng_pre=0x[0-9A-F]+ '
            r'rng_post=0x([0-9A-F]+) p1=0x([0-9A-F]+) p2=0x([0-9A-F]+)')

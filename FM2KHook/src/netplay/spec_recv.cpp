@@ -7,6 +7,7 @@
 #include "spec_wire.h"            // zero-RLE codec (SessionEvent_* live in spectator_node.h)
 #include "spec_relay_queue.h"     // hub-relay outbound queue (Phase 2c)
 #include "spectator_tcp.h"        // TCP transport for INPUT_BATCH stream
+#include "spec_impair.h"          // test-only spectator-downlink loss (FM2K_SPEC_DROP)
 #include "control_channel.h"
 #include "netplay.h"
 #include "replay.h"
@@ -313,6 +314,13 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             if (!g_state.have_frame_baseline) {
                 g_state.have_frame_baseline = true;
                 g_state.next_expected_frame = hdr.start_frame;
+                // [ANCHOR] proof-first instrumentation (task: in-battle-select
+                // divergence). Logs WHICH batch's start_frame the cursor
+                // latched to -- a live battle batch beating backfill here
+                // anchors the whole session at a wrong absolute frame.
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "[ANCHOR] baseline-latch start_frame=%u frame_count=%u",
+                    hdr.start_frame, hdr.frame_count);
             }
 
             // NOTE: there is deliberately NO "fully-consumed batch" early
@@ -489,6 +497,10 @@ void SpectatorNode_HandleUdpInputDatagram(const uint8_t* buf, size_t len,
     if (!g_state.have_frame_baseline) return;
     if (!g_state.udp_epoch_armed) return;
     if (!AddrEqual(from, g_state.upstream_addr)) return;  // spoof / stale upstream
+    // Test-only spectator-downlink loss (no-op unless FM2K_SPEC_DROP set).
+    // Discard BEFORE the liveness stamp + admission so a "dropped" batch is
+    // indistinguishable from one lost on the wire.
+    if (fm2k::specimpair::ShouldDropUdpInput()) return;
     g_state.last_udp_recv_ms = GetTickCount64();
 
     uint32_t op_seq = 0;

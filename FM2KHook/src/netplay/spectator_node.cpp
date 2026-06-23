@@ -482,6 +482,24 @@ void SpectatorNode_ApplyPendingSnapshot() {
     // Only reset state when our cursor is BEHIND the anchor — that's the
     // FULL_SESSION → CURRENT_MATCH renegotiation case where pb_queue
     // holds stale pre-anchor frames the snapshot supersedes.
+    // [ANCHOR] proof-first instrumentation (task: in-battle-select divergence).
+    // The "trust queue as-is" branch (cursor >= anchor) assumes the in-flight
+    // anchor..live events filled pb_queue contiguously; a hole in that window
+    // mis-anchors every later pop. Log the decision + the delta so a failing
+    // snapshot-join shows a nonzero (next_expected_frame - anchor) with a
+    // shorter-than-implied queue.
+    {
+        const bool will_reset = (!g_state.have_frame_baseline ||
+                                 g_state.next_expected_frame < anchor);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[ANCHOR] snapshot anchor=%u next_expected=%u baseline=%d -> %s "
+            "(queue=%zu, delta=%d)",
+            anchor, g_state.next_expected_frame,
+            g_state.have_frame_baseline ? 1 : 0,
+            will_reset ? "RESET" : "TRUST-AS-IS",
+            g_state.pb_queue.size(),
+            (int)g_state.next_expected_frame - (int)anchor);
+    }
     if (!g_state.have_frame_baseline ||
         g_state.next_expected_frame < anchor)
     {
