@@ -342,7 +342,9 @@ def main():
         # char0/char0 lock. The os.environ forward below still lets FM2K_AUTOPLAY_
         # CSS_DWELL override it.
         common_env["FM2K_AUTOPLAY_CSS_DWELL"] = str(args.css_dwell)
-    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE", "FM2K_TEST_BATTLE_SEED"):
+    for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE", "FM2K_TEST_BATTLE_SEED",
+              # in-process link impairment (players' gekko+control path)
+              "FM2K_NET_DELAY_MS", "FM2K_NET_JITTER_MS", "FM2K_NET_LOSS", "FM2K_NET_SEED"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]
 
@@ -378,7 +380,8 @@ def main():
         pty  = OUT_DIR / f"spec{k}_parity.pty"
         pty.unlink(missing_ok=True)
         env = {"FM2K_PARITY_RECORD_PATH": to_win(pty)}
-        for kk in ("FM2K_SPEC_DROP", "FM2K_SPEC_DROP_SEED"):
+        for kk in ("FM2K_SPEC_DROP", "FM2K_SPEC_DROP_SEED",
+                   "FM2K_NET_DELAY_MS", "FM2K_NET_JITTER_MS", "FM2K_NET_LOSS", "FM2K_NET_SEED"):
             if os.environ.get(kk):
                 env[kk] = os.environ[kk]
         sargs = [str(LAUNCHER), "--host", game_arg,

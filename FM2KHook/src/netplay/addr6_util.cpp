@@ -3,6 +3,10 @@
 #include <SDL3/SDL_log.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <vector>
 
 namespace fm2k {
 
@@ -98,7 +102,9 @@ static void LogFamilyErr(int r, bool v6) {
     }
 }
 
-int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
+// Raw family-aware send (the real sendto). Kept separate so the test-only
+// network-impairment intercept can re-emit delayed packets without re-impairing.
+static int Sendto4or6_Raw(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
     int r;
     if (s_socket_is_v6) {
         sockaddr_in6 d6 = Addr_Map4(dst4);
@@ -110,6 +116,72 @@ int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
     }
     LogFamilyErr(r, s_socket_is_v6);
     return r;
+}
+
+// ---- Test-only network impairment on the whole UDP link (control + gekko) ---
+// FM2K_NET_DELAY_MS (one-way ms), FM2K_NET_JITTER_MS (random +/-), FM2K_NET_LOSS
+// (drop prob 0..1), FM2K_NET_SEED. RTT ~= 2*delay (each peer impairs its own
+// outbound). Reproduces a real link IN-PROCESS -- the battle-start FA transient +
+// e2e under loss -- without external clumsy. The delay queue is pumped on every
+// send; gameplay sends ~100/s give ~10ms granularity.
+namespace {
+struct DelayedSend { std::vector<char> buf; sockaddr_in dst; SOCKET s; uint64_t due_ms; };
+std::mutex              g_ni_mutex;
+std::deque<DelayedSend> g_ni_queue;
+int      g_ni_delay  = -1;     // one-way ms; -1 = uninit
+int      g_ni_jitter = 0;
+double   g_ni_loss   = 0.0;
+uint64_t g_ni_rng    = 0;
+void NetImpairInit() {
+    if (g_ni_delay >= 0) return;
+    const char* j  = std::getenv("FM2K_NET_JITTER_MS");
+    const char* l  = std::getenv("FM2K_NET_LOSS");
+    const char* sd = std::getenv("FM2K_NET_SEED");
+    const char* d  = std::getenv("FM2K_NET_DELAY_MS");
+    g_ni_jitter = j ? std::atoi(j) : 0;
+    g_ni_loss   = l ? std::atof(l) : 0.0;
+    g_ni_rng    = sd ? std::strtoull(sd, nullptr, 10) : 0x9E3779B97F4A7C15ULL;
+    g_ni_delay  = d ? std::atoi(d) : 0;          // set LAST: arms the fast-path gate
+    if (g_ni_delay > 0 || g_ni_loss > 0.0)
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "[NET-IMPAIR] one-way delay=%dms jitter=%dms loss=%.3f (RTT~%dms) -- TEST ONLY",
+            g_ni_delay, g_ni_jitter, g_ni_loss, g_ni_delay * 2);
+}
+uint64_t NiRng() {
+    uint64_t x = g_ni_rng; x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    g_ni_rng = x; return x * 0x2545F4914F6CDD1DULL;
+}
+}  // namespace
+
+int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
+    NetImpairInit();
+    if (g_ni_delay <= 0 && g_ni_loss <= 0.0) {
+        return Sendto4or6_Raw(s, buf, len, dst4);   // fast path: impairment off
+    }
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(g_ni_mutex);
+    // Re-emit delayed packets whose time has come (raw -> no re-impair).
+    for (auto it = g_ni_queue.begin(); it != g_ni_queue.end(); ) {
+        if (it->due_ms <= now) {
+            Sendto4or6_Raw(it->s, it->buf.data(), (int)it->buf.size(), it->dst);
+            it = g_ni_queue.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (g_ni_loss > 0.0) {
+        const double r = (double)(NiRng() >> 11) * (1.0 / 9007199254740992.0);  // [0,1)
+        if (r < g_ni_loss) return len;   // dropped -- report success to caller
+    }
+    if (g_ni_delay > 0) {
+        int jit = g_ni_jitter > 0
+            ? (int)(NiRng() % (2u * (unsigned)g_ni_jitter + 1)) - g_ni_jitter : 0;
+        int d = g_ni_delay + jit; if (d < 0) d = 0;
+        g_ni_queue.push_back(DelayedSend{
+            std::vector<char>(buf, buf + len), dst4, s, now + (uint64_t)d });
+        return len;   // queued -- report success to caller
+    }
+    return Sendto4or6_Raw(s, buf, len, dst4);
 }
 
 int SendtoStorage(SOCKET s, const char* buf, int len, const sockaddr_storage& dst) {
