@@ -380,6 +380,17 @@ void SpectatorNode_StampInputAdmit() {
 }
 
 uint32_t SpectatorNode_RenderPeriodMs() {
+    // Offline replay plays at a RIGID 1:1 (paced by the file, not a live host).
+    // The whole file is queued at boot so the production-rate window is
+    // meaningless -- never let it drive the replay's tick rate (F12 is the only
+    // speed lever). Belt-and-braces vs the catch-up carve-out in
+    // trampoline_spectator.cpp.
+    static int s_is_replay = -1;
+    if (s_is_replay < 0) {
+        const char* rf = std::getenv("FM2K_REPLAY_FILE");
+        s_is_replay = (rf && rf[0]) ? 1 : 0;
+    }
+    if (s_is_replay) return 10;
     // Pace the spectator render loop to the measured host production period,
     // clamped [10ms, 20ms] = [100fps, 50fps]. 100fps host -> 10ms (identical to
     // the old rigid behavior); ~70fps heavy-stage host -> ~14ms, one render per
