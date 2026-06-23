@@ -78,9 +78,26 @@ void MaybeLogFrametime(uint64_t tick_start) {
     static uint64_t s_work_sum = 0, s_work_max = 0;
     static uint64_t s_frame_sum = 0, s_frame_max = 0;
     static uint32_t s_n = 0, s_frames = 0;
+    static uint32_t s_over_budget = 0;            // frames whose work exceeded 10ms
+    const uint64_t budget_ticks = freq / 100;     // 10ms = freq/100
     const uint64_t work = work_end - tick_start;
     s_work_sum += work;
     if (work > s_work_max) s_work_max = work;
+    // A frame whose WORK (engine+render+spectator fan-out, measured before the
+    // pacing sleep) exceeds the 10ms budget is a real host hiccup -- SleepToTarget
+    // can only pad UP to 10ms, never claw back time already spent. Count them so
+    // the spectator load test can assert the host never stalls the two players.
+    if (work > budget_ticks) {
+        ++s_over_budget;
+        // Surface a catastrophic single-frame stall (>2x budget) immediately --
+        // the 300-frame summary's average would otherwise bury it. Pure QPC
+        // reads, no timing perturbation.
+        if (work > budget_ticks * 2) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "[HICCUP] host frame work=%.1fms (>2x 10ms budget)",
+                (double)work * 1000.0 / (double)freq);
+        }
+    }
     if (s_prev_start) {
         const uint64_t frame = tick_start - s_prev_start;
         s_frame_sum += frame;
@@ -92,11 +109,12 @@ void MaybeLogFrametime(uint64_t tick_start) {
         auto ms = [freq](uint64_t t) { return (double)t * 1000.0 / (double)freq; };
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "[FRAMETIME] n=%u work avg=%.2fms max=%.2fms | frame avg=%.2fms "
-            "max=%.2fms (target 10.00ms = 100fps)",
+            "max=%.2fms (target 10.00ms = 100fps) over_budget=%u/%u",
             s_n, ms(s_work_sum) / s_n, ms(s_work_max),
-            s_frames ? ms(s_frame_sum) / s_frames : 0.0, ms(s_frame_max));
+            s_frames ? ms(s_frame_sum) / s_frames : 0.0, ms(s_frame_max),
+            s_over_budget, s_n);
         s_work_sum = s_work_max = s_frame_sum = s_frame_max = 0;
-        s_n = s_frames = 0;
+        s_n = s_frames = s_over_budget = 0;
     }
 }
 

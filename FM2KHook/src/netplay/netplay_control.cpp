@@ -494,6 +494,10 @@ void OnControlMessage(const CtrlPacket* packet, const sockaddr_in& from) {
             SpectatorNode_HandleLeave(from);
             break;
 
+        case CtrlMsg::SPEC_SESSION_END:
+            SpectatorNode_HandleSessionEnd(from);
+            break;
+
         default:
             break;
     }

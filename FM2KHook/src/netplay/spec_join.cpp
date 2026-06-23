@@ -369,6 +369,39 @@ void SpectatorNode_HandleLeave(const sockaddr_in& from) {
     }
 }
 
+// Host side: tell every subscriber the session is ending cleanly (player quit /
+// left). Without this the viewer sees only the dropped stream and treats it as a
+// glitch -- storm-reconnecting to a dead host for seconds. Sent a few times
+// because UDP is lossy and we tear down right after. Mirrors the expiry sweep's
+// SPEC_LEAVE send (spec_health.cpp) but with do-not-reconnect semantics.
+void SpectatorNode_BroadcastSessionEnd() {
+    if (g_state.subscribers.empty()) return;
+    CtrlPacket pkt = {};
+    pkt.header.type = CtrlMsg::SPEC_SESSION_END;
+    for (int rep = 0; rep < 3; ++rep) {
+        for (const auto& sub : g_state.subscribers) {
+            ControlChannel_SendTo(pkt, sub.addr);
+        }
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: broadcast SPEC_SESSION_END to %zu subscriber(s)",
+                g_state.subscribers.size());
+}
+
+// Viewer side: upstream sent SPEC_SESSION_END. Unlike SPEC_LEAVE (which fails
+// over to root), this means the whole session is OVER -- set session_ended so
+// the reconnect path in TickHealth stays parked instead of storming a dead host.
+void SpectatorNode_HandleSessionEnd(const sockaddr_in& from) {
+    if (g_state.subscribed_upstream && AddrEqual(g_state.upstream_addr, from)) {
+        char buf[48] = {}; FormatAddr(from, buf, sizeof(buf));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SpectatorNode: upstream %s sent SPEC_SESSION_END — session "
+                    "over, stopping (no reconnect)", buf);
+        g_state.session_ended = true;
+        g_state.subscribed_upstream = false;
+    }
+}
+
 void SpectatorNode_HandleHeartbeat(const sockaddr_in& from) {
     // Viewer side: an echo from the upstream is the gameplay-independent
     // liveness proof. The session-derived datagram flow stops whenever
@@ -417,6 +450,7 @@ std::vector<sockaddr_in> SpectatorNode_GetSubscriberAddrs() {
 bool SpectatorNode_RequestJoin(const sockaddr_in& upstream, SpecJoinMode mode) {
     g_state.upstream_addr       = upstream;
     g_state.subscribed_upstream = false;
+    g_state.session_ended       = false;  // fresh join clears any prior SESSION_END
     g_state.last_requested_mode = mode;  // sticky — see comment in State decl
     // Bump reconnect timestamp so TickHealth's failover backoff covers the
     // INITIAL JOIN_REQ too. Without this, last_reconnect_attempt_ms stays

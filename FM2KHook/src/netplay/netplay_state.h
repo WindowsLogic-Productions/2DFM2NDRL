@@ -105,6 +105,13 @@ enum class CtrlMsg : uint8_t {
     // computed delay independently off their own RTT samples and ended
     // up asymmetric on jittery links (#24).
     DELAY_PROPOSAL,
+
+    // SPEC_SESSION_END — host is exiting cleanly (player quit / left the match).
+    // Broadcast to all subscribers so they STOP, instead of treating the dropped
+    // stream as a transient glitch and storm-reconnecting to a now-dead host.
+    // Appended at the end so existing wire values don't renumber; older peers
+    // hit the dispatch default and ignore it harmlessly.
+    SPEC_SESSION_END,
 };
 
 // Convert message type to string for logging
@@ -134,6 +141,7 @@ inline const char* CtrlMsgToString(CtrlMsg msg) {
         case CtrlMsg::SPEC_LEAVE:        return "SPEC_LEAVE";
         case CtrlMsg::HOST_CONFIG:       return "HOST_CONFIG";
         case CtrlMsg::DELAY_PROPOSAL:    return "DELAY_PROPOSAL";
+        case CtrlMsg::SPEC_SESSION_END:  return "SPEC_SESSION_END";
         default:                         return "UNKNOWN";
     }
 }

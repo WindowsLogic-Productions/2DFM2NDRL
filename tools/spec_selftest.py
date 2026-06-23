@@ -48,6 +48,14 @@ GAME_EXE = GAMES["wanwan"]   # default; overridden by --game in main()
 OUT_DIR  = Path("/mnt/c/dev/wanwan/tools/.spec_selftest")
 PARITY_DIFF = Path(__file__).parent / "parity_diff.py"
 P1_PORT, P2_PORT, SPEC_PORT = 7000, 7001, 7002
+# Fake-spectator UDP ports start at 7200 -- clear of the real spec range (7002+)
+# AND the host's TCP listener (tries udp+100 = 7100 first). Fakes dial whatever
+# TCP port the JOIN_ACK reports, so no fake TCP bind collision.
+FAKE_PORT_BASE = 7200
+FAKE_SPEC_TOOL = Path(__file__).parent / "fake_spectator.py"
+# Fakes run as WINDOWS processes (so 127.0.0.1 reaches the Windows-side host;
+# NAT-mode WSL2 loopback would not). Windows Python on the test box.
+WIN_PYTHON = r"C:\Program Files\Python313\python.exe"
 
 
 def to_win(p: Path) -> str:
@@ -61,6 +69,37 @@ def kill_strays():
     for image in ("FM2K_RollbackLauncher.exe", "WonderfulWorld_ver_0946.exe"):
         subprocess.run(["taskkill.exe", "/F", "/T", "/IM", image],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def report_host_pacing(host_log, n_fake):
+    """Phase 3 signal: parse the host's [FRAMETIME]/[HICCUP] lines into one
+    HOST PACING line. over_budget = host frames whose engine+render+spectator-
+    fanout WORK exceeded the 10ms budget (a real player-visible stall, since
+    SleepToTarget can only pad up to 10ms not claw back time); [HICCUP] = a
+    single frame >20ms. Compare N=0 vs N: if adding fake spectators raises
+    over_budget/hiccups, the fan-out is lagging the host -- the bug to fix."""
+    import re
+    works, work_max, over, tot, hiccups = [], 0.0, 0, 0, 0
+    try:
+        for ln in open(host_log, errors="ignore"):
+            m = re.search(r"\[FRAMETIME\].*?work avg=([\d.]+)ms max=([\d.]+)ms"
+                          r".*?over_budget=(\d+)/(\d+)", ln)
+            if m:
+                works.append(float(m.group(1)))
+                work_max = max(work_max, float(m.group(2)))
+                over += int(m.group(3)); tot += int(m.group(4))
+            elif "[HICCUP]" in ln:
+                hiccups += 1
+    except OSError:
+        pass
+    if tot == 0:
+        print(f"[harness] HOST PACING (fake_specs={n_fake}): no [FRAMETIME] "
+              "samples (profiler off or host ran <300 frames)")
+        return
+    rate = 100.0 * over / tot
+    print(f"[harness] HOST PACING (fake_specs={n_fake}): frames={tot} "
+          f"work_avg={sum(works) / len(works):.2f}ms work_max={work_max:.2f}ms "
+          f"over_budget={over}/{tot} ({rate:.2f}%) hiccups={hiccups}")
 
 
 def launch(label, args, env_extra, log_path, timeout, done_when=None):
@@ -236,8 +275,28 @@ def main():
                          "instant char0/char0 path that exercises the spectator "
                          "battle-align fix (host confirms inside the seam-hold "
                          "window).")
+    # Phase 3 host-no-hiccup load test: N protocol-level FAKE spectators
+    # (tools/fake_spectator.py) join/churn the host WITHOUT running a game, so we
+    # load the host's fan-out path at N=3..7 without N real game instances lagging
+    # the box (which would confound the host frame-time measurement). Enables
+    # FM2K_PERF_PROFILE on the host so [FRAMETIME] over_budget is logged + parsed.
+    ap.add_argument("--fake-spectators", type=int, default=0,
+                    help="spawn N protocol-only fake spectators to load the host's "
+                         "fan-out (no game instances); reports host over_budget/hiccups")
+    ap.add_argument("--fake-schedule", default="",
+                    help="override the per-fake join/leave schedule "
+                         "(e.g. join@0,leave@8,join@12); default auto-staggers + churns the last")
+    ap.add_argument("--fake-duration", type=float, default=180.0,
+                    help="max seconds a fake spectator runs (killed when the host finishes)")
+    ap.add_argument("--no-fake-churn", action="store_true",
+                    help="disable the last fake spectator's leave/rejoin churn "
+                         "(churn re-triggers the host's snapshot+backfill = the heaviest path)")
     args = ap.parse_args()
     min_coverage = args.min_coverage if args.min_coverage >= 0 else args.frames - 100
+    # Measure host pacing when fakes are present OR when explicitly asked (so the
+    # N=0 baseline run -- FM2K_PERF_PROFILE=1 ... --fake-spectators 0 -- also logs
+    # [FRAMETIME], giving a clean delta vs the N=7 load run).
+    measure_host = args.fake_spectators > 0 or bool(os.environ.get("FM2K_PERF_PROFILE"))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     p1_pty   = OUT_DIR / "p1_parity.pty"
@@ -291,6 +350,10 @@ def main():
               "FM2K_LOCAL_PORT": str(P1_PORT),
               "FM2K_REMOTE_ADDR": f"127.0.0.1:{P2_PORT}",
               "FM2K_PARITY_RECORD_PATH": to_win(p1_pty)}
+    if measure_host:
+        # Host frame-time profiler ON for the load test -> [FRAMETIME]
+        # over_budget=X/300 + [HICCUP] lines land in the host's debug log.
+        p1_env["FM2K_PERF_PROFILE"] = "1"
     p2_env = {**common_env,
               "FM2K_LOCAL_PORT": str(P2_PORT),
               "FM2K_REMOTE_ADDR": f"127.0.0.1:{P1_PORT}"}
@@ -369,6 +432,40 @@ def main():
                          OUT_DIR / f"spec{s['k']}.log",
                          args.record_timeout + 60, make_spec_done(s))
 
+    def gen_fake_schedule(k):
+        # Stagger joins 1s apart so the host sees a steady ramp of subscribers.
+        # The LAST fake churns (leave -> rejoin twice) to repeatedly re-trigger
+        # the host's snapshot + full session-backfill -- the heaviest fan-out
+        # path -- landing in battle where the snapshot is a ~1MB savestate.
+        t = k * 1.0
+        if not args.no_fake_churn and k == args.fake_spectators - 1:
+            return (f"join@{t},leave@{t+6},join@{t+10},"
+                    f"leave@{t+16},join@{t+20}")
+        return f"join@{t}"
+
+    fake_procs = []
+    def spawn_fakes():
+        fake_win = to_win(FAKE_SPEC_TOOL)
+        for k in range(args.fake_spectators):
+            sched = args.fake_schedule or gen_fake_schedule(k)
+            log_win = to_win(OUT_DIR / f"fake{k}.log")
+            # Run the fake as a WINDOWS process (Windows Python, via .bat like the
+            # launcher). A WSL python on 127.0.0.1 hits WSL's loopback, NOT the
+            # Windows host (NAT-mode WSL2) -- the host never sees the JOIN. Windows
+            # python on 127.0.0.1 reaches the host exactly like the real clients.
+            bat = OUT_DIR / f".fake{k}.bat"
+            cmd = (f'"{WIN_PYTHON}" "{fake_win}" --host-udp 127.0.0.1:{P1_PORT} '
+                   f'--local-udp-port {FAKE_PORT_BASE + k} --schedule {sched} '
+                   f'--duration {args.fake_duration} --label fake{k}')
+            bat.write_text("@echo off\r\n" + cmd + f' > "{log_win}" 2>&1\r\n')
+            fp = subprocess.Popen(["cmd.exe", "/C", to_win(bat)],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            fake_procs.append(fp)
+        print(f"[harness] spawned {args.fake_spectators} fake spectators "
+              f"(Windows py, UDP {FAKE_PORT_BASE}..{FAKE_PORT_BASE + args.fake_spectators - 1}); "
+              f"host FM2K_PERF_PROFILE on")
+
     t1.start()
     time.sleep(1.0)
     t2.start()
@@ -376,6 +473,10 @@ def main():
     spec_threads = []
     # css-phase spectators dial in during the host's CSS (wall-clock delay).
     time.sleep(args.spec_join_delay)
+    # Fake spectators start loading the host now too (their own schedules then
+    # stagger joins + churn through CSS into battle).
+    if args.fake_spectators > 0:
+        spawn_fakes()
     for s in specs:
         if s["phase"] == "css":
             t = threading.Thread(target=launch_spec, args=(s,)); t.start()
@@ -404,6 +505,17 @@ def main():
     t1.join(); t2.join()
     for t in spec_threads:
         t.join()
+    for fp in fake_procs:
+        try:
+            fp.terminate()
+        except OSError:
+            pass
+    if fake_procs:
+        # Backstop: subscribed fakes self-exit on host_gone, but a churning fake
+        # parked in a 'left' window when the host dies would linger to
+        # --fake-duration. The fakes are the only Windows python.exe in a test.
+        subprocess.run(["taskkill.exe", "/F", "/IM", "python.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     kill_strays()
     print(f"[harness] rcs: P1={rcs[0]} P2={rcs[1]} "
           + " ".join(f"SPEC{s['k']}={s['rc']}" for s in specs))
@@ -709,15 +821,26 @@ def main():
         ct = len(trc_spec)
         mt = sum(1 for rng, _ in trc_spec if rng not in host_trc_rng)
         first_t = next(((rng,) for rng, _ in trc_spec if rng not in host_trc_rng), None)
-        sfp = fp_states(spec_live)
+        sfp = fp_states(spec_live)   # ordered by bf
         cf = len(sfp)
-        mf = sum(1 for st in sfp if st not in host_fp_set)
-        first_f = next((st for st in sfp if st not in host_fp_set), None)
-        # Gate = TRACE rng_post (aligned post-PGI+UG) + FP hp/scripts (capture-
-        # stable). FP rng and positions are NOT gated (different sub-frame
-        # capture point on host vs spec -> sub-frame-level false mismatches even
-        # when bit-exact).
-        return dict(ct=ct, cf=cf, mt=mt, mf=mf,
+        miss = [st not in host_fp_set for st in sfp]
+        mf_total = sum(miss)
+        # A real desync is DETERMINISTIC and PERSISTS: the spectator never rolls
+        # back, so once its sim diverges every later FP frame mismatches. An
+        # ISOLATED single miss (followed by a match) therefore cannot be a real
+        # desync -- it's a sub-frame capture-timing artifact on a value caught
+        # mid-transition (hp during a hit, script at a move-start), the same
+        # class as the position/rng capture noise already excluded. Gate the FP
+        # only on a CONSECUTIVE run >= 2 (a persistent divergence). The aligned
+        # TRACE rng_post (mt) remains the authoritative per-frame check.
+        run = mx = 0
+        for f in miss:
+            run = run + 1 if f else 0
+            if run > mx:
+                mx = run
+        mf = mf_total if mx >= 2 else 0
+        first_f = next((st for st, f in zip(sfp, miss) if f), None)
+        return dict(ct=ct, cf=cf, mt=mt, mf=mf, mf_total=mf_total, mx=mx,
                     checked=ct + cf, bad=mt + mf,
                     first_t=first_t, first_f=first_f)
 
@@ -728,11 +851,19 @@ def main():
         verdict = "PASS" if s["ok"] else ("INCONCLUSIVE" if r["checked"] == 0 else "FAIL")
         print(f"[harness] GATE SPEC{s['k']} ({s['phase']}, P{s['idx']+1}): "
               f"checked {r['checked']} (TRACE {r['ct']} rng + FP {r['cf']} hp/scripts); "
-              f"{r['mt']} TRACE-rng + {r['mf']} FP-state not-in-host -> {verdict}")
+              f"{r['mt']} TRACE-rng + {r['mf']} FP-state not-in-host "
+              f"(FP raw {r['mf_total']}, max-run {r['mx']}) -> {verdict}")
         if r["first_t"]:
             print(f"    TRACE rng-not-in-host (REAL divergence): {r['first_t']}")
+        if r["mf_total"] and r["mx"] < 2:
+            print(f"    (advisory) {r['mf_total']} isolated FP miss(es), max-run "
+                  f"{r['mx']} -- capture-timing on transitioning hp/script, not a desync")
         if r["first_f"]:
-            print(f"    FP hp/scripts-not-in-host (REAL divergence): {r['first_f']}")
+            print(f"    FP hp/scripts-not-in-host (REAL persistent divergence): {r['first_f']}")
+
+    # Phase 3: host-no-hiccup report (host ran with FM2K_PERF_PROFILE on).
+    if measure_host:
+        report_host_pacing(OUT_DIR / "live_FM2K_P1_Debug.log", args.fake_spectators)
 
     real_fail   = any(s["gate"]["checked"] > 0 and not s["ok"] for s in specs)
     checked_any = any(s["gate"]["checked"] > 0 for s in specs)

@@ -227,6 +227,10 @@ struct State {
 
     // Viewer-side state (this node subscribed upstream).
     bool                      subscribed_upstream = false;
+    // Set when the upstream sends SPEC_SESSION_END (host exited cleanly). Stops
+    // the reconnect machinery so we don't storm a dead host. Cleared on a fresh
+    // manual RequestJoin / Netplay_InitAsSpectator.
+    bool                      session_ended       = false;
     // Join-grace: false from JOIN until the first EVENT_BATCH applies.
     // The silence failover uses a 30s budget until then -- at real loss
     // rates the dial + 1MB snapshot + backfill exceed the steady-state

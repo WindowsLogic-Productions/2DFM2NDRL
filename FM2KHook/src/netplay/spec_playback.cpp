@@ -301,6 +301,16 @@ void ApplySessionEvent(const SessionEvent& ev) {
 
 static uint64_t g_last_input_admit_ms = 0;
 
+// Layer-2 render pacing: the host's PRODUCTION RATE, measured as admissions per
+// rolling 500ms window (robust to the 8-frame EVENT_BATCH bursts, which make
+// per-gap timing useless -- gaps are bimodal ~0ms within-batch / ~80ms between).
+// Smoothed -> g_prod_period_ms. SpectatorNode_RenderPeriodMs() clamps it to
+// [10,20]ms ([100,50]fps) and the spectator render loop paces to it, so a slow
+// heavy-stage host is rendered at its true rate with no duplicate frames.
+static uint32_t g_admit_window_count = 0;
+static uint64_t g_admit_window_start = 0;
+static double   g_prod_period_ms     = 10.0;  // start at the 100fps assumption
+
 // Adaptive delay bank (Phase G). The static 300-frame bank absorbs any
 // arrival gap shorter than 3s -- enough for the tested clumsy profile,
 // but a link with longer retransmit bursts still drains to q:0 and
@@ -328,6 +338,23 @@ void SpectatorNode_StampUdpInputAdmit() {
 void SpectatorNode_StampInputAdmit() {
     const uint64_t now = GetTickCount64();
     if (g_first_input_admit_ms == 0) g_first_input_admit_ms = now;
+    // Production-rate window (Layer-2 render pacing). Count admissions per 500ms
+    // -> fps -> smoothed period. A catch-up UDP flood spikes the rate, which only
+    // drives the period BELOW 10ms -> clamped back to 10ms by the accessor, so
+    // catch-up can't make the render crawl; no separate catchup gate needed.
+    ++g_admit_window_count;
+    if (g_admit_window_start == 0) {
+        g_admit_window_start = now;
+    } else if (now - g_admit_window_start >= 500) {
+        const double win_ms = (double)(now - g_admit_window_start);
+        const double rate_fps = (double)g_admit_window_count * 1000.0 / win_ms;
+        if (rate_fps > 1.0) {
+            const double period = 1000.0 / rate_fps;
+            g_prod_period_ms += 0.3 * (period - g_prod_period_ms);  // smooth
+        }
+        g_admit_window_count = 0;
+        g_admit_window_start = now;
+    }
     if (g_last_input_admit_ms != 0) {
         const uint64_t gap = now - g_last_input_admit_ms;
         // 10s ceiling: longer silences are outages (TCP death, frozen
@@ -350,6 +377,18 @@ void SpectatorNode_StampInputAdmit() {
         }
     }
     g_last_input_admit_ms = now;
+}
+
+uint32_t SpectatorNode_RenderPeriodMs() {
+    // Pace the spectator render loop to the measured host production period,
+    // clamped [10ms, 20ms] = [100fps, 50fps]. 100fps host -> 10ms (identical to
+    // the old rigid behavior); ~70fps heavy-stage host -> ~14ms, one render per
+    // produced frame, no duplicates, stable bank. Below 50fps the bank + the
+    // proportional slowdown (trampoline_spectator.cpp) absorb the rest.
+    double p = g_prod_period_ms;
+    if (p < 10.0) p = 10.0;
+    if (p > 20.0) p = 20.0;
+    return (uint32_t)(p + 0.5);
 }
 
 size_t SpectatorNode_TargetDelayFrames() {

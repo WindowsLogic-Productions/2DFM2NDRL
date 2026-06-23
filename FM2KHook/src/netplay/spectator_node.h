@@ -622,6 +622,13 @@ void SpectatorNode_HandleJoinReq(const sockaddr_in& from,
 // Handle SPEC_LEAVE — remove subscriber from list.
 void SpectatorNode_HandleLeave(const sockaddr_in& from);
 
+// Host side: broadcast SPEC_SESSION_END to all subscribers on clean exit so
+// they stop instead of storm-reconnecting to a dead host. Call in Netplay_Shutdown.
+void SpectatorNode_BroadcastSessionEnd();
+
+// Viewer side: handle SPEC_SESSION_END from upstream — park the reconnect path.
+void SpectatorNode_HandleSessionEnd(const sockaddr_in& from);
+
 // Handle SPEC_HEARTBEAT — refresh last-seen timestamp for this subscriber.
 void SpectatorNode_HandleHeartbeat(const sockaddr_in& from);
 
@@ -719,6 +726,10 @@ bool SpectatorNode_QueueHasPendingOp();
 // genuine starvation and play out its held frames instead of freezing.
 uint32_t SpectatorNode_MsSinceLastAdmit();
 void SpectatorNode_StampInputAdmit();
+// Layer-2 render pacing: the spectator's outer-tick sleep target in ms, =
+// clamp(measured host production period, 10, 20). Lets the spectator render at
+// the host's true rate (e.g. ~14ms/70fps on a heavy stage) with no duplicates.
+uint32_t SpectatorNode_RenderPeriodMs();
 // UDP-datagram INPUT admissions only (subset of the above). Feeds the
 // adaptive bank's TCP-only floor pre-arm.
 void SpectatorNode_StampUdpInputAdmit();

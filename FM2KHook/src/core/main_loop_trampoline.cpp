@@ -326,7 +326,16 @@ BOOL TrampolineMainLoop() {
                 // Hz here means once the initial catchup completes the
                 // spectator simply tracks the live edge with whatever
                 // delay the network gives it.
-                SleepToTarget(tick_start, 10);
+                //
+                // Layer-2 render pacing (2026-06-23): pace the outer tick to the
+                // host's MEASURED production period instead of a rigid 100Hz.
+                // 100fps host -> 10ms (unchanged); a render-bound heavy-stage
+                // host confirms inputs at ~70fps -> ~14ms, so the spectator
+                // renders one frame per produced frame instead of out-running
+                // production, draining the bank, and juddering on duplicate
+                // frames. The production-rate window clamps to 10ms during the
+                // catch-up flood so the outer tick never crawls.
+                SleepToTarget(tick_start, SpectatorNode_RenderPeriodMs());
                 break;
             }
         }

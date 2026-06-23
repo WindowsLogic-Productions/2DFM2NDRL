@@ -624,6 +624,11 @@ bool Netplay_InitAsSpectator(uint16_t local_port, const char* host_addr) {
 void Netplay_Shutdown() {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Netplay: Shutting down");
 
+    // Tell any subscribers we're exiting cleanly BEFORE we tear down the socket,
+    // so they stop instead of treating the dropped stream as a glitch and
+    // storm-reconnecting to a dead host. UDP control path is still live here.
+    SpectatorNode_BroadcastSessionEnd();
+
     if (g_session) {
         gekko_destroy(&g_session);
         g_session = nullptr;

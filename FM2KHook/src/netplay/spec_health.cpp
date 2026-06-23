@@ -17,6 +17,7 @@
 #include "../hooks/per_game_patches.h" // PerGamePatches_SetRuntimeBtbOverrides
 #include "../ui/shared_mem.h"         // C10: SharedMem_PublishMatchSession / RoundResult
 #include "gekkonet.h"
+#include <SDL3/SDL_timer.h>       // SDL_GetPerformanceCounter/Frequency (hi-res backfill timing)
 
 #include <SDL3/SDL_log.h>
 #include <winsock2.h>
@@ -184,7 +185,8 @@ void SpectatorNode_TickHealth() {
 
     // Reconnect path: not subscribed, but we have a root we can fall
     // back to. Throttle so we don't spam JOIN_REQ.
-    if ((!g_state.subscribed_upstream || g_state.tcp_rejoin_pending) &&
+    if (!g_state.session_ended &&            // host said SESSION_END: stop, no storm
+        (!g_state.subscribed_upstream || g_state.tcp_rejoin_pending) &&
         g_state.root_addr.sin_port != 0 &&
         // Never fire a new JOIN while an upstream connection exists --
         // the host's existing-sub re-JOIN path drops connections from
@@ -407,6 +409,10 @@ void SpectatorNode_TickHostMaintenance() {
             just_bound = true;
         }
         if (just_bound) {
+            // Time the whole synchronous backfill: it runs holding g_poll_mutex,
+            // so the host main loop's ControlChannel_Poll blocks for exactly this
+            // long when a spectator binds. This is the Phase 3 hiccup measurement.
+            const uint64_t bf_start = SDL_GetPerformanceCounter();
             char buf[48] = {}; FormatAddr(sub.addr, buf, sizeof(buf));
 
             // C5 backfill ordering fence:
@@ -514,9 +520,25 @@ void SpectatorNode_TickHostMaintenance() {
 
             sub.last_seen_ms = now;            // post-backfill liveness anchor
             SpectatorTCP::MarkBackfillComplete(sub.addr);
+            const double bf_ms = (double)(SDL_GetPerformanceCounter() - bf_start)
+                                 * 1000.0 / (double)SDL_GetPerformanceFrequency();
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "[SPEC-BACKFILL] join backfill for %s took %.1fms (events=%zu) -- "
+                "host main loop blocked this whole time", buf, bf_ms,
+                g_state.session_events.size());
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "SpectatorNode: backfill complete for %s — live broadcasts engaged",
                         buf);
+            // One bind + backfill per maintenance tick. Several spectators can
+            // be ready at the SAME instant -- classically a tournament's worth
+            // waiting at CSS that all bind on the battle-entry tick when
+            // StashSnapshot first validates the snapshot. Each backfill is only
+            // ~1-3ms (the 1MB state zero-RLEs to ~32KB), but N of them in a
+            // single game frame would stack. Spreading them one-per-frame keeps
+            // the host's per-frame spectator cost bounded no matter how many
+            // join at once -- the rest bind on the next tick (a few frames'
+            // delay to start watching, imperceptible).
+            break;
         }
     }
 
