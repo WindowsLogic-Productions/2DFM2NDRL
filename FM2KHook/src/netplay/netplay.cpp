@@ -478,10 +478,33 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
                     const char* unver =
                         std::getenv("FM2K_PEER_REFLEXIVE_UNVERIFIED");
                     bool punch_reflexive = !(unver && unver[0] == '1');
+                    // Phase 1: parse FM2K_PEER_V6_ADDR = "[2xxx::...]:port". The
+                    // bracket notation disambiguates the v6 colons from the port
+                    // colon. A valid v6 candidate is also-punched (CGNAT bypass).
+                    uint8_t peer_v6[16] = {};
+                    uint16_t v6_port = 0;
+                    const uint8_t* v6_ptr = nullptr;
+                    if (const char* v6e = std::getenv("FM2K_PEER_V6_ADDR")) {
+                        std::string vs(v6e);
+                        size_t rb = vs.find(']');
+                        if (vs.size() > 4 && vs.front() == '[' &&
+                            rb != std::string::npos && rb + 2 < vs.size() &&
+                            vs[rb + 1] == ':') {
+                            std::string host = vs.substr(1, rb - 1);
+                            int vp = std::atoi(vs.c_str() + rb + 2);
+                            in6_addr a6{};
+                            if (inet_pton(AF_INET6, host.c_str(), &a6) == 1 &&
+                                vp > 0 && vp <= 65535) {
+                                std::memcpy(peer_v6, &a6, 16);
+                                v6_port = static_cast<uint16_t>(vp);
+                                v6_ptr = peer_v6;
+                            }
+                        }
+                    }
                     ::fm2k::nat::StartPunch(peer_ia.s_addr,
                                              static_cast<uint16_t>(port_i),
                                              token_bytes, lan_ip_be, lan_port,
-                                             punch_reflexive);
+                                             punch_reflexive, v6_ptr, v6_port);
                 }
             }
         }
@@ -860,16 +883,13 @@ void Netplay_TickHeartbeat() {
     // cluster, 2026-06-13). Diagnostic only -- no behavior change. Formatting
     // mirrors g_remote_addr's (inet_ntop + "%s:%u") so the compare is byte-exact.
     if (::fm2k::nat::IsRelayMode()) {
-        char live[INET_ADDRSTRLEN + 8] = "?";
-        if (const sockaddr_in* rs = NetSocket_GetRemoteAddr()) {
-            char ip_buf[INET_ADDRSTRLEN] = {};
-            inet_ntop(AF_INET, (void*)&rs->sin_addr, ip_buf, sizeof(ip_buf));
-            snprintf(live, sizeof(live), "%s:%u", ip_buf, ntohs(rs->sin_port));
-        }
-        const bool match = (strcmp(live, g_remote_addr) == 0);
+        // Family-aware live stamp via the SAME formatter as the actor register
+        // + recv stamp, so the byte-compare is valid for v4 and v6 alike.
+        std::string live = NetSocket_GetRemoteActorString();
+        const bool match = (live == g_remote_addr);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "[BEAT-RELAY] gekko_ping=%ums actor='%s' live_stamp='%s' addr_match=%s%s",
-            stats.last_ping, g_remote_addr, live, match ? "yes" : "NO",
+            stats.last_ping, g_remote_addr, live.c_str(), match ? "yes" : "NO",
             (!match || stats.last_ping == 0)
                 ? "  <-- RTT-match BROKEN (ping pins at 0 -> one-sided rollback)" : "");
     }

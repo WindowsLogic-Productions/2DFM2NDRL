@@ -1,22 +1,22 @@
 #pragma once
 // IPv4/IPv6 address helpers -- the SINGLE owner of the dual-stack-socket
-// concern. The rest of the netcode keeps its v4 (sockaddr_in) assumptions.
+// concern. The rest of the netcode now holds peer/source addresses as
+// sockaddr_storage and formats / sends / compares them through here, so no
+// family logic leaks into the callers.
 //
 // The shared UDP socket is opened AF_INET6 dual-stack (IPV6_V6ONLY=0) when the
-// platform allows it; v4 peers are reached via v4-mapped (::ffff:a.b.c.d)
-// addresses on that SAME handle. On hosts where IPv6 is disabled we soft-fall-
-// back to a legacy AF_INET socket. Which one won is recorded here (set once at
-// init via Addr_SetSocketV6); Sendto4or6 + Addr_RecvSourceToV4 branch on it so
-// no v4/v6 logic leaks into the callers.
+// platform allows it; v4 peers ride v4-mapped (::ffff:a.b.c.d) on that SAME
+// handle. On hosts where IPv6 is disabled we soft-fall-back to a legacy
+// AF_INET socket. Which one won is recorded here (Addr_SetSocketV6).
 //
 // LOAD-BEARING INVARIANT: GekkoNet drops any packet whose source string is not
-// a byte-exact match of the actor string, which is formatted from a v4
-// sockaddr_in (inet_ntoa). So all IN-MEMORY peer/local addresses stay
-// sockaddr_in: inbound v4-mapped sources are un-mapped to AF_INET at the recv
-// boundary (Addr_RecvSourceToV4), and Sendto4or6 re-maps only on the wire.
+// a byte-exact match of the actor string. Addr_ActorString is the ONE formatter
+// used both to register the actor and to stamp inbound packets; its v4 output is
+// byte-identical to the legacy inet_ntoa("%s:%d") form, so v4 sync is preserved.
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <string>
 
 namespace fm2k {
 
@@ -30,18 +30,31 @@ bool Addr_IsV4Mapped(const sockaddr_in6& a6);
 sockaddr_in Addr_Unmap4(const sockaddr_in6& a6);   // precondition: v4-mapped
 sockaddr_in6 Addr_Map4(const sockaddr_in& a4);     // -> ::ffff:<a4>
 
-// Normalize a recvfrom source (received into a sockaddr_in6) to a real AF_INET
-// sockaddr_in for the v4-only peer-learning / actor-string path. Returns true
-// and fills `out` for a usable v4 source (v4-mapped on the dual-stack socket,
-// or the plain sockaddr_in the kernel wrote on the v4-fallback socket); returns
-// false for a native-IPv6 source (no v6 candidates in this build -- caller
-// drops it).
-bool Addr_RecvSourceToV4(const sockaddr_in6& from6, sockaddr_in& out);
+// Normalize a recvfrom source (received into a sockaddr_in6) to a real-family
+// sockaddr_storage: v4-mapped -> AF_INET; native v6 -> AF_INET6; on the v4-
+// fallback socket the kernel wrote a sockaddr_in. Always succeeds (v6 peers
+// are supported now).
+void Addr_NormalizeRecv(const sockaddr_in6& from6, sockaddr_storage& out);
+
+// The GekkoNet actor string for a peer/source: v4 -> "a.b.c.d:port" (BYTE-
+// IDENTICAL to the legacy inet_ntoa form), v6 -> "[2xxx::...]:port". The ONE
+// formatter used at every actor-register + recv-stamp site.
+std::string Addr_ActorString(const sockaddr_storage& sa);
+
+// Family-aware equality (family + address bytes + port). Used by peer-learning.
+bool Addr_Equal(const sockaddr_storage& a, const sockaddr_storage& b);
+
+// True if sa is a usable (non-empty) peer address (port != 0).
+bool Addr_HasPort(const sockaddr_storage& sa);
 
 // sendto a v4 destination on socket s: bare on the v4-fallback socket, or
-// v4-mapped on the dual-stack socket. Returns the raw sendto() result (caller
-// keeps its own WSAEWOULDBLOCK handling); logs only the family-mismatch errors
-// that would otherwise be silent.
+// v4-mapped on the dual-stack socket. Returns the raw sendto() result; logs
+// only the family-mismatch errors that would otherwise be silent.
 int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4);
+
+// sendto an arbitrary-family destination (sockaddr_storage): native v6 for an
+// AF_INET6 dst, else routed through Sendto4or6 (v4-mapped / bare). Used by the
+// direct gameplay egress now that the peer can be v6.
+int SendtoStorage(SOCKET s, const char* buf, int len, const sockaddr_storage& dst);
 
 } // namespace fm2k

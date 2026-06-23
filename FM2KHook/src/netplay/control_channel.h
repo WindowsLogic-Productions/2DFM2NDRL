@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstdint>
+#include <string>
 
 // Forward declaration for GekkoNet
 struct GekkoNetAdapter;
@@ -33,6 +34,9 @@ uint16_t NetSocket_GetLocalPort();
 
 // Get remote address info (for GekkoNet adapter)
 const sockaddr_in* NetSocket_GetRemoteAddr();
+// Canonical family-aware actor string for the current peer (v4 byte-identical
+// to the legacy form, v6 "[..]:port"). Use this for gekko_add_actor.
+std::string NetSocket_GetRemoteActorString();
 
 // =============================================================================
 // CONTROL CHANNEL (0xCC-prefixed packets)
@@ -53,7 +57,7 @@ SOCKET ControlChannel_GetSocket();
 // lands — the existing 0xCC HELLO/HELLO_ACK loop then sends to the right
 // place. Idempotent; subsequent calls overwrite (which is fine, the peer
 // addr should only update on legitimate authentication).
-void ControlChannel_LatchPeerAddr(const sockaddr_in& peer);
+void ControlChannel_LatchPeerAddr(const sockaddr_storage& peer);
 
 // Send a control packet to remote peer
 void ControlChannel_Send(const CtrlPacket& packet);

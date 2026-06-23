@@ -24,7 +24,7 @@
 // =============================================================================
 SOCKET g_socket = INVALID_SOCKET;
 sockaddr_in6 g_local_sockaddr = {};  // AF_INET6 dual-stack bind (or v4-fallback port)
-sockaddr_in g_remote_sockaddr = {};  // peer: stays v4 (un-mapped at recv)
+sockaddr_storage g_remote_sockaddr = {};  // peer: v4 (un-mapped) OR native v6
 bool g_socket_initialized = false;
 
 // Sequence numbers for reliable messaging
@@ -111,7 +111,7 @@ ControlMsgCallback g_msg_callback = nullptr;
 char g_recv_buffer[RECV_BUFFER_SIZE];
 
 // Queue for GekkoNet packets (filtered from receive)
-std::vector<std::pair<std::vector<char>, sockaddr_in>> g_gekko_packet_queue;
+std::vector<std::pair<std::vector<char>, sockaddr_storage>> g_gekko_packet_queue;
 
 // GekkoNet result pointers for adapter (actual results are heap-allocated)
 std::vector<GekkoNetResult*> g_gekko_result_ptrs;
@@ -316,8 +316,12 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
 
     // Parse remote address (format: "ip:port"). Empty/missing is allowed for
     // pure hosts: we'll learn the peer from the first inbound HELLO.
-    g_remote_sockaddr = {};
-    g_remote_sockaddr.sin_family = AF_INET;
+    // The env-supplied remote (FM2K_REMOTE_ADDR) is always v4 (the peer's
+    // reflexive/LAN). A v6 peer is only ever LEARNED later (v6 punch -> peer
+    // learning), so init parses v4 into the storage via a sockaddr_in view.
+    std::memset(&g_remote_sockaddr, 0, sizeof(g_remote_sockaddr));
+    sockaddr_in* r4 = reinterpret_cast<sockaddr_in*>(&g_remote_sockaddr);
+    r4->sin_family = AF_INET;
     bool have_remote = false;
     if (remote_addr && remote_addr[0]) {
         std::string addr_str(remote_addr);
@@ -325,8 +329,8 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
         if (colon_pos != std::string::npos) {
             std::string ip = addr_str.substr(0, colon_pos);
             uint16_t port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
-            if (inet_pton(AF_INET, ip.c_str(), &g_remote_sockaddr.sin_addr) == 1 && port != 0) {
-                g_remote_sockaddr.sin_port = htons(port);
+            if (inet_pton(AF_INET, ip.c_str(), &r4->sin_addr) == 1 && port != 0) {
+                r4->sin_port = htons(port);
                 have_remote = true;
             }
         }
@@ -334,8 +338,8 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "NetSocket: Ignoring invalid remote '%s', waiting for peer HELLO",
                         remote_addr);
-            g_remote_sockaddr.sin_port = 0;
-            g_remote_sockaddr.sin_addr.s_addr = 0;
+            r4->sin_port = 0;
+            r4->sin_addr.s_addr = 0;
         }
     }
 
@@ -396,7 +400,16 @@ uint16_t NetSocket_GetLocalPort() {
 }
 
 const sockaddr_in* NetSocket_GetRemoteAddr() {
-    return &g_remote_sockaddr;
+    // v4 view of the peer storage (valid for v4 + the v4-only spectator path).
+    return reinterpret_cast<const sockaddr_in*>(&g_remote_sockaddr);
+}
+
+// The canonical GekkoNet actor string for the current peer (family-aware: v4
+// byte-identical to the legacy form, v6 "[..]:port"). Both the actor register
+// (netplay_battle/css) and the relay diag format through this so they match the
+// recv stamp exactly -- the load-bearing actor-string invariant.
+std::string NetSocket_GetRemoteActorString() {
+    return fm2k::Addr_ActorString(g_remote_sockaddr);
 }
 
 // =============================================================================
@@ -407,28 +420,25 @@ SOCKET ControlChannel_GetSocket() {
     return g_socket;
 }
 
-void ControlChannel_LatchPeerAddr(const sockaddr_in& peer) {
-    char ip[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
-    if (g_remote_sockaddr.sin_addr.s_addr != peer.sin_addr.s_addr ||
-        g_remote_sockaddr.sin_port        != peer.sin_port) {
+void ControlChannel_LatchPeerAddr(const sockaddr_storage& peer) {
+    std::string peer_s = fm2k::Addr_ActorString(peer);
+    if (!fm2k::Addr_Equal(g_remote_sockaddr, peer)) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "ControlChannel: peer addr latched -> %s:%u (was %u)",
-            ip, (unsigned)ntohs(peer.sin_port),
-            (unsigned)ntohs(g_remote_sockaddr.sin_port));
-        // [RELAY-RTT-DIAG] A re-latch AFTER g_connected desyncs
-        // g_remote_sockaddr from the address ALREADY registered with
-        // gekko_add_actor (netplay.cpp:1928). gekko's NetworkHealth RTT only
-        // accrues when addr.Equals(actor) (backend.cpp:781); once the stamp
-        // diverges, AddRTT never fires -> last_ping pins at 0 -> that peer
-        // runs ahead -> one-sided rollback -> desync amplification. This WARN
-        // confirms/refutes that timing live on the next relay match; the fix
-        // (freeze the stamp post-connect) waits on this evidence. (2026-06-13)
+            "ControlChannel: peer addr latched -> %s", peer_s.c_str());
+        // Winning-candidate telemetry: which path authenticated first.
+        const char* kind = ::fm2k::nat::IsRelayMode() ? "relay"
+                         : (peer.ss_family == AF_INET6 ? "v6" : "v4");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "[NAT] winning candidate = %s -> %s", kind, peer_s.c_str());
+        // [RELAY-RTT-DIAG] A re-latch AFTER g_connected desyncs g_remote_sockaddr
+        // from the address ALREADY registered with gekko_add_actor. gekko's RTT
+        // only accrues when addr.Equals(actor); once the stamp diverges, last_ping
+        // pins at 0 -> that peer runs ahead -> one-sided rollback. (2026-06-13)
         if (g_connected) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "[RELAY-RTT-DIAG] post-connect peer re-latch -> %s:%u "
-                "DIVERGES gekko actor addr; expect ping=0 + one-sided rollback",
-                ip, (unsigned)ntohs(peer.sin_port));
+                "[RELAY-RTT-DIAG] post-connect peer re-latch -> %s DIVERGES "
+                "gekko actor addr; expect ping=0 + one-sided rollback",
+                peer_s.c_str());
         }
     }
     g_remote_sockaddr = peer;

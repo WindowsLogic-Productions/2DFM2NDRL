@@ -402,11 +402,11 @@ bool Netplay_StartBattle() {
     // inbound packet addresses from the real sockaddr ("ip:port"), so the string we
     // give gekko_add_actor must match that same formatting or every packet is dropped.
     if (const sockaddr_in* learned = NetSocket_GetRemoteAddr()) {
-        if (learned->sin_port != 0) {
-            char ip_buf[INET_ADDRSTRLEN] = {};
-            inet_ntop(AF_INET, (void*)&learned->sin_addr, ip_buf, sizeof(ip_buf));
-            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s:%u",
-                     ip_buf, ntohs(learned->sin_port));
+        if (learned->sin_port != 0) {  // sin_port aliases sin6_port (offset 2)
+            // Family-aware canonical actor string (v4 byte-identical to the old
+            // form; v6 "[..]:port") -- MUST match the recv stamp.
+            std::string actor = NetSocket_GetRemoteActorString();
+            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s", actor.c_str());
         }
     }
 

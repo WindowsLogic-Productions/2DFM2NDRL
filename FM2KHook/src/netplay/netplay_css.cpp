@@ -420,11 +420,9 @@ bool Netplay_StartCSSSession() {
 
     // Refresh remote address string from learned sockaddr (post-HELLO_ACK).
     if (const sockaddr_in* learned = NetSocket_GetRemoteAddr()) {
-        if (learned->sin_port != 0) {
-            char ip_buf[INET_ADDRSTRLEN] = {};
-            inet_ntop(AF_INET, (void*)&learned->sin_addr, ip_buf, sizeof(ip_buf));
-            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s:%u",
-                     ip_buf, ntohs(learned->sin_port));
+        if (learned->sin_port != 0) {  // sin_port aliases sin6_port (offset 2)
+            std::string actor = NetSocket_GetRemoteActorString();
+            snprintf(g_remote_addr, sizeof(g_remote_addr), "%s", actor.c_str());
         }
     }
 

@@ -53,10 +53,10 @@ void RawSend(const void* data, size_t len) {
         return;
     }
 
-    if (g_remote_sockaddr.sin_port == 0) return;  // peer address not known yet (host waiting for client)
+    if (!fm2k::Addr_HasPort(g_remote_sockaddr)) return;  // peer addr not known yet
 
-    int result = fm2k::Sendto4or6(g_socket, (const char*)data, (int)len,
-                                  g_remote_sockaddr);
+    int result = fm2k::SendtoStorage(g_socket, (const char*)data, (int)len,
+                                     g_remote_sockaddr);
     if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK) {
@@ -134,24 +134,14 @@ void RawReceive() {
 
         if (recv_len == 0) break;
 
-        // Normalize the source to a real AF_INET sockaddr_in BEFORE any
-        // compare/stamp/learn/dispatch below: peer-learning equality and the
-        // GekkoNet actor-string match both assume v4. On the dual-stack socket
-        // v4 peers arrive v4-mapped (::ffff:a.b.c.d); native v6 has no
-        // candidates in this build, so drop it. On the v4-fallback socket the
-        // kernel wrote a plain sockaddr_in into the front of the buffer.
-        sockaddr_in from_addr;
-        if (!fm2k::Addr_RecvSourceToV4(from6, from_addr)) {
-            // Native IPv6 source -- no v6 candidates in this build, drop it.
-            static bool warned_v6 = false;
-            if (!warned_v6) {
-                warned_v6 = true;
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "NetSocket: dropping native-IPv6 source "
-                    "(no v6 candidates in this build)");
-            }
-            continue;
-        }
+        // Normalize the source to a real-family sockaddr_storage BEFORE any
+        // compare/stamp/learn/dispatch below. On the dual-stack socket v4 peers
+        // arrive v4-mapped (un-mapped to AF_INET here); native v6 peers are now
+        // supported (kept AF_INET6). On the v4-fallback socket the kernel wrote
+        // a plain sockaddr_in. Addr_ActorString / Addr_Equal handle either
+        // family, so the gekko actor-string match holds for v4 and v6 alike.
+        sockaddr_storage from_addr;
+        fm2k::Addr_NormalizeRecv(from6, from_addr);
 
         g_last_recv_time = GetTimeMs();
 
@@ -185,14 +175,11 @@ void RawReceive() {
             // instead of the peer. In relay mode we don't need a
             // peer addr at all (RawSend's relay branch ignores it).
             if (!from_relay && !g_connected &&
-                (g_remote_sockaddr.sin_addr.s_addr != from_addr.sin_addr.s_addr ||
-                 g_remote_sockaddr.sin_port != from_addr.sin_port)) {
-                char ip_buf[INET_ADDRSTRLEN] = {};
-                inet_ntop(AF_INET, &from_addr.sin_addr, ip_buf, sizeof(ip_buf));
+                !fm2k::Addr_Equal(g_remote_sockaddr, from_addr)) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "NetSocket: Learned peer address %s:%u (was %u)",
-                            ip_buf, ntohs(from_addr.sin_port),
-                            ntohs(g_remote_sockaddr.sin_port));
+                            "NetSocket: Learned peer address %s (was %s)",
+                            fm2k::Addr_ActorString(from_addr).c_str(),
+                            fm2k::Addr_ActorString(g_remote_sockaddr).c_str());
                 g_remote_sockaddr = from_addr;
             }
 
@@ -229,7 +216,10 @@ void RawReceive() {
 
                 // Forward all messages to callback (including PING/PONG for logging)
                 if (g_msg_callback) {
-                    g_msg_callback(packet, from_addr);
+                    // OnControlMessage ignores the addr family; the peer is
+                    // already learned above. v4 view is safe for both families.
+                    g_msg_callback(packet,
+                        *reinterpret_cast<const sockaddr_in*>(&from_addr));
                 }
             }
         } else if (eff_len >= 1 && first == 0xCD) {
@@ -246,7 +236,8 @@ void RawReceive() {
             extern void SpectatorNode_HandleUdpInputDatagram(
                 const uint8_t* buf, size_t len, const sockaddr_in& from);
             SpectatorNode_HandleUdpInputDatagram(
-                reinterpret_cast<const uint8_t*>(eff_data), eff_len, from_addr);
+                reinterpret_cast<const uint8_t*>(eff_data), eff_len,
+                *reinterpret_cast<const sockaddr_in*>(&from_addr));
         } else {
             // GekkoNet packet - queue for adapter
             std::vector<char> pkt_data(
@@ -268,7 +259,7 @@ void RawReceive() {
             // inet_ntoa) are derived from this same g_remote_sockaddr, and
             // it was set via inet_pton (dotted-decimal only, no hostnames),
             // so the two formattings produce identical "ip:port" text.
-            const sockaddr_in& stamp = from_relay ? g_remote_sockaddr : from_addr;
+            const sockaddr_storage& stamp = from_relay ? g_remote_sockaddr : from_addr;
             g_gekko_packet_queue.push_back({std::move(pkt_data), stamp});
         }
     }

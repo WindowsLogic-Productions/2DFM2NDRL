@@ -120,13 +120,13 @@ static GekkoNetResult** MultiplexAdapter_Receive(int* length) {
         // Allocate the result struct on heap - GekkoNet will free it
         GekkoNetResult* result = (GekkoNetResult*)malloc(sizeof(GekkoNetResult));
 
-        // Create address string
-        char addr_str[64];
-        snprintf(addr_str, sizeof(addr_str), "%s:%d",
-                 inet_ntoa(from_addr.sin_addr), ntohs(from_addr.sin_port));
+        // Canonical family-aware actor string (v4 byte-identical to the old
+        // inet_ntoa form; v6 "[..]:port"). MUST match gekko_add_actor's string
+        // or gekko drops every packet from this source.
+        std::string addr_s = fm2k::Addr_ActorString(from_addr);
 
-        result->addr.data = _strdup(addr_str);  // GekkoNet will free this
-        result->addr.size = (int)strlen(addr_str);
+        result->addr.data = _strdup(addr_s.c_str());  // GekkoNet will free this
+        result->addr.size = (int)addr_s.size();
         result->data = (char*)malloc(pkt_data.size());
         memcpy(result->data, pkt_data.data(), pkt_data.size());
         result->data_len = (int)pkt_data.size();

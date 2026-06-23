@@ -20,9 +20,11 @@ extern SOCKET g_socket;
 // dual-stack when possible; in the v4 fallback only sin6_port is meaningful
 // (read by NetSocket_GetLocalPort). The v4/v6 family flag lives in addr6_util.
 extern sockaddr_in6 g_local_sockaddr;
-// Peer address STAYS sockaddr_in: inbound v4-mapped sources are un-mapped at
-// the recv boundary so the GekkoNet actor-string byte-match is preserved.
-extern sockaddr_in g_remote_sockaddr;
+// Peer address as sockaddr_storage so it can hold an IPv4 (un-mapped at recv)
+// OR a native IPv6 peer. The v4 family bytes/format are byte-identical to the
+// old sockaddr_in path (addr6_util's Addr_ActorString preserves the GekkoNet
+// actor-string match); v6 only ever appears when a v6 candidate latches.
+extern sockaddr_storage g_remote_sockaddr;
 extern bool g_socket_initialized;
 
 extern uint16_t g_send_seq;
@@ -57,7 +59,7 @@ extern ControlMsgCallback g_msg_callback;
 inline constexpr size_t RECV_BUFFER_SIZE = 2048;
 extern char g_recv_buffer[RECV_BUFFER_SIZE];
 
-extern std::vector<std::pair<std::vector<char>, sockaddr_in>> g_gekko_packet_queue;
+extern std::vector<std::pair<std::vector<char>, sockaddr_storage>> g_gekko_packet_queue;
 extern std::vector<GekkoNetResult*> g_gekko_result_ptrs;
 
 // ---- current time in milliseconds (steady clock) ----

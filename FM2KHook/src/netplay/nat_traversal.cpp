@@ -65,6 +65,12 @@ sockaddr_in       g_punch_peer{};
 // peer never authenticates (the 0xCC handshake + match_token gate adoption).
 sockaddr_in       g_punch_peer_lan{};
 bool              g_have_lan_peer = false;
+// Optional GLOBAL IPv6 candidate: the peer's native v6 host addr + its local
+// UDP bind port (no NAT remap on v6). When set, the burst ALSO punches here --
+// direct v6 bypasses CGNAT entirely. Sent NATIVELY (not via the v4-mapped
+// Sendto4or6 wrapper). Harmless if the peer has no v6 (never authenticates).
+sockaddr_in6      g_punch_peer_v6{};
+bool              g_have_v6_peer = false;
 
 constexpr int PUNCH_PACKETS  = 30;
 constexpr int PUNCH_PERIOD_MS = 10;   // ~300 ms total burst
@@ -160,7 +166,8 @@ bool SendStunProbe() {
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                 const uint8_t match_token[16],
                 uint32_t lan_ip_be, uint16_t lan_port,
-                bool punch_reflexive) {
+                bool punch_reflexive,
+                const uint8_t* peer_v6_addr, uint16_t v6_port) {
     char ip_str[INET_ADDRSTRLEN] = {};
     in_addr ia{};
     ia.s_addr = peer_ip_be;
@@ -200,6 +207,21 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
             "NAT: same-LAN candidate %s:%u — burst will also punch direct over LAN",
             lan_str, (unsigned)ntohs(g_punch_peer_lan.sin_port));
+    }
+
+    // Global IPv6 candidate (peer's native v6 + local bind port; no NAT remap).
+    g_have_v6_peer = false;
+    if (peer_v6_addr && v6_port) {
+        g_punch_peer_v6 = {};
+        g_punch_peer_v6.sin6_family = AF_INET6;
+        std::memcpy(&g_punch_peer_v6.sin6_addr, peer_v6_addr, 16);
+        g_punch_peer_v6.sin6_port = htons(v6_port);
+        g_have_v6_peer = true;
+        char v6s[INET6_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET6, &g_punch_peer_v6.sin6_addr, v6s, sizeof(v6s));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "NAT: IPv6 candidate [%s]:%u — burst will also punch direct over v6 "
+            "(CGNAT bypass)", v6s, (unsigned)v6_port);
     }
 
     // Loopback shortcut: same-machine peers don't need NAT punch. Two
@@ -293,6 +315,12 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                        reinterpret_cast<const char*>(pkt), sizeof(pkt),
                        g_punch_peer_lan);
             }
+            if (g_have_v6_peer) {
+                // Native v6 -- direct, no NAT translation (NOT Sendto4or6).
+                sendto(sock, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                       reinterpret_cast<sockaddr*>(&g_punch_peer_v6),
+                       sizeof(g_punch_peer_v6));
+            }
             Sleep(PUNCH_PERIOD_MS);
         }
 
@@ -347,12 +375,12 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
     });
 }
 
-void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
+void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_storage& from) {
     if (len < 2 || data[0] != MAGIC) return;
     const uint8_t tag = data[1];
 
-    char from_ip[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &from.sin_addr, from_ip, sizeof(from_ip));
+    // Family-aware "ip:port" / "[v6]:port" for logging + (on auth) the latch.
+    std::string from_s = fm2k::Addr_ActorString(from);
 
     switch (tag) {
         case TAG_ACK: {
@@ -381,14 +409,14 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
             if (len < 2 + MATCH_TOKEN_LEN) return;
             if (!g_match_token_set) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "NAT: CTRL_PUNCH from %s:%u dropped — no local token set",
-                    from_ip, (unsigned)ntohs(from.sin_port));
+                    "NAT: CTRL_PUNCH from %s dropped — no local token set",
+                    from_s.c_str());
                 return;
             }
             if (std::memcmp(data + 2, g_match_token, MATCH_TOKEN_LEN) != 0) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "NAT: CTRL_PUNCH from %s:%u dropped — token mismatch",
-                    from_ip, (unsigned)ntohs(from.sin_port));
+                    "NAT: CTRL_PUNCH from %s dropped — token mismatch",
+                    from_s.c_str());
                 return;
             }
             // First authentic peer punch: latch the address into
@@ -415,15 +443,15 @@ void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from) {
                         "NAT: relay disengaged — direct punch landed late");
                 }
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "NAT: CTRL_PUNCH from %s:%u authenticated — peer latched",
-                    from_ip, (unsigned)ntohs(from.sin_port));
+                    "NAT: CTRL_PUNCH from %s authenticated — peer latched",
+                    from_s.c_str());
             }
             return;
         }
         default:
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "NAT: unknown 0xCD tag=0x%02X from %s:%u (ignoring)",
-                (unsigned)tag, from_ip, (unsigned)ntohs(from.sin_port));
+                "NAT: unknown 0xCD tag=0x%02X from %s (ignoring)",
+                (unsigned)tag, from_s.c_str());
             return;
     }
 }

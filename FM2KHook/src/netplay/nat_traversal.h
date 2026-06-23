@@ -48,16 +48,20 @@ bool SendStunProbe();
 // rewriting CGNAT will have remapped), the burst does NOT spray that dead
 // reflexive port; it still punches the LAN candidate. The connection then
 // relies on the reverse punch / peer-learning / v6 / relay.
+// peer_v6_addr (optional, 16 bytes network-order in6_addr) + v6_port: the
+// peer's GLOBAL IPv6 host candidate. When non-null the burst ALSO punches it
+// natively -- direct v6 bypasses CGNAT (no NAT, no STUN). Safe if absent.
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                 const uint8_t match_token[16],
                 uint32_t lan_ip_be = 0, uint16_t lan_port = 0,
-                bool punch_reflexive = true);
+                bool punch_reflexive = true,
+                const uint8_t* peer_v6_addr = nullptr, uint16_t v6_port = 0);
 
 // Called once per call to control_channel.cpp::RawReceive when the
 // first byte of an inbound packet is 0xCD. `data`/`len` is the full
 // datagram. `from` is the source sockaddr — used as the candidate
 // peer address when the packet authenticates via match_token.
-void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_in& from);
+void HandleDatagram(const uint8_t* data, size_t len, const sockaddr_storage& from);
 
 // Hex-encode the 16-byte match_token (32 chars) into `out` if it has
 // been latched (StartPunch was called). Returns true on success, false
