@@ -217,6 +217,23 @@ void HubClient::OnMessage(const std::string& msg) {
             }
         }
 
+        // Peer's GLOBAL IPv6 candidate: hub forwards "v6": [addr, port] (same
+        // array shape as local). The address is a QUOTED v6 literal, so its
+        // inner colons stay inside the quotes and the comma after the closing
+        // quote cleanly splits addr from port. Direct v6 bypasses CGNAT.
+        std::string v6s = GetSub(peer_obj, "v6");
+        if (!v6s.empty() && (v6s.front() == '[' || v6s.front() == '"')) {
+            size_t a = v6s.find('"');
+            size_t b = (a == std::string::npos) ? a : v6s.find('"', a + 1);
+            if (a != std::string::npos && b != std::string::npos) {
+                ev.match.peer_v6_ip = v6s.substr(a + 1, b - a - 1);
+            }
+            size_t c = v6s.find(',');
+            if (c != std::string::npos) {
+                ev.match.peer_v6_port = std::atoi(v6s.c_str() + c + 1);
+            }
+        }
+
         std::string ws_addr = GetSub(peer_obj, "ws_addr");
         ev.match.peer_ws_addr = ws_addr;
 

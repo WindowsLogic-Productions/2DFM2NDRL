@@ -161,6 +161,11 @@ struct HubEvent {
         // so the hook also punches it -- same-house pairs go direct over the LAN.
         std::string peer_lan_ip;
         int peer_lan_port = 0;
+        // Peer's GLOBAL IPv6 host candidate + its local UDP port, forwarded by
+        // the hub from the peer's v6. Set FM2K_PEER_V6_ADDR so the hook also
+        // punches it -- direct v6 bypasses CGNAT entirely (no NAT, no STUN).
+        std::string peer_v6_ip;
+        int peer_v6_port = 0;
         // Relay fallback. Hub fills these on match_start so the hook
         // can switch to relay mode if direct punch fails. Empty/zero
         // means hub didn't advertise a relay (older hub or disabled).
@@ -344,8 +349,12 @@ public:
     // local_ip (optional): this machine's LAN IPv4 (fm2k::LocalLanIp()). The
     // hub relays it as the peer's same-LAN candidate so two players behind the
     // same router connect directly over the LAN. Empty = omit (backward-compat).
+    // v6 (optional): this machine's GLOBAL IPv6 host candidate
+    // (fm2k::LocalLanIpV6()). The hub relays it so the peer can connect
+    // directly over IPv6, bypassing CGNAT entirely. Empty = omit (backward).
     void SendUdpAddr(const std::string& ip, int port, int tcp_port = -1,
-                     const std::string& local_ip = "");
+                     const std::string& local_ip = "",
+                     const std::string& v6 = "");
 
     // UPnP-extended udp_addr (Phase 1 NAT reachability). Sent as a SECOND
     // udp_addr after the PortMapper completes a router mapping: carries the
@@ -362,7 +371,8 @@ public:
     // (D6) before honoring the port.
     void SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
                          const std::string& ext_ip, int ext_udp_port,
-                         bool upnp, const std::string& local_ip = "");
+                         bool upnp, const std::string& local_ip = "",
+                         const std::string& v6 = "");
 
     // NAT classification report (Phase 2a). Sent as a small udp_addr update
     // carrying just the nat_type string once the launcher's dual STUN probe

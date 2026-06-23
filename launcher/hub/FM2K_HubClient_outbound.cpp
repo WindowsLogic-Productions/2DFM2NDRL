@@ -54,7 +54,8 @@ void HubClient::SetStealth(bool on) {
 }
 
 void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port,
-                            const std::string& local_ip) {
+                            const std::string& local_ip,
+                            const std::string& v6) {
     // tcp_port < 0 → omit; spec hook listens on the same number as UDP by
     // convention (launcher passes the same value for both bind ports). Hub
     // stores it as `user.local_tcp_port` and forwards it in
@@ -68,13 +69,18 @@ void HubClient::SendUdpAddr(const std::string& ip, int port, int tcp_port,
     if (!local_ip.empty()) {
         m += ",\"local_ip\":\"" + EscapeJsonString(local_ip) + "\"";
     }
+    // v6: global IPv6 host candidate (the CGNAT bypass). Old hubs ignore it.
+    if (!v6.empty()) {
+        m += ",\"v6\":\"" + EscapeJsonString(v6) + "\"";
+    }
     m += "}";
     EnqueueOut(std::move(m));
 }
 
 void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
                                const std::string& ext_ip, int ext_udp_port,
-                               bool upnp, const std::string& local_ip) {
+                               bool upnp, const std::string& local_ip,
+                               const std::string& v6) {
     // Same base shape as SendUdpAddr (ip/port[/tcp_port]) plus the optional
     // UPnP fields. Kept as a separate method so the 3-arg call sites stay
     // untouched and the wire payload only grows the ext_* keys on the
@@ -95,6 +101,9 @@ void HubClient::SendUdpAddrUpnp(const std::string& ip, int port, int tcp_port,
     // the value from the first SendUdpAddr, but include it for robustness).
     if (!local_ip.empty()) {
         m += ",\"local_ip\":\"" + EscapeJsonString(local_ip) + "\"";
+    }
+    if (!v6.empty()) {
+        m += ",\"v6\":\"" + EscapeJsonString(v6) + "\"";
     }
     m += ",\"upnp\":";
     m += (upnp ? "true" : "false");

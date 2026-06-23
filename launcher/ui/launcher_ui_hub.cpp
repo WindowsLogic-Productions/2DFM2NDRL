@@ -194,6 +194,42 @@ std::string fm2k::LocalLanIp() {
     return out;
 }
 
+// IPv6 counterpart of LocalLanIp: discover the GLOBAL-unicast v6 address the OS
+// would source for outbound to a global dest (the connect()+getsockname() trick
+// auto-handles privacy/temporary address selection). A native global v6 IS the
+// routable address -- no STUN/NAT involved -- so this is our cleanest CGNAT
+// bypass candidate when both peers have v6. Filter to 2000::/3 (which already
+// excludes fe80:: link-local, fc00:: ULA, ::1 loopback and :: unspecified) and
+// drop the flaky transition prefixes (Teredo 2001:0::/32, 6to4 2002::/16).
+// Returns a bracketless "2xxx::..." or empty. NOTE: mingw's <ws2ipdef.h> has no
+// IN6_IS_ADDR_GLOBAL macro -- the by-hand prefix test below is the right call.
+std::string fm2k::LocalLanIpV6() {
+    SOCKET s = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return "";
+    sockaddr_in6 dst{};
+    dst.sin6_family = AF_INET6;
+    dst.sin6_port   = htons(53);
+    ::inet_pton(AF_INET6, "2001:4860:4860::8888", &dst.sin6_addr);  // route hint only
+    std::string out;
+    if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+        sockaddr_in6 local{};
+        int len = static_cast<int>(sizeof(local));
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            const uint8_t* b = local.sin6_addr.s6_addr;
+            bool global = (b[0] & 0xE0) == 0x20;  // 2000::/3 native global unicast
+            bool teredo = (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00);
+            bool sixto4 = (b[0] == 0x20 && b[1] == 0x02);
+            if (global && !teredo && !sixto4) {
+                char ip[INET6_ADDRSTRLEN] = {};
+                ::inet_ntop(AF_INET6, &local.sin6_addr, ip, sizeof(ip));
+                out = ip;
+            }
+        }
+    }
+    ::closesocket(s);
+    return out;
+}
+
 // Pre-match launcher STUN + NAT classification (Phase 2a). Binds the UDP
 // port the game will reuse, then sends TWO 0xCD 0x01 probes from the SAME
 // socket:

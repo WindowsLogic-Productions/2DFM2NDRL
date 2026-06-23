@@ -398,6 +398,22 @@ void LauncherUI::HandleMatchStartEvent(const fm2k::HubEvent& ev) {
                         ::SetEnvironmentVariableA("FM2K_PEER_REFLEXIVE_UNVERIFIED", nullptr);
                     }
 
+                    // Phase 1: peer's GLOBAL IPv6 candidate. Bracket notation
+                    // [ip]:port so the hook parser tells the v6 colons from the
+                    // port colon. NO same-machine guard -- two real boxes never
+                    // share a global v6, and a guard would block local v6
+                    // testing. Direct v6 bypasses CGNAT entirely (no NAT/STUN).
+                    if (!ev.match.peer_v6_ip.empty() && ev.match.peer_v6_port > 0) {
+                        std::string v6e = "[" + ev.match.peer_v6_ip + "]:" +
+                                          std::to_string(ev.match.peer_v6_port);
+                        ::SetEnvironmentVariableA("FM2K_PEER_V6_ADDR", v6e.c_str());
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: peer v6 candidate %s -> FM2K_PEER_V6_ADDR",
+                            v6e.c_str());
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_PEER_V6_ADDR", nullptr);
+                    }
+
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");

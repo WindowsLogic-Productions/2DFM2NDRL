@@ -67,6 +67,9 @@ NatClassifyResult LauncherStunClassify(uint16_t local_port,
 // same router connect directly over the LAN. Returns "" if it can't resolve a
 // private address (then the same-LAN path is simply skipped).
 std::string LocalLanIp();
+// This machine's GLOBAL IPv6 host candidate (2xxx::...), or "" if none. Sent to
+// the hub so a peer can connect directly over IPv6 and bypass CGNAT entirely.
+std::string LocalLanIpV6();
 }  // namespace fm2k
 
 // FM2K Memory addresses and structures (from research)
