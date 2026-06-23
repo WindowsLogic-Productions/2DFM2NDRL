@@ -288,20 +288,46 @@ fm2k::NatClassifyResult fm2k::LauncherStunClassify(uint16_t local_port,
             sent_a, sent_b);
     }
 
-    // Single ~1s collection window for BOTH acks. We can't tell which ack is
-    // which by the packet alone (both are 0xCD 0x02 ip port from the hub),
-    // so we disambiguate by the recvfrom *source port*: an ack from
-    // hub_udp_port answers probe A, one from hub_udp_port+3 answers probe B.
-    // Loop until both arrive or the deadline passes, shrinking the per-recv
-    // timeout to the remaining budget each pass.
+    // Retransmit-and-collect for BOTH acks. We can't tell which ack is which
+    // by the packet alone (both are 0xCD 0x02 ip port from the hub), so we
+    // disambiguate by the recvfrom *source port*: an ack from hub_udp_port
+    // answers probe A, one from hub_udp_port+3 answers probe B.
+    //
+    // A single send + a single recv timeout used to mis-classify lossy,
+    // high-RTT links (e.g. Latin-American / mobile carrier NAT to a US hub)
+    // as "blocked": one dropped probe or ack, or one recvfrom slice timeout,
+    // ended the whole wait. Now we re-send both probes on a cadence and keep
+    // collecting until the overall (adaptive) deadline -- a recvfrom slice
+    // timeout is a RETRY, never a stop. "blocked" therefore means zero acks
+    // across the full retransmit window, not a single unlucky drop.
+    constexpr uint32_t kBaseBudgetMs     = 2500;  // overall budget before first ack
+    constexpr uint32_t kResendMs         = 250;   // re-send both probes this often
+    constexpr DWORD    kRecvSliceMs      = 200;   // per-recvfrom wake so resends fire
+    constexpr uint32_t kSecondAckFloorMs = 600;   // min window for the 2nd ack
     bool have_a = false, have_b = false;
     uint16_t ext_a = 0, ext_b = 0;
     char ip_a_str[INET_ADDRSTRLEN] = {}, ip_b_str[INET_ADDRSTRLEN] = {};
-    const uint32_t deadline = static_cast<uint32_t>(SDL_GetTicks()) + 1000;
+    const uint32_t start  = static_cast<uint32_t>(SDL_GetTicks());
+    uint32_t deadline     = start + kBaseBudgetMs;   // extended on first ack
+    uint32_t next_send_ms = start + kResendMs;       // initial send already fired
+    uint32_t first_ack_ms = 0;
+    int      resend_passes = 0;
     while (!(have_a && have_b)) {
         uint32_t now = static_cast<uint32_t>(SDL_GetTicks());
         if (now >= deadline) break;
-        DWORD recv_to = deadline - now;            // remaining budget, ms
+        // Re-send both probes on the cadence (cheap: 2 tiny packets) so a
+        // dropped probe/ack gets another chance within the budget.
+        if (now >= next_send_ms) {
+            sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                   reinterpret_cast<const sockaddr*>(&haddr_a), sizeof(haddr_a));
+            sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                   reinterpret_cast<const sockaddr*>(&haddr_b), sizeof(haddr_b));
+            next_send_ms = now + kResendMs;
+            ++resend_passes;
+        }
+        uint32_t remaining = deadline - now;
+        DWORD recv_to = (remaining < kRecvSliceMs) ? (DWORD)remaining : kRecvSliceMs;
+        if (recv_to == 0) recv_to = 1;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&recv_to), sizeof(recv_to));
         uint8_t buf[64];
@@ -310,9 +336,12 @@ fm2k::NatClassifyResult fm2k::LauncherStunClassify(uint16_t local_port,
         int got = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                            reinterpret_cast<sockaddr*>(&from), &from_len);
         if (got < 8 || buf[0] != 0xCD || buf[1] != 0x02) {
-            if (got <= 0) break;  // timeout/error -- stop waiting
-            continue;             // junk packet, keep waiting within budget
+            // Slice timeout (got <= 0) or junk: do NOT stop -- keep
+            // retransmitting and collecting until the overall deadline. This
+            // is the crux of the false-"blocked" fix.
+            continue;
         }
+        bool none_before = !have_a && !have_b;
         uint32_t ip_be = 0;
         std::memcpy(&ip_be, buf + 2, 4);
         uint16_t port_be = 0;
@@ -330,6 +359,18 @@ fm2k::NatClassifyResult fm2k::LauncherStunClassify(uint16_t local_port,
             std::memcpy(ip_b_str, ip_str, sizeof(ip_b_str));
         }
         // Any other source port: ignore (not one of our two probes).
+        // On the FIRST ack, give the second ack a fair window on a lossy /
+        // high-RTT link: extend the deadline to 3x the measured round-trip,
+        // floored at kSecondAckFloorMs. UDP demonstrably works at this point,
+        // so we must not snap to "unknown" just because the 2nd ack is slow.
+        if (none_before && (have_a || have_b)) {
+            first_ack_ms = now;
+            uint32_t rtt   = now - start;
+            uint32_t extra = rtt * 3;
+            if (extra < kSecondAckFloorMs) extra = kSecondAckFloorMs;
+            uint32_t ext_deadline = now + extra;
+            if (ext_deadline > deadline) deadline = ext_deadline;
+        }
     }
 
     out.port_a = ext_a;
@@ -337,21 +378,24 @@ fm2k::NatClassifyResult fm2k::LauncherStunClassify(uint16_t local_port,
     if (have_a && have_b) {
         out.nat_type = (ext_a == ext_b) ? "cone" : "symmetric";
     } else if (!have_a && !have_b) {
-        out.nat_type = "blocked";
+        out.nat_type = "blocked";  // zero acks across the full retransmit window
     } else {
         out.nat_type = "unknown";  // only one side answered -- inconclusive
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "NAT classify: %s (port_a=%u port_b=%u, refl_ip=%s, local=%u, user=%s)",
+        "NAT classify: %s (port_a=%u port_b=%u, refl_ip=%s, local=%u, "
+        "resends=%d, first_ack=%ums, user=%s)",
         out.nat_type.c_str(), (unsigned)ext_a, (unsigned)ext_b,
         have_a ? ip_a_str : (have_b ? ip_b_str : "?"),
-        (unsigned)local_port, user_id.c_str());
+        (unsigned)local_port, resend_passes,
+        first_ack_ms ? (unsigned)(first_ack_ms - start) : 0u,
+        user_id.c_str());
     if (!have_a) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "STUN: no ack from primary %s:%u within ~1s "
-            "(hub records mapping anyway)",
-            hub_host.c_str(), (unsigned)hub_udp_port);
+            "STUN: no ack from primary %s:%u across the retransmit window "
+            "(%d resends, hub records mapping anyway)",
+            hub_host.c_str(), (unsigned)hub_udp_port, resend_passes);
     }
 
     closesocket(s);
