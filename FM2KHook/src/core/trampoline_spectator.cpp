@@ -271,22 +271,29 @@ void RunSpectatorTick() {
         SpectatorNode_InNaturalBootWalk() ||
         (qd > 0 && qd < SPECTATOR_LIVE_TARGET &&
          SpectatorNode_QueueHasPendingOp());
-    if (qd < SpectatorTargetDelayFrames() / 2 &&
+    if (qd < SpectatorTargetDelayFrames() &&
         !s_offline_replay_env_active && !boundary_bypass) {
-        // BANK MAINTENANCE: below half the delay bank, glide at half
-        // speed until arrivals restore it. The bank previously only
-        // existed at mirror start -- any host slow-period bled it at
-        // 1:1 playback and the next production stall hit q=0 (the
-        // mid-battle freeze, 2026-06-11 14:54). Half-speed playback
-        // during host slowdowns is a brief slow-mo the eye barely
-        // notices; a hard stall is not.
-        static bool s_glide_toggle = false;
-        s_glide_toggle = !s_glide_toggle;
-        if (qd == 0 || !s_glide_toggle) {
-            RenderFrameWithSnapshot();
+        // BANK MAINTENANCE: smoothly slow the playout IN PROPORTION to how far
+        // the buffer is below target, instead of slamming to a binary 50% glide.
+        // A spectator is a jitter-buffered video player: paces to the host's
+        // actual production rate (so a heavy-stage / jittery host that confirms
+        // inputs below 100fps doesn't drain the bank into a hard stall) while
+        // keeping the slow-down INVISIBLE during normal dips. Near target the
+        // skip fraction is ~0 (imperceptible); it ramps only as the buffer
+        // genuinely empties. Replaces the old jarring every-other-frame glide.
+        const size_t tgt = SpectatorTargetDelayFrames();
+        const double deficit = 1.0 - (double)qd / (double)(tgt ? tgt : 1);  // 0..1
+        // skip_rate = deficit^2 (gentle near target, stronger near empty),
+        // capped at 0.6 so playout never crawls below ~40% even near q=0.
+        const double skip_rate = deficit * deficit * 0.6;
+        static double s_skip_accum = 0.0;
+        s_skip_accum += skip_rate;
+        if (qd == 0 || s_skip_accum >= 1.0) {
+            if (s_skip_accum >= 1.0) s_skip_accum -= 1.0;
+            RenderFrameWithSnapshot();   // hold this frame, don't advance the sim
             return;
         }
-        // fall through: sim exactly one frame this tick
+        // fall through: sim exactly one frame this tick (full speed)
     }
     if (qd == 0 && !boundary_bypass) {
         // Truly empty — even offline replay has nothing left to do.
