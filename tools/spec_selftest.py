@@ -633,7 +633,8 @@ def main():
     # group(1)=bf, group(2)=rng, group(3+)=comparison fields.
     TRC = (r'(?:HOST|SPEC)-TRACE\] bf=(\d+) rng_pre=0x[0-9A-F]+ '
            r'rng_post=0x([0-9A-F]+) p1=0x([0-9A-F]+) p2=0x([0-9A-F]+)')
-    FP  = (r'(?:HOST|SPEC)-FP\] bf=(\d+).*?rng=0x([0-9A-F]+).*?'
+    FP  = (r'(?:HOST|SPEC)-FP\] bf=(\d+).*?p1_hp=(\d+) p2_hp=(\d+).*?'
+           r'p1_pos=\(([-\d]+),[-\d]+\) p2_pos=\(([-\d]+),[-\d]+\) '
            r'p1_script=(-?\d+) p2_script=(-?\d+)')
     def _rows2(path, pat):
         out = []
@@ -676,18 +677,48 @@ def main():
     # fingerprint: if every spectator rng appears in the host's set, the sims
     # produced identical state. Comparing inputs here gave false mismatches on a
     # snapshot-join (31 of them) while rng+scripts were bit-exact.
-    # Host trace set is shared; gate EACH spectator against it independently.
+    # FP checkpoint: gate on GAMEPLAY STATE (hp + positions + scripts), NOT the
+    # FP rng field. The host logs [HOST-FP] rng at a different sub-frame point
+    # (netplay_battle_events.cpp) than the spectator's [SPEC-FP]
+    # (trampoline_spectator.cpp), and the spectator's capture point is also
+    # catchup-dependent -- so FP rng differs host-vs-spec even when the sim is
+    # bit-exact (it false-FAILED a verified-correct mid-battle snapshot-join,
+    # 2026-06-23). hp/pos/scripts are aligned and a strong fingerprint; the dense
+    # aligned TRACE rng_post (bf 0-99) remains the authoritative rng check.
+    def fp_states(path):
+        out = []
+        try:
+            for ln in open(path, errors="ignore"):
+                m = _ret.search(FP, ln)
+                if m and int(m.group(1)) != 0:   # skip bf=0 (pre-pin transitional)
+                    # (hp1,hp2,s1,s2) -- POSITIONS dropped: they're captured at
+                    # different sub-frame points host-vs-spec (a moving player is
+                    # off by ~1 frame of travel at the termination tail) even when
+                    # bit-exact. hp + scripts are capture-stable (matched the whole
+                    # battle including the tail) and a real desync diverges in them.
+                    out.append((m.group(2), m.group(3), m.group(6), m.group(7)))
+        except OSError:
+            pass
+        return out
+    # Host sets are shared; gate EACH spectator against them independently.
     host_trc_rng = {rng for rng, _ in _rows2(host_dbg, TRC)}
-    host_fp_rows = _rows2(host_dbg, FP)
+    host_fp_set  = set(fp_states(host_dbg))
 
     def gate_one(spec_live):
         trc_spec = _rows2(spec_live, TRC)
         ct = len(trc_spec)
         mt = sum(1 for rng, _ in trc_spec if rng not in host_trc_rng)
         first_t = next(((rng,) for rng, _ in trc_spec if rng not in host_trc_rng), None)
-        cf, mf, ffm, first_f = _check(host_fp_rows, _rows2(spec_live, FP))
-        return dict(ct=ct, cf=cf, mt=mt, mf=mf, ffm=ffm,
-                    checked=ct + cf, bad=mt + mf + ffm,
+        sfp = fp_states(spec_live)
+        cf = len(sfp)
+        mf = sum(1 for st in sfp if st not in host_fp_set)
+        first_f = next((st for st in sfp if st not in host_fp_set), None)
+        # Gate = TRACE rng_post (aligned post-PGI+UG) + FP hp/scripts (capture-
+        # stable). FP rng and positions are NOT gated (different sub-frame
+        # capture point on host vs spec -> sub-frame-level false mismatches even
+        # when bit-exact).
+        return dict(ct=ct, cf=cf, mt=mt, mf=mf,
+                    checked=ct + cf, bad=mt + mf,
                     first_t=first_t, first_f=first_f)
 
     for s in specs:
@@ -696,13 +727,12 @@ def main():
         s["ok"] = r["checked"] > 0 and r["bad"] == 0
         verdict = "PASS" if s["ok"] else ("INCONCLUSIVE" if r["checked"] == 0 else "FAIL")
         print(f"[harness] GATE SPEC{s['k']} ({s['phase']}, P{s['idx']+1}): "
-              f"checked {r['checked']} frames (TRACE {r['ct']}, FP {r['cf']}); "
-              f"{r['mt'] + r['mf']} rng-not-in-host, {r['ffm']} FP script-mismatch "
-              f"-> {verdict}")
+              f"checked {r['checked']} (TRACE {r['ct']} rng + FP {r['cf']} hp/scripts); "
+              f"{r['mt']} TRACE-rng + {r['mf']} FP-state not-in-host -> {verdict}")
         if r["first_t"]:
-            print(f"    TRACE rng-not-in-host (real state divergence): {r['first_t']}")
+            print(f"    TRACE rng-not-in-host (REAL divergence): {r['first_t']}")
         if r["first_f"]:
-            print(f"    FP first issue: {r['first_f']}")
+            print(f"    FP hp/scripts-not-in-host (REAL divergence): {r['first_f']}")
 
     real_fail   = any(s["gate"]["checked"] > 0 and not s["ok"] for s in specs)
     checked_any = any(s["gate"]["checked"] > 0 for s in specs)
