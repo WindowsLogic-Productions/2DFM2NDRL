@@ -415,7 +415,15 @@ void RunSpectatorTick() {
     // the previous one-shot semantics gave us 30 frames of drain and left
     // the other 1100+ buffered, so first battle started 11 seconds behind
     // host with no recovery path short of F12.
-    if (!s_initial_catchup_done && !s_initial_catchup_active &&
+    // NEVER for offline replay: the whole .fm2krep sits in pb_queue from boot,
+    // so qd is thousands of frames and "catch up to the live edge" is
+    // meaningless -- it looks 1:1 through CSS (expensive .player frames bound the
+    // burst) then fast-forwards the instant battle's cheap frames begin (user
+    // report: "replay speeds up into battle"). Replays play 1:1; F12
+    // (needs_user_ff) is the only speed lever. Same carve-out as
+    // needs_battle_emergency below.
+    if (!s_offline_replay_env_active &&
+        !s_initial_catchup_done && !s_initial_catchup_active &&
         qd > SPECTATOR_LIVE_LAG_FRAMES) {
         s_initial_catchup_active = true;
     }
