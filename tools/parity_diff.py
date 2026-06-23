@@ -156,7 +156,11 @@ def _runs(keys, pos):
             runs.append([k])
     return runs
 
-def main(a_path, b_path):
+def main(a_path, b_path, context=None):
+    # context: when set, the caller is using this diff NON-authoritatively
+    # (index-paired streams that mis-align under multi-match / catch-up / loss).
+    # In that mode we do NOT print "REAL divergence" -- crying wolf there trains
+    # readers to ignore divergence, which would mask a genuine regression.
     A = battle_snaps(load(a_path))
     B = battle_snaps(load(b_path))
     print()
@@ -232,8 +236,15 @@ def main(a_path, b_path):
 
     r = persistent[0]
     k0 = r[0]
-    print(f"\nPERSISTENT ENGINE DIVERGENCE: run of {len(r)} frames from frame={k0} "
-          f"(does NOT reconverge within {RECONVERGE_WINDOW}) -- REAL divergence.")
+    if context:
+        print(f"\n[{context}] index-paired divergence: run of {len(r)} frames "
+              f"from frame={k0} (no reconverge within {RECONVERGE_WINDOW}). "
+              f"ADVISORY ONLY -- NOT a desync verdict; index pairing mis-aligns "
+              f"under multi-match / catch-up / loss. The authoritative check is "
+              f"the host-vs-spec trace GATE.")
+    else:
+        print(f"\nPERSISTENT ENGINE DIVERGENCE: run of {len(r)} frames from frame={k0} "
+              f"(does NOT reconverge within {RECONVERGE_WINDOW}) -- REAL divergence.")
     for fld, av, bv in div[k0]:
         if isinstance(av, int):
             print(f"  {fld:32s} A=0x{av & 0xFFFFFFFF:08X} B=0x{bv & 0xFFFFFFFF:08X} "
@@ -248,7 +259,9 @@ def main(a_path, b_path):
     return 1
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(__doc__)
+        print("usage: parity_diff.py <A.pty> <B.pty> [advisory-context-label]")
         sys.exit(2)
-    sys.exit(main(sys.argv[1], sys.argv[2]))
+    ctx = sys.argv[3] if len(sys.argv) == 4 else None
+    sys.exit(main(sys.argv[1], sys.argv[2], ctx))

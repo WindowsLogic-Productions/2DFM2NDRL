@@ -376,12 +376,16 @@ def main():
     print("[harness] (info) diffing HOST parity vs SPECTATOR parity "
           "(unreliable under packet loss -- host captures speculative states)")
     subprocess.call([sys.executable, str(PARITY_DIFF),
-                     str(p1_pty), str(spec_pty)])
+                     str(p1_pty), str(spec_pty),
+                     "host-vs-spec INFO (loss-sensitive, non-authoritative)"])
 
-    # THE GATE: spec-vs-replay, confirmed-vs-confirmed. Both the spectator
-    # stream and --replay playback are driven by the host's CONFIRMED input
-    # stream (post-e5fe11f recorder), so they must match bit-for-bit
-    # regardless of how much either side predicted live.
+    # ADVISORY (NOT the gate): spec-vs-replay, confirmed-vs-confirmed. In theory
+    # both the spectator stream and --replay playback are driven by the host's
+    # CONFIRMED input stream, so they should match -- but parity_diff index-pairs
+    # rows, which mis-aligns under multi-match autoplay + the spectator's
+    # catch-up cadence (the documented false "frame 71" alarms). The
+    # AUTHORITATIVE check is the host-vs-spec trace pairing further below; this
+    # diff is kept only as a human cross-check + the checked==0 fallback.
     if args.total_frames > 0:
         # Multi-match mode: the harness slice at terminate is a MID-MATCH-2
         # slice; the gate replays match 1's CANONICAL file (written by
@@ -504,7 +508,8 @@ def main():
           f"spectator's catch-up cadence -- it produced false 'frame 71' alarms "
           f"while host-vs-spec showed bit-exact sync. See the GATE below.")
     diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
-                               str(spec_m1), str(replay_m1)])
+                               str(spec_m1), str(replay_m1),
+                               "spec-vs-replay ADVISORY (index-paired)"])
 
     # AUTHORITATIVE GATE: host-vs-spec per-frame trace pairing (SAME run, same
     # match = ground truth). Both the host and spectator here watch the
