@@ -137,6 +137,10 @@ std::vector<GekkoNetResult*> g_gekko_result_ptrs;
 static void PollImplLocked();
 static void CALLBACK KeepaliveTimerProc(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR) {
     if (!g_socket_initialized) return;
+    // Flush the test-only network-impairment delay queue every timer tick,
+    // independent of send activity -- so an RTT-induced CSS/battle-entry stall
+    // can't deadlock waiting on a queued-but-never-sent packet. No-op in prod.
+    fm2k::NetImpair_Pump();
     // Outbound ping (post-handshake only).
     if (g_connected) {
         const uint32_t now_send = (uint32_t)timeGetTime();

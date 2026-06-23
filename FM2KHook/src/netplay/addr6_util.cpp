@@ -153,14 +153,9 @@ uint64_t NiRng() {
 }
 }  // namespace
 
-int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
-    NetImpairInit();
-    if (g_ni_delay <= 0 && g_ni_loss <= 0.0) {
-        return Sendto4or6_Raw(s, buf, len, dst4);   // fast path: impairment off
-    }
-    const uint64_t now = GetTickCount64();
-    std::lock_guard<std::mutex> lock(g_ni_mutex);
-    // Re-emit delayed packets whose time has come (raw -> no re-impair).
+// Re-emit delayed packets whose time has come (raw -> no re-impair). Caller
+// must hold g_ni_mutex.
+static void NetImpair_PumpLocked(uint64_t now) {
     for (auto it = g_ni_queue.begin(); it != g_ni_queue.end(); ) {
         if (it->due_ms <= now) {
             Sendto4or6_Raw(it->s, it->buf.data(), (int)it->buf.size(), it->dst);
@@ -169,6 +164,28 @@ int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
             ++it;
         }
     }
+}
+
+// Periodic pump -- called from the MM-timer worker (control_channel) so the
+// delay queue flushes every few ms REGARDLESS of whether this peer is sending.
+// Without it the queue drained only on send, so a CSS-sync / battle-entry stall
+// where BOTH peers wait on each other's delayed packet wedged: the awaited
+// packet sat un-flushed because neither peer was sending (the deadlock the
+// player saw under RTT). The MM-timer fires independent of the stalled main loop.
+void NetImpair_Pump() {
+    if (g_ni_delay <= 0) return;   // nothing queued when delay disabled/uninit
+    std::lock_guard<std::mutex> lock(g_ni_mutex);
+    NetImpair_PumpLocked(GetTickCount64());
+}
+
+int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4) {
+    NetImpairInit();
+    if (g_ni_delay <= 0 && g_ni_loss <= 0.0) {
+        return Sendto4or6_Raw(s, buf, len, dst4);   // fast path: impairment off
+    }
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(g_ni_mutex);
+    NetImpair_PumpLocked(now);
     if (g_ni_loss > 0.0) {
         const double r = (double)(NiRng() >> 11) * (1.0 / 9007199254740992.0);  // [0,1)
         if (r < g_ni_loss) return len;   // dropped -- report success to caller

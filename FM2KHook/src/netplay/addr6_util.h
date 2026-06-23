@@ -52,6 +52,12 @@ bool Addr_HasPort(const sockaddr_storage& sa);
 // only the family-mismatch errors that would otherwise be silent.
 int Sendto4or6(SOCKET s, const char* buf, int len, const sockaddr_in& dst4);
 
+// Test-only (FM2K_NET_DELAY_MS) periodic flush of the impairment delay queue.
+// MUST be called from a periodic worker (the MM-timer) so a CSS/battle-entry
+// stall where both peers wait on each other's delayed packet can't wedge. No-op
+// when impairment is off.
+void NetImpair_Pump();
+
 // sendto an arbitrary-family destination (sockaddr_storage): native v6 for an
 // AF_INET6 dst, else routed through Sendto4or6 (v4-mapped / bare). Used by the
 // direct gameplay egress now that the peer can be v6.
