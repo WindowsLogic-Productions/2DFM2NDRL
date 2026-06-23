@@ -36,7 +36,15 @@ import argparse, os, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 LAUNCHER = Path("/mnt/c/games/FM2K_RollbackLauncher.exe")
-GAME_EXE = Path("/mnt/c/games/2dfm/wanwan/WonderfulWorld_ver_0946.exe")
+# FM2K game registry: --game <name> picks the exe. Different games have
+# different rosters / CSS grid layouts / stage-select mechanics, so the
+# multi-game sweep validates the spectator across them.
+GAMES = {
+    "wanwan": Path("/mnt/c/games/2dfm/wanwan/WonderfulWorld_ver_0946.exe"),
+    "vanpri": Path("/mnt/c/games/2dfm/vanguard-princess/vanpri.exe"),
+    "urorfg": Path("/mnt/c/games/2dfm/URORFG Release 1 0 2/URORFGRelease102.exe"),
+}
+GAME_EXE = GAMES["wanwan"]   # default; overridden by --game in main()
 OUT_DIR  = Path("/mnt/c/dev/wanwan/tools/.spec_selftest")
 PARITY_DIFF = Path(__file__).parent / "parity_diff.py"
 P1_PORT, P2_PORT, SPEC_PORT = 7000, 7001, 7002
@@ -60,17 +68,25 @@ def launch(label, args, env_extra, log_path, timeout, done_when=None):
     # cmd.exe `set K=V&& ...` trick (same as the other harnesses).
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = open(log_path, "w")
-    set_parts = [f"set {k}={v}" for k, v in env_extra.items()]
     win_args = []
     for a in args:
         if a.startswith("/mnt/") and len(a) > 6 and a[6] == "/":
             a = a[5].upper() + ":" + a[6:]
         win_args.append(f'"{a}"' if " " in a else a)
-    cmd_inner = "&& ".join(set_parts + [" ".join(win_args)])
+    # Launch via a temp .bat, NOT `cmd /C "set K=V&& exe "spaced path""`: the
+    # latter's nested quotes get mangled and a game path WITH SPACES is
+    # truncated at the first space (the launcher received "C:/games/2dfm/URORFG"
+    # instead of the full "URORFG Release 1 0 2/..." path). A batch file sets the
+    # env + launches with native, un-mangled quoting.
+    bat_lines = ["@echo off"]
+    bat_lines += [f"set {k}={v}" for k, v in env_extra.items()]
+    bat_lines.append(" ".join(win_args))
+    bat_path = OUT_DIR / f".launch_{label}.bat"
+    bat_path.write_text("\r\n".join(bat_lines) + "\r\n")
     print(f"[{label}] launching: {' '.join(win_args)}")
     for k, v in env_extra.items():
         print(f"[{label}]   {k}={v}")
-    proc = subprocess.Popen(["cmd.exe", "/C", cmd_inner],
+    proc = subprocess.Popen(["cmd.exe", "/C", to_win(bat_path)],
                             stdout=log_f, stderr=subprocess.STDOUT)
     deadline = time.time() + timeout
     rc = None
@@ -199,6 +215,8 @@ def main():
                     help="minimum spectator battle frames required "
                          "(default: frames - 100)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--game", default="wanwan", choices=sorted(GAMES.keys()),
+                    help="which FM2K game to test (registry in GAMES)")
     ap.add_argument("--css-dwell", default="0.4",
                     help="CSS navigation depth (FM2K_AUTOPLAY_CSS_DWELL): the "
                          "players WANDER the char grid this long before confirming "
@@ -217,8 +235,13 @@ def main():
         if f.exists():
             f.unlink()
 
-    game_arg = to_win(GAME_EXE)
-    game_dir = GAME_EXE.parent
+    game_exe = GAMES[args.game]
+    if not game_exe.exists():
+        print(f"[harness] FATAL: --game {args.game} exe not found: {game_exe}")
+        return 2
+    print(f"[harness] game={args.game} ({game_exe.name})")
+    game_arg = to_win(game_exe)
+    game_dir = game_exe.parent
     kill_strays()
     time.sleep(1.0)
     wait_ports_free([P1_PORT, P2_PORT, SPEC_PORT])
@@ -365,7 +388,7 @@ def main():
     # boot time, so this is the only honest measure of join depth.
     try:
         import re as _re
-        host_log = open("/mnt/c/games/2dfm/wanwan/logs/FM2K_P1_Debug.log",
+        host_log = open(OUT_DIR / "live_FM2K_P1_Debug.log",
                         errors="replace").read()
         def ts_of(pattern):
             m = _re.search(r"\[(\d+):(\d+):(\d+)\.(\d+)\][^\n]*" + pattern, host_log)
@@ -428,7 +451,7 @@ def main():
         print(f"[harness] match-1 canonical replay file: {p0_rep.name}")
 
         # Multi-match liveness assertions.
-        host_log = open("/mnt/c/games/2dfm/wanwan/logs/FM2K_P1_Debug.log",
+        host_log = open(OUT_DIR / "live_FM2K_P1_Debug.log",
                         errors="replace").read()
         battles = host_log.count("GekkoNet battle session created")
         print(f"[harness] host battle sessions created: {battles}")
