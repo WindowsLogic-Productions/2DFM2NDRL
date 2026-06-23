@@ -29,16 +29,23 @@ void SleepToTarget(uint64_t start_qpc, uint32_t target_ms,
                           float frames_ahead) {
     const uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t target_ticks_count = (freq * target_ms) / 1000;
-    // GekkoNet drift correction. When we're more than half a frame
-    // ahead of the peer's confirmed input, lengthen this frame's
-    // target by 1.6%. Over time the local sim slows just enough for
-    // the lagging peer to catch up. Matches the canonical pattern
-    // in vendored/GekkoNet/Examples/OnlineSession/OnlineSession.cpp.
+    // GekkoNet drift correction. Gekko emits no pacing of its own
+    // (UpdateSession always advances; there is no Wait/Advise event), so
+    // this wall-clock slow-down of the AHEAD peer is the ONLY lever that
+    // lets the lagging peer catch up and shrink local_adv. Scale the brake
+    // with how far ahead we are so a multi-frame start gap bleeds off in
+    // ~25-35 frames instead of ~60, while a steady-state wobble keeps about
+    // the old gentle nudge. Cap +3.0ms/frame (>=77fps floor) -- MUST stay
+    // under one 10ms frame so we never invert the rift or stall a confirmed
+    // advance. Matches the canonical pattern in
+    // vendored/GekkoNet/Examples/OnlineSession/OnlineSession.cpp.
     // Without this the host's frame loop holds rigid 10 ms while the
-    // client falls 7-8 frames behind permanently — the symptom of
-    // "host says rb=300, client says rb=0, ahead pinned at ±8.5".
+    // client falls 7-8 frames behind permanently -- the symptom of
+    // "host says rb=300, client says rb=0, ahead pinned at +-8.5".
     if (frames_ahead > 0.5f) {
-        target_ticks_count = (target_ticks_count * 1016) / 1000;
+        float extra_ms = frames_ahead * 0.5f;
+        if (extra_ms > 3.0f) extra_ms = 3.0f;
+        target_ticks_count += (uint64_t)((double)freq * (double)extra_ms / 1000.0);
     }
     const uint64_t target_ticks = start_qpc + target_ticks_count;
     for (;;) {

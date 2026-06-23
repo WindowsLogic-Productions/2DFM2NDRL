@@ -793,6 +793,23 @@ void Netplay_HandleAdvanceEvent(GekkoGameEvent* update, bool& has_advance,
     // pass and floods the log. Also dedupe by last-logged frame
     // so rollback that re-hits a multiple-of-500 frame doesn't
     // re-log. [FM2K-DIAG] frame_time/skip/timer addresses are FM2K-only.
+    // [FA-TRACE] (FM2K_FA_TRACE=1): log gekko frames-ahead every confirmed
+    // battle frame for the first ~300 frames so the battle-start FA transient
+    // can be measured. PURE LOGGING -- no logic/throttle/timing change. bf is
+    // the live battle-frame label (g_netplay_frame). Reused by the fix phase.
+    if (!update->data.adv.rolling_back && !update->data.adv.running_ahead) {
+        static int s_fa_trace_enabled = -1;
+        if (s_fa_trace_enabled < 0) {
+            const char* v = std::getenv("FM2K_FA_TRACE");
+            s_fa_trace_enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (s_fa_trace_enabled && g_netplay_frame <= 300) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "[FA-TRACE] bf=%u fa=%.2f",
+                g_netplay_frame, Netplay_GetFramesAhead());
+        }
+    }
+
     if (!update->data.adv.rolling_back) {
         static uint32_t last_status_frame = 0;
         if (g_netplay_frame >= last_status_frame + 500) {
