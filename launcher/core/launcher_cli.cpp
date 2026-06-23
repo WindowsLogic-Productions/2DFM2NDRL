@@ -61,6 +61,7 @@ SDL_AppResult LauncherCli_ParseArgs(int argc, char** argv, LauncherCliArgs& out)
     std::string& spectate_target_addr = out.spectate_target_addr;
     std::string& spectate_join_mode   = out.spectate_join_mode;
     std::string& spectate_session_kind= out.spectate_session_kind;
+    int& spectate_player_index        = out.spectate_player_index;
     std::string& replay_file_path     = out.replay_file_path;
     bool& upnp_test_cli               = out.upnp_test_cli;
     uint16_t& upnp_test_port          = out.upnp_test_port;
@@ -154,6 +155,15 @@ SDL_AppResult LauncherCli_ParseArgs(int argc, char** argv, LauncherCliArgs& out)
                 spectate_mode = true;
             } else {
                 std::cerr << "Error: --spectate requires <host_ip:host_port>\n";
+                return SDL_APP_FAILURE;
+            }
+        } else if (arg == "--player-index") {
+            // Distinct index per concurrent spectator -> distinct
+            // FM2K_P{N+1}_Debug.log + parity. Default 2 (=> P3).
+            if (i + 1 < argc) {
+                spectate_player_index = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Error: --player-index requires N\n";
                 return SDL_APP_FAILURE;
             }
         } else if (arg == "--port" || arg == "-p") {
@@ -551,7 +561,9 @@ SDL_AppResult LauncherCli_ApplyLaunchMode(FM2KLauncher* launcher, LauncherCliArg
                                                     spectator_port,
                                                     host_ip, host_port,
                                                     spectate_session_kind,
-                                                    spectate_join_mode)) {
+                                                    spectate_join_mode,
+                                                    "tcp",
+                                                    args.spectate_player_index)) {
                 std::cerr << "Spectate: launch failed\n";
                 return SDL_APP_FAILURE;
             }

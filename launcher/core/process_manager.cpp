@@ -208,7 +208,8 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
                                          int host_port,
                                          const std::string& session_kind,
                                          const std::string& mode,
-                                         const std::string& spec_transport)
+                                         const std::string& spec_transport,
+                                         int player_index)
 {
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Launching remote spectator: %s (port=%d -> %s:%d, mode=%s, "
@@ -225,7 +226,10 @@ bool FM2KLauncher::LaunchRemoteSpectator(const std::string& game_path,
     ApplyPendingConfigToInstance(spectator_instance_.get());
 
     const std::string remote_addr = host_ip + ":" + std::to_string(host_port);
-    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",    "2");
+    // Per-spectator index so N concurrent spectators write distinct
+    // FM2K_P{index+1}_Debug.log + distinct parity (default 2 => P3, unchanged
+    // for the single-spectator UI/CLI callers).
+    spectator_instance_->SetEnvironmentVariable("FM2K_PLAYER_INDEX",    std::to_string(player_index));
     spectator_instance_->SetEnvironmentVariable("FM2K_LOCAL_PORT",      std::to_string(spectator_port));
     spectator_instance_->SetEnvironmentVariable("FM2K_REMOTE_ADDR",     remote_addr);
     spectator_instance_->SetEnvironmentVariable("FM2K_SPECTATOR_MODE",  "1");

@@ -217,6 +217,17 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--game", default="wanwan", choices=sorted(GAMES.keys()),
                     help="which FM2K game to test (registry in GAMES)")
+    ap.add_argument("--spectators", default="css",
+                    help="comma-list of spectator join-phases. 'css' = dial in "
+                         "during the host's CSS (FULL_SESSION / CSS-walk); "
+                         "'battle' = dial in after battle starts (CURRENT_MATCH "
+                         "snapshot). e.g. 'css,battle' = the E2E case (p3 on CSS + "
+                         "p4 mid-battle). Each gets a distinct port + player-index "
+                         "+ log + parity and is gated independently vs the host.")
+    ap.add_argument("--battle-join-offset", type=float, default=1.5,
+                    help="seconds after the host's battle session is created "
+                         "before a 'battle'-phase spectator dials in (so it joins "
+                         "a few frames into the match = a real mid-battle snapshot)")
     ap.add_argument("--css-dwell", default="0.4",
                     help="CSS navigation depth (FM2K_AUTOPLAY_CSS_DWELL): the "
                          "players WANDER the char grid this long before confirming "
@@ -230,10 +241,10 @@ def main():
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     p1_pty   = OUT_DIR / "p1_parity.pty"
-    spec_pty = OUT_DIR / "spec_parity.pty"
-    for f in (p1_pty, spec_pty):
-        if f.exists():
-            f.unlink()
+    if p1_pty.exists():
+        p1_pty.unlink()
+    # Per-spectator parity files are created below in the `specs` list.
+    spec_phases = [p.strip() for p in args.spectators.split(",") if p.strip()]
 
     game_exe = GAMES[args.game]
     if not game_exe.exists():
@@ -244,7 +255,7 @@ def main():
     game_dir = game_exe.parent
     kill_strays()
     time.sleep(1.0)
-    wait_ports_free([P1_PORT, P2_PORT, SPEC_PORT])
+    wait_ports_free([P1_PORT, P2_PORT] + [SPEC_PORT + k for k in range(len(spec_phases))])
 
     common_env = {
         "FM2K_PARITY_AUTOPLAY": "1",
@@ -288,10 +299,34 @@ def main():
     # downlink-loss shim: the impair knobs must reach the SPECTATOR (the path
     # that matters), else a "loss" run silently impairs nothing. Kept minimal
     # (no common_env merge) so the spec never gains autoplay inputs.
-    spec_env = {"FM2K_PARITY_RECORD_PATH": to_win(spec_pty)}
-    for k in ("FM2K_SPEC_DROP", "FM2K_SPEC_DROP_SEED"):
-        if os.environ.get(k):
-            spec_env[k] = os.environ[k]
+    # Per-spectator config. Each spectator dials the host on a DISTINCT port +
+    # --player-index (-> distinct FM2K_P{idx+1}_Debug.log + parity), so K
+    # concurrent spectators don't collide and each is gated independently. Env
+    # kept minimal (no common_env merge) so a spec never gains autoplay; the
+    # test-only downlink-loss shim knobs are forwarded (else a loss run silently
+    # impairs nothing). session-kind stays default boot-to-battle; the host
+    # decides FULL_SESSION (backfill-from-0 / CSS-walk) vs CURRENT_MATCH snapshot
+    # purely by WHEN the spec dials in (phase = css joins early, battle joins
+    # after the host's battle session is created).
+    specs = []
+    for k, phase in enumerate(spec_phases):
+        idx  = 2 + k                              # FM2K_PLAYER_INDEX -> FM2K_P{idx+1}
+        port = SPEC_PORT + k                      # 7002, 7003, ...
+        pty  = OUT_DIR / f"spec{k}_parity.pty"
+        pty.unlink(missing_ok=True)
+        env = {"FM2K_PARITY_RECORD_PATH": to_win(pty)}
+        for kk in ("FM2K_SPEC_DROP", "FM2K_SPEC_DROP_SEED"):
+            if os.environ.get(kk):
+                env[kk] = os.environ[kk]
+        sargs = [str(LAUNCHER), "--host", game_arg,
+                 "--spectate", f"127.0.0.1:{P1_PORT}",
+                 "--port", str(port), "--player-index", str(idx)]
+        specs.append({"k": k, "phase": phase, "idx": idx, "port": port,
+                      "pty": pty, "env": env, "args": sargs,
+                      "log": f"FM2K_P{idx+1}_Debug.log",
+                      "live": OUT_DIR / f"live_FM2K_P{idx+1}_Debug.log",
+                      "rc": None})
+    spec_pty = specs[0]["pty"]   # alias for the single-spec parity/replay code below
 
     start_ts = time.time()
 
@@ -301,26 +336,10 @@ def main():
     p1_args = [str(LAUNCHER), "--host", game_arg, "--port", str(P1_PORT)]
     p2_args = [str(LAUNCHER), "--connect", f"127.0.0.1:{P1_PORT}", game_arg,
                "--port", str(P2_PORT)]
-    # --host <game> supplies the direct-path game selection; --spectate
-    # flips the launch into passive-viewer mode (see FM2K_RollbackClient
-    # direct/spectate block). session-kind stays at the default "battle"
-    # (boot-to-battle): the spec boots straight to game_mode 3000 with
-    # placeholder chars, the deferred CURRENT_MATCH snapshot applies, and
-    # the input tail replays from the battle-start anchor. DO NOT pass
-    # "menu" here -- CURRENT_MATCH has no pre-anchor title/CSS events, so
-    # a menu-walk spectator waits at the title screen forever (verified
-    # 2026-06-11: 592 captured frames, all phase=1000).
-    #
-    # The snapshot is stashed at Netplay_StartBattle, so the spec replays
-    # battle frames from 0 regardless of when it joins -- parity_diff's
-    # index-paired battle alignment against the host stream is valid.
-    spec_args = [str(LAUNCHER), "--host", game_arg,
-                 "--spectate", f"127.0.0.1:{P1_PORT}",
-                 "--port", str(SPEC_PORT)]
 
-    print("[harness] launching P1 (host) + P2 (join), spectator joins "
-          f"{args.spec_join_delay:.0f}s later")
-    rcs = [None, None, None]
+    print("[harness] launching P1 (host) + P2 (join); spectators: "
+          + ", ".join(f"P{s['idx']+1}:{s['phase']}@{s['port']}" for s in specs))
+    rcs = [None, None]   # P1, P2
     t1 = threading.Thread(target=lambda: rcs.__setitem__(0,
         launch("P1", p1_args, p1_env, OUT_DIR / "p1.log",
                args.record_timeout, has_new_replay)))
@@ -328,41 +347,71 @@ def main():
         launch("P2", p2_args, p2_env, OUT_DIR / "p2.log",
                args.record_timeout, has_new_replay)))
 
-    # Spectator completion: parity stream quiescent (no growth for 6s
-    # after real content) -- the host's TerminateProcess cuts the TCP
-    # feed, so the spec drains whatever arrived and then idles.
-    spec_state = {"size": -1, "since": 0.0}
-    def spec_done():
-        if not has_new_replay():
-            return False    # match still running; keep consuming
-        try:
-            sz = spec_pty.stat().st_size
-        except OSError:
-            return False
-        now = time.time()
-        if sz != spec_state["size"]:
-            spec_state["size"] = sz
-            spec_state["since"] = now
-            return False
-        return sz > 32 + 260 * 10 and (now - spec_state["since"]) >= 6.0
+    # Per-spectator completion: its parity stream goes quiescent (no growth for
+    # 6s after real content) once the host's TerminateProcess cuts the feed.
+    def make_spec_done(s):
+        st = {"size": -1, "since": 0.0}
+        def done():
+            if not has_new_replay():
+                return False
+            try:
+                sz = s["pty"].stat().st_size
+            except OSError:
+                return False
+            now = time.time()
+            if sz != st["size"]:
+                st["size"] = sz; st["since"] = now; return False
+            return sz > 32 + 260 * 10 and (now - st["since"]) >= 6.0
+        return done
 
-    t3 = threading.Thread(target=lambda: rcs.__setitem__(2,
-        launch("SPEC", spec_args, spec_env, OUT_DIR / "spec.log",
-               args.record_timeout + 60, spec_done)))
+    def launch_spec(s):
+        s["rc"] = launch(f"SPEC{s['k']}", s["args"], s["env"],
+                         OUT_DIR / f"spec{s['k']}.log",
+                         args.record_timeout + 60, make_spec_done(s))
 
     t1.start()
     time.sleep(1.0)
     t2.start()
+
+    spec_threads = []
+    # css-phase spectators dial in during the host's CSS (wall-clock delay).
     time.sleep(args.spec_join_delay)
-    t3.start()
-    t1.join(); t2.join(); t3.join()
+    for s in specs:
+        if s["phase"] == "css":
+            t = threading.Thread(target=launch_spec, args=(s,)); t.start()
+            spec_threads.append(t)
+            print(f"[harness] SPEC{s['k']} (css, P{s['idx']+1}) joining now")
+    # battle-phase spectators dial in AFTER the host's battle session is created
+    # = a true mid-battle CURRENT_MATCH snapshot join.
+    battle_specs = [s for s in specs if s["phase"] == "battle"]
+    if battle_specs:
+        host_live = game_dir / "logs" / "FM2K_P1_Debug.log"
+        marker = "GekkoNet battle session created"
+        deadline = time.time() + args.record_timeout
+        while time.time() < deadline:
+            try:
+                if marker in open(host_live, errors="ignore").read():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.3)
+        time.sleep(args.battle_join_offset)
+        for s in battle_specs:
+            t = threading.Thread(target=launch_spec, args=(s,)); t.start()
+            spec_threads.append(t)
+            print(f"[harness] SPEC{s['k']} (battle, P{s['idx']+1}) joining mid-battle now")
+
+    t1.join(); t2.join()
+    for t in spec_threads:
+        t.join()
     kill_strays()
-    print(f"[harness] rcs: P1={rcs[0]} P2={rcs[1]} SPEC={rcs[2]}")
+    print(f"[harness] rcs: P1={rcs[0]} P2={rcs[1]} "
+          + " ".join(f"SPEC{s['k']}={s['rc']}" for s in specs))
 
     # Preserve the live-phase debug logs IMMEDIATELY -- before any
     # assertion can bail (a coverage FAIL used to skip preservation and
     # the replay phase of the NEXT run overwrote the evidence).
-    for lf in ("FM2K_P1_Debug.log", "FM2K_P2_Debug.log", "FM2K_P3_Debug.log"):
+    for lf in ["FM2K_P1_Debug.log", "FM2K_P2_Debug.log"] + [s["log"] for s in specs]:
         src = game_dir / "logs" / lf
         if src.exists():
             try:
@@ -508,7 +557,7 @@ def main():
     replay_pty.unlink(missing_ok=True)
     kill_strays()
     time.sleep(1.0)
-    wait_ports_free([P1_PORT, P2_PORT, SPEC_PORT])
+    wait_ports_free([P1_PORT, P2_PORT] + [SPEC_PORT + k for k in range(len(spec_phases))])
     # NOTE: no FM2K_BOOT_TO_BATTLE -- netplay-recorded replays must walk the
     # title/CSS path (see replay_netplay_diff.py:81-85).
     rep_env = {"FM2K_PARITY_RECORD_PATH": to_win(replay_pty),
@@ -532,26 +581,30 @@ def main():
                     args.record_timeout, rep_done)
     print(f"[harness] replay rc={rep_rc}")
     if not replay_pty.exists():
-        print("[harness] FAIL: replay parity missing")
-        return 1
-
-    # Trim both streams to their FIRST battle segment: the spectator's
-    # stream may continue into CSS/match 2, and the replay's stream has a
-    # title/CSS prefix + post-battle tail -- index pairing past either
-    # boundary compares unlike phases.
-    spec_m1   = OUT_DIR / "spec_m1.pty"
-    replay_m1 = OUT_DIR / "replay_m1.pty"
-    n_spec   = trim_first_battle_segment(spec_pty, spec_m1)
-    n_replay = trim_first_battle_segment(replay_pty, replay_m1)
-    print(f"[harness] (advisory) SPECTATOR vs REPLAY parity, first battle "
-          f"segment (spec={n_spec} rows, replay={n_replay} rows). NOT the gate: "
-          f"this compares against a SEPARATE replay process that mis-pairs the "
-          f"wrong match under multi-match autoplay and position-mis-aligns the "
-          f"spectator's catch-up cadence -- it produced false 'frame 71' alarms "
-          f"while host-vs-spec showed bit-exact sync. See the GATE below.")
-    diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
-                               str(spec_m1), str(replay_m1),
-                               "spec-vs-replay ADVISORY (index-paired)"])
+        # Advisory only -- do NOT block the authoritative host-vs-spec GATE.
+        # (The replay process can legitimately not produce parity when the
+        # first spectator is a mid-battle joiner, etc.)
+        print("[harness] (advisory) replay parity missing -- skipping the "
+              "spec-vs-replay advisory diff; the host-vs-spec GATE is authoritative.")
+        diff_rc = 2
+    else:
+        # Trim both streams to their FIRST battle segment: the spectator's
+        # stream may continue into CSS/match 2, and the replay's stream has a
+        # title/CSS prefix + post-battle tail -- index pairing past either
+        # boundary compares unlike phases.
+        spec_m1   = OUT_DIR / "spec_m1.pty"
+        replay_m1 = OUT_DIR / "replay_m1.pty"
+        n_spec   = trim_first_battle_segment(spec_pty, spec_m1)
+        n_replay = trim_first_battle_segment(replay_pty, replay_m1)
+        print(f"[harness] (advisory) SPECTATOR vs REPLAY parity, first battle "
+              f"segment (spec={n_spec} rows, replay={n_replay} rows). NOT the gate: "
+              f"this compares against a SEPARATE replay process that mis-pairs the "
+              f"wrong match under multi-match autoplay and position-mis-aligns the "
+              f"spectator's catch-up cadence -- it produced false 'frame 71' alarms "
+              f"while host-vs-spec showed bit-exact sync. See the GATE below.")
+        diff_rc = subprocess.call([sys.executable, str(PARITY_DIFF),
+                                   str(spec_m1), str(replay_m1),
+                                   "spec-vs-replay ADVISORY (index-paired)"])
 
     # AUTHORITATIVE GATE: host-vs-spec per-frame trace pairing (SAME run, same
     # match = ground truth). Both the host and spectator here watch the
@@ -577,7 +630,6 @@ def main():
     # spectator's traces. (2026-06-23: this masked a real bf=77 spectator
     # desync under loss -- the spec computed an rng no player ever produced.)
     host_dbg = OUT_DIR / "live_FM2K_P1_Debug.log"
-    spec_dbg = OUT_DIR / "live_FM2K_P3_Debug.log"
     # group(1)=bf, group(2)=rng, group(3+)=comparison fields.
     TRC = (r'(?:HOST|SPEC)-TRACE\] bf=(\d+) rng_pre=0x[0-9A-F]+ '
            r'rng_post=0x([0-9A-F]+) p1=0x([0-9A-F]+) p2=0x([0-9A-F]+)')
@@ -624,42 +676,54 @@ def main():
     # fingerprint: if every spectator rng appears in the host's set, the sims
     # produced identical state. Comparing inputs here gave false mismatches on a
     # snapshot-join (31 of them) while rng+scripts were bit-exact.
-    trc_spec = _rows2(spec_dbg, TRC)
+    # Host trace set is shared; gate EACH spectator against it independently.
     host_trc_rng = {rng for rng, _ in _rows2(host_dbg, TRC)}
-    ct = len(trc_spec)
-    mt = sum(1 for rng, _ in trc_spec if rng not in host_trc_rng)
-    first_t = next(((rng,) for rng, _ in trc_spec if rng not in host_trc_rng), None)
-    # FP: rng-presence + SCRIPT match (scripts are gameplay state -> reliable;
-    # a script mismatch at a matching rng would be a genuine desync).
-    cf, mf, ffm, first_f = _check(_rows2(host_dbg, FP), _rows2(spec_dbg, FP))
-    checked = ct + cf
-    bad = mt + mf + ffm
-    print(f"[harness] GATE (host-vs-spec; TRACE rng-presence, FP rng+scripts; "
-          f"any-join / multi-match robust): checked {checked} spectator frames "
-          f"(TRACE {ct}, FP {cf}); {mt + mf} rng-not-in-host, "
-          f"{ffm} FP script-mismatch")
-    if first_t:
-        print(f"  TRACE rng-not-in-host (real state divergence): {first_t}")
-    if first_f:
-        print(f"  FP first issue: {first_f}")
-    gate_ok = checked > 0 and bad == 0
+    host_fp_rows = _rows2(host_dbg, FP)
 
-    if not args.keep and gate_ok:
-        for f in (p1_pty, spec_pty, replay_pty, OUT_DIR / "p1.log",
-                  OUT_DIR / "p2.log", OUT_DIR / "spec.log",
-                  OUT_DIR / "replay.log"):
+    def gate_one(spec_live):
+        trc_spec = _rows2(spec_live, TRC)
+        ct = len(trc_spec)
+        mt = sum(1 for rng, _ in trc_spec if rng not in host_trc_rng)
+        first_t = next(((rng,) for rng, _ in trc_spec if rng not in host_trc_rng), None)
+        cf, mf, ffm, first_f = _check(host_fp_rows, _rows2(spec_live, FP))
+        return dict(ct=ct, cf=cf, mt=mt, mf=mf, ffm=ffm,
+                    checked=ct + cf, bad=mt + mf + ffm,
+                    first_t=first_t, first_f=first_f)
+
+    for s in specs:
+        r = gate_one(s["live"])
+        s["gate"] = r
+        s["ok"] = r["checked"] > 0 and r["bad"] == 0
+        verdict = "PASS" if s["ok"] else ("INCONCLUSIVE" if r["checked"] == 0 else "FAIL")
+        print(f"[harness] GATE SPEC{s['k']} ({s['phase']}, P{s['idx']+1}): "
+              f"checked {r['checked']} frames (TRACE {r['ct']}, FP {r['cf']}); "
+              f"{r['mt'] + r['mf']} rng-not-in-host, {r['ffm']} FP script-mismatch "
+              f"-> {verdict}")
+        if r["first_t"]:
+            print(f"    TRACE rng-not-in-host (real state divergence): {r['first_t']}")
+        if r["first_f"]:
+            print(f"    FP first issue: {r['first_f']}")
+
+    real_fail   = any(s["gate"]["checked"] > 0 and not s["ok"] for s in specs)
+    checked_any = any(s["gate"]["checked"] > 0 for s in specs)
+
+    if not args.keep and not real_fail and checked_any:
+        cleanup = [p1_pty, replay_pty, OUT_DIR / "p1.log", OUT_DIR / "p2.log",
+                   OUT_DIR / "replay.log"]
+        cleanup += [s["pty"] for s in specs]
+        cleanup += [OUT_DIR / f"spec{s['k']}.log" for s in specs]
+        for f in cleanup:
             f.unlink(missing_ok=True)
-    if checked == 0:
-        print("[harness] GATE INCONCLUSIVE: no spectator trace frames -- falling "
-              "back to spec-vs-replay diff_rc (need FM2K_HOST_TRACE=1 + "
-              "FM2K_SPECTATOR_DEBUG=1 and a battle phase)")
+
+    if real_fail:
+        print(f"[harness] OVERALL FAIL: a spectator desynced from host (rng-keyed).")
+        return 1
+    if not checked_any:
+        print("[harness] GATE INCONCLUSIVE: no spectator trace frames -- need "
+              "FM2K_HOST_TRACE=1 + FM2K_SPECTATOR_DEBUG=1 and a battle phase")
         return diff_rc
-    if gate_ok:
-        print("[harness] OVERALL PASS: spectator bit-exact with host "
-              "(every spectator frame's rng+inputs+scripts found in host).")
-        return 0
-    print("[harness] OVERALL FAIL: spectator desynced from host (rng-keyed).")
-    return 1
+    print(f"[harness] OVERALL PASS: all {len(specs)} spectator(s) bit-exact with host.")
+    return 0
 
 
 if __name__ == "__main__":

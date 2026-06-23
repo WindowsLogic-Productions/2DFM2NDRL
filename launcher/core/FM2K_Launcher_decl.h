@@ -161,7 +161,8 @@ public:
                                int host_port,
                                const std::string& session_kind = "menu",
                                const std::string& mode = "current",
-                               const std::string& spec_transport = "tcp");
+                               const std::string& spec_transport = "tcp",
+                               int player_index = 2);
 
     // Offline replay player. Launches the game with FM2K_SPECTATOR_MODE=1
     // + FM2K_REPLAY_FILE=<replay_path>; the hook reads the env var in
