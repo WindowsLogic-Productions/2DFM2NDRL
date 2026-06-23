@@ -372,6 +372,15 @@ struct State {
     // snapshot passed the old guard as a "first apply" and rewound the
     // live sim to the match anchor (battle restarted, 2026-06-11).
     bool                      pb_started               = false;
+    // Battle-entry alignment (live CSS-walk FULL_SESSION spectator). Set when
+    // MATCH_START drains while the local engine is still in CSS (mode<3000) --
+    // i.e. the host already entered battle but our (mask-delayed) CSS lock
+    // hasn't fired. While set, PopFrameInputs HOLDS battle inputs at the queue
+    // head (feeds neutral) and the armed CssAutoConfirm pin force-locks the
+    // host's chars; cleared the frame the engine crosses into battle. This
+    // anchors our battle-start to the host's MATCH_START session-frame instead
+    // of our local lock timing, killing the CSS-overrun input offset.
+    bool                      pb_battle_align_pending  = false;
     // Highest op_seq announced by any received UDP datagram. Drives the
     // silent-TCP-death detector in TickHealth: a persistent gap vs
     // ops_seen while TCP is quiet means the op stream is wedged.

@@ -154,6 +154,28 @@ void ApplySessionEvent(const SessionEvent& ev) {
                         g_state.pb_p1_char, g_state.pb_p1_color,
                         g_state.pb_p2_char, g_state.pb_p2_color,
                         g_state.pb_stage_id);
+                } else if (*(uint32_t*)FM2K::ADDR_GAME_MODE < 3000u) {
+                    // Live FULL_SESSION first-CSS walk: the host's MATCH_START
+                    // drained while we're STILL in CSS (mode<3000) -- the host
+                    // already entered battle, but our seam-hold-mask-delayed
+                    // CSS lock hasn't fired. A naive walk now consumes the
+                    // host's early BATTLE inputs as if they were CSS, offsetting
+                    // the entire battle stream (the ~+30-frame bf=77 desync).
+                    // Arm the SAME deterministic pin the offline/SEAM paths use
+                    // (force-locks the host's chars from MATCH_START metadata --
+                    // and the pin bypasses the seam-hold mask, css_autoconfirm
+                    // masks only when !g_active) and HOLD battle inputs until
+                    // the engine crosses into battle, so bf=0 lands exactly on
+                    // the host's first battle input (battle-start aligned).
+                    CssAutoConfirm_OnReplayMatchStart(
+                        g_state.pb_p1_char, g_state.pb_p1_color,
+                        g_state.pb_p2_char, g_state.pb_p2_color,
+                        g_state.pb_stage_id);
+                    g_state.pb_battle_align_pending = true;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SpectatorNode: battle-align -- MATCH_START at CSS "
+                        "(mode<3000); pin armed + holding battle inputs until "
+                        "mode>=3000 (anchors bf=0 to host battle-start)");
                 }
                 if (g_state.pb_boundary == State::PbBoundary::SEAM) {
                     g_state.pb_boundary = State::PbBoundary::PINNING;
@@ -479,6 +501,30 @@ bool SpectatorNode_PopFrameInputs(uint16_t* p1_input, uint16_t* p2_input) {
            g_state.pb_queue.front().type != SessionEventType::INPUT) {
         ApplySessionEvent(g_state.pb_queue.front());
         g_state.pb_queue.erase(g_state.pb_queue.begin());
+    }
+
+    // Battle-entry alignment HOLD (armed by the MATCH_START handler when the
+    // host's MATCH_START drains while we're still in CSS). The armed pin is
+    // force-locking the host's chars in the engine's CSS hook (independent of
+    // the input we feed); we HOLD the battle inputs now sitting at the queue
+    // head -- feeding neutral -- until the engine crosses into battle. Because
+    // no battle input is consumed during the (variable-length) pin-lock frames,
+    // the FIRST popped battle input lands exactly on our bf=0 == the host's
+    // bf=0, eliminating the CSS-overrun offset regardless of lock duration.
+    if (g_state.pb_battle_align_pending) {
+        const uint32_t mode_align = *(uint32_t*)FM2K::ADDR_GAME_MODE;
+        if (mode_align >= 3000u) {
+            g_state.pb_battle_align_pending = false;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SpectatorNode: battle-align complete -- engine entered battle; "
+                "resuming battle-input pops (bf=0 == host battle-start)");
+        } else {
+            g_state.pb_current_p1 = 0;
+            g_state.pb_current_p2 = 0;
+            if (p1_input) *p1_input = 0;
+            if (p2_input) *p2_input = 0;
+            return true;
+        }
     }
 
     // Boundary handling. SEAM: fall through to the normal pop -- the

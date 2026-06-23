@@ -199,6 +199,14 @@ def main():
                     help="minimum spectator battle frames required "
                          "(default: frames - 100)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--css-dwell", default="0.4",
+                    help="CSS navigation depth (FM2K_AUTOPLAY_CSS_DWELL): the "
+                         "players WANDER the char grid this long before confirming "
+                         "(~dwell*100 frames). Default 0.4 = real asymmetric "
+                         "navigation to varied non-char0 picks. Use 0 for the "
+                         "instant char0/char0 path that exercises the spectator "
+                         "battle-align fix (host confirms inside the seam-hold "
+                         "window).")
     args = ap.parse_args()
     min_coverage = args.min_coverage if args.min_coverage >= 0 else args.frames - 100
 
@@ -236,6 +244,11 @@ def main():
                               os.environ.get("FM2K_AUTOPLAY_CSS_DWELL", "8"))
     else:
         common_env["FM2K_AUTO_TERMINATE_AT_FRAME"] = str(args.frames)
+        # Real CSS navigation by default (--css-dwell): players wander to varied,
+        # asymmetric, non-char0 picks before confirming, instead of an instant
+        # char0/char0 lock. The os.environ forward below still lets FM2K_AUTOPLAY_
+        # CSS_DWELL override it.
+        common_env["FM2K_AUTOPLAY_CSS_DWELL"] = str(args.css_dwell)
     for k in ("FM2K_LOCAL_DELAY", "FM2K_PRED_WINDOW", "FM2K_PREDICTION_WINDOW", "FM2K_RUNAHEAD", "FM2K_SPEC_UDP", "FM2K_AUTOPLAY_CSS_DWELL", "FM2K_SPECTATOR_DEBUG", "FM2K_HOST_TRACE", "FM2K_TEST_BATTLE_SEED"):
         if os.environ.get(k):
             common_env[k] = os.environ[k]

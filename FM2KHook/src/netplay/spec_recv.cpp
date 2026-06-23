@@ -314,13 +314,6 @@ void SpectatorNode_HandleSpecData(const uint8_t* buf, size_t len,
             if (!g_state.have_frame_baseline) {
                 g_state.have_frame_baseline = true;
                 g_state.next_expected_frame = hdr.start_frame;
-                // [ANCHOR] proof-first instrumentation (task: in-battle-select
-                // divergence). Logs WHICH batch's start_frame the cursor
-                // latched to -- a live battle batch beating backfill here
-                // anchors the whole session at a wrong absolute frame.
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "[ANCHOR] baseline-latch start_frame=%u frame_count=%u",
-                    hdr.start_frame, hdr.frame_count);
             }
 
             // NOTE: there is deliberately NO "fully-consumed batch" early
