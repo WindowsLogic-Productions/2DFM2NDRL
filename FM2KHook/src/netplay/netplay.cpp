@@ -472,9 +472,16 @@ bool Netplay_Init(int player_index, uint16_t local_port, const char* remote_addr
                             }
                         }
                     }
+                    // BUG 2: skip bursting the peer's reflexive port when the
+                    // hub couldn't verify it (CGNAT advertised a local-port
+                    // guess a port-rewriting NAT will have remapped).
+                    const char* unver =
+                        std::getenv("FM2K_PEER_REFLEXIVE_UNVERIFIED");
+                    bool punch_reflexive = !(unver && unver[0] == '1');
                     ::fm2k::nat::StartPunch(peer_ia.s_addr,
                                              static_cast<uint16_t>(port_i),
-                                             token_bytes, lan_ip_be, lan_port);
+                                             token_bytes, lan_ip_be, lan_port,
+                                             punch_reflexive);
                 }
             }
         }

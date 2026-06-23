@@ -198,6 +198,9 @@ void HubClient::OnMessage(const std::string& msg) {
                 if (c != std::string::npos) ev.match.peer_udp_port = std::atoi(udp.c_str() + c + 1);
             }
         }
+        // BUG 2: did the hub VERIFY the peer's reflexive port? Default true so
+        // old hubs (no key) behave as before. False -> the hook won't burst it.
+        ev.match.peer_udp_verified = GetBool(peer_obj, "udp_verified", true);
         // Peer's same-LAN candidate: hub forwards "local": [ip, port] when the
         // peer self-reported a LAN IP (same array shape as udp_addr). Used to
         // also-punch the peer's private addr for same-router pairs.

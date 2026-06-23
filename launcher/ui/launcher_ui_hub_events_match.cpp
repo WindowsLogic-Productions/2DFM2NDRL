@@ -382,6 +382,22 @@ void LauncherUI::HandleMatchStartEvent(const fm2k::HubEvent& ev) {
                         ::SetEnvironmentVariableA("FM2K_PEER_LAN_ADDR", nullptr);
                     }
 
+                    // BUG 2: when the hub could not VERIFY the peer's reflexive
+                    // UDP port (CGNAT + UDP STUN blocked, so it advertised a
+                    // local-port guess a port-rewriting NAT will have remapped),
+                    // tell the hook NOT to burst that wrong port -- rely on
+                    // peer-learning + v6 + relay. Always clear on the verified
+                    // branch so a stale flag can't leak into the next match in
+                    // this persistent launcher process.
+                    if (!ev.match.peer_udp_verified) {
+                        ::SetEnvironmentVariableA("FM2K_PEER_REFLEXIVE_UNVERIFIED", "1");
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Hub: peer reflexive port UNVERIFIED -> "
+                            "FM2K_PEER_REFLEXIVE_UNVERIFIED=1 (hook skips bursting it)");
+                    } else {
+                        ::SetEnvironmentVariableA("FM2K_PEER_REFLEXIVE_UNVERIFIED", nullptr);
+                    }
+
                     NetworkConfig cfg = network_config_;
                     cfg.session_mode = SessionMode::ONLINE;
                     cfg.is_host = (ev.match.role == "host");

@@ -43,9 +43,15 @@ bool SendStunProbe();
 // candidate from the hub's local_ip exchange. When non-zero the burst also
 // punches there so same-router pairs connect directly over the LAN instead of
 // hairpinning their public IP. Safe off-LAN (never authenticates if wrong).
+// punch_reflexive (default true): when false (BUG 2 -- the hub could not VERIFY
+// the peer's reflexive port, so it advertised a local-port guess a port-
+// rewriting CGNAT will have remapped), the burst does NOT spray that dead
+// reflexive port; it still punches the LAN candidate. The connection then
+// relies on the reverse punch / peer-learning / v6 / relay.
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                 const uint8_t match_token[16],
-                uint32_t lan_ip_be = 0, uint16_t lan_port = 0);
+                uint32_t lan_ip_be = 0, uint16_t lan_port = 0,
+                bool punch_reflexive = true);
 
 // Called once per call to control_channel.cpp::RawReceive when the
 // first byte of an inbound packet is 0xCD. `data`/`len` is the full

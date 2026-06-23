@@ -187,6 +187,18 @@ int GetInt(const std::string& s, const std::string& key, int def) {
     return std::atoi(s.c_str() + p);
 }
 
+// Parse a JSON bool by KEY. A raw find("true") would false-match a later key
+// or nick containing the substring -- FindKey anchors to the actual value.
+// Mirrors GetInt: null/absent/unexpected -> default.
+bool GetBool(const std::string& s, const std::string& key, bool def) {
+    size_t p = FindKey(s, key);
+    if (p == std::string::npos) return def;
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
+    if (p + 4 <= s.size() && s.compare(p, 4, "true")  == 0) return true;
+    if (p + 5 <= s.size() && s.compare(p, 5, "false") == 0) return false;
+    return def;
+}
+
 // Pull a substring containing the JSON value following `key`. Returns empty
 // if not found. Handles only object/array values where braces match — used
 // for nested {peer:{...}}.

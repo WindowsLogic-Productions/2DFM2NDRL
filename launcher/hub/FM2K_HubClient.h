@@ -149,6 +149,12 @@ struct HubEvent {
         HubUser peer;
         std::string peer_udp_ip;
         int peer_udp_port = 0;
+        // BUG 2: false when the hub could not VERIFY the peer's reflexive UDP
+        // port (UDP STUN blocked -> it advertised a local-port guess a
+        // port-rewriting CGNAT will have remapped). Default true so old hubs /
+        // a missing key behave as before. When false the hook skips bursting
+        // that port and leans on peer-learning + v6 + relay.
+        bool peer_udp_verified = true;
         std::string peer_ws_addr;
         // Peer's same-LAN candidate (its private 192.168/10/172.16 addr),
         // forwarded by the hub from the peer's local_ip. Set FM2K_PEER_LAN_ADDR

@@ -15,6 +15,7 @@ namespace fm2k {
 std::string EscapeJsonString(const std::string& s);
 std::string GetStr(const std::string& s, const std::string& key);
 int         GetInt(const std::string& s, const std::string& key, int def = 0);
+bool        GetBool(const std::string& s, const std::string& key, bool def = false);
 std::string GetSub(const std::string& s, const std::string& key);
 
 // Object/array extractors + UTF-16 widen (json defines; dispatch + transport use).

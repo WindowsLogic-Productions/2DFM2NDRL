@@ -159,7 +159,8 @@ bool SendStunProbe() {
 
 void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
                 const uint8_t match_token[16],
-                uint32_t lan_ip_be, uint16_t lan_port) {
+                uint32_t lan_ip_be, uint16_t lan_port,
+                bool punch_reflexive) {
     char ip_str[INET_ADDRSTRLEN] = {};
     in_addr ia{};
     ia.s_addr = peer_ip_be;
@@ -239,7 +240,8 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
     }
 
     g_punching.store(true);
-    g_punch_thread = std::thread([ip_str_copy = std::string(ip_str), peer_port]() {
+    g_punch_thread = std::thread([ip_str_copy = std::string(ip_str), peer_port,
+                                  punch_reflexive]() {
         // Boost only this thread's priority — process-wide boost would
         // starve the game's main loop. timeBeginPeriod(1) tightens
         // Sleep granularity so 10 ms means ~10 ms instead of ~16 ms
@@ -267,13 +269,21 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
             ip_str_copy.c_str(), (unsigned)peer_port,
             PUNCH_PACKETS, PUNCH_PACKETS * PUNCH_PERIOD_MS);
 
+        if (!punch_reflexive) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "NAT: peer reflexive port UNVERIFIED -- skipping reflexive burst "
+                "(rely on reverse punch / peer-learning / v6 / relay); still "
+                "punching the LAN candidate if present");
+        }
         int sent_ok = 0;
         for (int i = 0; i < PUNCH_PACKETS; ++i) {
             if (!g_punching.load()) break;  // peer latched, stop early
-            int sent = fm2k::Sendto4or6(sock,
-                              reinterpret_cast<const char*>(pkt), sizeof(pkt),
-                              g_punch_peer);
-            if (sent == (int)sizeof(pkt)) ++sent_ok;
+            if (punch_reflexive) {
+                int sent = fm2k::Sendto4or6(sock,
+                                  reinterpret_cast<const char*>(pkt), sizeof(pkt),
+                                  g_punch_peer);
+                if (sent == (int)sizeof(pkt)) ++sent_ok;
+            }
             // Same-LAN candidate gets the same burst. Whichever address answers
             // first authenticates and control_channel peer-learning adopts it
             // (one socket carries control + gekko), so a successful LAN punch
