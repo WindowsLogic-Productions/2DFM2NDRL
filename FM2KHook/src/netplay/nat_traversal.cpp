@@ -18,6 +18,7 @@
 
 #include "nat_traversal.h"
 #include "control_channel.h"
+#include "addr6_util.h"        // Sendto4or6 (dual-stack v4-mapped send)
 
 #include <SDL3/SDL_log.h>
 
@@ -142,8 +143,8 @@ bool SendStunProbe() {
     SOCKET sock = ControlChannel_GetSocket();
     if (sock == INVALID_SOCKET) return false;
 
-    int sent = sendto(sock, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
-                      reinterpret_cast<sockaddr*>(&hub), sizeof(hub));
+    int sent = fm2k::Sendto4or6(sock, reinterpret_cast<const char*>(pkt),
+                                sizeof(pkt), hub);
     if (sent != (int)sizeof(pkt)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
             "NAT: STUN probe sendto failed (err=%d)", WSAGetLastError());
@@ -219,10 +220,9 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
             uint8_t pkt[2 + MATCH_TOKEN_LEN] = {MAGIC, TAG_CTRL_PUNCH};
             std::memcpy(pkt + 2, g_match_token, MATCH_TOKEN_LEN);
             for (int i = 0; i < 3; ++i) {
-                sendto(sock,
-                       reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
-                       reinterpret_cast<sockaddr*>(&g_punch_peer),
-                       sizeof(g_punch_peer));
+                fm2k::Sendto4or6(sock,
+                       reinterpret_cast<const char*>(pkt), sizeof(pkt),
+                       g_punch_peer);
             }
         }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -270,20 +270,18 @@ void StartPunch(uint32_t peer_ip_be, uint16_t peer_port,
         int sent_ok = 0;
         for (int i = 0; i < PUNCH_PACKETS; ++i) {
             if (!g_punching.load()) break;  // peer latched, stop early
-            int sent = sendto(sock,
-                              reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
-                              reinterpret_cast<sockaddr*>(&g_punch_peer),
-                              sizeof(g_punch_peer));
+            int sent = fm2k::Sendto4or6(sock,
+                              reinterpret_cast<const char*>(pkt), sizeof(pkt),
+                              g_punch_peer);
             if (sent == (int)sizeof(pkt)) ++sent_ok;
             // Same-LAN candidate gets the same burst. Whichever address answers
             // first authenticates and control_channel peer-learning adopts it
             // (one socket carries control + gekko), so a successful LAN punch
             // routes the whole match over the LAN with zero further config.
             if (g_have_lan_peer) {
-                sendto(sock,
-                       reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
-                       reinterpret_cast<sockaddr*>(&g_punch_peer_lan),
-                       sizeof(g_punch_peer_lan));
+                fm2k::Sendto4or6(sock,
+                       reinterpret_cast<const char*>(pkt), sizeof(pkt),
+                       g_punch_peer_lan);
             }
             Sleep(PUNCH_PERIOD_MS);
         }

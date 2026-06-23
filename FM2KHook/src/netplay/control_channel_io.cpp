@@ -13,9 +13,10 @@
 #include <cstring>
 #include <utility>
 #include <vector>
-#include <ws2tcpip.h>
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include "addr6_util.h"        // Sendto4or6 + v4-mapped un-map helpers
 
 // =============================================================================
 // RAW SEND/RECEIVE
@@ -39,11 +40,9 @@ void RawSend(const void* data, size_t len) {
             reinterpret_cast<const uint8_t*>(data), len,
             wrapped, sizeof(wrapped));
         if (wrapped_len == 0) return;  // payload too large
-        int result = sendto(g_socket,
+        int result = fm2k::Sendto4or6(g_socket,
                             reinterpret_cast<const char*>(wrapped),
-                            (int)wrapped_len, 0,
-                            reinterpret_cast<const sockaddr*>(relay),
-                            sizeof(*relay));
+                            (int)wrapped_len, *relay);
         if (result == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err != WSAEWOULDBLOCK) {
@@ -56,8 +55,8 @@ void RawSend(const void* data, size_t len) {
 
     if (g_remote_sockaddr.sin_port == 0) return;  // peer address not known yet (host waiting for client)
 
-    int result = sendto(g_socket, (const char*)data, (int)len, 0,
-                        (sockaddr*)&g_remote_sockaddr, sizeof(g_remote_sockaddr));
+    int result = fm2k::Sendto4or6(g_socket, (const char*)data, (int)len,
+                                  g_remote_sockaddr);
     if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK) {
@@ -111,11 +110,17 @@ void RawReceive() {
     RawReceiveRaceGuard _race_guard;
 
     while (true) {
-        sockaddr_in from_addr;
-        int from_len = sizeof(from_addr);
+        // Receive into a sockaddr_in6 (28 bytes) so the dual-stack socket can
+        // report v4-mapped / native-v6 sources. from_len is in/out -- re-set to
+        // the FULL size every iteration or a stale 16 would truncate the
+        // v4-mapped octets and mis-detect every v4 peer as native v6.
+        sockaddr_in6 from6;
+        int from_len = sizeof(from6);
+        static_assert(sizeof(from6) >= sizeof(sockaddr_in),
+                      "recv buffer must hold a v4 source too");
 
         int recv_len = recvfrom(g_socket, g_recv_buffer, RECV_BUFFER_SIZE, 0,
-                                (sockaddr*)&from_addr, &from_len);
+                                (sockaddr*)&from6, &from_len);
 
         if (recv_len == SOCKET_ERROR) {
             int err = WSAGetLastError();
@@ -128,6 +133,25 @@ void RawReceive() {
         }
 
         if (recv_len == 0) break;
+
+        // Normalize the source to a real AF_INET sockaddr_in BEFORE any
+        // compare/stamp/learn/dispatch below: peer-learning equality and the
+        // GekkoNet actor-string match both assume v4. On the dual-stack socket
+        // v4 peers arrive v4-mapped (::ffff:a.b.c.d); native v6 has no
+        // candidates in this build, so drop it. On the v4-fallback socket the
+        // kernel wrote a plain sockaddr_in into the front of the buffer.
+        sockaddr_in from_addr;
+        if (!fm2k::Addr_RecvSourceToV4(from6, from_addr)) {
+            // Native IPv6 source -- no v6 candidates in this build, drop it.
+            static bool warned_v6 = false;
+            if (!warned_v6) {
+                warned_v6 = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "NetSocket: dropping native-IPv6 source "
+                    "(no v6 candidates in this build)");
+            }
+            continue;
+        }
 
         g_last_recv_time = GetTimeMs();
 

@@ -6,6 +6,7 @@
 #include "spectator_node.h"
 #include "spectator_tcp.h"
 #include "nat_traversal.h"
+#include "addr6_util.h"        // Sendto4or6 (dual-stack v4-mapped send)
 #include "../ui/shared_mem.h"  // SharedMem_PublishMatchOutcome on ControlChannel timeout
 #include <SDL3/SDL_log.h>
 #include <vector>
@@ -22,8 +23,8 @@
 // INTERNAL STATE
 // =============================================================================
 SOCKET g_socket = INVALID_SOCKET;
-sockaddr_in g_local_sockaddr = {};
-sockaddr_in g_remote_sockaddr = {};
+sockaddr_in6 g_local_sockaddr = {};  // AF_INET6 dual-stack bind (or v4-fallback port)
+sockaddr_in g_remote_sockaddr = {};  // peer: stays v4 (un-mapped at recv)
 bool g_socket_initialized = false;
 
 // Sequence numbers for reliable messaging
@@ -190,13 +191,46 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
         return false;
     }
 
-    // Create UDP socket
-    g_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    // Create the shared UDP socket. Prefer AF_INET6 dual-stack (IPV6_V6ONLY=0)
+    // so one handle carries IPv4 (via v4-mapped) and, in a later phase, native
+    // IPv6 peers. If IPv6 is unavailable -- disabled by policy/registry, common
+    // on locked-down ISP boxes which are exactly the CGNAT population we want to
+    // help -- SOFT-FALL-BACK to a legacy AF_INET socket so pure-v4 netplay still
+    // works. The winning family is handed to addr6_util (Addr_SetSocketV6),
+    // which owns all v4/v6 send/recv normalization from here on.
+    bool socket_is_v6 = false;
+    g_socket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_socket != INVALID_SOCKET) {
+        DWORD v6only = 0;
+        setsockopt(g_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                   reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+        // Verify it actually took -- a stack that silently keeps V6ONLY=1 would
+        // drop every v4-mapped datagram, so trust the readback, not the call.
+        DWORD readback = 1; int rb_len = sizeof(readback);
+        if (getsockopt(g_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                       reinterpret_cast<char*>(&readback), &rb_len) == 0
+            && readback == 0) {
+            socket_is_v6 = true;
+        } else {
+            closesocket(g_socket);
+            g_socket = INVALID_SOCKET;
+        }
+    }
+    if (!socket_is_v6) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "NetSocket: AF_INET6 dual-stack unavailable (err=%d) -- "
+            "falling back to legacy IPv4 socket", WSAGetLastError());
+        g_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    }
     if (g_socket == INVALID_SOCKET) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "NetSocket: socket() failed: %d", WSAGetLastError());
         WSACleanup();
         return false;
     }
+    fm2k::Addr_SetSocketV6(socket_is_v6);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "NetSocket: socket family = %s",
+        socket_is_v6 ? "AF_INET6 dual-stack" : "AF_INET (v4 fallback)");
 
     // Set non-blocking
     u_long mode = 1;
@@ -215,10 +249,25 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
     setsockopt(g_socket, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
-    // Bind to local port
-    g_local_sockaddr.sin_family = AF_INET;
-    g_local_sockaddr.sin_addr.s_addr = INADDR_ANY;
-    g_local_sockaddr.sin_port = htons(local_port);
+    // Bind address. g_local_sockaddr is AF_INET6 -- a dual-stack socket bound to
+    // the zero (in6addr_any) address accepts both v4 (as v4-mapped) and v6. Only
+    // sin6_port is read downstream (NetSocket_GetLocalPort); it is set in BOTH
+    // the v6 and v4-fallback paths. The fallback v4 socket binds a plain
+    // sockaddr_in instead (an AF_INET socket rejects a 28-byte sockaddr_in6).
+    g_local_sockaddr = {};
+    g_local_sockaddr.sin6_family = AF_INET6;
+    // sin6_addr left zero == in6addr_any (avoids the in6addr_any extern symbol)
+    g_local_sockaddr.sin6_port = htons(local_port);
+    sockaddr_in v4_bind = {};
+    v4_bind.sin_family = AF_INET;
+    v4_bind.sin_addr.s_addr = INADDR_ANY;
+    v4_bind.sin_port = htons(local_port);
+    const sockaddr* bind_sa = socket_is_v6
+        ? reinterpret_cast<const sockaddr*>(&g_local_sockaddr)
+        : reinterpret_cast<const sockaddr*>(&v4_bind);
+    const int bind_len = socket_is_v6
+        ? static_cast<int>(sizeof(g_local_sockaddr))
+        : static_cast<int>(sizeof(v4_bind));
 
     // Bind with retry. The port can be TRANSIENTLY held at game boot:
     // the launcher's pre-match STUN probe (LauncherStunProbe) binds the
@@ -230,8 +279,7 @@ bool NetSocket_Init(uint16_t local_port, const char* remote_addr) {
     {
         int bind_attempts = 0;
         for (;;) {
-            if (bind(g_socket, (sockaddr*)&g_local_sockaddr,
-                     sizeof(g_local_sockaddr)) != SOCKET_ERROR) {
+            if (bind(g_socket, bind_sa, bind_len) != SOCKET_ERROR) {
                 if (bind_attempts > 0) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "NetSocket: bound port %d after %d retries (%.1fs)",
@@ -344,7 +392,7 @@ SOCKET NetSocket_GetHandle() {
 
 uint16_t NetSocket_GetLocalPort() {
     if (!g_socket_initialized) return 0;
-    return ntohs(g_local_sockaddr.sin_port);
+    return ntohs(g_local_sockaddr.sin6_port);
 }
 
 const sockaddr_in* NetSocket_GetRemoteAddr() {
@@ -505,16 +553,16 @@ void ControlChannel_SendTo(const CtrlPacket& packet, const sockaddr_in& dest) {
     pkt.header.ack       = g_recv_seq;
     pkt.header.player_id = g_local_player_id;
 
-    sendto(g_socket, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
-           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+    fm2k::Sendto4or6(g_socket, reinterpret_cast<const char*>(&pkt),
+                     sizeof(pkt), dest);
 }
 
 void ControlChannel_SendRawTo(const void* buf, size_t len, const sockaddr_in& dest) {
     if (!g_socket_initialized) return;
     if (g_socket == INVALID_SOCKET) return;
     if (dest.sin_port == 0) return;
-    sendto(g_socket, reinterpret_cast<const char*>(buf), (int)len, 0,
-           reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+    fm2k::Sendto4or6(g_socket, reinterpret_cast<const char*>(buf),
+                     (int)len, dest);
 }
 
 bool ControlChannel_IsConnected() {

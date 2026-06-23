@@ -444,7 +444,6 @@ bool     AddrEqual(const sockaddr_in& a, const sockaddr_in& b);
 void     FormatAddr(const sockaddr_in& a, char* out, size_t out_sz);
 void     OutboundBroadcast(const void* buf, size_t len);
 void     OutboundSendTo(const sockaddr_in& to, const void* buf, size_t len);
-void     SendRaw(const void* buf, size_t len, const sockaddr_in& to);
 void     AppendEventToWire(std::vector<uint8_t>& out, const SessionEvent& ev,
                            const std::vector<MatchHeader>& headers);
 uint32_t CountInputs(const std::vector<SessionEvent>& events, size_t first, size_t last);

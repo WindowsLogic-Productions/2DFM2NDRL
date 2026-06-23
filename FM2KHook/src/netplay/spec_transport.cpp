@@ -168,14 +168,6 @@ void FormatAddr(const sockaddr_in& a, char* out, size_t out_sz) {
     std::snprintf(out, out_sz, "%s:%u", ip, ntohs(a.sin_port));
 }
 
-// Send a raw UDP buffer to a peer via the shared socket.
-void SendRaw(const void* buf, size_t len, const sockaddr_in& to) {
-    SOCKET sock = NetSocket_GetHandle();
-    if (sock == INVALID_SOCKET) return;
-    sendto(sock, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0,
-           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
-}
-
 // =============================================================================
 // BROADCAST
 // =============================================================================

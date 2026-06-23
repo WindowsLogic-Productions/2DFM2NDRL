@@ -12,10 +12,16 @@
 #include <vector>
 #include <utility>
 #include <winsock2.h>
+#include <ws2tcpip.h>   // sockaddr_in6 / dual-stack
 
 // ---- socket + sequence + connection state (defined in control_channel.cpp) --
 extern SOCKET g_socket;
-extern sockaddr_in g_local_sockaddr;
+// Bind address. sockaddr_in6 because the shared socket is opened AF_INET6
+// dual-stack when possible; in the v4 fallback only sin6_port is meaningful
+// (read by NetSocket_GetLocalPort). The v4/v6 family flag lives in addr6_util.
+extern sockaddr_in6 g_local_sockaddr;
+// Peer address STAYS sockaddr_in: inbound v4-mapped sources are un-mapped at
+// the recv boundary so the GekkoNet actor-string byte-match is preserved.
 extern sockaddr_in g_remote_sockaddr;
 extern bool g_socket_initialized;
 

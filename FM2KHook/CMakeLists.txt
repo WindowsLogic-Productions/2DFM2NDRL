@@ -66,6 +66,7 @@ set(FM2KHOOK_SOURCES
     src/netplay/netplay_css.cpp      # CSS lockstep + CSS session (split from netplay)
     src/netplay/netplay_spectate.cpp # spectate session + host battle-swap handoff (split from netplay)
     src/netplay/control_channel.cpp        # core: state defs + socket lifecycle + poll/accessors (split)
+    src/netplay/addr6_util.cpp             # IPv4/IPv6 v4-mapped helpers for the dual-stack socket
     src/netplay/control_channel_io.cpp     # RawSend/RawReceive + race guard (split from control_channel)
     src/netplay/control_channel_send.cpp   # ControlChannel_Send* packet builders (split from control_channel)
     src/netplay/control_channel_gekko.cpp  # GekkoNet MultiplexAdapter (split from control_channel)

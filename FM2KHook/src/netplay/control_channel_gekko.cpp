@@ -12,8 +12,9 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
-#include <ws2tcpip.h>
 #include <winsock2.h>
+#include <ws2tcpip.h>
+#include "addr6_util.h"        // Sendto4or6 (dual-stack v4-mapped send)
 
 // =============================================================================
 // GEKKONET CUSTOM ADAPTER
@@ -71,8 +72,7 @@ static void MultiplexAdapter_Send(GekkoNetAddress* addr, const char* data, int l
         return;
     }
 
-    int result = sendto(g_socket, data, length, 0,
-                        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+    int result = fm2k::Sendto4or6(g_socket, data, length, dst);
     if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK) {
