@@ -51,7 +51,7 @@ everyone else. the normal flow is make_build.sh && build.sh.
 
 ## license
 
-source-available, NOT open source. the launcher + hooks (my own code) are under
+source-available, NOT open source. the launcher + hooks (not my own code) are under
 the PolyForm Noncommercial License 1.0.0 with a revocation addendum -- see
 [LICENSE](LICENSE). short version: personal/noncommercial use, modification and
 noncommercial redistribution are fine; commercial use needs a separate license;
